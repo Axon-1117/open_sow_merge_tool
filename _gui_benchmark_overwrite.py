@@ -1,7 +1,7 @@
 """GUI benchmark: measure overwrite performance (row overwrite) without desktop automation.
 
 Run:
-  .venv\Scripts\python.exe _gui_benchmark_overwrite.py
+  .venv\\Scripts\\python.exe _gui_benchmark_overwrite.py
 
 Outputs timing for:
 - A2B row overwrite
@@ -11,9 +11,9 @@ This is a best-effort benchmark; results vary by machine and file size.
 """
 
 import os
-import tempfile
 import time
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def _make_xlsx(path: str, rows):
@@ -42,8 +42,8 @@ def main():
     a_rows = [header, a_row]
     b_rows = [header, b_row]
 
-    td1 = tempfile.mkdtemp(prefix="sow_merge_bench_a_")
-    td2 = tempfile.mkdtemp(prefix="sow_merge_bench_b_")
+    td1 = make_temp_dir(prefix="sow_merge_bench_a_")
+    td2 = make_temp_dir(prefix="sow_merge_bench_b_")
     fa = os.path.join(td1, "same.xlsx")
     fb = os.path.join(td2, "same.xlsx")
     _make_xlsx(fa, a_rows)

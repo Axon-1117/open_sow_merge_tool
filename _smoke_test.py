@@ -1,9 +1,10 @@
 from openpyxl import Workbook
-import os, tempfile
+import os
+from _test_temp_utils import make_temp_dir
 
 # create two small workbooks in separate dirs but same basename
-root_a = tempfile.mkdtemp(prefix='sow_merge_testA_')
-root_b = tempfile.mkdtemp(prefix='sow_merge_testB_')
+root_a = make_temp_dir(prefix='sow_merge_testA_')
+root_b = make_temp_dir(prefix='sow_merge_testB_')
 
 fa = os.path.join(root_a, 't.xlsx')
 fb = os.path.join(root_b, 't.xlsx')

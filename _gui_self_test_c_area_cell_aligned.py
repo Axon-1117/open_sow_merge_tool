@@ -7,8 +7,8 @@ No desktop automation required.
 """
 
 import os
-import tempfile
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def _make_xlsx(path: str, rows):
@@ -25,8 +25,8 @@ def main():
     a_rows = [["h1", "h2", "h3"], ["a", "b", "X"]]
     b_rows = [["h1", "h2", "h3"], ["a", "b", "Y"]]
 
-    td1 = tempfile.mkdtemp(prefix="sow_merge_gui_test_c_area_a_")
-    td2 = tempfile.mkdtemp(prefix="sow_merge_gui_test_c_area_b_")
+    td1 = make_temp_dir(prefix="sow_merge_gui_test_c_area_a_")
+    td2 = make_temp_dir(prefix="sow_merge_gui_test_c_area_b_")
     fa = os.path.join(td1, "same.xlsx")
     fb = os.path.join(td2, "same.xlsx")
     _make_xlsx(fa, a_rows)

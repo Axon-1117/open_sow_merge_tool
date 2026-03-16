@@ -1,10 +1,10 @@
 import os
 import sys
 import time
-import tempfile
 from pathlib import Path
 
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 from pywinauto import Application
 from pywinauto.timings import wait_until_passes
@@ -16,8 +16,8 @@ APP_TITLE_RE = r"sow_merge_tool.*"
 
 def make_pair() -> tuple[str, str]:
     """Create two workbooks in different dirs but same basename."""
-    root_a = Path(tempfile.mkdtemp(prefix="sow_ui_A_"))
-    root_b = Path(tempfile.mkdtemp(prefix="sow_ui_B_"))
+    root_a = Path(make_temp_dir(prefix="sow_ui_A_"))
+    root_b = Path(make_temp_dir(prefix="sow_ui_B_"))
 
     fa = root_a / "t.xlsx"
     fb = root_b / "t.xlsx"

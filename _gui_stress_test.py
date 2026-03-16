@@ -8,7 +8,7 @@ then starts SowMergeApp and measures:
 - Time for background confirmation to complete (all sheets reach state 0 or 2)
 
 Run:
-  .venv\Scripts\python.exe _gui_stress_test.py
+  .venv\\Scripts\\python.exe _gui_stress_test.py
 
 You can override defaults via env vars:
   SOW_STRESS_ROWS=10000
@@ -19,9 +19,9 @@ You can override defaults via env vars:
 """
 
 import os
-import tempfile
 import time
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def env_int(name: str, default: int) -> int:
@@ -76,8 +76,8 @@ def main():
     diff_every = env_int("SOW_STRESS_DIFF_EVERY", 50)
     diff_col_every = env_int("SOW_STRESS_DIFF_COL_EVERY", 7)
 
-    td1 = tempfile.mkdtemp(prefix="sow_stress_a_")
-    td2 = tempfile.mkdtemp(prefix="sow_stress_b_")
+    td1 = make_temp_dir(prefix="sow_stress_a_")
+    td2 = make_temp_dir(prefix="sow_stress_b_")
     fa = os.path.join(td1, "same.xlsx")
     fb = os.path.join(td2, "same.xlsx")
 

@@ -5,8 +5,8 @@ Run:
 """
 
 import os
-import tempfile
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def _make_xlsx(path: str):
@@ -19,7 +19,7 @@ def _make_xlsx(path: str):
 
 
 def main():
-    td = tempfile.mkdtemp(prefix="sow_merge_gui_test_bottom_align_")
+    td = make_temp_dir(prefix="sow_merge_gui_test_bottom_align_")
     fb_dir = os.path.join(td, "normal")
     os.makedirs(fb_dir, exist_ok=True)
 

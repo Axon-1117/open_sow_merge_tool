@@ -12,5 +12,9 @@ $python = Join-Path $venv 'Scripts\python.exe'
 & $python -m pip install -r requirements.txt
 & $python -m pip install -r requirements-dev.txt
 
+$uiTmp = Join-Path $PSScriptRoot 'tmp\ui_tests'
+New-Item -ItemType Directory -Force -Path $uiTmp | Out-Null
+$env:SOW_TEST_TMPDIR = $uiTmp
+
 Write-Host "Running UI tests..." -ForegroundColor Cyan
 & $python ui_test_scenarios.py

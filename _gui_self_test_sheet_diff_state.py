@@ -7,10 +7,10 @@ No desktop automation required.
 """
 
 import os
-import tempfile
 import time
 
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def _make_xlsx(path: str, sheets: dict[str, list[list[object]]]):
@@ -36,14 +36,18 @@ def _pump(root, seconds=1.0):
 
 
 def main():
-    td1 = tempfile.mkdtemp(prefix="sow_state_a_")
-    td2 = tempfile.mkdtemp(prefix="sow_state_b_")
+    td1 = make_temp_dir(prefix="sow_state_a_")
+    td2 = make_temp_dir(prefix="sow_state_b_")
     fa = os.path.join(td1, "same.xlsx")
     fb = os.path.join(td2, "same.xlsx")
 
-    base = [["h1", "h2"], [1, 2], [3, 4]]
+    base = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]
     sheets_a = {"S_ok": base, "S_diff": base, "S_diff2": base}
-    sheets_b = {"S_ok": base, "S_diff": [["h1", "h2"], [1, 999], [3, 4]], "S_diff2": [["h1", "h2"], [1, 2], [3, 888]]}
+    sheets_b = {
+        "S_ok": base,
+        "S_diff": [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, 999], [6, 7, 8, 9, 10]],
+        "S_diff2": [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, 5], [6, 7, 8, 9, 888]],
+    }
 
     _make_xlsx(fa, sheets_a)
     _make_xlsx(fb, sheets_b)

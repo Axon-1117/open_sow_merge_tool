@@ -14,9 +14,9 @@ NOTE: This is a programmatic Tk test; it does not require an interactive desktop
 """
 
 import os
-import tempfile
 
 from openpyxl import Workbook
+from _test_temp_utils import make_temp_dir
 
 
 def _make_xlsx(path: str, rows):
@@ -40,11 +40,11 @@ def main():
         ["a", "b", "Y"],
     ]
 
-    td = tempfile.mkdtemp(prefix="sow_merge_gui_test_")
+    td = make_temp_dir(prefix="sow_merge_gui_test_")
     fa = os.path.join(td, "same.xlsx")
     fb = os.path.join(td, "same.xlsx.copy.xlsx")
     # The app requires same filename; create in separate dirs
-    td2 = tempfile.mkdtemp(prefix="sow_merge_gui_test2_")
+    td2 = make_temp_dir(prefix="sow_merge_gui_test2_")
     fb = os.path.join(td2, "same.xlsx")
 
     _make_xlsx(fa, a_rows)

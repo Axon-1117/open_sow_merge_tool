@@ -6,6 +6,7 @@ import difflib
 import tempfile
 import subprocess
 import traceback
+import atexit
 from datetime import datetime
 import time
 import stat
@@ -19,15 +20,15 @@ from tkinter import filedialog, messagebox, ttk
 import json
 import threading
 
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook as _openpyxl_load_workbook, Workbook
 from openpyxl.worksheet.formula import ArrayFormula
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
 from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-07.update17"
-APP_BUILD_TAG = "new94-rowheader-bg-restore"
+APP_VERSION = "2026-03-16.update22"
+APP_BUILD_TAG = "new99-bounds-fallback-sandbox-tests"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -52,16 +53,17 @@ _CACHE_CHECK_MAX_CELLS = 3000
 # Render performance: limit initial rows rendered (user can load full)
 _FAST_RENDER_ROW_LIMIT = 800
 _FAST_RENDER_BATCH = 500
-_LARGE_SHEET_ROW_THRESHOLD = 1000
+_LARGE_SHEET_ROW_THRESHOLD = 2000
 _LARGE_SHEET_INITIAL_ROWS = 200
 _LARGE_SHEET_BLOCK_ROWS = 1000
-_LARGE_SHEET_DIRECT_PAIR_THRESHOLD = 5000
-_ROW_ALIGN_MAX_ROWS = 1000
+_ROW_ALIGN_MAX_ROWS = 2000
+_ROW_ALIGN_SOFT_MAX_ROWS = 5000
 _TABMARK_QUICK_TAIL_ROWS = 2000
 # Fast tab-mark pre-scan can duplicate workbook open cost on huge files.
 # Skip it above this size and rely on the normal background compute path.
 _FAST_TABMARK_SCAN_SKIP_MB = 25
 _FAST_TABMARK_PHASE2_ENABLED = False
+_SVN_EXPORT_TIMEOUT_SECS = 15
 # Grid display: max chars shown per cell before truncation, and column separator
 _COL_MAX_DISPLAY_WIDTH = 30
 _COL_SEP = " \u2502 "    # 3-char separator between columns (U+2502 BOX DRAWINGS LIGHT VERTICAL)
@@ -92,6 +94,127 @@ def _dlog(msg: str):
         pass
 
 
+_WORKBOOK_REPAIR_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _cleanup_repair_cache():
+    """Remove all temporary repaired workbook copies on process exit."""
+    for path in list(_WORKBOOK_REPAIR_CACHE.values()):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+    _WORKBOOK_REPAIR_CACHE.clear()
+
+
+atexit.register(_cleanup_repair_cache)
+
+
+def _workbook_sig(path: str) -> tuple[str, int, int]:
+    p = os.path.abspath(path)
+    try:
+        st = os.stat(p)
+        return p, int(getattr(st, "st_mtime_ns", 0)), int(st.st_size)
+    except Exception:
+        return p, 0, 0
+
+
+def _repair_missing_shared_strings_part(xlsx_path: str) -> str | None:
+    """Create a temporary repaired copy when sharedStrings.xml is referenced but missing.
+
+    Some third-party exports leave the sharedStrings part declared in [Content_Types].xml
+    but omit xl/sharedStrings.xml entirely. openpyxl raises KeyError on open in that case.
+    We inject an empty sharedStrings.xml into a temp copy and retry the load.
+    """
+    if not xlsx_path or (not os.path.isfile(xlsx_path)):
+        return None
+    key = _workbook_sig(xlsx_path)
+    cached = _WORKBOOK_REPAIR_CACHE.get(key)
+    if cached and os.path.isfile(cached):
+        return cached
+    try:
+        with zipfile.ZipFile(xlsx_path, "r") as zf:
+            names = zf.namelist()
+            if "xl/sharedStrings.xml" in names:
+                return xlsx_path
+            original_infos = {n: zf.getinfo(n) for n in names}
+            all_bytes = {n: zf.read(n) for n in names}
+    except Exception as e:
+        _dlog(f"repair sharedStrings open failed: path={xlsx_path} err={e}")
+        return None
+
+    all_bytes["xl/sharedStrings.xml"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>'
+    )
+
+    ct_name = "[Content_Types].xml"
+    ct_bytes = all_bytes.get(ct_name)
+    if ct_bytes is not None:
+        try:
+            ct_root = ET.fromstring(ct_bytes)
+            if ct_root.tag.startswith("{"):
+                ns_uri = ct_root.tag[1:].split("}", 1)[0]
+                q = lambda tag: f"{{{ns_uri}}}{tag}"
+            else:
+                q = lambda tag: tag
+            has_override = False
+            for node in ct_root.findall(q("Override")):
+                if node.get("PartName") == "/xl/sharedStrings.xml":
+                    has_override = True
+                    break
+            if not has_override:
+                ET.SubElement(
+                    ct_root,
+                    q("Override"),
+                    {
+                        "PartName": "/xl/sharedStrings.xml",
+                        "ContentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+                    },
+                )
+                all_bytes[ct_name] = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True)
+        except Exception as e:
+            _dlog(f"repair sharedStrings content-types failed: path={xlsx_path} err={e}")
+
+    base = os.path.basename(xlsx_path)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    repaired = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_repair_sst_{os.getpid()}_{ts}_{base}")
+    if not repaired.lower().endswith(".xlsx"):
+        repaired += ".xlsx"
+    try:
+        with zipfile.ZipFile(repaired, "w") as zf:
+            for name, payload in all_bytes.items():
+                info = original_infos.get(name)
+                comp = info.compress_type if info else zipfile.ZIP_DEFLATED
+                zf.writestr(name, payload, compress_type=comp)
+        _WORKBOOK_REPAIR_CACHE[key] = repaired
+        _dlog(f"repair sharedStrings created: src={xlsx_path} repaired={repaired}")
+        return repaired
+    except Exception as e:
+        _dlog(f"repair sharedStrings write failed: path={xlsx_path} err={e}")
+        try:
+            if os.path.exists(repaired):
+                os.remove(repaired)
+        except Exception:
+            pass
+        return None
+
+
+def load_workbook(filename, *args, **kwargs):
+    try:
+        return _openpyxl_load_workbook(filename, *args, **kwargs)
+    except KeyError as e:
+        if "sharedStrings.xml" not in str(e):
+            raise
+        path = str(filename)
+        repaired = _repair_missing_shared_strings_part(path)
+        if not repaired:
+            raise
+        _dlog(f"load_workbook retry with repaired sharedStrings: src={path} repaired={repaired}")
+        return _openpyxl_load_workbook(repaired, *args, **kwargs)
+
+
 def _val_to_str(v):
     """Render a cell value as single-line text for the Text widget.
 
@@ -115,45 +238,82 @@ def _format_cell(val_str: str, width: int) -> str:
     return val_str.ljust(width)
 
 
-def _effective_bounds(ws):
-    """Return (max_row, max_col) based on actual non-empty cells.
+def _should_auto_row_align(max_row_a: int, max_row_b: int, force: bool = False) -> bool:
+    """Auto-enable row alignment when it prevents cascading false diffs.
 
-    Some workbooks have an inaccurate ws.max_row/ws.max_column (e.g. only first
-    N rows reported). We scan ws._cells (when available) to derive a safer bound.
+    For very large sheets we still avoid full SequenceMatcher by default, but if the
+    two sides have different total row counts we allow a higher soft limit. That
+    covers inserted/deleted row blocks without forcing row alignment on every large
+    sheet open.
+    """
+    max_row = max(max_row_a, max_row_b)
+    if max_row <= 0:
+        return False
+    if force:
+        return True
+    if max_row < _ROW_ALIGN_MAX_ROWS:
+        return True
+    if max_row > _ROW_ALIGN_SOFT_MAX_ROWS:
+        return False
+    return max_row_a != max_row_b
+
+
+def _effective_bounds(ws):
+    """Return (max_row, max_col) using the true last non-empty row.
+
+    Empty strings are treated as empty, so formulas returning "" do not keep a sheet
+    artificially large. On read-only worksheets we avoid shrinking max_col from a
+    single tail row because that can truncate real columns seen earlier in the sheet.
     """
     max_r = ws.max_row or 1
     max_c = ws.max_column or 1
+    last_r = 1
+    last_c = 1
+    found = False
+    found_via_cells = False
     try:
         cells = getattr(ws, "_cells", None)
         if cells:
-            last_r = 1
-            last_c = 1
-            found = False
             for cell in cells.values():
                 v = cell.value
                 if v not in (None, ""):
                     found = True
+                    found_via_cells = True
                     if cell.row > last_r:
                         last_r = cell.row
                     if cell.column > last_c:
                         last_c = cell.column
-            if found:
-                max_r = max(max_r, last_r)
-                max_c = max(max_c, last_c)
     except Exception:
         pass
-    return max(1, max_r), max(1, max_c)
+    if not found:
+        try:
+            for r in range(max_r, max(0, max_r - 5000), -1):
+                row = next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=max_c, values_only=True), ())
+                if any(v not in (None, "") for v in row):
+                    found = True
+                    last_r = r
+                    break
+        except Exception:
+            pass
+    if not found:
+        return 1, max(1, max_c)
+    if found_via_cells:
+        return max(1, last_r), max(1, last_c)
+    return max(1, last_r), max(1, max_c)
 
 
 def _save_values_only_from_wb(src_wb, target_path: str):
     """Fast save: values only, no styles. Drops formatting."""
     def _trim_bounds_ws(ws):
-        # Find last non-empty row/col (scan ws._cells then fallback)
+        # Find the true last non-empty row. Empty strings count as empty so formulas
+        # returning "" do not keep trailing blank regions alive. Keep max_c for
+        # read-only fallback paths so earlier populated columns are not truncated.
         max_r = ws.max_row or 1
         max_c = ws.max_column or 1
         last_r = 1
         last_c = 1
         found = False
+        found_via_cells = False
         try:
             cells = getattr(ws, "_cells", None)
             if cells:
@@ -161,6 +321,7 @@ def _save_values_only_from_wb(src_wb, target_path: str):
                     v = cell.value
                     if v not in (None, ""):
                         found = True
+                        found_via_cells = True
                         if cell.row > last_r:
                             last_r = cell.row
                         if cell.column > last_c:
@@ -168,22 +329,17 @@ def _save_values_only_from_wb(src_wb, target_path: str):
         except Exception:
             pass
         if not found:
-            for r in range(max_r, max(1, max_r - 5000), -1):
+            for r in range(max_r, max(0, max_r - 5000), -1):
                 row = next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=max_c, values_only=True), ())
                 if any(v not in (None, "") for v in row):
                     found = True
                     last_r = r
-                    for ci in range(len(row), 0, -1):
-                        v = row[ci - 1]
-                        if v not in (None, ""):
-                            last_c = ci
-                            break
                     break
         if not found:
-            return max_r, max_c
-        use_r = min(max_r, last_r + 50)
-        use_c = min(max_c, last_c + 50)
-        return max(1, use_r), max(1, use_c)
+            return 1, max(1, max_c)
+        if found_via_cells:
+            return max(1, last_r), max(1, last_c)
+        return max(1, last_r), max(1, max_c)
 
     dst = Workbook(write_only=True)
     # Remove default sheet
@@ -210,7 +366,12 @@ def _save_values_only_from_wb(src_wb, target_path: str):
 
 
 def _capture_external_link_parts(xlsx_path: str):
-    """Capture fragile package parts to preserve them across saves."""
+    """Capture fragile package parts to preserve them across saves.
+
+    Only activate this path when the workbook actually contains externalLinks parts.
+    Capturing workbook/content-types metadata for every normal workbook can overwrite
+    openpyxl's newly written package metadata and produce invalid archives.
+    """
     if not xlsx_path or (not os.path.isfile(xlsx_path)):
         return None
     try:
@@ -220,17 +381,16 @@ def _capture_external_link_parts(xlsx_path: str):
                 n for n in names
                 if n.startswith("xl/externalLinks/")
             )
+            if not target_names:
+                return None
             # workbook rels may carry externalLink relationship targets
             if "xl/_rels/workbook.xml.rels" in names:
                 target_names.add("xl/_rels/workbook.xml.rels")
-            # Preserve workbook/content-types metadata as-is to avoid Excel repair
-            # on heavily customized workbooks with external links.
+            # Preserve workbook/content-types metadata only for real external-link workbooks.
             if "xl/workbook.xml" in names:
                 target_names.add("xl/workbook.xml")
             if "[Content_Types].xml" in names:
                 target_names.add("[Content_Types].xml")
-            if not target_names:
-                return None
             parts = {n: zf.read(n) for n in target_names}
             _dlog(f"capture fragile parts: path={xlsx_path} count={len(parts)}")
             return parts
@@ -255,6 +415,24 @@ def _restore_external_link_parts(xlsx_path: str, parts) -> int:
     # Merge: keep all saved parts, overwrite/add captured external-link parts.
     for n, b in parts.items():
         all_bytes[n] = b
+
+    # Keep package metadata internally consistent. Some originals carry a sharedStrings
+    # override while openpyxl rewrites strings inline and omits xl/sharedStrings.xml.
+    # If we restore the old [Content_Types].xml, add an empty sharedStrings part back.
+    try:
+        ct_name = "[Content_Types].xml"
+        ct_bytes = all_bytes.get(ct_name)
+        if ct_bytes is not None and "xl/sharedStrings.xml" not in all_bytes:
+            ct_root = ET.fromstring(ct_bytes)
+            for node in ct_root.iter():
+                if node.tag.endswith('Override') and node.get('PartName') == '/xl/sharedStrings.xml':
+                    all_bytes['xl/sharedStrings.xml'] = (
+                        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>'
+                    )
+                    break
+    except Exception as e:
+        _dlog(f"fragile parts sharedStrings reconcile failed: {xlsx_path} err={e}")
 
     changed = len(parts)
 
@@ -292,18 +470,19 @@ def _cell_display_and_equal(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int, c:
 
     if _USE_CACHED_VALUES_ONLY:
         # If cache missing but edit has a literal value, use it for display/compare.
-        if ws_a_edit is not None and ws_b_edit is not None:
-            try:
-                if va_val is None:
-                    va_edit = ws_a_edit.cell(row=r, column=c).value
-                    if va_edit is not None and not _formula_text(va_edit):
-                        va_val = va_edit
-                if vb_val is None:
-                    vb_edit = ws_b_edit.cell(row=r, column=c).value
-                    if vb_edit is not None and not _formula_text(vb_edit):
-                        vb_val = vb_edit
-            except Exception:
-                pass
+        # Each side falls back independently so a missing edit WB on one side does not
+        # prevent the other side from recovering its literal value.
+        try:
+            if va_val is None and ws_a_edit is not None:
+                va_edit = ws_a_edit.cell(row=r, column=c).value
+                if va_edit is not None and not _formula_text(va_edit):
+                    va_val = va_edit
+            if vb_val is None and ws_b_edit is not None:
+                vb_edit = ws_b_edit.cell(row=r, column=c).value
+                if vb_edit is not None and not _formula_text(vb_edit):
+                    vb_val = vb_edit
+        except Exception:
+            pass
         # If cache missing on one side but both formulas are the same, treat as equal and display the available value.
         if ws_a_edit is not None and ws_b_edit is not None and ((va_val is None) != (vb_val is None)):
             va_edit = ws_a_edit.cell(row=r, column=c).value
@@ -324,27 +503,27 @@ def _cell_display_and_equal_by_row(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra:
     vb_val = ws_b_val.cell(row=rb, column=c).value if rb is not None else None
 
     if _USE_CACHED_VALUES_ONLY:
-        if ws_a_edit is not None and ws_b_edit is not None:
+        # Each side falls back independently.
+        try:
+            if va_val is None and ra is not None and ws_a_edit is not None:
+                va_edit = ws_a_edit.cell(row=ra, column=c).value
+                if va_edit is not None and not _formula_text(va_edit):
+                    va_val = va_edit
+            if vb_val is None and rb is not None and ws_b_edit is not None:
+                vb_edit = ws_b_edit.cell(row=rb, column=c).value
+                if vb_edit is not None and not _formula_text(vb_edit):
+                    vb_val = vb_edit
+        except Exception:
+            pass
+        if ws_a_edit is not None and ws_b_edit is not None and (va_val is None) != (vb_val is None):
             try:
-                if va_val is None and ra is not None:
-                    va_edit = ws_a_edit.cell(row=ra, column=c).value
-                    if va_edit is not None and not _formula_text(va_edit):
-                        va_val = va_edit
-                if vb_val is None and rb is not None:
-                    vb_edit = ws_b_edit.cell(row=rb, column=c).value
-                    if vb_edit is not None and not _formula_text(vb_edit):
-                        vb_val = vb_edit
+                va_edit = ws_a_edit.cell(row=ra, column=c).value if ra is not None else None
+                vb_edit = ws_b_edit.cell(row=rb, column=c).value if rb is not None else None
+                if _same_formula(va_edit, vb_edit):
+                    v = va_val if va_val is not None else vb_val
+                    return v, v, True
             except Exception:
                 pass
-            if (va_val is None) != (vb_val is None):
-                try:
-                    va_edit = ws_a_edit.cell(row=ra, column=c).value if ra is not None else None
-                    vb_edit = ws_b_edit.cell(row=rb, column=c).value if rb is not None else None
-                    if _same_formula(va_edit, vb_edit):
-                        v = va_val if va_val is not None else vb_val
-                        return v, v, True
-                except Exception:
-                    pass
         eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
         return va_val, vb_val, eq
 
@@ -837,6 +1016,21 @@ def _recalc_and_prepare_val_path(path: str) -> str | None:
         return None
 
 
+def _maybe_recalc_and_prepare_val_path(path: str, force: bool = False) -> str | None:
+    """Recalc only when needed, unless forced by the caller."""
+    if not path:
+        return None
+    try:
+        if not force:
+            has_formula, _missing_cache = _scan_formula_cache(path)
+            if not has_formula:
+                return None
+        return _recalc_and_prepare_val_path(path)
+    except Exception as e:
+        _dlog(f"maybe recalc path failed: path={path} err={e}")
+        return None
+
+
 def _launch_deferred_copy(src: str, dst: str, retries: int = 60, delay_ms: int = 500):
     """Launch a background copy that retries for a while (to avoid lock issues)."""
     try:
@@ -963,7 +1157,7 @@ def _try_export_svn_revision_from_merge_temp(path: str) -> str:
             return path
 
         # Wait for file to be created (best-effort)
-        for _ in range(50):
+        for _ in range(int(_SVN_EXPORT_TIMEOUT_SECS / 0.1)):
             try:
                 if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
                     return save_path
@@ -2823,21 +3017,39 @@ class SheetView:
         self._suppress_c_xsync = True
         try:
             try:
-                self.cursor_cmp.xview_moveto(frac)
+                c_first = self._map_xfirst_between_widgets(self.left, self.cursor_cmp, frac)
+                self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
-                    self.cursor_cmp_colhdr.xview_moveto(frac)
-                cf, cl = self.cursor_cmp.xview()
-                self.cursor_hsb.set(cf, cl)
+                    self.cursor_cmp_colhdr.xview_moveto(c_first)
             except Exception:
                 pass
             try:
-                self.cell_cmp_text.xview_moveto(frac)
-                sf, sl = self.cell_cmp_text.xview()
-                self.cell_cmp_hsb.set(sf, sl)
+                cell_first = self._map_xfirst_between_widgets(self.left, self.cell_cmp_text, frac)
+                self.cell_cmp_text.xview_moveto(cell_first)
             except Exception:
                 pass
+            self._set_c_hscrollbars_from_main()
         finally:
             self._suppress_c_xsync = prev_suppress
+
+    def _set_c_hscrollbars_from_main(self):
+        try:
+            first, last = self.left.xview()
+        except Exception:
+            try:
+                first, last = self.right.xview()
+            except Exception:
+                first, last = (0.0, 1.0)
+        try:
+            if getattr(self, "cursor_hsb", None) is not None:
+                self.cursor_hsb.set(first, last)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "cell_cmp_hsb", None) is not None:
+                self.cell_cmp_hsb.set(first, last)
+        except Exception:
+            pass
 
     @staticmethod
     def _clamp(value: float, lo: float, hi: float) -> float:
@@ -2931,18 +3143,15 @@ class SheetView:
                 self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
                     self.cursor_cmp_colhdr.xview_moveto(c_first)
-                cf, cl = self.cursor_cmp.xview()
-                self.cursor_hsb.set(cf, cl)
             except Exception:
                 pass
             try:
                 if hasattr(self, "cell_cmp_text"):
                     cell_first = self._map_xfirst_between_widgets(src_widget, self.cell_cmp_text, src_first)
                     self.cell_cmp_text.xview_moveto(cell_first)
-                    sf, sl = self.cell_cmp_text.xview()
-                    self.cell_cmp_hsb.set(sf, sl)
             except Exception:
                 pass
+            self._set_c_hscrollbars_from_main()
         finally:
             self._suppress_c_xsync = prev_suppress
 
@@ -3006,8 +3215,7 @@ class SheetView:
             first, last = self.left.xview()
             self._sync_main_x_to_frac(first)
             self._sync_c_x_from_widget(self.left, first)
-            # Reflect main-pane scroll state in cursor_hsb for full-range thumb.
-            self.cursor_hsb.set(first, last)
+            self._set_c_hscrollbars_from_main()
         finally:
             self._xsyncing = False
         try:
@@ -3021,7 +3229,7 @@ class SheetView:
         # Passive C-pane xscroll callback should never drive main panes.
         # Only explicit C scrollbar command handlers (_xview_cursor_cmp/_xview_cell_cmp)
         # are allowed to sync main xview.
-        self.cursor_hsb.set(first, last)
+        self._set_c_hscrollbars_from_main()
         return
 
     def _xview_cell_cmp(self, *args):
@@ -3029,11 +3237,14 @@ class SheetView:
             return
         self._xsyncing = True
         try:
-            self.cell_cmp_text.xview(*args)
-            first, last = self.cell_cmp_text.xview()
-            self.cell_cmp_hsb.set(first, last)
-            self._sync_main_x_from_widget(self.cell_cmp_text, first)
-            self._sync_c_x_from_widget(self.cell_cmp_text, first)
+            # Keep the lower C-area scrollbar as a main-pane controller too.
+            # The cell text itself is often narrower than the main sheet viewport,
+            # so driving from its own xview would collapse the thumb to 0..1.
+            self.left.xview(*args)
+            first, last = self.left.xview()
+            self._sync_main_x_to_frac(first)
+            self._sync_c_x_from_widget(self.left, first)
+            self._set_c_hscrollbars_from_main()
         finally:
             self._xsyncing = False
         try:
@@ -3045,7 +3256,7 @@ class SheetView:
         if self._is_click_trace_active():
             _dlog(f"xscroll_cell_cmp first={first} last={last} xsyncing={self._xsyncing} suppress={getattr(self, '_suppress_c_xsync', False)}")
         # Same rule as cursor_cmp: passive callback updates only its own scrollbar.
-        self.cell_cmp_hsb.set(first, last)
+        self._set_c_hscrollbars_from_main()
         return
 
     def _is_grid_overlay_enabled(self) -> bool:
@@ -4654,8 +4865,9 @@ class SheetView:
         max_row = max(max_row_a, max_row_b)
         if max_row <= 0:
             return []
-        if (not force) and max_row >= _ROW_ALIGN_MAX_ROWS:
-            # Large-sheet fast path: skip SequenceMatcher and pair rows directly.
+        if not _should_auto_row_align(max_row_a, max_row_b, force=force):
+            # Large-sheet fast path: skip SequenceMatcher unless row-count drift suggests
+            # an insert/delete block that would otherwise cascade false diffs.
             return self._build_row_pairs_direct(max_row_a, max_row_b)
 
         def _row_sig_list(ws, max_row_local: int):
@@ -6010,17 +6222,16 @@ class SheetView:
                 max_row_b = ws_b.max_row or 1
 
                 force_align = bool(getattr(self, "_force_sequence_align", False))
+                should_align = (
+                    (not getattr(self.app, "merge_conflict_mode", False))
+                    and _should_auto_row_align(max_row_a, max_row_b, force=force_align)
+                )
 
-                # Large sheets: skip expensive row-alignment on open unless user forces SM.
-                if (self.max_row >= _ROW_ALIGN_MAX_ROWS) and (not force_align):
-                    self._align_rows_enabled = False
-                    self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
+                self._align_rows_enabled = should_align
+                if self._align_rows_enabled:
+                    self.row_pairs = self._build_row_pairs(ws_a, ws_b, force=force_align)
                 else:
-                    self._align_rows_enabled = (not getattr(self.app, "merge_conflict_mode", False))
-                    if self._align_rows_enabled:
-                        self.row_pairs = self._build_row_pairs(ws_a, ws_b, force=force_align)
-                    else:
-                        self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
+                    self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
 
                 for idx, (ra, rb) in enumerate(self.row_pairs):
                     if ra is not None:
@@ -6063,8 +6274,52 @@ class SheetView:
             self._full_display_rows = rows
         elif bool(self.only_diff_var.get()):
             if (not self.snapshot_only_diff) or rescan or (row_only is None) or (not self.display_rows):
-                # build snapshot: diff rows + touched rows
+                # Build snapshot: diff rows + touched rows.
                 rows = [idx for idx, cols in self.pair_diff_cols.items() if cols]
+
+                # Recovery path:
+                # In fast-open/background scenarios (especially large sheets), pair_diff_cols can be
+                # incomplete when users switch to only-diff. If tab state already says this sheet has
+                # diffs but rows is empty, do an on-demand fill so only-diff never becomes an empty page.
+                if (not rows) and row_only is None:
+                    try:
+                        state = int(getattr(self.app, "sheet_diff_state", {}).get(self.sheet, 0))
+                    except Exception:
+                        state = 0
+                    if state > 0:
+                        try:
+                            _dlog(
+                                f"ONLY_DIFF_RECOVERY sheet={self.sheet} "
+                                f"large={self._is_large_sheet} pairs={len(self.row_pairs)}"
+                            )
+                        except Exception:
+                            pass
+                        if self._is_large_sheet:
+                            max_row_a = ws_a.max_row or 1
+                            max_row_b = ws_b.max_row or 1
+                            self._precompute_large_diff_by_blocks(
+                                ws_a, ws_b, ws_a_edit, ws_b_edit, max_row_a, max_row_b
+                            )
+                        else:
+                            for idx, (ra, rb) in enumerate(self.row_pairs):
+                                if idx in self.pair_diff_cols:
+                                    continue
+                                line_a, line_b, cols = self._build_row_and_diff_pair(
+                                    ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb
+                                )
+                                self.pair_diff_cols[idx] = cols
+                                self.pair_text_a[idx] = line_a
+                                self.pair_text_b[idx] = line_b
+                        rows = [idx for idx, cols in self.pair_diff_cols.items() if cols]
+                        # If recovery found no diffs, the sheet_diff_state was stale.
+                        # Clear it so subsequent refreshes do not re-trigger recovery.
+                        if not rows:
+                            try:
+                                if hasattr(self.app, "sheet_diff_state"):
+                                    self.app.sheet_diff_state[self.sheet] = 0
+                            except Exception:
+                                pass
+
                 rows_set = set(rows)
                 for r in self.touched_rows:
                     idx = self.row_a_to_pair_idx.get(r)
@@ -6855,14 +7110,15 @@ class SowMergeApp:
                 pass
 
         def _compute_trim_bounds(ws):
-            # Find last non-empty row/col; then +50 buffer.
-            # Prefer ws._cells (only stored non-empty cells) to avoid missing data
-            # when max_row/max_col are inflated by styles.
+            # Find the true last non-empty row for this sheet. Empty strings are
+            # treated as empty so formulas returning "" do not expand the bounds.
+            # Keep max_c on read-only fallback paths so earlier wide rows are preserved.
             max_r = ws.max_row or 1
             max_c = ws.max_column or 1
             last_r = 1
             last_c = 1
             found = False
+            found_via_cells = False
 
             try:
                 cells = getattr(ws, "_cells", None)
@@ -6871,6 +7127,7 @@ class SowMergeApp:
                         v = cell.value
                         if v not in (None, ""):
                             found = True
+                            found_via_cells = True
                             if cell.row > last_r:
                                 last_r = cell.row
                             if cell.column > last_c:
@@ -6879,30 +7136,22 @@ class SowMergeApp:
                 pass
 
             if not found:
-                # Fallback: scan backwards up to 5000 rows.
-                # If still not found, do NOT trim (avoid cutting real data).
-                for r in range(max_r, max(1, max_r - 5000), -1):
+                for r in range(max_r, max(0, max_r - 5000), -1):
                     row = next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=max_c, values_only=True), ())
                     if any(v not in (None, "") for v in row):
                         found = True
                         last_r = r
-                        # determine last non-empty col from that row
-                        for ci in range(len(row), 0, -1):
-                            v = row[ci - 1]
-                            if v not in (None, ""):
-                                last_c = ci
-                                break
                         break
                 if not found:
-                    return max_r, max_c
+                    return 1, max(1, max_c)
 
-            use_r = min(max_r, last_r + 50)
-            use_c = min(max_c, last_c + 50)
-            return max(1, use_r), max(1, use_c)
+            if found_via_cells:
+                return max(1, last_r), max(1, last_c)
+            return max(1, last_r), max(1, max_c)
 
         def _compute_row_pairs_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
-            if max(max_row_a, max_row_b) >= _ROW_ALIGN_MAX_ROWS:
+            if not _should_auto_row_align(max_row_a, max_row_b, force=False):
                 max_row = max(max_row_a, max_row_b)
                 pairs = []
                 for r in range(1, max_row + 1):
@@ -6921,7 +7170,7 @@ class SowMergeApp:
                         max_col=max_col,
                         values_only=True,
                     ):
-                        sigs.append("\x1f".join(_merge_cmp_value(v) for v in (row or ())))
+                        sigs.append("\x1f".join(_merge_cmp_value(v).replace("\x1f", "\x1e") for v in (row or ())))
                 except Exception:
                     return []
                 return sigs
@@ -7387,9 +7636,10 @@ class SowMergeApp:
             self.set_sheet_has_diff(sheet, has, confirmed=True)
             view = self.sheet_views.get(sheet)
             if has and view and view._prefer_only_diff_when_ready and view.only_diff_var.get() == 0:
-                view.only_diff_var.set(1)
-                view.refresh(row_only=None, rescan=False)
-                view._update_cursor_lines()
+                if not getattr(view, "_is_large_sheet", False) and getattr(view, "_data_ready", False):
+                    view.only_diff_var.set(1)
+                    view.refresh(row_only=None, rescan=False)
+                    view._update_cursor_lines()
             self.refresh_sheet_nav()
 
         def _sheet_has_diff_fast_tail(ws_a, ws_b, max_row: int, max_col: int, min_row: int = 1):
@@ -8119,43 +8369,10 @@ class SowMergeApp:
     def recalc_and_refresh(self):
         # Manual: force Excel recalc to refresh cached values, then reload view.
         def _do_recalc():
-            new_a = _recalc_and_prepare_val_path(self.file_a)
-            new_b = _recalc_and_prepare_val_path(self.file_b)
-            new_base = _recalc_and_prepare_val_path(self.base_path) if getattr(self, "has_base", False) else None
-            if new_a:
-                _loaded = load_workbook(new_a, data_only=True)
-                _wbs_close(getattr(self, "_wb_a_val", None))
-                self._file_a_val_path = new_a
-                self._wb_a_val = _loaded
-            if new_b:
-                _loaded = load_workbook(new_b, data_only=True)
-                _wbs_close(getattr(self, "_wb_b_val", None))
-                self._file_b_val_path = new_b
-                self._wb_b_val = _loaded
-            if new_base and getattr(self, "has_base", False):
-                _loaded = load_workbook(new_base, data_only=True)
-                _wbs_close(getattr(self, "_wb_base_val", None))
-                self._file_base_val_path = new_base
-                self._wb_base_val = _loaded
-
-            # Refresh current sheet immediately
-            try:
-                tab_id = self.nb.select()
-                tab_text = self.nb.tab(tab_id, "text")
-                view = self.sheet_views.get(tab_text)
-                if view:
-                    view.refresh(row_only=None, rescan=True)
-            except Exception:
-                pass
-            # Recompute diff states in background
-            try:
-                for s in self.common_sheets:
-                    self.set_sheet_has_diff(s, False, confirmed=False)
-                with self._compute_lock:
-                    self._compute_queue = [s for s in self.common_sheets if s not in self._compute_inflight]
-                self._kick_worker()
-            except Exception:
-                pass
+            new_a = _maybe_recalc_and_prepare_val_path(self.file_a, force=True)
+            new_b = _maybe_recalc_and_prepare_val_path(self.file_b, force=True)
+            new_base = _maybe_recalc_and_prepare_val_path(self.base_path, force=True) if getattr(self, "has_base", False) else None
+            self._apply_recalc_results(new_a=new_a, new_b=new_b, new_base=new_base)
 
         try:
             self._with_progress("重算中", "正在重算并刷新，请稍候...", _do_recalc)
@@ -8165,17 +8382,15 @@ class SowMergeApp:
     def _schedule_auto_recalc(self):
         if not (_AUTO_RECALC_ON_OPEN and _USE_CACHED_VALUES_ONLY):
             return
-        if not getattr(self, "merge_mode", False):
-            return
         if self._auto_recalc_started:
             return
         self._auto_recalc_started = True
 
         def _worker():
             try:
-                new_a = _recalc_and_prepare_val_path(self.file_a)
-                new_b = _recalc_and_prepare_val_path(self.file_b)
-                new_base = _recalc_and_prepare_val_path(self.base_path) if getattr(self, "has_base", False) else None
+                new_a = _maybe_recalc_and_prepare_val_path(self.file_a)
+                new_b = _maybe_recalc_and_prepare_val_path(self.file_b)
+                new_base = _maybe_recalc_and_prepare_val_path(self.base_path) if getattr(self, "has_base", False) else None
             except Exception:
                 new_a = None
                 new_b = None
@@ -8186,39 +8401,7 @@ class SowMergeApp:
 
             def _apply():
                 try:
-                    if new_a:
-                        _loaded = load_workbook(new_a, data_only=True)
-                        _wbs_close(getattr(self, "_wb_a_val", None))
-                        self._file_a_val_path = new_a
-                        self._wb_a_val = _loaded
-                    if new_b:
-                        _loaded = load_workbook(new_b, data_only=True)
-                        _wbs_close(getattr(self, "_wb_b_val", None))
-                        self._file_b_val_path = new_b
-                        self._wb_b_val = _loaded
-                    if new_base and getattr(self, "has_base", False):
-                        _loaded = load_workbook(new_base, data_only=True)
-                        _wbs_close(getattr(self, "_wb_base_val", None))
-                        self._file_base_val_path = new_base
-                        self._wb_base_val = _loaded
-
-                    try:
-                        tab_id = self.nb.select()
-                        tab_text = self.nb.tab(tab_id, "text")
-                        view = self.sheet_views.get(tab_text)
-                        if view:
-                            view.refresh(row_only=None, rescan=True)
-                    except Exception:
-                        pass
-
-                    try:
-                        for s in self.common_sheets:
-                            self.set_sheet_has_diff(s, False, confirmed=False)
-                        with self._compute_lock:
-                            self._compute_queue = [s for s in self.common_sheets if s not in self._compute_inflight]
-                        self._kick_worker()
-                    except Exception:
-                        pass
+                    self._apply_recalc_results(new_a=new_a, new_b=new_b, new_base=new_base)
                 except Exception as e:
                     _dlog(f"auto recalc apply failed: {e}")
 
@@ -8228,6 +8411,7 @@ class SowMergeApp:
                 pass
 
         threading.Thread(target=_worker, daemon=True).start()
+
 
     def _with_progress(self, title: str, message: str, fn):
         dlg = tk.Toplevel(self.root)
@@ -8376,14 +8560,14 @@ class SowMergeApp:
 
     def _atomic_replace_file_with_retry(self, src_path: str, target_path: str, retries: int = 6, delay_sec: float = 0.5):
         last_err = None
-        for _ in range(max(1, retries)):
+        for attempt in range(max(1, retries)):
             try:
                 self._atomic_replace_file(src_path, target_path)
                 return
             except Exception as e:
                 if getattr(e, "winerror", None) in (5, 32, 33) or isinstance(e, PermissionError):
                     last_err = e
-                    time.sleep(delay_sec)
+                    time.sleep(delay_sec * (2 ** min(attempt, 4)))
                     continue
                 raise
         if last_err:
@@ -8442,15 +8626,111 @@ class SowMergeApp:
             f"将直接覆盖保存 {which} 文件（原路径、原文件名）：\n\n{path}\n\n建议确保该 Excel 未在 WPS/Excel 中打开。继续吗？",
         )
 
+    def _refresh_current_view_after_val_reload(self):
+        try:
+            tab_id = self.nb.select()
+            tab_text = self.nb.tab(tab_id, "text")
+            view = self.sheet_views.get(tab_text)
+            if view:
+                view.refresh(row_only=None, rescan=True)
+                view._update_cursor_lines()
+        except Exception:
+            pass
+        try:
+            for s in self.common_sheets:
+                self.set_sheet_has_diff(s, False, confirmed=False)
+            with self._compute_lock:
+                self._compute_queue = [s for s in self.common_sheets if s not in self._compute_inflight]
+            self._kick_worker()
+        except Exception:
+            pass
+
+    def _apply_recalc_results(self, new_a=None, new_b=None, new_base=None):
+        specs = []
+        if new_a:
+            specs.append(("_wb_a_val", "_file_a_val_path", new_a))
+        if new_b:
+            specs.append(("_wb_b_val", "_file_b_val_path", new_b))
+        if new_base and getattr(self, "has_base", False):
+            specs.append(("_wb_base_val", "_file_base_val_path", new_base))
+        if not specs:
+            return
+
+        loaded_items = []
+        try:
+            for wb_attr, path_attr, wb_path in specs:
+                loaded_items.append((wb_attr, path_attr, wb_path, load_workbook(wb_path, data_only=True)))
+        except Exception:
+            _wbs_close(*(wb for *_rest, wb in loaded_items))
+            raise
+
+        for wb_attr, path_attr, wb_path, loaded_wb in loaded_items:
+            old_wb = getattr(self, wb_attr, None)
+            setattr(self, path_attr, wb_path)
+            setattr(self, wb_attr, loaded_wb)
+            _wbs_close(old_wb)
+
+        self._refresh_current_view_after_val_reload()
+
+    def _recalc_saved_path_inplace(self, path: str, which: str) -> bool:
+        if not (_USE_CACHED_VALUES_ONLY and path):
+            return False
+        has_formula, _missing_cache = _scan_formula_cache(path)
+        if not has_formula:
+            return False
+        tmp = _recalc_and_prepare_val_path(path)
+        if not tmp:
+            raise RuntimeError(f"{which} 文件包含公式，但自动重算未能生成最新缓存值。")
+        try:
+            self._atomic_replace_file_with_retry(tmp, path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        return True
+
+    def _post_save_refresh(self, which: str, path: str) -> str | None:
+        warning = None
+        try:
+            self._recalc_saved_path_inplace(path, which)
+        except Exception as e:
+            warning = f"{which} 文件已保存，但公式缓存刷新失败：\n{e}"
+            _dlog(f"post save recalc failed: which={which} path={path} err={e}")
+
+        try:
+            if which == "A":
+                self._apply_recalc_results(new_a=path)
+            elif which == "B":
+                self._apply_recalc_results(new_b=path)
+            elif which == "BASE" and getattr(self, "has_base", False):
+                self._apply_recalc_results(new_base=path)
+        except Exception as e:
+            _dlog(f"post save reload failed: which={which} path={path} err={e}")
+            reload_warning = f"{which} 文件已保存，但界面刷新失败：\n{e}"
+            warning = f"{warning}\n\n{reload_warning}" if warning else reload_warning
+        return warning
+
     def save_b_inplace(self):
         self._ensure_edit_loaded()
         path = self.file_b
         if not self._confirm_overwrite("B", path):
             return
         try:
-            self._with_progress("保存中", f"正在保存：\n{path}", lambda: self._atomic_save(self._wb_b_edit, path))
+            warning = None
+
+            def _do_save():
+                nonlocal warning
+                self._atomic_save(self._wb_b_edit, path)
+                warning = self._post_save_refresh("B", path)
+
+            self._with_progress("保存中", f"正在保存：\n{path}", _do_save)
             self.modified_b = False
-            messagebox.showinfo("Saved", f"已保存并覆盖：\n{path}")
+            if warning:
+                messagebox.showwarning("Saved", f"已保存并覆盖：\n{path}\n\n{warning}")
+            else:
+                messagebox.showinfo("Saved", f"已保存并覆盖：\n{path}")
         except Exception as e:
             # If the file is locked or denied, offer save-as fallback
             if getattr(e, "winerror", None) in (5, 32, 33) or isinstance(e, PermissionError):
@@ -8467,9 +8747,19 @@ class SowMergeApp:
         if not self._confirm_overwrite("A", path):
             return
         try:
-            self._with_progress("保存中", f"正在保存：\n{path}", lambda: self._atomic_save(self._wb_a_edit, path))
+            warning = None
+
+            def _do_save():
+                nonlocal warning
+                self._atomic_save(self._wb_a_edit, path)
+                warning = self._post_save_refresh("A", path)
+
+            self._with_progress("保存中", f"正在保存：\n{path}", _do_save)
             self.modified_a = False
-            messagebox.showinfo("Saved", f"已保存并覆盖：\n{path}")
+            if warning:
+                messagebox.showwarning("Saved", f"已保存并覆盖：\n{path}\n\n{warning}")
+            else:
+                messagebox.showinfo("Saved", f"已保存并覆盖：\n{path}")
         except Exception as e:
             if getattr(e, "winerror", None) in (5, 32, 33) or isinstance(e, PermissionError):
                 diag = self._path_diagnostics(path)
@@ -8478,6 +8768,7 @@ class SowMergeApp:
                         self.modified_a = False
                         return
             messagebox.showerror("保存失败", f"保存 A 失败：\n{e}")
+
 
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:

@@ -9,10 +9,11 @@ Run with: D:\\Tools\\sow_merge_tool\\.venv\\Scripts\\python.exe _smoke_test_curs
 """
 
 from openpyxl import Workbook
-import os, tempfile
+import os
+from _test_temp_utils import make_temp_dir
 
-root_a = tempfile.mkdtemp(prefix='sow_cursor_A_')
-root_b = tempfile.mkdtemp(prefix='sow_cursor_B_')
+root_a = make_temp_dir(prefix='sow_cursor_A_')
+root_b = make_temp_dir(prefix='sow_cursor_B_')
 fa = os.path.join(root_a, 't.xlsx')
 fb = os.path.join(root_b, 't.xlsx')
 
@@ -51,9 +52,7 @@ view._update_cursor_lines()
 line1 = view.cursor_cmp.get('1.0', '1.end')
 line2 = view.cursor_cmp.get('2.0', '2.end')
 
-assert line1.startswith('2\t') or line1.startswith('2\t') or line1.startswith('2\t') or line1.startswith('2\t')
-assert line1.startswith('2\t') or line1.startswith('2\t') or line1.startswith('2\t')
-# easier: check it contains left2
+# Cursor compare area no longer prefixes row numbers; validate by cell content.
 assert 'left2' in line1, (line1, line2)
 assert 'x' in line2 and 'Y' in line2, (line1, line2)
 
