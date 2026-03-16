@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-16.update22"
-APP_BUILD_TAG = "new99-bounds-fallback-sandbox-tests"
+APP_VERSION = "2026-03-16.update23"
+APP_BUILD_TAG = "new100-c-hover-tooltip"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -2833,6 +2833,8 @@ class SheetView:
         self.cursor_hsb.pack(side="top", fill="x")
         self.cursor_cmp.bind("<Button-1>", self._on_cursor_cmp_click)
         self.cursor_cmp.bind("<Double-Button-1>", self._on_cursor_cmp_double_click)
+        self.cursor_cmp.bind("<Motion>", self._on_cursor_cmp_hover_tooltip)
+        self.cursor_cmp.bind("<Leave>", lambda e: self._hide_cell_tooltip())
 
         # ---- C2: cell-aligned view (optional; can be hidden if not useful/performance) ----
         self._enable_c_cell = False  # user feedback: not useful; keep hidden by default
@@ -3868,6 +3870,89 @@ class SheetView:
             return
         key = (self.sheet, side, r, target_col, full_text)
         self._show_cell_tooltip(full_text, event.x_root, event.y_root, key)
+
+    def _active_pair_idx_for_c_area(self) -> int | None:
+        pair_idx = self.selected_pair_idx
+        if pair_idx is None:
+            try:
+                line_guess = int(self.left.index("insert").split(".")[0])
+                pair_idx = self._pair_idx_for_line(line_guess)
+            except Exception:
+                pair_idx = None
+        try:
+            if pair_idx is None or int(pair_idx) < 0 or int(pair_idx) >= len(self.row_pairs):
+                return None
+            return int(pair_idx)
+        except Exception:
+            return None
+
+    def _cursor_cmp_tooltip_payload(self, char_no: int):
+        spans = self._spans_for_line()
+        target_col = None
+        for c, (s, e) in spans.items():
+            if s <= char_no < e:
+                target_col = c
+                break
+        if target_col is None:
+            return None
+
+        pair_idx = self._active_pair_idx_for_c_area()
+        if pair_idx is None:
+            return None
+        pair = self.row_pairs[pair_idx]
+
+        is_three = self._is_three_way_enabled()
+        sides = ["BASE", "A", "B"] if is_three else ["A", "B"]
+        rows: list[int | None] = [self._row_for_side(pair, side) for side in sides]
+
+        values = []
+        for side, row_no in zip(sides, rows):
+            v = ""
+            if row_no is None:
+                v = "<missing>"
+            else:
+                try:
+                    if side == "A":
+                        ws = self.app.ws_a_val(self.sheet)
+                    elif side == "BASE":
+                        ws = self.app.ws_base_val(self.sheet)
+                    else:
+                        ws = self.app.ws_b_val(self.sheet)
+                    v = _val_to_str(ws.cell(row=row_no, column=target_col).value)
+                except Exception:
+                    return None
+            values.append(v)
+
+        width = max(1, int(self.col_char_widths.get(target_col, 1)))
+        need_tip = False
+        for row_no, v in zip(rows, values):
+            if row_no is not None and len(v) > width:
+                need_tip = True
+                break
+        if not need_tip:
+            return None
+
+        lines = []
+        for side, row_no, v in zip(sides, rows, values):
+            row_label = "-" if row_no is None else str(row_no)
+            lines.append(f"{side}[{row_label}]: {v}")
+        tip_text = "\n".join(lines)
+        key = (self.sheet, "C", pair_idx, target_col, tuple(values))
+        return tip_text, key
+
+    def _on_cursor_cmp_hover_tooltip(self, event):
+        try:
+            idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
+            char_no = int(str(idx).split(".")[1])
+        except Exception:
+            self._hide_cell_tooltip()
+            return
+        payload = self._cursor_cmp_tooltip_payload(char_no)
+        if not payload:
+            self._hide_cell_tooltip()
+            return
+        tip_text, key = payload
+        self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)
 
     def _on_click_with_arrow(self, w: tk.Text, event, direction: str):
         # Keep horizontal position stable on click; Tk default Text binding may call see(insert).

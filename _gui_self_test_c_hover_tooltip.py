@@ -1,0 +1,127 @@
+"""GUI self-test: C-area hover tooltip shows full cell content.
+
+Validates:
+- 2-way mode: tooltip contains A/B full text lines.
+- 3-way mode: tooltip contains BASE/A/B full text lines.
+"""
+
+import os
+
+from openpyxl import Workbook
+
+import sow_merge_tool as mod
+from _test_temp_utils import make_temp_dir
+
+
+def _make_xlsx(path: str, rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S"
+    for r_idx, row in enumerate(rows, start=1):
+        for c_idx, v in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx).value = v
+    wb.save(path)
+    wb.close()
+
+
+def _ensure_view(app: mod.SowMergeApp):
+    sheet = app.common_sheets[0]
+    view = app.sheet_views.get(sheet)
+    if view is None:
+        app.nb.select(app._sheet_containers[sheet])
+        app.root.update_idletasks()
+        app.root.update()
+        view = app.sheet_views[sheet]
+    return view
+
+
+def _c_tooltip_text_by_col(view, c_line: int, col: int) -> str:
+    spans = view._spans_for_line()
+    assert col in spans, f"Column {col} not found in spans: {spans}"
+    s, e = spans[col]
+    char_pos = s + 1 if (e - s) > 1 else s
+    payload = view._cursor_cmp_tooltip_payload(char_pos)
+    assert payload is not None, f"Expected tooltip payload for c_line={c_line}, col={col}, span=({s},{e})"
+    txt, _key = payload
+    return str(txt)
+
+
+def _run_2way():
+    td_a = make_temp_dir(prefix="sow_c_tip_2a_")
+    td_b = make_temp_dir(prefix="sow_c_tip_2b_")
+    fa = os.path.join(td_a, "same.xlsx")
+    fb = os.path.join(td_b, "same.xlsx")
+    long_a = "A_FULL_" + ("x" * 80)
+    long_b = "B_FULL_" + ("y" * 90)
+    rows_a = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_a]]
+    rows_b = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_b]]
+    _make_xlsx(fa, rows_a)
+    _make_xlsx(fb, rows_b)
+
+    app = mod.SowMergeApp(fa, fb)
+    view = _ensure_view(app)
+    view.only_diff_var.set(0)
+    view.refresh(row_only=None, rescan=True)
+    view.left.mark_set("insert", "2.0")
+    view.right.mark_set("insert", "2.0")
+    view._update_cursor_lines()
+    app.root.update_idletasks()
+    app.root.update()
+
+    txt = _c_tooltip_text_by_col(view, c_line=1, col=5)
+    assert "A[" in txt and "B[" in txt, txt
+    assert "BASE[" not in txt, txt
+    assert long_a in txt and long_b in txt, txt
+
+    try:
+        app.root.destroy()
+    except Exception:
+        pass
+
+
+def _run_3way():
+    td_base = make_temp_dir(prefix="sow_c_tip_3base_")
+    td_mine = make_temp_dir(prefix="sow_c_tip_3mine_")
+    td_theirs = make_temp_dir(prefix="sow_c_tip_3theirs_")
+    fbase = os.path.join(td_base, "same.xlsx")
+    fmine = os.path.join(td_mine, "same.xlsx")
+    ftheirs = os.path.join(td_theirs, "same.xlsx")
+    long_base = "BASE_FULL_" + ("b" * 70)
+    long_mine = "MINE_FULL_" + ("m" * 75)
+    long_theirs = "THEIRS_FULL_" + ("t" * 85)
+    rows_base = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_base]]
+    rows_mine = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_mine]]
+    rows_theirs = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_theirs]]
+    _make_xlsx(fbase, rows_base)
+    _make_xlsx(fmine, rows_mine)
+    _make_xlsx(ftheirs, rows_theirs)
+
+    app = mod.SowMergeApp(fmine, ftheirs, merge_mode=True, base_path=fbase)
+    view = _ensure_view(app)
+    view.only_diff_var.set(0)
+    view.refresh(row_only=None, rescan=True)
+    view.left.mark_set("insert", "2.0")
+    view.base.mark_set("insert", "2.0")
+    view.right.mark_set("insert", "2.0")
+    view._update_cursor_lines()
+    app.root.update_idletasks()
+    app.root.update()
+
+    txt = _c_tooltip_text_by_col(view, c_line=2, col=5)
+    assert "BASE[" in txt and "A[" in txt and "B[" in txt, txt
+    assert long_base in txt and long_mine in txt and long_theirs in txt, txt
+
+    try:
+        app.root.destroy()
+    except Exception:
+        pass
+
+
+def main():
+    _run_2way()
+    _run_3way()
+    print("GUI_SELF_TEST_C_HOVER_TOOLTIP_OK")
+
+
+if __name__ == "__main__":
+    main()
