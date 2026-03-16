@@ -23,6 +23,17 @@ def _build_sample(path: str):
     wb.close()
 
 
+def _build_formula_sample(path: str):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws.cell(row=1, column=1).value = "id"
+    ws.cell(row=1, column=5).value = "=A1"
+    ws.cell(row=20, column=1).value = "tail"
+    wb.save(path)
+    wb.close()
+
+
 def main():
     root = make_temp_dir(prefix="sow_bounds_trim_")
     src = os.path.join(root, "src.xlsx")
@@ -43,6 +54,15 @@ def main():
     assert ws_out.cell(row=1, column=5).value == "WIDE_COL_VALUE", "Column 5 value was truncated"
     assert ws_out.cell(row=10, column=2).value == "TAIL_ROW_VALUE", "Tail row value was truncated"
     wb_out.close()
+
+    # Cached-values mode must not collapse formula columns to 1 when cache is missing.
+    formula_src = os.path.join(root, "formula_src.xlsx")
+    _build_formula_sample(formula_src)
+    wb_formula_ro = load_workbook(formula_src, data_only=True)
+    ws_formula_ro = wb_formula_ro["S1"]
+    fr, fc = mod._effective_bounds(ws_formula_ro)
+    assert (fr, fc) == (20, 5), f"Formula bounds collapsed unexpectedly: {(fr, fc)}"
+    wb_formula_ro.close()
 
     print("SMOKE_BOUNDS_TRIM_OK")
 

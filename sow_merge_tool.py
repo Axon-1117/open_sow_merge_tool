@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-16.update23"
-APP_BUILD_TAG = "new100-c-hover-tooltip"
+APP_VERSION = "2026-03-16.update24"
+APP_BUILD_TAG = "new101-onlydiff-cols-hotfix"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -298,6 +298,12 @@ def _effective_bounds(ws):
     if not found:
         return 1, max(1, max_c)
     if found_via_cells:
+        # data_only mode can read uncached formula cells as None, which would
+        # under-estimate columns when relying only on non-empty _cells.
+        if _USE_CACHED_VALUES_ONLY and max_c > last_c:
+            return max(1, last_r), max(1, max_c)
+        if last_c <= 1 and max_c > last_c:
+            return max(1, last_r), max(1, max_c)
         return max(1, last_r), max(1, last_c)
     return max(1, last_r), max(1, max_c)
 
@@ -338,6 +344,12 @@ def _save_values_only_from_wb(src_wb, target_path: str):
         if not found:
             return 1, max(1, max_c)
         if found_via_cells:
+            # Keep columns conservative in cached-values mode to avoid losing
+            # uncached formula columns when _cells appears sparse.
+            if _USE_CACHED_VALUES_ONLY and max_c > last_c:
+                return max(1, last_r), max(1, max_c)
+            if last_c <= 1 and max_c > last_c:
+                return max(1, last_r), max(1, max_c)
             return max(1, last_r), max(1, last_c)
         return max(1, last_r), max(1, max_c)
 
@@ -984,10 +996,20 @@ def _recalc_with_excel(path: str) -> str | None:
         )
         if r.returncode != 0:
             _dlog(f"excel recalc ps failed: {r.stderr.strip()}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
             return None
         return tmp
     except Exception as e:
         _dlog(f"excel recalc failed: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return None
 
 
@@ -7227,10 +7249,16 @@ class SowMergeApp:
                         found = True
                         last_r = r
                         break
-                if not found:
-                    return 1, max(1, max_c)
+            if not found:
+                return 1, max(1, max_c)
 
             if found_via_cells:
+                # Cached-values-only reads can miss formula columns with no
+                # cache; prefer worksheet max_col in that situation.
+                if _USE_CACHED_VALUES_ONLY and max_c > last_c:
+                    return max(1, last_r), max(1, max_c)
+                if last_c <= 1 and max_c > last_c:
+                    return max(1, last_r), max(1, max_c)
                 return max(1, last_r), max(1, last_c)
             return max(1, last_r), max(1, max_c)
 
@@ -8685,14 +8713,21 @@ class SowMergeApp:
                 except Exception:
                     readonly = False
             dir_writable = False
+            test_file = None
             try:
                 test_file = os.path.join(folder, f"~perm_test_{os.getpid()}.tmp")
                 with open(test_file, "w", encoding="utf-8") as f:
                     f.write("x")
-                os.remove(test_file)
                 dir_writable = True
             except Exception:
                 dir_writable = False
+            finally:
+                if test_file is not None:
+                    try:
+                        if os.path.exists(test_file):
+                            os.remove(test_file)
+                    except Exception:
+                        pass
             return f"exists={exists}, readonly={readonly}, dir_writable={dir_writable}"
         except Exception:
             return "diagnostics_failed"
