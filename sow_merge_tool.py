@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-16.update24"
-APP_BUILD_TAG = "new101-onlydiff-cols-hotfix"
+APP_VERSION = "2026-03-17.update25"
+APP_BUILD_TAG = "new102-c-hover-tooltip-panes"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -3838,6 +3838,12 @@ class SheetView:
         try:
             tip = tk.Toplevel(self.root)
             tip.wm_overrideredirect(True)
+            try:
+                # Keep tooltip above the main window on Windows when hovering
+                # across multiple text widgets (A/B/C areas).
+                tip.wm_attributes("-topmost", True)
+            except Exception:
+                pass
             tip.wm_geometry(f"+{x_root + 14}+{y_root + 18}")
             lbl = tk.Label(tip, text=text, justify="left", relief="solid", borderwidth=1, bg="#fffbe6", fg="#222", font=("Consolas", 10))
             self._cell_tip_win = tip
@@ -3845,6 +3851,50 @@ class SheetView:
             lbl.pack(ipadx=4, ipady=2)
         except Exception:
             self._hide_cell_tooltip()
+
+    def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int):
+        try:
+            if pair_idx is None or int(pair_idx) < 0 or int(pair_idx) >= len(self.row_pairs):
+                return None
+            target_col = int(target_col)
+            if target_col <= 0:
+                return None
+        except Exception:
+            return None
+
+        pair = self.row_pairs[int(pair_idx)]
+        is_three = self._is_three_way_enabled()
+        sides = ["BASE", "A", "B"] if is_three else ["A", "B"]
+        rows = [self._row_for_side(pair, side) for side in sides]
+
+        values = []
+        for side, row_no in zip(sides, rows):
+            if row_no is None:
+                values.append("<missing>")
+                continue
+            try:
+                if side == "A":
+                    ws = self.app.ws_a_val(self.sheet)
+                elif side == "BASE":
+                    ws = self.app.ws_base_val(self.sheet)
+                else:
+                    ws = self.app.ws_b_val(self.sheet)
+                values.append(_val_to_str(ws.cell(row=row_no, column=target_col).value))
+            except Exception:
+                return None
+
+        width = max(1, int(self.col_char_widths.get(target_col, 1)))
+        need_tip = any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
+        if not need_tip:
+            return None
+
+        lines = []
+        for side, row_no, v in zip(sides, rows, values):
+            row_label = "-" if row_no is None else str(row_no)
+            lines.append(f"{side}[{row_label}]: {v}")
+        tip_text = "\n".join(lines)
+        key = (self.sheet, "CMP", int(pair_idx), target_col, tuple(values))
+        return tip_text, key
 
     def _on_cell_hover_tooltip(self, w: tk.Text, event, side: str):
         try:
@@ -3870,28 +3920,12 @@ class SheetView:
         if target_col is None:
             self._hide_cell_tooltip()
             return
-        pair = self.row_pairs[pair_idx]
-        r = self._row_for_side(pair, side)
-        if r is None:
+        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col)
+        if not payload:
             self._hide_cell_tooltip()
             return
-        try:
-            if side == "A":
-                ws = self.app.ws_a_val(self.sheet)
-            elif side == "BASE":
-                ws = self.app.ws_base_val(self.sheet)
-            else:
-                ws = self.app.ws_b_val(self.sheet)
-            full_text = _val_to_str(ws.cell(row=r, column=target_col).value)
-        except Exception:
-            self._hide_cell_tooltip()
-            return
-        width = max(1, int(self.col_char_widths.get(target_col, 1)))
-        if len(full_text) <= width:
-            self._hide_cell_tooltip()
-            return
-        key = (self.sheet, side, r, target_col, full_text)
-        self._show_cell_tooltip(full_text, event.x_root, event.y_root, key)
+        tip_text, key = payload
+        self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)
 
     def _active_pair_idx_for_c_area(self) -> int | None:
         pair_idx = self.selected_pair_idx
@@ -3919,48 +3953,7 @@ class SheetView:
             return None
 
         pair_idx = self._active_pair_idx_for_c_area()
-        if pair_idx is None:
-            return None
-        pair = self.row_pairs[pair_idx]
-
-        is_three = self._is_three_way_enabled()
-        sides = ["BASE", "A", "B"] if is_three else ["A", "B"]
-        rows: list[int | None] = [self._row_for_side(pair, side) for side in sides]
-
-        values = []
-        for side, row_no in zip(sides, rows):
-            v = ""
-            if row_no is None:
-                v = "<missing>"
-            else:
-                try:
-                    if side == "A":
-                        ws = self.app.ws_a_val(self.sheet)
-                    elif side == "BASE":
-                        ws = self.app.ws_base_val(self.sheet)
-                    else:
-                        ws = self.app.ws_b_val(self.sheet)
-                    v = _val_to_str(ws.cell(row=row_no, column=target_col).value)
-                except Exception:
-                    return None
-            values.append(v)
-
-        width = max(1, int(self.col_char_widths.get(target_col, 1)))
-        need_tip = False
-        for row_no, v in zip(rows, values):
-            if row_no is not None and len(v) > width:
-                need_tip = True
-                break
-        if not need_tip:
-            return None
-
-        lines = []
-        for side, row_no, v in zip(sides, rows, values):
-            row_label = "-" if row_no is None else str(row_no)
-            lines.append(f"{side}[{row_label}]: {v}")
-        tip_text = "\n".join(lines)
-        key = (self.sheet, "C", pair_idx, target_col, tuple(values))
-        return tip_text, key
+        return self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col)
 
     def _on_cursor_cmp_hover_tooltip(self, event):
         try:

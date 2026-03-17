@@ -46,6 +46,15 @@ def _c_tooltip_text_by_col(view, c_line: int, col: int) -> str:
     return str(txt)
 
 
+def _main_tooltip_text_by_col(view, line_no: int, col: int) -> str:
+    pair_idx = view._pair_idx_for_line(line_no)
+    assert pair_idx is not None, f"Expected pair for line {line_no}"
+    payload = view._cmp_tooltip_payload_by_pair_col(pair_idx, col)
+    assert payload is not None, f"Expected main tooltip payload for line={line_no}, col={col}"
+    txt, _key = payload
+    return str(txt)
+
+
 def _run_2way():
     td_a = make_temp_dir(prefix="sow_c_tip_2a_")
     td_b = make_temp_dir(prefix="sow_c_tip_2b_")
@@ -72,6 +81,9 @@ def _run_2way():
     assert "A[" in txt and "B[" in txt, txt
     assert "BASE[" not in txt, txt
     assert long_a in txt and long_b in txt, txt
+    txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
+    assert "A[" in txt_main and "B[" in txt_main, txt_main
+    assert long_a in txt_main and long_b in txt_main, txt_main
 
     try:
         app.root.destroy()
@@ -110,6 +122,9 @@ def _run_3way():
     txt = _c_tooltip_text_by_col(view, c_line=2, col=5)
     assert "BASE[" in txt and "A[" in txt and "B[" in txt, txt
     assert long_base in txt and long_mine in txt and long_theirs in txt, txt
+    txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
+    assert "BASE[" in txt_main and "A[" in txt_main and "B[" in txt_main, txt_main
+    assert long_base in txt_main and long_mine in txt_main and long_theirs in txt_main, txt_main
 
     try:
         app.root.destroy()
