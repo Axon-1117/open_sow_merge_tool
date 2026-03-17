@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update27"
-APP_BUILD_TAG = "new104-hover-maxcap-tip"
+APP_VERSION = "2026-03-17.update28"
+APP_BUILD_TAG = "new105-hover-separator-hitfix"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -3866,6 +3866,7 @@ class SheetView:
         is_three = self._is_three_way_enabled()
         sides = ["BASE", "A", "B"] if is_three else ["A", "B"]
         rows = [self._row_for_side(pair, side) for side in sides]
+        ws_edit_cache = {}
 
         values = []
         for side, row_no in zip(sides, rows):
@@ -3874,12 +3875,35 @@ class SheetView:
                 continue
             try:
                 if side == "A":
-                    ws = self.app.ws_a_val(self.sheet)
+                    ws_val = self.app.ws_a_val(self.sheet)
                 elif side == "BASE":
-                    ws = self.app.ws_base_val(self.sheet)
+                    ws_val = self.app.ws_base_val(self.sheet)
                 else:
-                    ws = self.app.ws_b_val(self.sheet)
-                values.append(_val_to_str(ws.cell(row=row_no, column=target_col).value))
+                    ws_val = self.app.ws_b_val(self.sheet)
+                v_disp = ws_val.cell(row=row_no, column=target_col).value
+                # Keep tooltip value source aligned with row rendering:
+                # when cached-values mode misses literals, rendering falls back to edit WB.
+                if _USE_CACHED_VALUES_ONLY and v_disp is None:
+                    ws_edit = ws_edit_cache.get(side)
+                    if ws_edit is None:
+                        try:
+                            if side == "A":
+                                ws_edit = self.app.ws_a_edit(self.sheet)
+                            elif side == "BASE":
+                                ws_edit = self.app.ws_base_edit(self.sheet)
+                            else:
+                                ws_edit = self.app.ws_b_edit(self.sheet)
+                            ws_edit_cache[side] = ws_edit
+                        except Exception:
+                            ws_edit = None
+                    if ws_edit is not None:
+                        try:
+                            v_edit = ws_edit.cell(row=row_no, column=target_col).value
+                            if v_edit is not None and not _formula_text(v_edit):
+                                v_disp = v_edit
+                        except Exception:
+                            pass
+                values.append(_val_to_str(v_disp))
             except Exception:
                 return None
 
@@ -3912,6 +3936,23 @@ class SheetView:
             pass
         return False
 
+    def _hit_col_from_char(self, char_no: int):
+        """Map a text char position to column span; separator chars belong to the left column."""
+        spans = self._spans_for_line()
+        last_col = None
+        last_span = None
+        for c, (s, e) in spans.items():
+            last_col = c
+            last_span = (s, e)
+            if s <= char_no < e:
+                return c, s, e
+            sep_end = e + _COL_SEP_LEN
+            if e <= char_no < sep_end:
+                return c, s, e
+        if last_col is not None and last_span is not None and char_no >= last_span[1]:
+            return last_col, last_span[0], last_span[1]
+        return None, 0, 0
+
     def _on_cell_hover_tooltip(self, w: tk.Text, event, side: str):
         try:
             idx = w.index(f"@{event.x},{event.y}")
@@ -3927,16 +3968,7 @@ class SheetView:
         if pair_idx is None or pair_idx >= len(self.row_pairs):
             self._hide_cell_tooltip()
             return
-        spans = self._spans_for_line()
-        target_col = None
-        span_s = 0
-        span_e = 0
-        for c, (s, e) in spans.items():
-            if s <= col_char < e:
-                target_col = c
-                span_s = s
-                span_e = e
-                break
+        target_col, span_s, span_e = self._hit_col_from_char(col_char)
         if target_col is None:
             self._hide_cell_tooltip()
             return
@@ -3970,12 +4002,7 @@ class SheetView:
             return None
 
     def _cursor_cmp_tooltip_payload(self, char_no: int):
-        spans = self._spans_for_line()
-        target_col = None
-        for c, (s, e) in spans.items():
-            if s <= char_no < e:
-                target_col = c
-                break
+        target_col, _s, _e = self._hit_col_from_char(char_no)
         if target_col is None:
             return None
 
@@ -3991,26 +4018,17 @@ class SheetView:
         except Exception:
             self._hide_cell_tooltip()
             return
-        force_show = False
-        try:
-            spans = self._spans_for_line()
-            for c, (s, e) in spans.items():
-                if s <= char_no < e:
-                    line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
-                    frag = line_text[s:e]
-                    force_show = self._should_force_hover_tip(c, frag)
-                    break
-        except Exception:
-            force_show = False
-        spans = self._spans_for_line()
-        target_col = None
-        for c, (s, e) in spans.items():
-            if s <= char_no < e:
-                target_col = c
-                break
+        target_col, span_s, span_e = self._hit_col_from_char(char_no)
         if target_col is None:
             self._hide_cell_tooltip()
             return
+        force_show = False
+        try:
+            line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
+            frag = line_text[span_s:span_e]
+            force_show = self._should_force_hover_tip(target_col, frag)
+        except Exception:
+            force_show = False
         pair_idx = self._active_pair_idx_for_c_area()
         payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
         if not payload:
