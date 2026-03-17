@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update25"
-APP_BUILD_TAG = "new102-c-hover-tooltip-panes"
+APP_VERSION = "2026-03-17.update26"
+APP_BUILD_TAG = "new103-hover-ellipsis-force-tip"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -3852,7 +3852,7 @@ class SheetView:
         except Exception:
             self._hide_cell_tooltip()
 
-    def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int):
+    def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int, force_show: bool = False):
         try:
             if pair_idx is None or int(pair_idx) < 0 or int(pair_idx) >= len(self.row_pairs):
                 return None
@@ -3884,7 +3884,7 @@ class SheetView:
                 return None
 
         width = max(1, int(self.col_char_widths.get(target_col, 1)))
-        need_tip = any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
+        need_tip = bool(force_show) or any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
         if not need_tip:
             return None
 
@@ -3913,14 +3913,27 @@ class SheetView:
             return
         spans = self._spans_for_line()
         target_col = None
+        span_s = 0
+        span_e = 0
         for c, (s, e) in spans.items():
             if s <= col_char < e:
                 target_col = c
+                span_s = s
+                span_e = e
                 break
         if target_col is None:
             self._hide_cell_tooltip()
             return
-        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col)
+        force_show = False
+        try:
+            line_text = w.get(f"{line}.0", f"{line}.end")
+            frag = line_text[span_s:span_e]
+            # Force tooltip when the rendered cell already carries an ellipsis,
+            # even if raw-length heuristics miss this row in large-sheet paths.
+            force_show = bool(frag.rstrip().endswith("\u2026"))
+        except Exception:
+            force_show = False
+        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
         if not payload:
             self._hide_cell_tooltip()
             return
@@ -3958,11 +3971,34 @@ class SheetView:
     def _on_cursor_cmp_hover_tooltip(self, event):
         try:
             idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
-            char_no = int(str(idx).split(".")[1])
+            idx_s = str(idx)
+            line_no = int(idx_s.split(".")[0])
+            char_no = int(idx_s.split(".")[1])
         except Exception:
             self._hide_cell_tooltip()
             return
-        payload = self._cursor_cmp_tooltip_payload(char_no)
+        force_show = False
+        try:
+            spans = self._spans_for_line()
+            for c, (s, e) in spans.items():
+                if s <= char_no < e:
+                    line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
+                    frag = line_text[s:e]
+                    force_show = bool(frag.rstrip().endswith("\u2026"))
+                    break
+        except Exception:
+            force_show = False
+        spans = self._spans_for_line()
+        target_col = None
+        for c, (s, e) in spans.items():
+            if s <= char_no < e:
+                target_col = c
+                break
+        if target_col is None:
+            self._hide_cell_tooltip()
+            return
+        pair_idx = self._active_pair_idx_for_c_area()
+        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
         if not payload:
             self._hide_cell_tooltip()
             return
