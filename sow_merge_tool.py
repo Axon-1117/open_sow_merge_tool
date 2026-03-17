@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update29"
-APP_BUILD_TAG = "new106-hover-overlay-tooltip"
+APP_VERSION = "2026-03-17.update30"
+APP_BUILD_TAG = "new107-hover-diffcell-force"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -4009,6 +4009,12 @@ class SheetView:
             line_text = w.get(f"{line}.0", f"{line}.end")
             frag = line_text[span_s:span_e]
             force_show = self._should_force_hover_tip(target_col, frag)
+            try:
+                tags_here = set(w.tag_names(f"{line}.{max(0, int(col_char))}"))
+                if "diffcell" in tags_here:
+                    force_show = True
+            except Exception:
+                pass
         except Exception:
             force_show = False
         payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
@@ -4059,6 +4065,12 @@ class SheetView:
             line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
             frag = line_text[span_s:span_e]
             force_show = self._should_force_hover_tip(target_col, frag)
+            try:
+                tags_here = set(self.cursor_cmp.tag_names(f"{line_no}.{max(0, int(char_no))}"))
+                if "diffcell" in tags_here:
+                    force_show = True
+            except Exception:
+                pass
         except Exception:
             force_show = False
         pair_idx = self._active_pair_idx_for_c_area()
