@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update30"
-APP_BUILD_TAG = "new107-hover-diffcell-force"
+APP_VERSION = "2026-03-17.update31"
+APP_BUILD_TAG = "new108-hover-fixed-compare-panel"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -68,6 +68,7 @@ _SVN_EXPORT_TIMEOUT_SECS = 15
 _COL_MAX_DISPLAY_WIDTH = 30
 _COL_SEP = " \u2502 "    # 3-char separator between columns (U+2502 BOX DRAWINGS LIGHT VERTICAL)
 _COL_SEP_LEN = 3
+_HOVER_COMPARE_CLEAR_DELAY_MS = 120
 
 # Unified pane colors (main 3-way panes and C-area rows)
 _MINE_BG = "#F6C16B"
@@ -2774,9 +2775,9 @@ class SheetView:
         self.left.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.left, e, "A"))
         self.base.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.base, e, "BASE"))
         self.right.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.right, e, "B"))
-        self.left.bind("<Leave>", lambda e: self._hide_cell_tooltip())
-        self.base.bind("<Leave>", lambda e: self._hide_cell_tooltip())
-        self.right.bind("<Leave>", lambda e: self._hide_cell_tooltip())
+        self.left.bind("<Leave>", lambda e: self._on_hover_compare_leave())
+        self.base.bind("<Leave>", lambda e: self._on_hover_compare_leave())
+        self.right.bind("<Leave>", lambda e: self._on_hover_compare_leave())
         # Double-click merge (single cell)
         self.left.bind("<Double-Button-1>", lambda e, d=left_click_dir: self._copy_cell(d, e))
         self.base.bind("<Double-Button-1>", lambda e: self._copy_cell("BASE2A", e))
@@ -2856,7 +2857,7 @@ class SheetView:
         self.cursor_cmp.bind("<Button-1>", self._on_cursor_cmp_click)
         self.cursor_cmp.bind("<Double-Button-1>", self._on_cursor_cmp_double_click)
         self.cursor_cmp.bind("<Motion>", self._on_cursor_cmp_hover_tooltip)
-        self.cursor_cmp.bind("<Leave>", lambda e: self._hide_cell_tooltip())
+        self.cursor_cmp.bind("<Leave>", lambda e: self._on_hover_compare_leave())
 
         # ---- C2: cell-aligned view (optional; can be hidden if not useful/performance) ----
         self._enable_c_cell = False  # user feedback: not useful; keep hidden by default
@@ -2890,6 +2891,31 @@ class SheetView:
 
         self.cell_cmp_text.pack(side="top", fill="x", expand=True)
         self.cell_cmp_hsb.pack(side="top", fill="x")
+
+        # Stable hover compare panel (primary path; independent from popup windows).
+        self._enable_hover_popup = False
+        self._hover_clear_after_id = None
+        self._last_hover_compare_key = None
+        hover_cmp_frame = ttk.LabelFrame(self.frame, text="悬停完整对比")
+        hover_cmp_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比：-")
+        ttk.Label(hover_cmp_frame, textvariable=self.hover_cmp_title_var).pack(anchor="w", padx=4, pady=(2, 2))
+        self.hover_cmp_text = tk.Text(
+            hover_cmp_frame,
+            height=3 if self._is_three_way_enabled() else 2,
+            wrap="none",
+            font=self.editor_font,
+            bd=1,
+            relief="solid",
+        )
+        self.hover_cmp_hsb = ttk.Scrollbar(hover_cmp_frame, orient="horizontal", command=self.hover_cmp_text.xview)
+        self.hover_cmp_text.configure(xscrollcommand=self.hover_cmp_hsb.set)
+        self.hover_cmp_text.pack(side="top", fill="x", expand=True)
+        self.hover_cmp_hsb.pack(side="top", fill="x")
+        try:
+            self.hover_cmp_text.configure(state="disabled")
+        except Exception:
+            pass
 
         # initial render should respect the persisted only-diff setting
         # Defer heavy initial refresh; SowMergeApp will lazy-load the active sheet.
@@ -2999,6 +3025,11 @@ class SheetView:
             pass
         try:
             self.cursor_cmp_ln.configure(height=3 if enabled else 2)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "hover_cmp_text"):
+                self.hover_cmp_text.configure(height=3 if enabled else 2)
         except Exception:
             pass
         if not init_only:
@@ -3814,7 +3845,7 @@ class SheetView:
         else:
             self._hover_ln_line_right = line
 
-    def _hide_cell_tooltip(self):
+    def _hide_hover_popup(self):
         tip_lbl = getattr(self, "_cell_tip_label", None)
         if tip_lbl is not None:
             try:
@@ -3829,11 +3860,77 @@ class SheetView:
                 pass
         self._cell_tip_win = None
         self._cell_tip_label = None
+
+    def _clear_hover_compare_panel(self):
+        try:
+            if hasattr(self, "hover_cmp_title_var"):
+                self.hover_cmp_title_var.set("悬停完整对比：-")
+            if hasattr(self, "hover_cmp_text"):
+                self.hover_cmp_text.configure(state="normal")
+                self.hover_cmp_text.delete("1.0", "end")
+                self.hover_cmp_text.configure(state="disabled")
+        except Exception:
+            pass
+        self._last_hover_compare_key = None
+
+    def _cancel_hover_compare_clear(self):
+        aid = getattr(self, "_hover_clear_after_id", None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._hover_clear_after_id = None
+
+    def _schedule_hover_compare_clear(self):
+        self._cancel_hover_compare_clear()
+        try:
+            self._hover_clear_after_id = self.root.after(_HOVER_COMPARE_CLEAR_DELAY_MS, self._clear_hover_compare_panel)
+        except Exception:
+            self._clear_hover_compare_panel()
+
+    def _on_hover_compare_leave(self):
+        self._hide_hover_popup()
+        self._schedule_hover_compare_clear()
+
+    def _set_hover_compare_panel(self, text: str, key):
+        if not text:
+            self._clear_hover_compare_panel()
+            return
+        self._cancel_hover_compare_clear()
+        if getattr(self, "_last_hover_compare_key", None) == key:
+            return
+        col_text = "-"
+        try:
+            if isinstance(key, tuple) and len(key) >= 4 and int(key[3]) > 0:
+                ci = int(key[3])
+                col_text = f"{get_column_letter(ci)}({ci})"
+        except Exception:
+            col_text = "-"
+        try:
+            if hasattr(self, "hover_cmp_title_var"):
+                self.hover_cmp_title_var.set(f"悬停完整对比 | Sheet: {self.sheet} | Col: {col_text}")
+            if hasattr(self, "hover_cmp_text"):
+                self.hover_cmp_text.configure(state="normal")
+                self.hover_cmp_text.delete("1.0", "end")
+                self.hover_cmp_text.insert("1.0", text)
+                self.hover_cmp_text.configure(state="disabled")
+        except Exception:
+            pass
+        self._last_hover_compare_key = key
+
+    def _hide_cell_tooltip(self):
+        self._hide_hover_popup()
+        self._clear_hover_compare_panel()
         self._cell_tip_key = None
 
     def _show_cell_tooltip(self, text: str, x_root: int, y_root: int, key):
         if not text:
             self._hide_cell_tooltip()
+            return
+        self._set_hover_compare_panel(text, key)
+        self._cell_tip_key = key
+        if not bool(getattr(self, "_enable_hover_popup", False)):
             return
         try:
             lbl = getattr(self, "_cell_tip_label", None)
@@ -3850,10 +3947,8 @@ class SheetView:
                 )
                 self._cell_tip_label = lbl
             lbl.configure(text=text)
-            self._cell_tip_key = key
             self._cell_tip_win = None
 
-            # Position tooltip inside root to avoid WM-level popup suppression.
             rx = int(self.root.winfo_rootx())
             ry = int(self.root.winfo_rooty())
             rw = max(1, int(self.root.winfo_width()))
@@ -3868,7 +3963,6 @@ class SheetView:
             lbl.place(x=x, y=y)
             lbl.lift()
         except Exception:
-            # Fallback to old Toplevel behavior as last resort.
             try:
                 tip = tk.Toplevel(self.root)
                 tip.wm_overrideredirect(True)
@@ -3955,7 +4049,8 @@ class SheetView:
     def _should_force_hover_tip(self, target_col: int, rendered_fragment: str = "") -> bool:
         """Heuristics for truncated/likely-truncated cell hover in dense grid rendering."""
         try:
-            if rendered_fragment and rendered_fragment.rstrip().endswith("\u2026"):
+            frag = (rendered_fragment or "").rstrip()
+            if frag.endswith("\u2026") or frag.endswith("..."):
                 return True
         except Exception:
             pass

@@ -3,9 +3,11 @@
 Validates:
 - 2-way mode: tooltip contains A/B full text lines.
 - 3-way mode: tooltip contains BASE/A/B full text lines.
+- real hover event path updates fixed hover-compare panel content.
 """
 
 import os
+from types import SimpleNamespace
 
 from openpyxl import Workbook
 
@@ -55,6 +57,57 @@ def _main_tooltip_text_by_col(view, line_no: int, col: int) -> str:
     return str(txt)
 
 
+def _panel_text(view) -> str:
+    try:
+        return str(view.hover_cmp_text.get("1.0", "end-1c"))
+    except Exception:
+        return ""
+
+
+def _panel_title(view) -> str:
+    try:
+        return str(view.hover_cmp_title_var.get())
+    except Exception:
+        return ""
+
+
+def _motion_event_for_cell(text_widget, line_no: int, char_pos: int):
+    box = text_widget.bbox(f"{line_no}.{max(0, int(char_pos))}")
+    assert box is not None, f"bbox is None for line={line_no}, char={char_pos}"
+    x, y, w, h = box
+    px = int(x + max(1, w // 2))
+    py = int(y + max(1, h // 2))
+    return SimpleNamespace(
+        x=px,
+        y=py,
+        x_root=int(text_widget.winfo_rootx() + px),
+        y_root=int(text_widget.winfo_rooty() + py),
+    )
+
+
+def _drive_main_hover(view, line_no: int, col: int, side: str = "A"):
+    spans = view._spans_for_line()
+    assert col in spans, f"Column {col} not found in spans: {spans}"
+    s, e = spans[col]
+    char_pos = s + 1 if (e - s) > 1 else s
+    widget = view.left if side == "A" else (view.base if side == "BASE" else view.right)
+    ev = _motion_event_for_cell(widget, line_no=line_no, char_pos=char_pos)
+    view._on_cell_hover_tooltip(widget, ev, side)
+    view.app.root.update_idletasks()
+    view.app.root.update()
+
+
+def _drive_c_hover(view, line_no: int, col: int):
+    spans = view._spans_for_line()
+    assert col in spans, f"Column {col} not found in spans: {spans}"
+    s, e = spans[col]
+    char_pos = s + 1 if (e - s) > 1 else s
+    ev = _motion_event_for_cell(view.cursor_cmp, line_no=line_no, char_pos=char_pos)
+    view._on_cursor_cmp_hover_tooltip(ev)
+    view.app.root.update_idletasks()
+    view.app.root.update()
+
+
 def _run_2way():
     td_a = make_temp_dir(prefix="sow_c_tip_2a_")
     td_b = make_temp_dir(prefix="sow_c_tip_2b_")
@@ -85,8 +138,20 @@ def _run_2way():
     assert "A[" in txt_main and "B[" in txt_main, txt_main
     assert long_a in txt_main and long_b in txt_main, txt_main
 
+    _drive_main_hover(view, line_no=2, col=5, side="A")
+    panel = _panel_text(view)
+    assert "A[" in panel and "B[" in panel, panel
+    assert long_a in panel and long_b in panel, panel
+    assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+
+    _drive_c_hover(view, line_no=1, col=5)
+    panel = _panel_text(view)
+    assert "A[" in panel and "B[" in panel, panel
+    assert long_a in panel and long_b in panel, panel
+
     try:
-        app.root.destroy()
+        view._cancel_hover_compare_clear()
+        app._shutdown_root()
     except Exception:
         pass
 
@@ -126,8 +191,20 @@ def _run_3way():
     assert "BASE[" in txt_main and "A[" in txt_main and "B[" in txt_main, txt_main
     assert long_base in txt_main and long_mine in txt_main and long_theirs in txt_main, txt_main
 
+    _drive_main_hover(view, line_no=2, col=5, side="BASE")
+    panel = _panel_text(view)
+    assert "BASE[" in panel and "A[" in panel and "B[" in panel, panel
+    assert long_base in panel and long_mine in panel and long_theirs in panel, panel
+    assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+
+    _drive_c_hover(view, line_no=2, col=5)
+    panel = _panel_text(view)
+    assert "BASE[" in panel and "A[" in panel and "B[" in panel, panel
+    assert long_base in panel and long_mine in panel and long_theirs in panel, panel
+
     try:
-        app.root.destroy()
+        view._cancel_hover_compare_clear()
+        app._shutdown_root()
     except Exception:
         pass
 
