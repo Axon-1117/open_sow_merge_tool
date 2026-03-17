@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update26"
-APP_BUILD_TAG = "new103-hover-ellipsis-force-tip"
+APP_VERSION = "2026-03-17.update27"
+APP_BUILD_TAG = "new104-hover-maxcap-tip"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -3896,6 +3896,22 @@ class SheetView:
         key = (self.sheet, "CMP", int(pair_idx), target_col, tuple(values))
         return tip_text, key
 
+    def _should_force_hover_tip(self, target_col: int, rendered_fragment: str = "") -> bool:
+        """Heuristics for truncated/likely-truncated cell hover in dense grid rendering."""
+        try:
+            if rendered_fragment and rendered_fragment.rstrip().endswith("\u2026"):
+                return True
+        except Exception:
+            pass
+        try:
+            # When a column has already hit the global display cap, rows near the
+            # cap can still feel clipped in practice; force compare tooltip there.
+            if int(self.col_char_widths.get(int(target_col), 0)) >= int(_COL_MAX_DISPLAY_WIDTH):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _on_cell_hover_tooltip(self, w: tk.Text, event, side: str):
         try:
             idx = w.index(f"@{event.x},{event.y}")
@@ -3928,9 +3944,7 @@ class SheetView:
         try:
             line_text = w.get(f"{line}.0", f"{line}.end")
             frag = line_text[span_s:span_e]
-            # Force tooltip when the rendered cell already carries an ellipsis,
-            # even if raw-length heuristics miss this row in large-sheet paths.
-            force_show = bool(frag.rstrip().endswith("\u2026"))
+            force_show = self._should_force_hover_tip(target_col, frag)
         except Exception:
             force_show = False
         payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
@@ -3984,7 +3998,7 @@ class SheetView:
                 if s <= char_no < e:
                     line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
                     frag = line_text[s:e]
-                    force_show = bool(frag.rstrip().endswith("\u2026"))
+                    force_show = self._should_force_hover_tip(c, frag)
                     break
         except Exception:
             force_show = False
