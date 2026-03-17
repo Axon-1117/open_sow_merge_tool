@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update28"
-APP_BUILD_TAG = "new105-hover-separator-hitfix"
+APP_VERSION = "2026-03-17.update29"
+APP_BUILD_TAG = "new106-hover-overlay-tooltip"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -3815,6 +3815,12 @@ class SheetView:
             self._hover_ln_line_right = line
 
     def _hide_cell_tooltip(self):
+        tip_lbl = getattr(self, "_cell_tip_label", None)
+        if tip_lbl is not None:
+            try:
+                tip_lbl.place_forget()
+            except Exception:
+                pass
         tip = getattr(self, "_cell_tip_win", None)
         if tip is not None:
             try:
@@ -3822,35 +3828,61 @@ class SheetView:
             except Exception:
                 pass
         self._cell_tip_win = None
+        self._cell_tip_label = None
         self._cell_tip_key = None
 
     def _show_cell_tooltip(self, text: str, x_root: int, y_root: int, key):
         if not text:
             self._hide_cell_tooltip()
             return
-        if getattr(self, "_cell_tip_key", None) == key and getattr(self, "_cell_tip_win", None) is not None:
-            try:
-                self._cell_tip_win.geometry(f"+{x_root + 14}+{y_root + 18}")
-            except Exception:
-                pass
-            return
-        self._hide_cell_tooltip()
         try:
-            tip = tk.Toplevel(self.root)
-            tip.wm_overrideredirect(True)
-            try:
-                # Keep tooltip above the main window on Windows when hovering
-                # across multiple text widgets (A/B/C areas).
-                tip.wm_attributes("-topmost", True)
-            except Exception:
-                pass
-            tip.wm_geometry(f"+{x_root + 14}+{y_root + 18}")
-            lbl = tk.Label(tip, text=text, justify="left", relief="solid", borderwidth=1, bg="#fffbe6", fg="#222", font=("Consolas", 10))
-            self._cell_tip_win = tip
+            lbl = getattr(self, "_cell_tip_label", None)
+            if lbl is None:
+                lbl = tk.Label(
+                    self.root,
+                    justify="left",
+                    relief="solid",
+                    borderwidth=1,
+                    bg="#fffbe6",
+                    fg="#222",
+                    font=("Consolas", 10),
+                    anchor="w",
+                )
+                self._cell_tip_label = lbl
+            lbl.configure(text=text)
             self._cell_tip_key = key
-            lbl.pack(ipadx=4, ipady=2)
+            self._cell_tip_win = None
+
+            # Position tooltip inside root to avoid WM-level popup suppression.
+            rx = int(self.root.winfo_rootx())
+            ry = int(self.root.winfo_rooty())
+            rw = max(1, int(self.root.winfo_width()))
+            rh = max(1, int(self.root.winfo_height()))
+            x = int(x_root - rx + 16)
+            y = int(y_root - ry + 20)
+            self.root.update_idletasks()
+            tw = max(1, int(lbl.winfo_reqwidth()))
+            th = max(1, int(lbl.winfo_reqheight()))
+            x = max(0, min(x, max(0, rw - tw - 4)))
+            y = max(0, min(y, max(0, rh - th - 4)))
+            lbl.place(x=x, y=y)
+            lbl.lift()
         except Exception:
-            self._hide_cell_tooltip()
+            # Fallback to old Toplevel behavior as last resort.
+            try:
+                tip = tk.Toplevel(self.root)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.wm_attributes("-topmost", True)
+                except Exception:
+                    pass
+                tip.wm_geometry(f"+{x_root + 14}+{y_root + 18}")
+                lbl = tk.Label(tip, text=text, justify="left", relief="solid", borderwidth=1, bg="#fffbe6", fg="#222", font=("Consolas", 10))
+                self._cell_tip_win = tip
+                self._cell_tip_key = key
+                lbl.pack(ipadx=4, ipady=2)
+            except Exception:
+                self._hide_cell_tooltip()
 
     def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int, force_show: bool = False):
         try:
