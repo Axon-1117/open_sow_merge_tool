@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update32"
-APP_BUILD_TAG = "new109-hover-compare-diffchar-highlight"
+APP_VERSION = "2026-03-17.update33"
+APP_BUILD_TAG = "new110-hover-panel-pin-scroll"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -2900,7 +2900,19 @@ class SheetView:
         hover_cmp_frame = ttk.LabelFrame(self.frame, text="悬停完整对比")
         hover_cmp_frame.pack(fill="x", padx=8, pady=(0, 4))
         self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比：-")
-        ttk.Label(hover_cmp_frame, textvariable=self.hover_cmp_title_var).pack(anchor="w", padx=4, pady=(2, 2))
+        self.hover_cmp_pin_var = tk.IntVar(value=0)
+        hover_hdr = ttk.Frame(hover_cmp_frame)
+        hover_hdr.pack(fill="x", padx=4, pady=(2, 2))
+        ttk.Label(hover_hdr, textvariable=self.hover_cmp_title_var).pack(side="left", anchor="w")
+        ttk.Button(hover_hdr, text="清空", command=self._on_hover_compare_clear_click).pack(side="right", padx=(6, 0))
+        ttk.Checkbutton(
+            hover_hdr,
+            text="固定",
+            variable=self.hover_cmp_pin_var,
+            onvalue=1,
+            offvalue=0,
+            command=self._on_hover_compare_pin_toggle,
+        ).pack(side="right")
         self.hover_cmp_text = tk.Text(
             hover_cmp_frame,
             height=3 if self._is_three_way_enabled() else 2,
@@ -2919,6 +2931,10 @@ class SheetView:
         self.hover_cmp_text.configure(xscrollcommand=self.hover_cmp_hsb.set)
         self.hover_cmp_text.pack(side="top", fill="x", expand=True)
         self.hover_cmp_hsb.pack(side="top", fill="x")
+        self.hover_cmp_text.bind("<Shift-MouseWheel>", self._on_hover_cmp_shift_wheel)
+        self.hover_cmp_text.bind("<MouseWheel>", self._on_hover_cmp_mousewheel)
+        self.hover_cmp_text.bind("<Shift-Button-4>", self._on_hover_cmp_shift_wheel)
+        self.hover_cmp_text.bind("<Shift-Button-5>", self._on_hover_cmp_shift_wheel)
         try:
             self.hover_cmp_text.configure(state="disabled")
         except Exception:
@@ -3880,6 +3896,62 @@ class SheetView:
             pass
         self._last_hover_compare_key = None
 
+    def _hover_compare_is_pinned(self) -> bool:
+        try:
+            return bool(getattr(self, "hover_cmp_pin_var", None) and self.hover_cmp_pin_var.get())
+        except Exception:
+            return False
+
+    def _on_hover_compare_pin_toggle(self):
+        try:
+            if self._hover_compare_is_pinned():
+                if getattr(self, "_last_hover_compare_key", None) is None:
+                    self.hover_cmp_title_var.set("悬停完整对比 | 已固定（等待下一次悬停内容）")
+                elif hasattr(self, "hover_cmp_title_var"):
+                    t = str(self.hover_cmp_title_var.get() or "")
+                    if "已固定" not in t:
+                        self.hover_cmp_title_var.set(f"{t} | 已固定")
+            else:
+                if hasattr(self, "hover_cmp_title_var"):
+                    t = str(self.hover_cmp_title_var.get() or "")
+                    self.hover_cmp_title_var.set(t.replace(" | 已固定", ""))
+        except Exception:
+            pass
+
+    def _on_hover_compare_clear_click(self):
+        self._hide_hover_popup()
+        self._clear_hover_compare_panel()
+
+    def _on_hover_cmp_mousewheel(self, event):
+        # Keep default behavior unless Shift is held (then treat as horizontal scroll).
+        try:
+            if int(getattr(event, "state", 0)) & 0x1:
+                return self._on_hover_cmp_shift_wheel(event)
+        except Exception:
+            pass
+        return None
+
+    def _on_hover_cmp_shift_wheel(self, event):
+        try:
+            delta = int(getattr(event, "delta", 0))
+        except Exception:
+            delta = 0
+        step = 0
+        if delta != 0:
+            step = -1 if delta > 0 else 1
+        else:
+            num = getattr(event, "num", None)
+            if num == 4:
+                step = -1
+            elif num == 5:
+                step = 1
+        if step != 0:
+            try:
+                self.hover_cmp_text.xview_scroll(step * 3, "units")
+            except Exception:
+                pass
+        return "break"
+
     def _cancel_hover_compare_clear(self):
         aid = getattr(self, "_hover_clear_after_id", None)
         if aid is not None:
@@ -3898,13 +3970,15 @@ class SheetView:
 
     def _on_hover_compare_leave(self):
         self._hide_hover_popup()
-        self._schedule_hover_compare_clear()
+        # Keep panel content visible for manual horizontal drag/inspection.
+        self._cancel_hover_compare_clear()
 
     def _set_hover_compare_panel(self, text: str, key):
         if not text:
-            self._clear_hover_compare_panel()
             return
         self._cancel_hover_compare_clear()
+        if self._hover_compare_is_pinned() and getattr(self, "_last_hover_compare_key", None) is not None:
+            return
         if getattr(self, "_last_hover_compare_key", None) == key:
             return
         col_text = "-"
@@ -3916,7 +3990,8 @@ class SheetView:
             col_text = "-"
         try:
             if hasattr(self, "hover_cmp_title_var"):
-                self.hover_cmp_title_var.set(f"悬停完整对比 | Sheet: {self.sheet} | Col: {col_text}")
+                suffix = " | 已固定" if self._hover_compare_is_pinned() else ""
+                self.hover_cmp_title_var.set(f"悬停完整对比 | Sheet: {self.sheet} | Col: {col_text}{suffix}")
             self._render_hover_compare_panel(text, key)
         except Exception:
             pass
@@ -4016,14 +4091,15 @@ class SheetView:
             except Exception:
                 pass
 
-    def _hide_cell_tooltip(self):
+    def _hide_cell_tooltip(self, clear_panel: bool = True):
         self._hide_hover_popup()
-        self._clear_hover_compare_panel()
+        if clear_panel:
+            self._clear_hover_compare_panel()
         self._cell_tip_key = None
 
     def _show_cell_tooltip(self, text: str, x_root: int, y_root: int, key):
         if not text:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         self._set_hover_compare_panel(text, key)
         self._cell_tip_key = key
@@ -4073,7 +4149,7 @@ class SheetView:
                 self._cell_tip_key = key
                 lbl.pack(ipadx=4, ipady=2)
             except Exception:
-                self._hide_cell_tooltip()
+                self._hide_cell_tooltip(clear_panel=False)
 
     def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int, force_show: bool = False):
         try:
@@ -4197,18 +4273,18 @@ class SheetView:
             line = int(idx.split(".")[0])
             col_char = int(idx.split(".")[1])
         except Exception:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         if not (1 <= line <= len(self.display_rows)):
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         pair_idx = self._pair_idx_for_line(line)
         if pair_idx is None or pair_idx >= len(self.row_pairs):
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         target_col, span_s, span_e = self._hit_col_from_char(col_char)
         if target_col is None:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         force_show = False
         try:
@@ -4225,7 +4301,7 @@ class SheetView:
             force_show = False
         payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
         if not payload:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         tip_text, key = payload
         self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)
@@ -4260,11 +4336,11 @@ class SheetView:
             line_no = int(idx_s.split(".")[0])
             char_no = int(idx_s.split(".")[1])
         except Exception:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         target_col, span_s, span_e = self._hit_col_from_char(char_no)
         if target_col is None:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         force_show = False
         try:
@@ -4282,7 +4358,7 @@ class SheetView:
         pair_idx = self._active_pair_idx_for_c_area()
         payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
         if not payload:
-            self._hide_cell_tooltip()
+            self._hide_cell_tooltip(clear_panel=False)
             return
         tip_text, key = payload
         self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)

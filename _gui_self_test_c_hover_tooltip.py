@@ -4,6 +4,7 @@ Validates:
 - 2-way mode: tooltip contains A/B full text lines.
 - 3-way mode: tooltip contains BASE/A/B full text lines.
 - real hover event path updates fixed hover-compare panel content.
+- hover panel persists after leave and supports pin/clear + shift-wheel horizontal scroll.
 """
 
 import os
@@ -158,6 +159,43 @@ def _run_2way():
     panel = _panel_text(view)
     assert "A[" in panel and "B[" in panel, panel
     assert long_a in panel and long_b in panel, panel
+    keep_panel = panel
+
+    # Leave should not clear panel anymore (allow manual horizontal review).
+    view._on_hover_compare_leave()
+    view.app.root.update_idletasks()
+    view.app.root.update()
+    assert _panel_text(view) == keep_panel, _panel_text(view)
+
+    # Pin mode freezes auto updates.
+    view.hover_cmp_pin_var.set(1)
+    view._on_hover_compare_pin_toggle()
+    view._set_hover_compare_panel(
+        "A[9]: SHOULD_NOT_APPLY\nB[9]: SHOULD_NOT_APPLY",
+        ("S", "CMP", 999, 9, ("SHOULD_NOT_APPLY", "SHOULD_NOT_APPLY")),
+    )
+    assert _panel_text(view) == keep_panel, _panel_text(view)
+
+    # Shift+wheel should move horizontal viewport.
+    x0 = float((view.hover_cmp_text.xview() or (0.0, 1.0))[0])
+    view._on_hover_cmp_shift_wheel(SimpleNamespace(delta=-120, state=0x1))
+    view.app.root.update_idletasks()
+    view.app.root.update()
+    x1 = float((view.hover_cmp_text.xview() or (0.0, 1.0))[0])
+    assert x1 >= x0, (x0, x1)
+
+    # Clear button should clear even when pinned.
+    view._on_hover_compare_clear_click()
+    view.app.root.update_idletasks()
+    view.app.root.update()
+    assert _panel_text(view) == "", _panel_text(view)
+
+    # Unpin then next update should apply.
+    view.hover_cmp_pin_var.set(0)
+    view._on_hover_compare_pin_toggle()
+    _drive_main_hover(view, line_no=2, col=5, side="A")
+    panel = _panel_text(view)
+    assert "A[" in panel and "B[" in panel, panel
 
     try:
         view._cancel_hover_compare_clear()
