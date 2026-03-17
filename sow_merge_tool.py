@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update31"
-APP_BUILD_TAG = "new108-hover-fixed-compare-panel"
+APP_VERSION = "2026-03-17.update32"
+APP_BUILD_TAG = "new109-hover-compare-diffchar-highlight"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -2896,6 +2896,7 @@ class SheetView:
         self._enable_hover_popup = False
         self._hover_clear_after_id = None
         self._last_hover_compare_key = None
+        self._hover_payload_cache = {}
         hover_cmp_frame = ttk.LabelFrame(self.frame, text="悬停完整对比")
         hover_cmp_frame.pack(fill="x", padx=8, pady=(0, 4))
         self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比：-")
@@ -2908,6 +2909,12 @@ class SheetView:
             bd=1,
             relief="solid",
         )
+        # Source row backgrounds align with main panes.
+        self.hover_cmp_text.tag_configure("hover_side_base", background=_BASE_BG)
+        self.hover_cmp_text.tag_configure("hover_side_mine", background=_MINE_BG)
+        self.hover_cmp_text.tag_configure("hover_side_theirs", background=_THEIRS_BG)
+        # Char-level diff highlight inside each source line.
+        self.hover_cmp_text.tag_configure("hover_diffchar", background=_DIFF_CELL_BG, foreground="#ffffff")
         self.hover_cmp_hsb = ttk.Scrollbar(hover_cmp_frame, orient="horizontal", command=self.hover_cmp_text.xview)
         self.hover_cmp_text.configure(xscrollcommand=self.hover_cmp_hsb.set)
         self.hover_cmp_text.pack(side="top", fill="x", expand=True)
@@ -3910,14 +3917,104 @@ class SheetView:
         try:
             if hasattr(self, "hover_cmp_title_var"):
                 self.hover_cmp_title_var.set(f"悬停完整对比 | Sheet: {self.sheet} | Col: {col_text}")
-            if hasattr(self, "hover_cmp_text"):
-                self.hover_cmp_text.configure(state="normal")
-                self.hover_cmp_text.delete("1.0", "end")
-                self.hover_cmp_text.insert("1.0", text)
-                self.hover_cmp_text.configure(state="disabled")
+            self._render_hover_compare_panel(text, key)
         except Exception:
             pass
         self._last_hover_compare_key = key
+
+    @staticmethod
+    def _hover_diff_masks(values):
+        """Mark non-equal chars for each source value via pairwise sequence compare."""
+        vals = ["" if v is None else str(v) for v in (values or ())]
+        masks = [set() for _ in vals]
+        if len(vals) <= 1:
+            return masks
+        for i in range(len(vals)):
+            for j in range(i + 1, len(vals)):
+                a = vals[i]
+                b = vals[j]
+                sm = difflib.SequenceMatcher(None, a, b)
+                for tag, a1, a2, b1, b2 in sm.get_opcodes():
+                    if tag == "equal":
+                        continue
+                    masks[i].update(range(a1, a2))
+                    masks[j].update(range(b1, b2))
+        return masks
+
+    @staticmethod
+    def _side_tag_for_hover_line(side: str, has_base: bool) -> str:
+        s = (side or "").upper()
+        if s == "BASE":
+            return "hover_side_base"
+        if s == "A":
+            return "hover_side_mine" if has_base else "hover_side_base"
+        if s == "B":
+            return "hover_side_theirs" if has_base else "hover_side_mine"
+        return "hover_side_base"
+
+    def _render_hover_compare_panel(self, text: str, key):
+        if not hasattr(self, "hover_cmp_text"):
+            return
+        w = self.hover_cmp_text
+        try:
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+            payload = (getattr(self, "_hover_payload_cache", {}) or {}).get(key)
+            if not payload:
+                w.insert("1.0", text)
+                w.configure(state="disabled")
+                return
+            sides = list(payload.get("sides") or [])
+            rows = list(payload.get("rows") or [])
+            values = ["" if v is None else str(v) for v in (payload.get("values") or ())]
+            has_base = any((str(s).upper() == "BASE") for s in sides)
+            masks = self._hover_diff_masks(values)
+
+            for i, (side, row_no, val) in enumerate(zip(sides, rows, values), start=1):
+                row_label = "-" if row_no is None else str(row_no)
+                prefix = f"{side}[{row_label}]: "
+                line_txt = f"{prefix}{val}"
+                if i > 1:
+                    w.insert("end", "\n")
+                line_start = f"{i}.0"
+                w.insert("end", line_txt)
+                # Color the whole source line by provenance.
+                side_tag = self._side_tag_for_hover_line(side, has_base)
+                w.tag_add(side_tag, line_start, f"{i}.end")
+
+                # Color changed chars in value body.
+                mask = sorted(masks[i - 1]) if (i - 1) < len(masks) else []
+                if mask:
+                    seg_s = None
+                    seg_e = None
+                    for p in mask:
+                        if p < 0 or p >= len(val):
+                            continue
+                        if seg_s is None:
+                            seg_s = p
+                            seg_e = p + 1
+                            continue
+                        if p == seg_e:
+                            seg_e = p + 1
+                            continue
+                        b0 = len(prefix) + seg_s
+                        b1 = len(prefix) + seg_e
+                        w.tag_add("hover_diffchar", f"{i}.{b0}", f"{i}.{b1}")
+                        seg_s = p
+                        seg_e = p + 1
+                    if seg_s is not None and seg_e is not None:
+                        b0 = len(prefix) + seg_s
+                        b1 = len(prefix) + seg_e
+                        w.tag_add("hover_diffchar", f"{i}.{b0}", f"{i}.{b1}")
+            w.configure(state="disabled")
+        except Exception:
+            try:
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+                w.insert("1.0", text)
+                w.configure(state="disabled")
+            except Exception:
+                pass
 
     def _hide_cell_tooltip(self):
         self._hide_hover_popup()
@@ -4044,6 +4141,20 @@ class SheetView:
             lines.append(f"{side}[{row_label}]: {v}")
         tip_text = "\n".join(lines)
         key = (self.sheet, "CMP", int(pair_idx), target_col, tuple(values))
+        try:
+            if not isinstance(getattr(self, "_hover_payload_cache", None), dict):
+                self._hover_payload_cache = {}
+            self._hover_payload_cache[key] = {
+                "sides": tuple(sides),
+                "rows": tuple(rows),
+                "values": tuple(values),
+            }
+            # Keep cache bounded; only recent hover payloads are needed.
+            if len(self._hover_payload_cache) > 128:
+                for old_k in list(self._hover_payload_cache.keys())[:-64]:
+                    self._hover_payload_cache.pop(old_k, None)
+        except Exception:
+            pass
         return tip_text, key
 
     def _should_force_hover_tip(self, target_col: int, rendered_fragment: str = "") -> bool:

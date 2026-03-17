@@ -71,6 +71,13 @@ def _panel_title(view) -> str:
         return ""
 
 
+def _has_tag(view, tag_name: str) -> bool:
+    try:
+        return len(view.hover_cmp_text.tag_ranges(tag_name)) >= 2
+    except Exception:
+        return False
+
+
 def _motion_event_for_cell(text_widget, line_no: int, char_pos: int):
     box = text_widget.bbox(f"{line_no}.{max(0, int(char_pos))}")
     assert box is not None, f"bbox is None for line={line_no}, char={char_pos}"
@@ -143,6 +150,9 @@ def _run_2way():
     assert "A[" in panel and "B[" in panel, panel
     assert long_a in panel and long_b in panel, panel
     assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+    assert _has_tag(view, "hover_side_base"), "expected BASE-like row background in 2-way hover panel"
+    assert _has_tag(view, "hover_side_mine"), "expected MINE-like row background in 2-way hover panel"
+    assert _has_tag(view, "hover_diffchar"), "expected diff-char highlight in hover panel"
 
     _drive_c_hover(view, line_no=1, col=5)
     panel = _panel_text(view)
@@ -196,6 +206,10 @@ def _run_3way():
     assert "BASE[" in panel and "A[" in panel and "B[" in panel, panel
     assert long_base in panel and long_mine in panel and long_theirs in panel, panel
     assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+    assert _has_tag(view, "hover_side_base"), "expected BASE row background in 3-way hover panel"
+    assert _has_tag(view, "hover_side_mine"), "expected MINE row background in 3-way hover panel"
+    assert _has_tag(view, "hover_side_theirs"), "expected THEIRS row background in 3-way hover panel"
+    assert _has_tag(view, "hover_diffchar"), "expected diff-char highlight in hover panel"
 
     _drive_c_hover(view, line_no=2, col=5)
     panel = _panel_text(view)
