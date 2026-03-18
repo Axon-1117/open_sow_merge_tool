@@ -167,6 +167,13 @@ def _run_2way():
     view.app.root.update()
     assert _panel_text(view) == keep_panel, _panel_text(view)
 
+    # F4 hotkey toggles pin on/off.
+    assert int(view.hover_cmp_pin_var.get()) == 0
+    view._on_hover_compare_f4_toggle()
+    assert int(view.hover_cmp_pin_var.get()) == 1
+    view._on_hover_compare_f4_toggle()
+    assert int(view.hover_cmp_pin_var.get()) == 0
+
     # Pin mode freezes auto updates.
     view.hover_cmp_pin_var.set(1)
     view._on_hover_compare_pin_toggle()

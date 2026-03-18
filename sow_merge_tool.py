@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update33"
-APP_BUILD_TAG = "new110-hover-panel-pin-scroll"
+APP_VERSION = "2026-03-17.update34"
+APP_BUILD_TAG = "new111-hover-pin-f4-toggle"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -2907,7 +2907,7 @@ class SheetView:
         ttk.Button(hover_hdr, text="清空", command=self._on_hover_compare_clear_click).pack(side="right", padx=(6, 0))
         ttk.Checkbutton(
             hover_hdr,
-            text="固定",
+            text="固定(F4)",
             variable=self.hover_cmp_pin_var,
             onvalue=1,
             offvalue=0,
@@ -2935,6 +2935,10 @@ class SheetView:
         self.hover_cmp_text.bind("<MouseWheel>", self._on_hover_cmp_mousewheel)
         self.hover_cmp_text.bind("<Shift-Button-4>", self._on_hover_cmp_shift_wheel)
         self.hover_cmp_text.bind("<Shift-Button-5>", self._on_hover_cmp_shift_wheel)
+        try:
+            self.root.bind("<F4>", self._on_hover_compare_f4_toggle, add="+")
+        except Exception:
+            pass
         try:
             self.hover_cmp_text.configure(state="disabled")
         except Exception:
@@ -3917,6 +3921,16 @@ class SheetView:
                     self.hover_cmp_title_var.set(t.replace(" | 已固定", ""))
         except Exception:
             pass
+
+    def _on_hover_compare_f4_toggle(self, event=None):
+        # Quick keyboard toggle for pin/unpin while reviewing long content.
+        try:
+            cur = 1 if self._hover_compare_is_pinned() else 0
+            self.hover_cmp_pin_var.set(0 if cur else 1)
+            self._on_hover_compare_pin_toggle()
+        except Exception:
+            pass
+        return "break"
 
     def _on_hover_compare_clear_click(self):
         self._hide_hover_popup()
