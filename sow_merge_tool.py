@@ -27,8 +27,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-17.update34"
-APP_BUILD_TAG = "new111-hover-pin-f4-toggle"
+APP_VERSION = "2026-03-18.update36"
+APP_BUILD_TAG = "new113-f4-route-and-hover-read-fix"
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
@@ -68,7 +68,6 @@ _SVN_EXPORT_TIMEOUT_SECS = 15
 _COL_MAX_DISPLAY_WIDTH = 30
 _COL_SEP = " \u2502 "    # 3-char separator between columns (U+2502 BOX DRAWINGS LIGHT VERTICAL)
 _COL_SEP_LEN = 3
-_HOVER_COMPARE_CLEAR_DELAY_MS = 120
 
 # Unified pane colors (main 3-way panes and C-area rows)
 _MINE_BG = "#F6C16B"
@@ -2030,6 +2029,7 @@ class SheetView:
     def __init__(self, parent, app, sheet_name: str):
         self.parent = parent
         self.app = app
+        self.root = getattr(app, "root", None)
         self.sheet = sheet_name
         # Support lazy tab containers: if parent is already a tab frame, reuse it.
         if isinstance(parent, ttk.Frame) and not parent.winfo_children():
@@ -2762,7 +2762,8 @@ class SheetView:
             w.bind("<ButtonRelease-1>", lambda e: self._update_cursor_lines())
             if getattr(self.app, "merge_conflict_mode", False):
                 #快捷键：下一处/上一处冲突
-                w.bind("<F4>", lambda e: (self._goto_next_diff_block(), "break"))
+                # F4 is reserved for hover panel pin/unpin toggle.
+                w.bind("<F4>", self._on_hover_compare_f4_toggle)
                 w.bind("<Shift-F4>", lambda e: (self._goto_prev_diff_block(), "break"))
                 w.bind("<Control-n>", lambda e: (self._goto_next_diff_block(), "break"))
                 w.bind("<Control-p>", lambda e: (self._goto_prev_diff_block(), "break"))
@@ -2929,16 +2930,12 @@ class SheetView:
         self.hover_cmp_text.tag_configure("hover_diffchar", background=_DIFF_CELL_BG, foreground="#ffffff")
         self.hover_cmp_hsb = ttk.Scrollbar(hover_cmp_frame, orient="horizontal", command=self.hover_cmp_text.xview)
         self.hover_cmp_text.configure(xscrollcommand=self.hover_cmp_hsb.set)
-        self.hover_cmp_text.pack(side="top", fill="x", expand=True)
-        self.hover_cmp_hsb.pack(side="top", fill="x")
+        self.hover_cmp_hsb.pack(side="bottom", fill="x")
+        self.hover_cmp_text.pack(side="top", fill="both", expand=True)
         self.hover_cmp_text.bind("<Shift-MouseWheel>", self._on_hover_cmp_shift_wheel)
         self.hover_cmp_text.bind("<MouseWheel>", self._on_hover_cmp_mousewheel)
         self.hover_cmp_text.bind("<Shift-Button-4>", self._on_hover_cmp_shift_wheel)
         self.hover_cmp_text.bind("<Shift-Button-5>", self._on_hover_cmp_shift_wheel)
-        try:
-            self.root.bind("<F4>", self._on_hover_compare_f4_toggle, add="+")
-        except Exception:
-            pass
         try:
             self.hover_cmp_text.configure(state="disabled")
         except Exception:
@@ -3886,7 +3883,6 @@ class SheetView:
             except Exception:
                 pass
         self._cell_tip_win = None
-        self._cell_tip_label = None
 
     def _clear_hover_compare_panel(self):
         try:
@@ -3924,6 +3920,18 @@ class SheetView:
 
     def _on_hover_compare_f4_toggle(self, event=None):
         # Quick keyboard toggle for pin/unpin while reviewing long content.
+        # Multiple SheetView instances may register F4 on root; only the active
+        # sheet view should consume the key event.
+        try:
+            nb = getattr(self.app, "nb", None)
+            if nb is not None:
+                tab_id = nb.select()
+                if tab_id:
+                    tab_text = str(nb.tab(tab_id, "text") or "")
+                    if tab_text != str(self.sheet):
+                        return None
+        except Exception:
+            pass
         try:
             cur = 1 if self._hover_compare_is_pinned() else 0
             self.hover_cmp_pin_var.set(0 if cur else 1)
@@ -3974,13 +3982,6 @@ class SheetView:
             except Exception:
                 pass
         self._hover_clear_after_id = None
-
-    def _schedule_hover_compare_clear(self):
-        self._cancel_hover_compare_clear()
-        try:
-            self._hover_clear_after_id = self.root.after(_HOVER_COMPARE_CLEAR_DELAY_MS, self._clear_hover_compare_panel)
-        except Exception:
-            self._clear_hover_compare_panel()
 
     def _on_hover_compare_leave(self):
         self._hide_hover_popup()
@@ -4216,7 +4217,12 @@ class SheetView:
                                 v_disp = v_edit
                         except Exception:
                             pass
-                values.append(_val_to_str(v_disp))
+                if v_disp is None:
+                    v_str = ""
+                else:
+                    v_str = str(v_disp)
+                    v_str = v_str.replace("\r\n", "⏎").replace("\r", "⏎").replace("\n", "⏎")
+                values.append(v_str)
             except Exception:
                 return None
 
@@ -7501,6 +7507,37 @@ class SowMergeApp:
             if confirmed:
                 self.sheet_diff_state[sheet] = 0
 
+    def _active_sheet_name(self) -> str | None:
+        try:
+            tab_id = self.nb.select()
+            if not tab_id:
+                return None
+            tab_text = str(self.nb.tab(tab_id, "text") or "").strip()
+            return tab_text or None
+        except Exception:
+            return None
+
+    def _on_global_f4(self, event=None):
+        """Route F4 to the currently active sheet view only."""
+        try:
+            sheet = self._active_sheet_name()
+            if not sheet:
+                return None
+            view = self.sheet_views.get(sheet)
+            if view is None and sheet in self._sheet_containers:
+                try:
+                    self.nb.select(self._sheet_containers[sheet])
+                    self.root.update_idletasks()
+                    self.root.update()
+                    view = self.sheet_views.get(sheet)
+                except Exception:
+                    view = None
+            if view is None:
+                return None
+            return view._on_hover_compare_f4_toggle(event)
+        except Exception:
+            return None
+
     def _build_ui(self):
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=8)
@@ -7535,6 +7572,10 @@ class SowMergeApp:
 
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        try:
+            self.root.bind("<F4>", self._on_global_f4)
+        except Exception:
+            pass
 
         # Bottom bar: sheet nav (only)
         self.bottom = ttk.Frame(self.root)

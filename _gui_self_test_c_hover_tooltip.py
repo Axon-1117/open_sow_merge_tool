@@ -167,11 +167,19 @@ def _run_2way():
     view.app.root.update()
     assert _panel_text(view) == keep_panel, _panel_text(view)
 
-    # F4 hotkey toggles pin on/off.
+    # F4 hotkey toggles pin on/off (both direct handler and root key event).
     assert int(view.hover_cmp_pin_var.get()) == 0
     view._on_hover_compare_f4_toggle()
     assert int(view.hover_cmp_pin_var.get()) == 1
     view._on_hover_compare_f4_toggle()
+    assert int(view.hover_cmp_pin_var.get()) == 0
+    view.app.root.event_generate("<F4>")
+    view.app.root.update_idletasks()
+    view.app.root.update()
+    assert int(view.hover_cmp_pin_var.get()) == 1
+    view.app.root.event_generate("<F4>")
+    view.app.root.update_idletasks()
+    view.app.root.update()
     assert int(view.hover_cmp_pin_var.get()) == 0
 
     # Pin mode freezes auto updates.
@@ -268,9 +276,80 @@ def _run_3way():
         pass
 
 
+def _run_f4_routes_to_active_sheet():
+    td_a = make_temp_dir(prefix="sow_c_tip_f4_a_")
+    td_b = make_temp_dir(prefix="sow_c_tip_f4_b_")
+    fa = os.path.join(td_a, "same.xlsx")
+    fb = os.path.join(td_b, "same.xlsx")
+
+    wb_a = Workbook()
+    ws = wb_a.active
+    ws.title = "S1"
+    ws["A1"] = "A1"
+    ws2 = wb_a.create_sheet("S2")
+    ws2["A1"] = "A2"
+    wb_a.save(fa)
+    wb_a.close()
+
+    wb_b = Workbook()
+    ws = wb_b.active
+    ws.title = "S1"
+    ws["A1"] = "B1"
+    ws2 = wb_b.create_sheet("S2")
+    ws2["A1"] = "B2"
+    wb_b.save(fb)
+    wb_b.close()
+
+    app = mod.SowMergeApp(fa, fb)
+    assert len(app.common_sheets) >= 2, app.common_sheets
+    s1, s2 = app.common_sheets[0], app.common_sheets[1]
+
+    app.nb.select(app._sheet_containers[s1])
+    app.root.update_idletasks()
+    app.root.update()
+    v1 = app.sheet_views[s1]
+
+    app.nb.select(app._sheet_containers[s2])
+    app.root.update_idletasks()
+    app.root.update()
+    v2 = app.sheet_views[s2]
+
+    assert int(v1.hover_cmp_pin_var.get()) == 0
+    assert int(v2.hover_cmp_pin_var.get()) == 0
+
+    # Deterministic route check via app-level F4 handler.
+    app._on_global_f4(None)
+    app.root.update_idletasks()
+    app.root.update()
+    assert int(v1.hover_cmp_pin_var.get()) == 0, "inactive sheet should not be toggled by F4"
+    assert int(v2.hover_cmp_pin_var.get()) == 1, "active sheet should be toggled by F4"
+
+    # Also verify real key-event path.
+    try:
+        app.root.focus_force()
+    except Exception:
+        pass
+    app.root.focus_set()
+    app.root.update_idletasks()
+    app.root.update()
+    app.root.event_generate("<F4>")
+    app.root.update_idletasks()
+    app.root.update()
+    assert int(v1.hover_cmp_pin_var.get()) == 0, "inactive sheet should remain unchanged"
+    assert int(v2.hover_cmp_pin_var.get()) == 0, "active sheet should toggle back on second F4"
+
+    try:
+        v1._cancel_hover_compare_clear()
+        v2._cancel_hover_compare_clear()
+        app._shutdown_root()
+    except Exception:
+        pass
+
+
 def main():
     _run_2way()
     _run_3way()
+    _run_f4_routes_to_active_sheet()
     print("GUI_SELF_TEST_C_HOVER_TOOLTIP_OK")
 
 
