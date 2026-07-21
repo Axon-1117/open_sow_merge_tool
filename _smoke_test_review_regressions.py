@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 from openpyxl import Workbook, load_workbook
 
@@ -212,6 +213,21 @@ def _test_background_recalc_policy_is_explicit():
         mod._recalc_and_prepare_val_path = old_recalc
 
 
+def _test_large_only_diff_disk_worker_is_blocked_after_user_edits():
+    view = SimpleNamespace(
+        _is_large_sheet=True,
+        touched_rows={1401},
+        sheet="S1",
+        app=SimpleNamespace(modified_sheets_a={"S1"}, modified_sheets_b=set()),
+    )
+    view._has_user_edits_for_current_sheet = lambda: mod.SheetView._has_user_edits_for_current_sheet(view)
+    assert mod.SheetView._start_async_large_only_diff_build(view) is False
+
+    view.touched_rows.clear()
+    view.app.modified_sheets_a.clear()
+    assert not mod.SheetView._has_user_edits_for_current_sheet(view)
+
+
 def main():
     _test_only_diff_region_boundaries()
     _test_logical_region_extends_beyond_render_limit()
@@ -221,6 +237,7 @@ def main():
     _test_large_alignment_fast_and_exact()
     _test_stable_copy_waits_for_complete_zip()
     _test_background_recalc_policy_is_explicit()
+    _test_large_only_diff_disk_worker_is_blocked_after_user_edits()
     print("SMOKE_REVIEW_REGRESSIONS_OK")
 
 

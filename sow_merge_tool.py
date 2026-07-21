@@ -29,8 +29,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-21.update48"
-APP_BUILD_TAG = "new125-region-stale-recalc-fix"
+APP_VERSION = "2026-07-21.update49"
+APP_BUILD_TAG = "new126-only-diff-async-stale-ui-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -7982,6 +7982,13 @@ class SheetView:
         self._only_diff_async_building = False
         self._only_diff_async_build_seq += 1
 
+    def _has_user_edits_for_current_sheet(self) -> bool:
+        if bool(self.touched_rows):
+            return True
+        modified_a = getattr(self.app, "modified_sheets_a", set())
+        modified_b = getattr(self.app, "modified_sheets_b", set())
+        return self.sheet in modified_a or self.sheet in modified_b
+
     def _current_only_diff_cache_key(self) -> tuple:
         return (
             self.sheet,
@@ -8047,6 +8054,11 @@ class SheetView:
 
     def _start_async_large_only_diff_build(self) -> bool:
         if not getattr(self, "_is_large_sheet", False):
+            return False
+        # This worker opens disk snapshots. Once the user has adopted any data,
+        # those files are stale and must never be allowed to rebuild UI text.
+        if self._has_user_edits_for_current_sheet():
+            _dlog(f"only-diff async skipped after user edits: sheet={self.sheet}")
             return False
         if not getattr(self, "_data_ready", False):
             self._prefer_only_diff_when_ready = True
@@ -8375,6 +8387,11 @@ class SheetView:
                 if res.get("build_key") != self._current_only_diff_cache_key():
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    return
+                if self._has_user_edits_for_current_sheet():
+                    self._only_diff_async_building = False
+                    self._only_diff_async_build_key = None
+                    _dlog(f"only-diff async result dropped after user edits: sheet={self.sheet}")
                     return
                 self._only_diff_async_building = False
                 self._only_diff_async_build_key = None
@@ -10545,7 +10562,17 @@ class SheetView:
                     keep_rows = list(self.display_rows) if self.display_rows else list(self._full_display_rows)
                     self._full_display_rows = keep_rows
                 else:
-                    fallback_rows = cached_only_diff_rows if cached_only_diff_rows is not None else []
+                    # A disk-backed async rebuild is intentionally unavailable
+                    # after user edits. Reuse the current in-memory diff maps so
+                    # resolved/touched rows remain stable and text is rebuilt
+                    # from the edited in-memory workbooks below.
+                    fallback_rows = cached_only_diff_rows
+                    if fallback_rows is None:
+                        fallback_rows = [
+                            idx for idx in range(len(self.row_pairs))
+                            if self._pair_has_visual_diff(idx)
+                        ]
+                        self._cache_only_diff_rows_snapshot(fallback_rows)
                     self._full_display_rows = self._only_diff_rows_with_touched(fallback_rows)
             elif (not self.snapshot_only_diff) or rescan or (cached_only_diff_rows is None):
                 # Build snapshot: diff rows + touched rows.

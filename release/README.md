@@ -1,10 +1,12 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-07-21.update48`
-- Build Tag：`new125-region-stale-recalc-fix`
+- 版本号：`2026-07-21.update49`
+- Build Tag：`new126-only-diff-async-stale-ui-fix`
 
 ### 本次修复
+- 修复大表只看差异模式采用 theirs 后约 7 秒界面又显示 mine 旧值的问题；根因是区域操作失效快照后重新启动了读取磁盘旧 mine 的 only-diff 后台构建，并在完成后覆盖主视区行文本。
+- 当前 Sheet 一旦发生用户操作，only-diff 后台任务会在启动和结果应用两处被阻止；后续刷新改为从已编辑的内存工作簿与当前差异映射重建文本，不再读取磁盘旧 mine。
 - 修复大公式表点击“使用右侧区域”后先延迟生效、随后又恢复 mine 旧值的问题；日志确认旧版本会在打开后依次后台重算 mine/theirs/base，并把较早启动的 mine 结果回灌到用户操作后的界面。
 - merge 模式不再自动启动 Excel 全表重算；自动重算策略现在严格遵守配置，存在未保存覆盖操作时也会阻止手动重算，避免磁盘旧文件覆盖内存合并结果。
 - 后台 Sheet 差异缓存现在只要检测到该 Sheet 有任何用户操作就拒绝应用，不再要求初始 `_data_ready` 已完成，消除首屏后台结果延迟覆盖用户操作的竞态。
@@ -72,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
 ```
 
 可选参数：
-- `-GitCommitMessage "release: 2026-07-21.update48 (new125-region-stale-recalc-fix)"`：自定义提交信息。
+- `-GitCommitMessage "release: 2026-07-21.update49 (new126-only-diff-async-stale-ui-fix)"`：自定义提交信息。
 - `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
 - `-GitRemote origin`：指定推送远端，默认 `origin`。
 - `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。
