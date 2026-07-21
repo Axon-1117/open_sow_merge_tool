@@ -1,11 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set "TOOL=D:\Tools\sow_merge_tool_proj\dist\sow_merge_tool.exe"
+set "TOOL=%~dp0sow_merge_tool.exe"
+if not exist "%TOOL%" set "TOOL=%~dp0dist\sow_merge_tool.exe"
 set "ROOT=HKCU\Software\TortoiseSVN"
 set "DIFFTOOLS=%ROOT%\DiffTools"
 set "MERGETOOLS=%ROOT%\MergeTools"
-set "DIFF_CMD=\"%TOOL%\" %%base %%mine --title %%bname"
+set "DIFF_CMD=\"%TOOL%\" --mine %%mine --base %%base --title %%bname"
 set "MERGE_CMD=\"%TOOL%\" --base %%base --mine %%mine --theirs %%theirs --merged %%merged --title %%bname"
 set "MERGE_ARGS=--base %%base --mine %%mine --theirs %%theirs --merged %%merged --title %%bname"
 
@@ -52,16 +53,16 @@ reg add "%ROOT%" /v Merge /t REG_SZ /d "%MERGE_CMD%" /f >nul
 reg add "%ROOT%" /v DiffArgs /t REG_SZ /d "" /f >nul
 reg add "%ROOT%" /v MergeArgs /t REG_SZ /d "" /f >nul
 
-echo [4/5] Setting per-extension tools (.xlsx/.xlsm/.csv)...
-for %%E in (.xlsx .xlsm .csv) do (
+echo [4/5] Setting per-extension tools (.xlsx/.xlsm)...
+for %%E in (.xlsx .xlsm) do (
   reg add "%DIFFTOOLS%" /v %%E /t REG_SZ /d "%DIFF_CMD%" /f >nul
   reg add "%MERGETOOLS%" /v %%E /t REG_SZ /d "%MERGE_CMD%" /f >nul
 )
 
 echo [5/5] Setting command/args under extension subkeys...
-for %%K in (XLSX XLSM CSV) do (
+for %%K in (XLSX XLSM) do (
   reg add "%DIFFTOOLS%\%%K" /v command /t REG_SZ /d "%DIFF_CMD%" /f >nul
-  reg add "%DIFFTOOLS%\%%K" /v args /t REG_SZ /d "%%base %%mine --title %%bname" /f >nul
+  reg add "%DIFFTOOLS%\%%K" /v args /t REG_SZ /d "--mine %%mine --base %%base --title %%bname" /f >nul
   reg add "%MERGETOOLS%\%%K" /v command /t REG_SZ /d "%MERGE_CMD%" /f >nul
   reg add "%MERGETOOLS%\%%K" /v args /t REG_SZ /d "%MERGE_ARGS%" /f >nul
 )

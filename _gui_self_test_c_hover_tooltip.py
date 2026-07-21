@@ -139,16 +139,21 @@ def _run_2way():
     app.root.update()
 
     txt = _c_tooltip_text_by_col(view, c_line=1, col=5)
-    assert "A[" in txt and "B[" in txt, txt
-    assert "BASE[" not in txt, txt
+    assert "base[" in txt and "mine[" in txt, txt
+    assert "theirs[" not in txt, txt
     assert long_a in txt and long_b in txt, txt
     txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
-    assert "A[" in txt_main and "B[" in txt_main, txt_main
+    assert "base[" in txt_main and "mine[" in txt_main, txt_main
     assert long_a in txt_main and long_b in txt_main, txt_main
+
+    # Short, non-truncated cells should still update the fixed hover panel.
+    _drive_main_hover(view, line_no=2, col=2, side="A")
+    panel_short = _panel_text(view)
+    assert "base[2]: 2" in panel_short and "mine[2]: 2" in panel_short, panel_short
 
     _drive_main_hover(view, line_no=2, col=5, side="A")
     panel = _panel_text(view)
-    assert "A[" in panel and "B[" in panel, panel
+    assert "base[" in panel and "mine[" in panel, panel
     assert long_a in panel and long_b in panel, panel
     assert "Col: E(5)" in _panel_title(view), _panel_title(view)
     assert _has_tag(view, "hover_side_base"), "expected BASE-like row background in 2-way hover panel"
@@ -157,7 +162,7 @@ def _run_2way():
 
     _drive_c_hover(view, line_no=1, col=5)
     panel = _panel_text(view)
-    assert "A[" in panel and "B[" in panel, panel
+    assert "base[" in panel and "mine[" in panel, panel
     assert long_a in panel and long_b in panel, panel
     keep_panel = panel
 
@@ -186,7 +191,7 @@ def _run_2way():
     view.hover_cmp_pin_var.set(1)
     view._on_hover_compare_pin_toggle()
     view._set_hover_compare_panel(
-        "A[9]: SHOULD_NOT_APPLY\nB[9]: SHOULD_NOT_APPLY",
+        "base[9]: SHOULD_NOT_APPLY\nmine[9]: SHOULD_NOT_APPLY",
         ("S", "CMP", 999, 9, ("SHOULD_NOT_APPLY", "SHOULD_NOT_APPLY")),
     )
     assert _panel_text(view) == keep_panel, _panel_text(view)
@@ -210,7 +215,7 @@ def _run_2way():
     view._on_hover_compare_pin_toggle()
     _drive_main_hover(view, line_no=2, col=5, side="A")
     panel = _panel_text(view)
-    assert "A[" in panel and "B[" in panel, panel
+    assert "base[" in panel and "mine[" in panel, panel
 
     try:
         view._cancel_hover_compare_clear()
@@ -248,15 +253,23 @@ def _run_3way():
     app.root.update()
 
     txt = _c_tooltip_text_by_col(view, c_line=2, col=5)
-    assert "BASE[" in txt and "A[" in txt and "B[" in txt, txt
+    assert "base[" in txt and "mine[" in txt and "theirs[" in txt, txt
     assert long_base in txt and long_mine in txt and long_theirs in txt, txt
+    assert int(view.hover_cmp_text.cget("height")) >= 4, view.hover_cmp_text.cget("height")
+    actual_h = int(view.hover_cmp_text.winfo_height())
+    req_h = int(view.hover_cmp_text.winfo_reqheight())
+    assert actual_h >= max(40, req_h - 20), (actual_h, req_h)
     txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
-    assert "BASE[" in txt_main and "A[" in txt_main and "B[" in txt_main, txt_main
+    assert "base[" in txt_main and "mine[" in txt_main and "theirs[" in txt_main, txt_main
     assert long_base in txt_main and long_mine in txt_main and long_theirs in txt_main, txt_main
+
+    _drive_main_hover(view, line_no=2, col=2, side="BASE")
+    panel_short = _panel_text(view)
+    assert "base[2]: 2" in panel_short and "mine[2]: 2" in panel_short and "theirs[2]: 2" in panel_short, panel_short
 
     _drive_main_hover(view, line_no=2, col=5, side="BASE")
     panel = _panel_text(view)
-    assert "BASE[" in panel and "A[" in panel and "B[" in panel, panel
+    assert "base[" in panel and "mine[" in panel and "theirs[" in panel, panel
     assert long_base in panel and long_mine in panel and long_theirs in panel, panel
     assert "Col: E(5)" in _panel_title(view), _panel_title(view)
     assert _has_tag(view, "hover_side_base"), "expected BASE row background in 3-way hover panel"
@@ -266,7 +279,7 @@ def _run_3way():
 
     _drive_c_hover(view, line_no=2, col=5)
     panel = _panel_text(view)
-    assert "BASE[" in panel and "A[" in panel and "B[" in panel, panel
+    assert "base[" in panel and "mine[" in panel and "theirs[" in panel, panel
     assert long_base in panel and long_mine in panel and long_theirs in panel, panel
 
     try:

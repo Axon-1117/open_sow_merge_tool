@@ -1,8 +1,43 @@
 # sow_merge_tool 使用指南
 
+## 0. 当前版本
+- 版本号：`2026-07-21.update46`
+- Build Tag：`new123-formula-cache-safe-merge-fix`
+
+### 本次修复
+- 修复 `WorldMonster.xlsx` 在“只看差异”下采用右侧区域后，相同公式的计算结果会被刷新流程恢复为 mine 旧缓存的问题；现在保留原公式、采用 theirs 当前缓存值，并提示同步合并公式依赖数据。
+- 修复公式工作簿保存后 Excel 提示修复、修复后公式缓存结果丢失的问题；单元格覆盖优先使用经过结构校验的 OOXML 定点写回，保留共享公式元数据和未改动公式缓存，无法安全保存时会停止而不是生成风险文件。
+- 公式与缓存结果采用独立操作记录，插入/删除行时会同步迁移记录；保存后仍保留公式，且不会为了采用缓存结果主动触发整本工作簿重算。
+- 合并输出默认恢复为临时文件写入后原子替换，避免保存中断留下半写入文件。
+- 修复 `Language.xlsx` 这类大表里点击“使用右侧区域”/“使用左侧区域”时明显卡顿的问题；区域模式下连续的单边新增行现在会合并成一次批量插入，不再逐行 `insert_rows()`，真实回放里 `theirs -> mine` 区域 adopt 从约 12.8 秒下降到约 3 秒。
+- 修复 3-way 悬停完整对比区的来源标签口径，三方模式现在统一显示为 `base[行号] / mine[行号] / theirs[行号]`，不再显示 `A[...] / B[...]`。
+- 修复 3-way 悬停/C 区等 Base 取值路径仍复用旧的 `A-side row` 口径的问题；涉及结构漂移或单边缺失行时，Base 现在统一按真实 `_base_row_for_pair()` 映射读取。
+- 修复 `Language.xlsx` 这类 working copy 冲突文件在无法调用 `svn.exe` 或 Tortoise `cat BASE` 时，Base 会错误回退到目录里较小 `.r####` 文件的问题；现在会直接从 working copy 的 `.svn\\wc.db + pristine` 读取真正的 pristine BASE。
+- 修复 `Language.xlsx / default@design@na_TLanguageCn` 这类“远端尾部大块新增 + 本地尾部独立新增”场景下，本地新增行被错误吸附到远端旧行的问题；尾部低相似度 paired 行现在会按保守规则拆成独立块。
+- 修复拆分后的 paired twin rows 仍同时显示同一个 Base 行的问题；Base 现在只会保留在更接近 base 的那一侧，另一侧显示为空。
+- 修复 3-way 下“悬停完整对比”面板在部分大表/首屏布局场景中被主视区挤压、导致高度异常的问题；现在会为底部对比区域预留稳定高度，确保 BASE / mine / theirs 三行能完整显示。
+- 修复 3-way 尾部独立新增块被错误配对为同一行冲突的问题；对相对 base 的双方独立尾部追加，改为按 `theirs` 在前、`mine` 在后拆分成独立块，配合现有 `B2A` 插行语义可保留双方新增。
+- 修复 10000+ 行大表时主视区/C 区行号栏宽度不足、只能显示 4 位数字的问题，行号宽度现在会随位数自动同步。
+- 修复 `Language.xlsx` 这类 3-way 大表冲突在 merge 模式下首屏可能长时间无法打开的问题；大表 only-diff 首屏不再走 read-only worksheet 的高行号逐格随机访问慢路径。
+- 为大表 only-diff 预计算增加块级行缓存，改为按 block 读取并在内存中比较 A/B/Base，避免 `refresh(rescan=True)` 卡到分钟级。
+- 优化 3-way 大表的 Base 差异缓存与首屏渲染，只为当前候选/可见行补齐 base 口径，不再为整张大表做逐 pair 全量扫描。
+- 修复 3-way 模式下 Base 列在结构漂移后可能读错 base 行的问题，`BASE2A` 现在会按真实 `mine -> base` 映射读取与覆盖。
+- 修复 3-way 冲突扫描在插入/删除行后按原始行号误报冲突的问题，改为基于行映射比较。
+- 修复 3-way 保存时可能丢失单边新增/删除整 sheet 的问题，并补齐整 sheet adopt/delete 保存链路。
+- 缺失整 sheet 不再只显示摘要页签，改为空白对照表视图，并支持整表采用。
+- 修复“只看差异”模式下新增整行，尤其是插入的空白行，未被正确筛选出来的问题。
+- 修复差异 minimap 在只看差异模式下按过滤列表压缩定位、导致红块位置明显偏移的问题，改为按整张 sheet 的真实行位次定位。
+- 修复主视区与 C 区的差异单元格高亮渲染，确保 diffcell 红底在主视区正确生效。
+- 优化主视区 hover 驱动逻辑：无显式选中时，悬停任意单元格都会驱动 C 区和悬停对比区；有显式选中时，C 区保持锁定。
+- 支持在主视区和 C 区右键取消显式单元格选中，恢复到 hover-driven 状态。
+- 修复切换“只看差异”时旧的 `selcell` 蓝框残留问题，并保留仍然可见的差异行选中状态。
+- 修复切换“只看差异”后旧 hover 状态可能继续指向被隐藏普通行、导致 C 区显示错误内容的问题。
+- 修复首次打开 sheet 时后台 cache 应用漏同步列边界、导致主视区局部误出现灰色背景的问题；刷新本 Sheet 后恢复正常的问题也一并消除。
+- 修复在“只看差异”模式下取消勾选后，主视区需要额外滚动一次鼠标才会恢复完整内容的问题；现在会立即重绘到正确的全量首屏。
+
 ## 1. 适用范围
-- 用于 Excel `.xlsx` 文件的对比与冲突合并（SVN/TortoiseSVN 工作流）。
-- 当前仅支持 `.xlsx`，不支持 `.xlsm`。
+- 用于 Excel `.xlsx` / `.xlsm` 文件的对比与冲突合并（SVN/TortoiseSVN 工作流）。
+- `.xlsm` 会保留宏工作簿容器并按原扩展名保存。
 
 ## 2. 环境要求
 - Windows 10/11
@@ -10,12 +45,37 @@
 
 ## 3. 直接运行
 双击：
-`dist\sow_merge_tool.exe`
+`sow_merge_tool.exe`
+
+## 3.1 打包发布与 GitHub 提交
+常用发布命令：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+如果本次发布需要在打包完成后顺手提交到 GitHub，可改用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
+  -GitInclude sow_merge_tool.py,build_exe.ps1,release/README.md,release/sow_merge_tool.exe,release/sow_merge_tool_release.zip
+```
+
+可选参数：
+- `-GitCommitMessage "release: 2026-07-21.update46 (new123-formula-cache-safe-merge-fix)"`：自定义提交信息。
+- `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
+- `-GitRemote origin`：指定推送远端，默认 `origin`。
+- `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。
+
+说明：
+- Git 提交流程默认不会自动启用，避免误把临时改动直接推送。
+- 开启后只会暂存 `-GitInclude` 明确列出的路径，然后提交并推送。
+- 如果没有可提交的变更，脚本会跳过 commit，并保留已完成的打包/发布结果。
 
 ## 4. 命令行参数
 ### 4.1 普通对比
 ```bat
-sow_merge_tool.exe --base "A.xlsx" --mine "B.xlsx"
+sow_merge_tool.exe --base "A.xlsx" --mine "B.xlsm"
 ```
 
 ### 4.2 SVN 冲突合并（推荐）
@@ -48,19 +108,25 @@ sow_merge_tool.exe "C:\path\conflict.xlsx"
 ### 7.1 Diff
 ```bat
 reg add "HKCU\Software\TortoiseSVN\DiffTools" /v .xlsx /t REG_SZ /d "\"D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe\" --base \"%base\" --mine \"%mine\" --title \"%bname\"" /f
+reg add "HKCU\Software\TortoiseSVN\DiffTools" /v .xlsm /t REG_SZ /d "\"D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe\" --base \"%base\" --mine \"%mine\" --title \"%bname\"" /f
 ```
 
 ### 7.2 Merge
 ```bat
 reg add "HKCU\Software\TortoiseSVN\MergeTools" /v .xlsx /t REG_SZ /d "\"D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe\" --base \"%base\" --mine \"%mine\" --theirs \"%theirs\" --merged \"%merged\" --title \"%bname\"" /f
+reg add "HKCU\Software\TortoiseSVN\MergeTools" /v .xlsm /t REG_SZ /d "\"D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe\" --base \"%base\" --mine \"%mine\" --theirs \"%theirs\" --merged \"%merged\" --title \"%bname\"" /f
 ```
 
-### 7.3 备用（XLSX 节点）
+### 7.3 备用（XLSX / XLSM 节点）
 ```bat
 reg add "HKCU\Software\TortoiseSVN\DiffTools\XLSX" /v command /t REG_SZ /d "D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe" /f
 reg add "HKCU\Software\TortoiseSVN\DiffTools\XLSX" /v args /t REG_SZ /d "--base %base --mine %mine --title %bname" /f
 reg add "HKCU\Software\TortoiseSVN\MergeTools\XLSX" /v command /t REG_SZ /d "D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe" /f
 reg add "HKCU\Software\TortoiseSVN\MergeTools\XLSX" /v args /t REG_SZ /d "--base %base --mine %mine --theirs %theirs --merged %merged --title %bname" /f
+reg add "HKCU\Software\TortoiseSVN\DiffTools\XLSM" /v command /t REG_SZ /d "D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe" /f
+reg add "HKCU\Software\TortoiseSVN\DiffTools\XLSM" /v args /t REG_SZ /d "--base %base --mine %mine --title %bname" /f
+reg add "HKCU\Software\TortoiseSVN\MergeTools\XLSM" /v command /t REG_SZ /d "D:\\Tools\\sow_merge_tool\\dist\\sow_merge_tool.exe" /f
+reg add "HKCU\Software\TortoiseSVN\MergeTools\XLSM" /v args /t REG_SZ /d "--base %base --mine %mine --theirs %theirs --merged %merged --title %bname" /f
 ```
 
 ## 8. 日志

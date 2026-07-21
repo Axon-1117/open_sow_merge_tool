@@ -29,3 +29,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local build churn / temp leftovers
+build_new*/
+build_tmp*/
+dist_new*/
+dist_tmp*/
+tmp/
+sow_merge_tool_new*.spec

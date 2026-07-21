@@ -2,11 +2,13 @@ import os
 import sys
 import argparse
 import re
+import bisect
 import difflib
 import tempfile
 import subprocess
 import traceback
 import atexit
+import copy
 from datetime import datetime
 import time
 import stat
@@ -27,16 +29,19 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-03-18.update36"
-APP_BUILD_TAG = "new113-f4-route-and-hover-read-fix"
+APP_VERSION = "2026-07-21.update46"
+APP_BUILD_TAG = "new123-formula-cache-safe-merge-fix"
+_SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
 _DEBUG_ENABLED = False
 _LAUNCH_TRACE_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_launch_trace.log")
 
-# Save performance: fast mode writes directly to target (faster, less safe than atomic replace)
-_FAST_SAVE_ENABLED = True
+# Save safety: default to atomic "write tmp + os.replace" so an interrupted save
+# can never leave a half-written / corrupted target. The fast direct-write path
+# (faster, but not crash-safe) remains available behind this opt-in flag.
+_FAST_SAVE_ENABLED = False
 # Save correctness: keep workbook fidelity (styles/formulas/metadata).
 # values-only fast save can make unrelated sheets look modified in SVN diff.
 _FAST_SAVE_VALUES_ONLY = False
@@ -81,6 +86,22 @@ _ROW_ARROW_LEFT = "⬅"
 
 # Settings (persist UI prefs)
 _SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME, "settings.json")
+
+
+def _workbook_ext(path: str | None, default: str = ".xlsx") -> str:
+    """Infer workbook extension even for SVN sidecar/temp filenames."""
+    base = os.path.basename(str(path or ""))
+    ext = os.path.splitext(base)[1].lower()
+    if ext in _SUPPORTED_WORKBOOK_EXTS:
+        return ext
+    m = re.search(r"\.(xlsx|xlsm)", base, flags=re.IGNORECASE)
+    if m:
+        return "." + m.group(1).lower()
+    return default
+
+
+def _is_macro_enabled_workbook(path: str | None) -> bool:
+    return _workbook_ext(path) == ".xlsm"
 
 
 def _dlog(msg: str):
@@ -180,8 +201,9 @@ def _repair_missing_shared_strings_part(xlsx_path: str) -> str | None:
     base = os.path.basename(xlsx_path)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     repaired = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_repair_sst_{os.getpid()}_{ts}_{base}")
-    if not repaired.lower().endswith(".xlsx"):
-        repaired += ".xlsx"
+    ext = _workbook_ext(xlsx_path)
+    if not repaired.lower().endswith(ext):
+        repaired += ext
     try:
         with zipfile.ZipFile(repaired, "w") as zf:
             for name, payload in all_bytes.items():
@@ -202,6 +224,8 @@ def _repair_missing_shared_strings_part(xlsx_path: str) -> str | None:
 
 
 def load_workbook(filename, *args, **kwargs):
+    if "keep_vba" not in kwargs and _is_macro_enabled_workbook(str(filename)):
+        kwargs["keep_vba"] = True
     try:
         return _openpyxl_load_workbook(filename, *args, **kwargs)
     except KeyError as e:
@@ -213,6 +237,540 @@ def load_workbook(filename, *args, **kwargs):
             raise
         _dlog(f"load_workbook retry with repaired sharedStrings: src={path} repaired={repaired}")
         return _openpyxl_load_workbook(repaired, *args, **kwargs)
+
+
+def _blank_worksheet(title: str = "Sheet"):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title
+    return wb, ws
+
+
+def _row_sig_list_for_ws(ws, max_row_local: int, max_col: int):
+    try:
+        all_rows = list(ws.iter_rows(
+            min_row=1,
+            max_row=max_row_local,
+            min_col=1,
+            max_col=max_col,
+            values_only=True,
+        ))
+    except Exception:
+        all_rows = []
+    sigs = []
+    for row in all_rows:
+        if row is None:
+            row = ()
+        sigs.append("\x1f".join(_merge_cmp_value(v) for v in row))
+    return sigs
+
+
+def _compute_row_pairs_from_signatures(sig_a: list[str], sig_b: list[str]):
+    """Align precomputed row signatures without rescanning worksheets.
+
+    Trimming the exact common prefix/suffix first avoids SequenceMatcher's
+    quadratic behavior on large sheets containing many repeated rows while
+    preserving exact alignment inside the changed middle section.
+    """
+    len_a = len(sig_a)
+    len_b = len(sig_b)
+    prefix = 0
+    common_len = min(len_a, len_b)
+    while prefix < common_len and sig_a[prefix] == sig_b[prefix]:
+        prefix += 1
+
+    suffix = 0
+    while (
+        suffix < (common_len - prefix)
+        and sig_a[len_a - suffix - 1] == sig_b[len_b - suffix - 1]
+    ):
+        suffix += 1
+
+    pairs: list[tuple[int | None, int | None]] = [
+        (idx + 1, idx + 1) for idx in range(prefix)
+    ]
+
+    end_a = len_a - suffix
+    end_b = len_b - suffix
+    mid_a = sig_a[prefix:end_a]
+    mid_b = sig_b[prefix:end_b]
+
+    def _sim_score(sa: str, sb: str) -> float:
+        if sa == sb:
+            return 2.0
+        if (not sa) or (not sb):
+            return 0.0
+        try:
+            return difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).ratio()
+        except Exception:
+            return 0.0
+
+    sm = difflib.SequenceMatcher(a=mid_a, b=mid_b, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        ai1 = prefix + i1
+        ai2 = prefix + i2
+        bj1 = prefix + j1
+        bj2 = prefix + j2
+        if tag == "equal":
+            for i, j in zip(range(ai1, ai2), range(bj1, bj2)):
+                pairs.append((i + 1, j + 1))
+        elif tag == "replace":
+            block_len_a = ai2 - ai1
+            block_len_b = bj2 - bj1
+            common = min(block_len_a, block_len_b)
+            head_score = 0.0
+            tail_score = 0.0
+            for k in range(common):
+                head_score += _sim_score(sig_a[ai1 + k], sig_b[bj1 + k])
+                tail_score += _sim_score(sig_a[ai2 - common + k], sig_b[bj2 - common + k])
+            use_tail = tail_score >= head_score
+            if use_tail:
+                extra_a = block_len_a - common
+                extra_b = block_len_b - common
+                for k in range(extra_a):
+                    pairs.append((ai1 + k + 1, None))
+                for k in range(extra_b):
+                    pairs.append((None, bj1 + k + 1))
+                a_start = ai2 - common
+                b_start = bj2 - common
+                for k in range(common):
+                    pairs.append((a_start + k + 1, b_start + k + 1))
+            else:
+                for k in range(common):
+                    pairs.append((ai1 + k + 1, bj1 + k + 1))
+                for k in range(common, block_len_a):
+                    pairs.append((ai1 + k + 1, None))
+                for k in range(common, block_len_b):
+                    pairs.append((None, bj1 + k + 1))
+        elif tag == "delete":
+            for i in range(ai1, ai2):
+                pairs.append((i + 1, None))
+        elif tag == "insert":
+            for j in range(bj1, bj2):
+                pairs.append((None, j + 1))
+
+    if suffix:
+        start_a = len_a - suffix
+        start_b = len_b - suffix
+        for k in range(suffix):
+            pairs.append((start_a + k + 1, start_b + k + 1))
+    return pairs
+
+
+def _compute_row_pairs_generic(ws_a, ws_b, max_col: int, force: bool = False):
+    """Compute row alignment pairs between two worksheets."""
+    max_row_a = ws_a.max_row or 1
+    max_row_b = ws_b.max_row or 1
+    max_row = max(max_row_a, max_row_b)
+    if max_row <= 0:
+        return []
+    if not _should_auto_row_align(max_row_a, max_row_b, force=force):
+        return [(r if r <= max_row_a else None, r if r <= max_row_b else None) for r in range(1, max_row + 1)]
+
+    sig_a = _row_sig_list_for_ws(ws_a, max_row_a, max_col)
+    sig_b = _row_sig_list_for_ws(ws_b, max_row_b, max_col)
+
+    return _compute_row_pairs_from_signatures(sig_a, sig_b)
+
+
+def _row_map_from_pairs(pairs: list[tuple[int | None, int | None]]) -> dict[int, int]:
+    out = {}
+    for left, right in pairs:
+        if left is not None and right is not None:
+            out[left] = right
+    return out
+
+
+def _split_tail_independent_append_pairs(
+    display_pairs: list[tuple[int | None, int | None]],
+    mine_to_base: dict[int, int] | None,
+    theirs_to_base: dict[int, int] | None,
+    ws_mine=None,
+    ws_theirs=None,
+    max_col: int | None = None,
+) -> list[tuple[int | None, int | None]]:
+    """Split safe 3-way tail append pairs into independent theirs/mine blocks.
+
+    Conservative rule:
+    - only consider pairs where both mine/theirs rows exist
+    - neither row maps to base
+    - both rows are strictly after their respective last mapped base row
+    - require each side to have at least one mapped base row first
+
+    Output order is fixed as: theirs block first, mine block second.
+    """
+    pairs = list(display_pairs or [])
+    if not pairs:
+        return pairs
+    mine_map = mine_to_base or {}
+    theirs_map = theirs_to_base or {}
+    if not mine_map or not theirs_map:
+        return pairs
+    try:
+        last_mine_mapped = max(int(r) for r in mine_map.keys() if r is not None)
+        last_theirs_mapped = max(int(r) for r in theirs_map.keys() if r is not None)
+    except Exception:
+        return pairs
+
+    split_indices: set[int] = set()
+    for idx, (ra, rb) in enumerate(pairs):
+        if ra is None or rb is None:
+            continue
+        if ra in mine_map or rb in theirs_map:
+            continue
+        if int(ra) <= last_mine_mapped or int(rb) <= last_theirs_mapped:
+            continue
+        # Identical independent appends are one logical row, not two competing
+        # blocks. Compare the real row content before splitting the aligned pair.
+        if ws_mine is not None and ws_theirs is not None and max_col:
+            try:
+                mine_row = next(
+                    ws_mine.iter_rows(
+                        min_row=int(ra), max_row=int(ra), min_col=1,
+                        max_col=int(max_col), values_only=True,
+                    ),
+                    (),
+                )
+                theirs_row = next(
+                    ws_theirs.iter_rows(
+                        min_row=int(rb), max_row=int(rb), min_col=1,
+                        max_col=int(max_col), values_only=True,
+                    ),
+                    (),
+                )
+                mine_sig = "\x1f".join(_merge_cmp_value(v) for v in (mine_row or ()))
+                theirs_sig = "\x1f".join(_merge_cmp_value(v) for v in (theirs_row or ()))
+                if mine_sig == theirs_sig:
+                    continue
+            except Exception:
+                # If equality cannot be proven, retain the conservative split.
+                pass
+        split_indices.add(idx)
+
+    if not split_indices:
+        return pairs
+
+    out: list[tuple[int | None, int | None]] = []
+    idx = 0
+    while idx < len(pairs):
+        if idx not in split_indices:
+            out.append(pairs[idx])
+            idx += 1
+            continue
+        end = idx
+        while end + 1 < len(pairs) and (end + 1) in split_indices:
+            end += 1
+        # Keep the agreed deterministic order for an independent tail block:
+        # all theirs rows first, followed by all mine rows.
+        out.extend((None, pairs[pos][1]) for pos in range(idx, end + 1))
+        out.extend((pairs[pos][0], None) for pos in range(idx, end + 1))
+        idx = end + 1
+    return out
+
+
+def _split_low_similarity_tail_pairs(
+    display_pairs: list[tuple[int | None, int | None]],
+    mine_to_base: dict[int, int] | None,
+    theirs_to_base: dict[int, int] | None,
+    ws_mine,
+    ws_theirs,
+    max_col: int,
+    *,
+    sim_threshold: float = 0.75,
+) -> list[tuple[int | None, int | None]]:
+    """Split misaligned tail pairs before a mapped one-sided tail block.
+
+    Conservative rule:
+    - only consider the very end of the sheet
+    - require a trailing mapped one-sided block on one side
+    - only split immediately preceding paired rows that map to the matching
+      base rows but have low row similarity
+
+    This preserves exact behavior for the body of the sheet while allowing
+    "local tail append vs remote tail append" cases to stay visible as
+    independent rows in 3-way mode.
+    """
+    pairs = list(display_pairs or [])
+    mine_map = mine_to_base or {}
+    theirs_map = theirs_to_base or {}
+    if not pairs or not mine_map or not theirs_map:
+        return pairs
+
+    def _row_sim_cache(ws_a, rows_a, ws_b, rows_b):
+        rows_a_cache = _read_rows_into_cache(ws_a, rows_a, max_col)
+        rows_b_cache = _read_rows_into_cache(ws_b, rows_b, max_col)
+        sim_cache: dict[tuple[int, int], float] = {}
+        for ra, rb in zip(rows_a, rows_b):
+            row_a = _row_from_cache(rows_a_cache, ra, max_col)
+            row_b = _row_from_cache(rows_b_cache, rb, max_col)
+            sig_a = "\x1f".join(_merge_cmp_value(v) for v in row_a)
+            sig_b = "\x1f".join(_merge_cmp_value(v) for v in row_b)
+            if sig_a == sig_b:
+                sim_cache[(ra, rb)] = 2.0
+                continue
+            if (not sig_a) or (not sig_b):
+                sim_cache[(ra, rb)] = 0.0
+                continue
+            try:
+                sim_cache[(ra, rb)] = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False).ratio()
+            except Exception:
+                sim_cache[(ra, rb)] = 0.0
+        return sim_cache
+
+    def _split_one_side(
+        cur_pairs: list[tuple[int | None, int | None]],
+        *,
+        trailing_side: str,
+    ) -> list[tuple[int | None, int | None]]:
+        if trailing_side == "B":
+            trailing_idx = 1
+            lead_idx = 0
+            trailing_map = theirs_map
+            lead_map = mine_map
+        else:
+            trailing_idx = 0
+            lead_idx = 1
+            trailing_map = mine_map
+            lead_map = theirs_map
+
+        cursor = len(cur_pairs) - 1
+        suffix_start = len(cur_pairs)
+        found_one_sided = False
+        candidate_rows_a: list[int] = []
+        candidate_rows_b: list[int] = []
+        candidate_idx_pairs: list[tuple[int, int, int]] = []
+        while cursor >= 0:
+            pair = cur_pairs[cursor]
+            lead_row = pair[lead_idx]
+            trail_row = pair[trailing_idx]
+            if lead_row is None and trail_row is not None:
+                base_row = trailing_map.get(trail_row)
+                if base_row is None:
+                    break
+                found_one_sided = True
+                suffix_start = cursor
+                cursor -= 1
+                continue
+            ra, rb = pair
+            if ra is None or rb is None:
+                break
+            base_a = mine_map.get(ra)
+            base_b = theirs_map.get(rb)
+            if base_a is None or base_b is None or base_a != base_b:
+                break
+            candidate_rows_a.append(ra)
+            candidate_rows_b.append(rb)
+            candidate_idx_pairs.append((cursor, ra, rb))
+            suffix_start = cursor
+            cursor -= 1
+        if (not found_one_sided) or (not candidate_idx_pairs):
+            return cur_pairs
+
+        sim_cache = _row_sim_cache(ws_mine, candidate_rows_a, ws_theirs, candidate_rows_b)
+
+        split_indices: set[int] = set()
+        for global_idx, ra, rb in sorted(candidate_idx_pairs, key=lambda x: x[0], reverse=True):
+            if sim_cache.get((ra, rb), 0.0) >= sim_threshold:
+                break
+            split_indices.add(global_idx)
+        if not split_indices:
+            return cur_pairs
+
+        out: list[tuple[int | None, int | None]] = list(cur_pairs[:suffix_start])
+        seen_one_sided = False
+        for global_idx in range(suffix_start, len(cur_pairs)):
+            ra, rb = cur_pairs[global_idx]
+            lead_row = cur_pairs[global_idx][lead_idx]
+            trail_row = cur_pairs[global_idx][trailing_idx]
+            if lead_row is None and trail_row is not None:
+                out.append(cur_pairs[global_idx])
+                seen_one_sided = True
+                continue
+            if global_idx not in split_indices:
+                out.append(cur_pairs[global_idx])
+                continue
+            if trailing_side == "B":
+                if seen_one_sided:
+                    out.append((ra, None))
+                    out.append((None, rb))
+                else:
+                    out.append((None, rb))
+                    out.append((ra, None))
+            else:
+                if seen_one_sided:
+                    out.append((None, rb))
+                    out.append((ra, None))
+                else:
+                    out.append((ra, None))
+                    out.append((None, rb))
+        return out
+
+    pairs = _split_one_side(pairs, trailing_side="B")
+    pairs = _split_one_side(pairs, trailing_side="A")
+    return pairs
+
+
+def _build_pair_base_row_overrides(
+    row_pairs: list[tuple[int | None, int | None]],
+    mine_to_base: dict[int, int] | None,
+    theirs_to_base: dict[int, int] | None,
+    ws_base,
+    ws_mine,
+    ws_theirs,
+    max_col: int,
+    *,
+    sim_delta: float = 0.05,
+) -> dict[int, int | None]:
+    """Choose which side should own the base row for adjacent split pairs."""
+    pairs = list(row_pairs or [])
+    mine_map = mine_to_base or {}
+    theirs_map = theirs_to_base or {}
+    if (not pairs) or ws_base is None or (not mine_map and not theirs_map):
+        return {}
+
+    twin_specs: list[tuple[int, int, int, int, int]] = []
+    base_rows_needed: set[int] = set()
+    mine_rows_needed: set[int] = set()
+    theirs_rows_needed: set[int] = set()
+
+    for idx in range(len(pairs) - 1):
+        p1 = pairs[idx]
+        p2 = pairs[idx + 1]
+        base_1 = mine_map.get(p1[0]) if p1[0] is not None else theirs_map.get(p1[1]) if p1[1] is not None else None
+        base_2 = mine_map.get(p2[0]) if p2[0] is not None else theirs_map.get(p2[1]) if p2[1] is not None else None
+        if base_1 is None or base_2 is None or base_1 != base_2:
+            continue
+        if p1[0] is None and p1[1] is not None and p2[0] is not None and p2[1] is None:
+            theirs_pair_idx, mine_pair_idx = idx, idx + 1
+            theirs_row, mine_row = p1[1], p2[0]
+        elif p1[0] is not None and p1[1] is None and p2[0] is None and p2[1] is not None:
+            mine_pair_idx, theirs_pair_idx = idx, idx + 1
+            mine_row, theirs_row = p1[0], p2[1]
+        else:
+            continue
+        twin_specs.append((mine_pair_idx, theirs_pair_idx, mine_row, theirs_row, base_1))
+        base_rows_needed.add(base_1)
+        mine_rows_needed.add(mine_row)
+        theirs_rows_needed.add(theirs_row)
+
+    if not twin_specs:
+        return {}
+
+    rows_base = _read_rows_into_cache(ws_base, sorted(base_rows_needed), max_col)
+    rows_mine = _read_rows_into_cache(ws_mine, sorted(mine_rows_needed), max_col)
+    rows_theirs = _read_rows_into_cache(ws_theirs, sorted(theirs_rows_needed), max_col)
+
+    def _sim_against_base(side_cache, side_row: int, base_row: int) -> float:
+        row_side = _row_from_cache(side_cache, side_row, max_col)
+        row_base = _row_from_cache(rows_base, base_row, max_col)
+        sig_side = "\x1f".join(_merge_cmp_value(v) for v in row_side)
+        sig_base = "\x1f".join(_merge_cmp_value(v) for v in row_base)
+        if sig_side == sig_base:
+            return 2.0
+        if (not sig_side) or (not sig_base):
+            return 0.0
+        try:
+            return difflib.SequenceMatcher(a=sig_side, b=sig_base, autojunk=False).ratio()
+        except Exception:
+            return 0.0
+
+    overrides: dict[int, int | None] = {}
+    for mine_pair_idx, theirs_pair_idx, mine_row, theirs_row, base_row in twin_specs:
+        sim_mine = _sim_against_base(rows_mine, mine_row, base_row)
+        sim_theirs = _sim_against_base(rows_theirs, theirs_row, base_row)
+        if abs(sim_mine - sim_theirs) < sim_delta:
+            continue
+        if sim_mine > sim_theirs:
+            overrides[mine_pair_idx] = base_row
+            overrides[theirs_pair_idx] = None
+        else:
+            overrides[mine_pair_idx] = None
+            overrides[theirs_pair_idx] = base_row
+    return overrides
+
+
+def _copy_sheet_basic(src_ws, dst_ws):
+    """Copy enough worksheet structure for merge/save fallback paths."""
+    try:
+        for row in src_ws.iter_rows():
+            for src_cell in row:
+                dst_cell = dst_ws.cell(row=src_cell.row, column=src_cell.column)
+                dst_cell.value = src_cell.value
+                if src_cell.has_style:
+                    dst_cell._style = copy.copy(src_cell._style)
+                if src_cell.number_format:
+                    dst_cell.number_format = src_cell.number_format
+                if src_cell.font:
+                    dst_cell.font = copy.copy(src_cell.font)
+                if src_cell.fill:
+                    dst_cell.fill = copy.copy(src_cell.fill)
+                if src_cell.border:
+                    dst_cell.border = copy.copy(src_cell.border)
+                if src_cell.alignment:
+                    dst_cell.alignment = copy.copy(src_cell.alignment)
+                if src_cell.protection:
+                    dst_cell.protection = copy.copy(src_cell.protection)
+    except Exception:
+        pass
+    try:
+        for key, dim in src_ws.row_dimensions.items():
+            dst_ws.row_dimensions[key] = copy.copy(dim)
+    except Exception:
+        pass
+    try:
+        for key, dim in src_ws.column_dimensions.items():
+            dst_ws.column_dimensions[key] = copy.copy(dim)
+    except Exception:
+        pass
+    try:
+        for merged in list(src_ws.merged_cells.ranges):
+            dst_ws.merge_cells(str(merged))
+    except Exception:
+        pass
+    for attr in (
+        "sheet_format",
+        "sheet_properties",
+        "sheet_view",
+        "views",
+        "page_margins",
+        "page_setup",
+        "print_options",
+        "sheet_state",
+    ):
+        try:
+            setattr(dst_ws, attr, copy.copy(getattr(src_ws, attr)))
+        except Exception:
+            pass
+    try:
+        dst_ws.freeze_panes = src_ws.freeze_panes
+    except Exception:
+        pass
+    try:
+        dst_ws.auto_filter = copy.copy(src_ws.auto_filter)
+    except Exception:
+        pass
+
+
+def _remove_sheet_if_exists(wb, sheet_name: str):
+    if wb is None or (not sheet_name):
+        return False
+    if sheet_name not in wb.sheetnames:
+        return False
+    wb.remove(wb[sheet_name])
+    return True
+
+
+def _create_sheet_from_source(dst_wb, src_ws, title: str, index: int | None = None):
+    if dst_wb is None or src_ws is None or not title:
+        return None
+    if title in dst_wb.sheetnames:
+        _remove_sheet_if_exists(dst_wb, title)
+    if index is None:
+        dst_ws = dst_wb.create_sheet(title=title)
+    else:
+        dst_ws = dst_wb.create_sheet(title=title, index=max(0, int(index)))
+    _copy_sheet_basic(src_ws, dst_ws)
+    return dst_ws
 
 
 def _val_to_str(v):
@@ -480,67 +1038,86 @@ def _cell_display_and_equal(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int, c:
     va_val = ws_a_val.cell(row=r, column=c).value
     vb_val = ws_b_val.cell(row=r, column=c).value
 
+    va_edit = ws_a_edit.cell(row=r, column=c).value if ws_a_edit is not None else None
+    vb_edit = ws_b_edit.cell(row=r, column=c).value if ws_b_edit is not None else None
+    return _cell_display_and_equal_from_values(va_val, vb_val, va_edit, vb_edit)
+
+
+def _cell_display_and_equal_from_values(va_val, vb_val, va_edit=None, vb_edit=None):
+    """Compare already-fetched cell values while preserving the existing fallback rules."""
     if _USE_CACHED_VALUES_ONLY:
         # If cache missing but edit has a literal value, use it for display/compare.
-        # Each side falls back independently so a missing edit WB on one side does not
-        # prevent the other side from recovering its literal value.
-        try:
-            if va_val is None and ws_a_edit is not None:
-                va_edit = ws_a_edit.cell(row=r, column=c).value
-                if va_edit is not None and not _formula_text(va_edit):
-                    va_val = va_edit
-            if vb_val is None and ws_b_edit is not None:
-                vb_edit = ws_b_edit.cell(row=r, column=c).value
-                if vb_edit is not None and not _formula_text(vb_edit):
-                    vb_val = vb_edit
-        except Exception:
-            pass
-        # If cache missing on one side but both formulas are the same, treat as equal and display the available value.
-        if ws_a_edit is not None and ws_b_edit is not None and ((va_val is None) != (vb_val is None)):
-            va_edit = ws_a_edit.cell(row=r, column=c).value
-            vb_edit = ws_b_edit.cell(row=r, column=c).value
-            if _same_formula(va_edit, vb_edit):
-                v = va_val if va_val is not None else vb_val
-                return v, v, True
-        # Compare with numeric/string normalization to avoid false diffs
+        if va_val is None and va_edit is not None and not _formula_text(va_edit):
+            va_val = va_edit
+        if vb_val is None and vb_edit is not None and not _formula_text(vb_edit):
+            vb_val = vb_edit
+
+        # If cache missing on one side but both formulas are the same, treat as equal
+        # and display the available value.
+        if (va_val is None) != (vb_val is None) and _same_formula(va_edit, vb_edit):
+            v = va_val if va_val is not None else vb_val
+            return v, v, True
+
         eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
         return va_val, vb_val, eq
 
     eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
     return va_val, vb_val, eq
+
+
+def _pad_row_values(row_vals, max_col: int):
+    row = tuple(row_vals or ())
+    if len(row) >= max_col:
+        return row[:max_col]
+    return row + (None,) * (max_col - len(row))
+
+
+def _read_rows_into_cache(ws, row_indices, max_col: int):
+    """Read a set of rows via one contiguous iter_rows pass."""
+    rows = {}
+    try:
+        needed = sorted({int(r) for r in row_indices if r is not None and int(r) > 0})
+    except Exception:
+        needed = []
+    if not needed:
+        return rows
+
+    min_r = needed[0]
+    max_r = needed[-1]
+    needed_set = set(needed)
+    try:
+        for idx, row in enumerate(
+            ws.iter_rows(
+                min_row=min_r,
+                max_row=max_r,
+                min_col=1,
+                max_col=max_col,
+                values_only=True,
+            ),
+            start=min_r,
+        ):
+            if idx in needed_set:
+                rows[idx] = _pad_row_values(row, max_col)
+    except Exception:
+        pass
+
+    for r in needed:
+        rows.setdefault(r, (None,) * max_col)
+    return rows
+
+
+def _row_from_cache(rows_cache: dict[int, tuple], row_idx: int | None, max_col: int):
+    if row_idx is None:
+        return (None,) * max_col
+    return rows_cache.get(int(row_idx), (None,) * max_col)
 
 
 def _cell_display_and_equal_by_row(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra: int | None, rb: int | None, c: int):
     va_val = ws_a_val.cell(row=ra, column=c).value if ra is not None else None
     vb_val = ws_b_val.cell(row=rb, column=c).value if rb is not None else None
-
-    if _USE_CACHED_VALUES_ONLY:
-        # Each side falls back independently.
-        try:
-            if va_val is None and ra is not None and ws_a_edit is not None:
-                va_edit = ws_a_edit.cell(row=ra, column=c).value
-                if va_edit is not None and not _formula_text(va_edit):
-                    va_val = va_edit
-            if vb_val is None and rb is not None and ws_b_edit is not None:
-                vb_edit = ws_b_edit.cell(row=rb, column=c).value
-                if vb_edit is not None and not _formula_text(vb_edit):
-                    vb_val = vb_edit
-        except Exception:
-            pass
-        if ws_a_edit is not None and ws_b_edit is not None and (va_val is None) != (vb_val is None):
-            try:
-                va_edit = ws_a_edit.cell(row=ra, column=c).value if ra is not None else None
-                vb_edit = ws_b_edit.cell(row=rb, column=c).value if rb is not None else None
-                if _same_formula(va_edit, vb_edit):
-                    v = va_val if va_val is not None else vb_val
-                    return v, v, True
-            except Exception:
-                pass
-        eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
-        return va_val, vb_val, eq
-
-    eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
-    return va_val, vb_val, eq
+    va_edit = ws_a_edit.cell(row=ra, column=c).value if (ra is not None and ws_a_edit is not None) else None
+    vb_edit = ws_b_edit.cell(row=rb, column=c).value if (rb is not None and ws_b_edit is not None) else None
+    return _cell_display_and_equal_from_values(va_val, vb_val, va_edit, vb_edit)
 
 
 def _formula_text(v):
@@ -580,6 +1157,16 @@ def _choose_edit_value(v_val, v_edit):
     return v_val if _USE_CACHED_VALUES_ONLY else v_edit
 
 
+def _is_same_formula_copy_noop(src_edit, dst_edit) -> bool:
+    """Return True when copying would only replace a formula with itself.
+
+    Cached results can differ because precedent cells differ. Copying the same
+    formula cannot adopt that result; Excel will recalculate it from the target
+    workbook and make the apparent overwrite revert.
+    """
+    return _same_formula(src_edit, dst_edit)
+
+
 def _col_index_from_ref(ref: str) -> int:
     if not ref:
         return 0
@@ -605,7 +1192,16 @@ def _extract_ns_map(xml_bytes: bytes) -> dict:
     return ns_map
 
 
-def _sheet_xml_set_cell(ws_root, row_idx: int, col_idx: int, value):
+_MISSING_VALUE = object()
+
+
+def _sheet_xml_set_cell(
+    ws_root,
+    row_idx: int,
+    col_idx: int,
+    value,
+    cached_value=_MISSING_VALUE,
+):
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     q = lambda t: f"{{{ns}}}{t}"
     xml_space = "{http://www.w3.org/XML/1998/namespace}space"
@@ -653,15 +1249,56 @@ def _sheet_xml_set_cell(ws_root, row_idx: int, col_idx: int, value):
         else:
             target_row.insert(insert_cell_at, target_cell)
 
+    formula = _formula_text(value)
+    existing_formula = target_cell.find(q("f"))
+    if existing_formula is not None:
+        existing_text = existing_formula.text or ""
+        existing_full = ("=" + existing_text) if existing_text else None
+        if formula and existing_full and _norm_formula_text(existing_full) == _norm_formula_text(formula):
+            # Preserve shared/array formula metadata while allowing an explicit
+            # cached-result adoption for workbooks that use manual calculation.
+            if cached_value is not _MISSING_VALUE:
+                for child in list(target_cell):
+                    if child.tag == q("v"):
+                        target_cell.remove(child)
+                target_cell.attrib.pop("t", None)
+                if cached_value is not None:
+                    if isinstance(cached_value, bool):
+                        target_cell.attrib["t"] = "b"
+                        cache_text = "1" if cached_value else "0"
+                    elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
+                        cache_text = str(cached_value)
+                    else:
+                        cache_text = str(cached_value)
+                        target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
+                    v = ET.SubElement(target_cell, q("v"))
+                    v.text = cache_text
+            return
+        if existing_formula.attrib.get("t") == "shared":
+            raise RuntimeError(
+                f"ZIP fallback cannot safely replace shared formula cell {cell_ref}; "
+                "Excel native save is required"
+            )
+
     # Keep row/cell attrs (like style index), replace only value payload.
     for child in list(target_cell):
         target_cell.remove(child)
 
-    formula = _formula_text(value)
     if formula:
         target_cell.attrib.pop("t", None)
         f = ET.SubElement(target_cell, q("f"))
         f.text = formula[1:] if str(formula).startswith("=") else str(formula)
+        if cached_value is not _MISSING_VALUE and cached_value is not None:
+            if isinstance(cached_value, bool):
+                target_cell.attrib["t"] = "b"
+                cache_text = "1" if cached_value else "0"
+            elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
+                cache_text = str(cached_value)
+            else:
+                cache_text = str(cached_value)
+                target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
+            v = ET.SubElement(target_cell, q("v"))
+            v.text = cache_text
         return
 
     if value is None:
@@ -690,7 +1327,84 @@ def _sheet_xml_set_cell(ws_root, row_idx: int, col_idx: int, value):
     t_node.text = s
 
 
-def _build_manual_merge_xlsx_via_zip(src_xlsx: str, out_xlsx: str, manual_ops: dict):
+def _filter_noop_manual_ops(src_xlsx: str, manual_ops: dict) -> dict:
+    """Drop formula-to-identical-formula writes before any save backend runs."""
+    if not manual_ops:
+        return {}
+    wb = None
+    try:
+        wb = load_workbook(src_xlsx, data_only=False, read_only=False)
+        filtered = {}
+        for key, value in manual_ops.items():
+            sheet, row_idx, col_idx = key
+            if sheet not in wb.sheetnames:
+                filtered[key] = value
+                continue
+            original = wb[sheet].cell(row=int(row_idx), column=int(col_idx)).value
+            if _same_formula(original, value):
+                continue
+            filtered[key] = value
+        return filtered
+    except Exception as e:
+        _dlog(f"manual op no-op filter failed; keeping original ops: {e}")
+        return dict(manual_ops)
+    finally:
+        _wbs_close(wb)
+
+
+def _xlsx_contains_formulas(path: str) -> bool:
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            for name in zf.namelist():
+                if name.startswith("xl/worksheets/") and name.endswith(".xml"):
+                    if re.search(rb"<(?:[A-Za-z_][\w.-]*:)?f(?:\s|>)", zf.read(name)):
+                        return True
+    except Exception:
+        return True
+    return False
+
+
+def _validate_xlsx_package(path: str) -> tuple[bool, str]:
+    """Validate ZIP/XML integrity and shared-formula master references."""
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            bad_part = zf.testzip()
+            if bad_part:
+                return False, f"ZIP CRC failed: {bad_part}"
+            for name in zf.namelist():
+                if not name.endswith((".xml", ".rels")):
+                    continue
+                root = ET.fromstring(zf.read(name))
+                if not name.startswith("xl/worksheets/") or not name.endswith(".xml"):
+                    continue
+                shared: dict[str, dict[str, int]] = {}
+                for node in root.iter():
+                    if not str(node.tag).endswith("}f") and node.tag != "f":
+                        continue
+                    if node.attrib.get("t") != "shared":
+                        continue
+                    si = str(node.attrib.get("si") or "")
+                    state = shared.setdefault(si, {"masters": 0, "members": 0})
+                    state["members"] += 1
+                    if node.attrib.get("ref") and (node.text or "").strip():
+                        state["masters"] += 1
+                for si, state in shared.items():
+                    if state["members"] and state["masters"] != 1:
+                        return False, (
+                            f"invalid shared formula group in {name}: "
+                            f"si={si!r} masters={state['masters']} members={state['members']}"
+                        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _build_manual_merge_xlsx_via_zip(
+    src_xlsx: str,
+    out_xlsx: str,
+    manual_ops: dict,
+    cached_values: dict | None = None,
+):
     """Patch only selected cells at XML level; keep untouched parts byte-identical."""
     with zipfile.ZipFile(src_xlsx, "r") as zf:
         names = zf.namelist()
@@ -736,8 +1450,10 @@ def _build_manual_merge_xlsx_via_zip(src_xlsx: str, out_xlsx: str, manual_ops: d
                 sheet_to_part[name] = part
 
     ops_by_sheet = {}
+    cached_values = cached_values or {}
     for (sheet, r, c), v in manual_ops.items():
-        ops_by_sheet.setdefault(sheet, []).append((int(r), int(c), v))
+        cached = cached_values.get((sheet, int(r), int(c)), _MISSING_VALUE)
+        ops_by_sheet.setdefault(sheet, []).append((int(r), int(c), v, cached))
 
     for sheet, ops in ops_by_sheet.items():
         part = sheet_to_part.get(sheet)
@@ -748,8 +1464,8 @@ def _build_manual_merge_xlsx_via_zip(src_xlsx: str, out_xlsx: str, manual_ops: d
         for pfx, uri in ns_map.items():
             ET.register_namespace(pfx, uri)
         ws_root = ET.fromstring(files[part])
-        for r, c, v in sorted(ops, key=lambda x: (x[0], x[1])):
-            _sheet_xml_set_cell(ws_root, r, c, v)
+        for r, c, v, cached in sorted(ops, key=lambda x: (x[0], x[1])):
+            _sheet_xml_set_cell(ws_root, r, c, v, cached)
         xml_bytes = ET.tostring(ws_root, encoding="utf-8", xml_declaration=True)
         xml_bytes = re.sub(
             rb'<\?xml[^?]*\?>',
@@ -820,64 +1536,136 @@ def _build_manual_merge_xlsx_via_zip(src_xlsx: str, out_xlsx: str, manual_ops: d
             info = infos.get(n)
             comp = info.compress_type if info else zipfile.ZIP_DEFLATED
             zf.writestr(n, files[n], compress_type=comp)
+    valid, reason = _validate_xlsx_package(out_xlsx)
+    if not valid:
+        raise RuntimeError(f"unsafe XLSX output rejected: {reason}")
 
 
-def _build_manual_merge_output_with_excel(src_xlsx: str, out_xlsx: str, manual_ops: dict) -> bool:
+def _build_manual_merge_output_with_excel(
+    src_xlsx: str,
+    out_xlsx: str,
+    manual_ops: dict,
+    row_ops: list[dict] | None = None,
+    sheet_ops: list[dict] | None = None,
+    source_paths: dict[str, str] | None = None,
+) -> bool:
     """Apply manual ops through Excel COM to preserve workbook fidelity."""
-    if not manual_ops:
+    if not manual_ops and not row_ops and not sheet_ops:
         try:
             shutil.copy2(src_xlsx, out_xlsx)
             return True
         except Exception:
             return False
+    row_ops = list(row_ops or [])
+    sheet_ops = list(sheet_ops or [])
     ops = []
     for (sheet, r, c), v in manual_ops.items():
         fv = _formula_text(v)
         if fv:
             ops.append({"sheet": sheet, "r": int(r), "c": int(c), "formula": fv})
         else:
-            ops.append({"sheet": sheet, "r": int(r), "c": int(c), "value": v})
+            ops.append({
+                "sheet": sheet,
+                "r": int(r),
+                "c": int(c),
+                "value": v,
+                "value_kind": "text" if isinstance(v, str) else "typed",
+            })
     try:
         ops_json = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merge_ops_{os.getpid()}_{int(time.time())}.json")
         with open(ops_json, "w", encoding="utf-8") as f:
-            json.dump(ops, f, ensure_ascii=False)
+            json.dump({"row_ops": row_ops, "cell_ops": ops, "sheet_ops": sheet_ops}, f, ensure_ascii=False)
     except Exception as e:
         _dlog(f"excel native save: write ops json failed: {e}")
         return False
     try:
+        source_paths = source_paths or {}
+        base_src = str(source_paths.get("BASE") or "").replace("'", "''")
+        theirs_src = str(source_paths.get("B") or source_paths.get("THEIRS") or "").replace("'", "''")
         ps = (
             "$ErrorActionPreference='Stop';"
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            "$OutputEncoding=[System.Text.Encoding]::UTF8;"
             "$src='" + src_xlsx.replace("'", "''") + "';"
             "$out='" + out_xlsx.replace("'", "''") + "';"
             "$opsPath='" + ops_json.replace("'", "''") + "';"
-            "$ops=Get-Content -Raw -LiteralPath $opsPath | ConvertFrom-Json;"
+            "$baseSrc='" + base_src + "';"
+            "$theirsSrc='" + theirs_src + "';"
+            "$payload=Get-Content -Raw -LiteralPath $opsPath | ConvertFrom-Json;"
             "$xl=New-Object -ComObject Excel.Application;"
             "$xl.Visible=$false;"
             "$xl.DisplayAlerts=$false;"
             "$xl.AskToUpdateLinks=$false;"
             "$xl.EnableEvents=$false;"
             "$wb=$xl.Workbooks.Open($src,0,$false);"
-            "foreach($op in $ops){"
+            "$wbBase=$null;"
+            "$wbTheirs=$null;"
+            "if($baseSrc){$wbBase=$xl.Workbooks.Open($baseSrc,0,$true)};"
+            "if($theirsSrc){$wbTheirs=$xl.Workbooks.Open($theirsSrc,0,$true)};"
+            "foreach($op in @($payload.sheet_ops)){"
+            "  if($null -eq $op){continue};"
+            "  if($op.kind -eq 'delete_sheet'){"
+            "    try{"
+            "      if($wb.Worksheets.Count -gt 1){$wb.Worksheets.Item($op.sheet).Delete()}"
+            "    }catch{};"
+            "    continue"
+            "  };"
+            "  if($op.kind -eq 'copy_sheet'){"
+            "    $srcWs=$null;"
+            "    if($op.source_side -eq 'BASE' -and $wbBase -ne $null){$srcWs=$wbBase.Worksheets.Item($op.sheet)}"
+            "    elseif(($op.source_side -eq 'B' -or $op.source_side -eq 'THEIRS') -and $wbTheirs -ne $null){$srcWs=$wbTheirs.Worksheets.Item($op.sheet)}"
+            "    elseif($op.source_side -eq 'A'){$srcWs=$wb.Worksheets.Item($op.sheet)};"
+            "    if($srcWs -eq $null){continue};"
+            "    try{$wb.Worksheets.Item($op.sheet).Delete()}catch{};"
+            "    $after=$wb.Worksheets.Item($wb.Worksheets.Count);"
+            "    $srcWs.Copy($null, $after);"
+            "    $newWs=$wb.Worksheets.Item($wb.Worksheets.Count);"
+            "    try{$newWs.Name=$op.sheet}catch{};"
+            "  }"
+            "};"
+            "foreach($op in @($payload.row_ops)){"
+            "  if($null -eq $op){continue};"
+            "  $ws=$wb.Worksheets.Item($op.sheet);"
+            "  if($op.kind -eq 'insert_rows'){"
+            "    for($i=0;$i -lt [int]$op.count;$i++){[void]$ws.Rows.Item([int]$op.row).Insert()}"
+            "  }"
+            "};"
+            "foreach($op in @($payload.cell_ops)){"
+            "  if($null -eq $op){continue};"
             "  $ws=$wb.Worksheets.Item($op.sheet);"
             "  $cell=$ws.Cells.Item([int]$op.r,[int]$op.c);"
-            "  if($null -ne $op.formula){$cell.Formula=$op.formula}else{$cell.Value2=$op.value}"
+            "  if($null -ne $op.formula){$cell.Formula=$op.formula}"
+            "  elseif($op.value_kind -eq 'text'){$cell.NumberFormat='@';$cell.Value2=[string]$op.value}"
+            "  else{$cell.Value2=$op.value}"
             "};"
             "$wb.SaveCopyAs($out);"
             "$wb.Close($false);"
+            "if($wbBase -ne $null){$wbBase.Close($false)};"
+            "if($wbTheirs -ne $null){$wbTheirs.Close($false)};"
             "$xl.Quit();"
             "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null;"
+            "if($wbBase -ne $null){[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wbBase) | Out-Null};"
+            "if($wbTheirs -ne $null){[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wbTheirs) | Out-Null};"
             "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null;"
         )
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
         )
         if r.returncode != 0:
             _dlog(f"excel native save failed rc={r.returncode} err={r.stderr.strip()}")
             return False
-        _dlog(f"excel native save ok: {out_xlsx} ops={len(ops)}")
+        valid, reason = _validate_xlsx_package(out_xlsx)
+        if not valid:
+            _dlog(f"excel native save produced invalid package: {reason}")
+            return False
+        _dlog(f"excel native save ok: {out_xlsx} sheet_ops={len(sheet_ops)} row_ops={len(row_ops)} cell_ops={len(ops)}")
         return True
     except Exception as e:
         _dlog(f"excel native save exception: {e}")
@@ -888,6 +1676,70 @@ def _build_manual_merge_output_with_excel(src_xlsx: str, out_xlsx: str, manual_o
                 os.remove(ops_json)
         except Exception:
             pass
+
+
+def _build_manual_merge_output_with_openpyxl(
+    src_xlsx: str,
+    out_xlsx: str,
+    manual_ops: dict,
+    row_ops: list[dict] | None = None,
+    sheet_ops: list[dict] | None = None,
+    source_paths: dict[str, str] | None = None,
+) -> bool:
+    """Replay manual merge operations with openpyxl when Excel COM is unavailable."""
+    wb = None
+    wb_base = None
+    wb_b = None
+    ext_parts = _capture_external_link_parts(src_xlsx)
+    try:
+        wb = load_workbook(src_xlsx, data_only=False)
+        source_paths = source_paths or {}
+        if source_paths.get("BASE"):
+            wb_base = load_workbook(source_paths["BASE"], data_only=False)
+        if source_paths.get("B"):
+            wb_b = load_workbook(source_paths["B"], data_only=False)
+        for op in list(sheet_ops or []):
+            kind = str(op.get("kind") or "")
+            sheet = str(op.get("sheet") or "")
+            if kind == "delete_sheet":
+                _remove_sheet_if_exists(wb, sheet)
+                continue
+            if kind != "copy_sheet" or not sheet:
+                continue
+            side = str(op.get("source_side") or "").upper()
+            src_ws = None
+            if side == "A":
+                src_ws = wb[sheet] if sheet in wb.sheetnames else None
+            elif side == "BASE":
+                src_ws = wb_base[sheet] if wb_base is not None and sheet in wb_base.sheetnames else None
+            elif side in ("B", "THEIRS"):
+                src_ws = wb_b[sheet] if wb_b is not None and sheet in wb_b.sheetnames else None
+            if src_ws is None:
+                continue
+            _create_sheet_from_source(wb, src_ws, sheet)
+        for op in list(row_ops or []):
+            if op.get("kind") != "insert_rows":
+                continue
+            sheet = op.get("sheet")
+            if not sheet or sheet not in wb.sheetnames:
+                continue
+            row = max(1, int(op.get("row", 1)))
+            count = max(1, int(op.get("count", 1)))
+            wb[sheet].insert_rows(idx=row, amount=count)
+        for (sheet, r, c), v in manual_ops.items():
+            if sheet not in wb.sheetnames:
+                continue
+            wb[sheet].cell(row=int(r), column=int(c)).value = v
+        wb.save(out_xlsx)
+        if ext_parts:
+            _apply_external_link_parts_on_file(out_xlsx, ext_parts)
+        _dlog(f"openpyxl merge save ok: {out_xlsx} sheet_ops={len(list(sheet_ops or []))} row_ops={len(list(row_ops or []))} cell_ops={len(manual_ops)}")
+        return True
+    except Exception as e:
+        _dlog(f"openpyxl merge save failed: {e}")
+        return False
+    finally:
+        _wbs_close(wb, wb_base, wb_b)
 
 
 def _merge_cmp_value(v):
@@ -964,6 +1816,9 @@ def _recalc_with_excel(path: str) -> str | None:
         base = os.path.basename(path)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_recalc_{os.getpid()}_{ts}_{base}")
+        ext = _workbook_ext(path)
+        if not tmp.lower().endswith(ext):
+            tmp += ext
         shutil.copy2(path, tmp)
     except Exception as e:
         _dlog(f"recalc copy failed: {e}")
@@ -988,9 +1843,11 @@ def _recalc_with_excel(path: str) -> str | None:
         )
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["powershell", "-NoProfile", "-STA", "-Command", ps],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
             creationflags=no_window,
         )
@@ -1053,8 +1910,13 @@ def _maybe_recalc_and_prepare_val_path(path: str, force: bool = False) -> str | 
         return None
 
 
-def _launch_deferred_copy(src: str, dst: str, retries: int = 60, delay_ms: int = 500):
-    """Launch a background copy that retries for a while (to avoid lock issues)."""
+def _launch_deferred_copy(src: str, dst: str, retries: int = 60, delay_ms: int = 500) -> bool:
+    """Launch a background copy that retries for a while (to avoid lock issues).
+
+    Returns True if the background process was successfully launched, False
+    otherwise. A False result means the deferred copy did NOT start, so callers
+    must NOT report success to the user.
+    """
     try:
         ps = (
             "$src='" + src.replace("'", "''") + "';"
@@ -1070,8 +1932,10 @@ def _launch_deferred_copy(src: str, dst: str, retries: int = 60, delay_ms: int =
         except Exception:
             creationflags = 0
         subprocess.Popen(["powershell", "-NoProfile", "-Command", ps], creationflags=creationflags)
+        return True
     except Exception as e:
         _dlog(f"deferred copy launch failed: {e}")
+        return False
 
 
 def _find_tortoise_merge_exe():
@@ -1121,6 +1985,7 @@ def _query_svn_version(svn_exe: str) -> str:
             [svn_exe, "--version", "--quiet"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=8,
             creationflags=no_window,
         )
@@ -1156,8 +2021,9 @@ def _try_export_svn_revision_from_merge_temp(path: str) -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = os.path.basename(base_path)
         save_path = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svncat_r{rev}_{ts}_{base_name}")
-        if not save_path.lower().endswith(".xlsx"):
-            save_path += ".xlsx"
+        ext = _workbook_ext(base_name)
+        if not save_path.lower().endswith(ext):
+            save_path += ext
 
         try:
             _dlog(f"svn export: {base_path} r{rev} -> {save_path}")
@@ -1210,8 +2076,9 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = os.path.basename(p)
         save_path = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svncat_BASE_{ts}_{base_name}")
-        if not save_path.lower().endswith(".xlsx"):
-            save_path += ".xlsx"
+        ext = _workbook_ext(base_name)
+        if not save_path.lower().endswith(ext):
+            save_path += ext
 
         # Prefer svn CLI (usually uses WC metadata for BASE).
         svn_exe = shutil.which("svn")
@@ -1259,6 +2126,62 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
                 time.sleep(0.1)
         except Exception as e:
             _dlog(f"svn base export(tortoise) exception: {e}")
+        # Fallback: read WC metadata directly and copy the pristine blob.
+        try:
+            import sqlite3
+
+            p_dir = os.path.dirname(p)
+            wc_root = None
+            probe = p_dir
+            while probe:
+                wc_db = os.path.join(probe, ".svn", "wc.db")
+                if os.path.isfile(wc_db):
+                    wc_root = probe
+                    break
+                parent = os.path.dirname(probe)
+                if not parent or parent == probe:
+                    break
+                probe = parent
+            if wc_root is None:
+                return None
+
+            rel_path = os.path.relpath(p, wc_root).replace("\\", "/")
+            wc_db = os.path.join(wc_root, ".svn", "wc.db")
+            conn = sqlite3.connect(wc_db)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    select checksum
+                    from NODES
+                    where local_relpath = ?
+                      and op_depth = 0
+                      and kind = 'file'
+                      and presence = 'normal'
+                    limit 1
+                    """,
+                    (rel_path,),
+                )
+                row = cur.fetchone()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            checksum = row[0] if row else None
+            m = re.match(r"^\$sha1\$([0-9a-fA-F]{40})$", str(checksum or ""))
+            if not m:
+                return None
+            sha1 = m.group(1).lower()
+            pristine_path = os.path.join(wc_root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
+            if not os.path.exists(pristine_path):
+                return None
+            shutil.copyfile(pristine_path, save_path)
+            if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                _dlog(f"svn base export(pristine): {p} -> {save_path}")
+                return save_path
+        except Exception as e:
+            _dlog(f"svn base export(pristine) exception: {e}")
             return None
     except Exception as e:
         _dlog(f"svn base export error: {e}")
@@ -1292,6 +2215,7 @@ def _log_lock_holders(path: str) -> bool:
             [handle_exe, "-accepteula", path],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=10,
             creationflags=no_window,
         )
@@ -1414,10 +2338,10 @@ def pick_two_files_same_name():
     root = tk.Tk()
     root.withdraw()
 
-    a = filedialog.askopenfilename(title="Select first .xlsx file", filetypes=[("Excel Workbook", "*.xlsx")])
+    a = filedialog.askopenfilename(title="Select first Excel workbook", filetypes=[("Excel Workbook", "*.xlsx *.xlsm")])
     if not a:
         return None, None
-    b = filedialog.askopenfilename(title="Select second .xlsx file (same filename)", filetypes=[("Excel Workbook", "*.xlsx")])
+    b = filedialog.askopenfilename(title="Select second Excel workbook (same filename)", filetypes=[("Excel Workbook", "*.xlsx *.xlsm")])
     if not b:
         return None, None
 
@@ -1602,6 +2526,7 @@ def _auto_pick_conflict_file():
                     [svn_exe, "status", cwd],
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=8,
                     creationflags=no_window,
                 )
@@ -1665,7 +2590,7 @@ def pick_files_or_conflict():
         if conflict:
             return ("merge",) + conflict + (True,)
 
-    a = filedialog.askopenfilename(title="Select .xlsx file", filetypes=[("Excel Workbook", "*.xlsx")])
+    a = filedialog.askopenfilename(title="Select Excel workbook", filetypes=[("Excel Workbook", "*.xlsx *.xlsm")])
     if not a:
         return None
 
@@ -1673,7 +2598,7 @@ def pick_files_or_conflict():
     if conflict:
         return ("merge",) + conflict + (True,)
 
-    b = filedialog.askopenfilename(title="Select second .xlsx file (same filename)", filetypes=[("Excel Workbook", "*.xlsx")])
+    b = filedialog.askopenfilename(title="Select second Excel workbook (same filename)", filetypes=[("Excel Workbook", "*.xlsx *.xlsm")])
     if not b:
         return None
 
@@ -1709,15 +2634,18 @@ def _atomic_save_wb(wb, target_path: str):
 
 
 def _ensure_xlsx_copy(path: str) -> str:
-    """If path is not .xlsx, copy to a temp .xlsx and return new path."""
+    """If path is not a directly openable workbook path, copy it to a temp workbook path."""
     if not path:
         return path
-    if os.path.splitext(path)[1].lower() == ".xlsx":
+    if os.path.splitext(path)[1].lower() in _SUPPORTED_WORKBOOK_EXTS:
         return _ensure_stable_copy(path)
     try:
         base = os.path.basename(path)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svn_{base}_{ts}.xlsx")
+        ext = _workbook_ext(path)
+        tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svn_{base}_{ts}")
+        if not tmp.lower().endswith(ext):
+            tmp += ext
         shutil.copy2(path, tmp)
         return tmp
     except Exception:
@@ -1738,8 +2666,9 @@ def _ensure_stable_copy(path: str) -> str:
         if looks_temp or looks_svn:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_stable_{ts}_{base}")
-            if not tmp.lower().endswith(".xlsx"):
-                tmp += ".xlsx"
+            ext = _workbook_ext(path)
+            if not tmp.lower().endswith(ext):
+                tmp += ext
             shutil.copy2(path, tmp)
             return tmp
     except Exception:
@@ -1754,7 +2683,7 @@ def _is_temp_base_path(path: str) -> bool:
     base = os.path.basename(path).lower()
     if p.startswith(os.path.abspath(tempfile.gettempdir()).lower()):
         return True
-    if "revbase" in base or ".svn" in p or base.endswith(".tmp.xlsx") or ".r" in base:
+    if "revbase" in base or ".svn" in p or base.endswith(".tmp.xlsx") or base.endswith(".tmp.xlsm") or ".r" in base:
         return True
     return False
 
@@ -1767,19 +2696,36 @@ def _wbs_close(*wbs):
                 wb.close()
             except Exception:
                 pass
+            try:
+                vba_archive = getattr(wb, "vba_archive", None)
+                if vba_archive is not None:
+                    vba_archive.close()
+                    try:
+                        vba_archive.fp = None
+                    except Exception:
+                        pass
+                    try:
+                        wb.vba_archive = None
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
 
 def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_path: str, save_merged: bool = True):
-    """3-way merge: apply theirs onto mine when no conflict.
+    """3-way merge using row-aligned diff (consistent with _scan_three_way_conflicts).
 
-    Conflict: mine and theirs both changed a cell differently vs base.
+    Conflict: mine and theirs both changed an aligned cell differently vs base.
+    Non-conflicting theirs changes are applied onto mine for 1:1 aligned rows.
+
+    Row alignment (via mine_to_base / theirs_to_base / display_pairs) is used instead
+    of comparing by physical row number, so inserted/deleted rows no longer cause
+    cross-row mis-comparison or theirs being written to the wrong row. Structural rows
+    that exist on only one side (inserts/deletes) are left for the manual 3-way UI
+    rather than blindly written by physical position.
+
     Returns (conflicts, merged_preview_path, conflict_cells_by_sheet).
     """
-    # XLSM not supported in current scope
-    for p in (base_path, mine_path, theirs_path, merged_path):
-        if p and os.path.splitext(p)[1].lower() == ".xlsm":
-            raise ValueError("当前版本暂不支持 .xlsm 文件合并")
-
     base_path = _ensure_xlsx_copy(base_path)
     mine_path = _ensure_xlsx_copy(mine_path)
     theirs_path = _ensure_xlsx_copy(theirs_path)
@@ -1819,6 +2765,23 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     conflicts = []
     conflict_cells_by_sheet = {}
 
+    def _cmp_cell(ws_val, ws_edit, row_idx: int | None, col_idx: int):
+        if ws_val is None or row_idx is None or row_idx <= 0:
+            return None
+        try:
+            vv = ws_val.cell(row=row_idx, column=col_idx).value
+        except Exception:
+            vv = None
+        cmp_v = vv
+        try:
+            if cmp_v is None and ws_edit is not None:
+                ve = ws_edit.cell(row=row_idx, column=col_idx).value
+                if ve is not None and not _formula_text(ve):
+                    cmp_v = ve
+        except Exception:
+            pass
+        return cmp_v
+
     common = sorted(set_mine & set_theirs)
     for name in common:
         ws_b = wb_base_val[name] if name in set_base else None
@@ -1828,77 +2791,85 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
         ws_b_edit = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
         ws_t_edit = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
 
-        max_row = max(ws_m_val.max_row or 1, ws_t.max_row or 1, (ws_b.max_row or 1) if ws_b else 1)
         max_col = max(ws_m_val.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
 
-        it_m = ws_m_val.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
-        it_t = ws_t.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
-        if ws_b:
-            it_b = ws_b.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
-        else:
-            it_b = ((None,) * max_col for _ in range(max_row))
+        # Same row-alignment pipeline as _scan_three_way_conflicts so auto-merge and
+        # the UI agree on which cells line up across inserted/deleted rows.
+        mine_sigs = _row_sig_list_for_ws(ws_m_val, ws_m_val.max_row or 1, max_col)
+        theirs_sigs = _row_sig_list_for_ws(ws_t, ws_t.max_row or 1, max_col)
+        base_sigs = _row_sig_list_for_ws(ws_b, ws_b.max_row or 1, max_col) if ws_b is not None else []
+        mine_to_base = _row_map_from_pairs(
+            _compute_row_pairs_from_signatures(mine_sigs, base_sigs)
+        ) if ws_b is not None else {}
+        theirs_to_base = _row_map_from_pairs(
+            _compute_row_pairs_from_signatures(theirs_sigs, base_sigs)
+        ) if ws_b is not None else {}
+        display_pairs = _compute_row_pairs_from_signatures(mine_sigs, theirs_sigs)
+        if ws_b is not None:
+            display_pairs = _split_tail_independent_append_pairs(
+                display_pairs, mine_to_base, theirs_to_base,
+                ws_m_val, ws_t, max_col,
+            )
+            display_pairs = _split_low_similarity_tail_pairs(
+                display_pairs,
+                mine_to_base,
+                theirs_to_base,
+                ws_m_val,
+                ws_t,
+                max_col,
+            )
 
-        for r, (row_m, row_t, row_b) in enumerate(zip(it_m, it_t, it_b), start=1):
-            if len(row_m) < max_col:
-                row_m = tuple(row_m) + (None,) * (max_col - len(row_m))
-            if len(row_t) < max_col:
-                row_t = tuple(row_t) + (None,) * (max_col - len(row_t))
-            if len(row_b) < max_col:
-                row_b = tuple(row_b) + (None,) * (max_col - len(row_b))
+        for ra, rb in display_pairs:
+            base_row_m = mine_to_base.get(ra) if ra is not None else None
+            base_row_t = theirs_to_base.get(rb) if rb is not None else None
+            for c in range(1, max_col + 1):
+                vm_cmp = _cmp_cell(ws_m_val, ws_m_edit, ra, c)
+                vt_cmp = _cmp_cell(ws_t, ws_t_edit, rb, c)
+                conflict_row = ra if ra is not None else (rb if rb is not None else 0)
 
-            for c, (vm, vt, vb) in enumerate(zip(row_m, row_t, row_b), start=1):
-                # Normalize formula objects to text for comparison
-                vm_cmp = vm
-                vt_cmp = vt
-                vb_cmp = vb
-                # If cached value missing but edit cell has a literal (non-formula) value, use it
-                try:
-                    if vm_cmp is None:
-                        vme = ws_m_edit.cell(row=r, column=c).value
-                        if vme is not None and not _formula_text(vme):
-                            vm_cmp = vme
-                    if vt_cmp is None:
-                        vte = ws_t_edit.cell(row=r, column=c).value if ws_t_edit is not None else None
-                        if vte is not None and not _formula_text(vte):
-                            vt_cmp = vte
-                    if vb_cmp is None and ws_b_edit is not None:
-                        vbe = ws_b_edit.cell(row=r, column=c).value
-                        if vbe is not None and not _formula_text(vbe):
-                            vb_cmp = vbe
-                except Exception:
-                    pass
-                # If base cache is missing but base/theirs formulas are identical, treat base as theirs
-                if vb_cmp is None and vt_cmp is not None and ws_b_edit is not None and ws_t_edit is not None:
-                    try:
-                        if _same_formula(ws_b_edit.cell(row=r, column=c).value, ws_t_edit.cell(row=r, column=c).value):
-                            vb_cmp = vt_cmp
-                    except Exception:
-                        pass
+                # Aligned 1:1 row sharing a base row -> full 3-way cell logic.
+                if ra is not None and rb is not None and base_row_m is not None and base_row_m == base_row_t:
+                    vb_cmp = _cmp_cell(ws_b, ws_b_edit, base_row_m, c)
+                    if vb_cmp is None and vt_cmp is not None and ws_b_edit is not None and ws_t_edit is not None:
+                        try:
+                            if _same_formula(ws_b_edit.cell(row=base_row_m, column=c).value, ws_t_edit.cell(row=rb, column=c).value):
+                                vb_cmp = vt_cmp
+                        except Exception:
+                            pass
+                    vm_key = _merge_cmp_value(vm_cmp)
+                    vt_key = _merge_cmp_value(vt_cmp)
+                    vb_key = _merge_cmp_value(vb_cmp)
+                    mine_changed = (vm_key != vb_key)
+                    theirs_changed = (vt_key != vb_key)
+                    if mine_changed and theirs_changed:
+                        if vm_key != vt_key:
+                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
+                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
+                        # else: identical change on both sides; keep mine as-is.
+                    elif (not mine_changed) and theirs_changed:
+                        # Safe to apply theirs onto mine's aligned row (preserve formulas).
+                        _t_edit_v = ws_t_edit.cell(row=rb, column=c).value if ws_t_edit is not None else None
+                        ws_m_edit.cell(row=ra, column=c).value = _t_edit_v if _t_edit_v is not None else vt_cmp
+                    continue
 
-                vm_key = _merge_cmp_value(vm_cmp)
-                vt_key = _merge_cmp_value(vt_cmp)
-                vb_key = _merge_cmp_value(vb_cmp)
-
-                mine_changed = (vm_key != vb_key)
-                theirs_changed = (vt_key != vb_key)
-                if mine_changed and theirs_changed:
-                    if vm_key != vt_key:
-                        conflicts.append((name, r, c, vm_cmp, vt_cmp))
-                        conflict_cells_by_sheet.setdefault(name, {}).setdefault(r, set()).add(c)
-                    else:
-                        # same change; keep as is
-                        continue
-                elif (not mine_changed) and theirs_changed:
-                    # safe to apply theirs: use edit value to preserve formulas
-                    _t_edit_v = ws_t_edit.cell(row=r, column=c).value if ws_t_edit is not None else None
-                    ws_m_edit.cell(row=r, column=c).value = _t_edit_v if _t_edit_v is not None else vt
+                # Both sides added the same logical row independently (no shared base):
+                # differing values are a conflict for manual resolution.
+                if ra is not None and rb is not None and base_row_m is None and base_row_t is None:
+                    if _merge_cmp_value(vm_cmp) != _merge_cmp_value(vt_cmp):
+                        conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
+                        conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
+                # ra is None (theirs-only row) or rb is None (mine-only row): structural
+                # insert/delete -> left for the manual 3-way UI, never written by physical row.
 
     _merge_result = None
     try:
         # Always save a preview for UI if needed
         if conflicts or (not save_merged):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            preview = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merged_preview_{os.getpid()}_{ts}.xlsx")
+            preview = os.path.join(
+                tempfile.gettempdir(),
+                f"{APP_NAME}_merged_preview_{os.getpid()}_{ts}{_workbook_ext(merged_path or mine_path)}",
+            )
             _atomic_save_wb(wb_merged, preview)
             _merge_result = (conflicts, preview, conflict_cells_by_sheet)
         else:
@@ -1948,6 +2919,23 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
         set_theirs = set(wb_theirs_val.sheetnames)
         common = sorted(set_mine & set_theirs)
 
+        def _cmp_cell(ws_val, ws_edit, row_idx: int | None, col_idx: int):
+            if ws_val is None or row_idx is None or row_idx <= 0:
+                return None
+            try:
+                vv = ws_val.cell(row=row_idx, column=col_idx).value
+            except Exception:
+                vv = None
+            cmp_v = vv
+            try:
+                if cmp_v is None and ws_edit is not None:
+                    ve = ws_edit.cell(row=row_idx, column=col_idx).value
+                    if ve is not None and not _formula_text(ve):
+                        cmp_v = ve
+            except Exception:
+                pass
+            return cmp_v
+
         for name in common:
             ws_b = wb_base_val[name] if name in set_base else None
             ws_m = wb_mine_val[name]
@@ -1956,55 +2944,63 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
             ws_b_e = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
             ws_t_e = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
 
-            max_row = max(ws_m.max_row or 1, ws_t.max_row or 1, (ws_b.max_row or 1) if ws_b else 1)
             max_col = max(ws_m.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
+            mine_sigs = _row_sig_list_for_ws(ws_m, ws_m.max_row or 1, max_col)
+            theirs_sigs = _row_sig_list_for_ws(ws_t, ws_t.max_row or 1, max_col)
+            base_sigs = _row_sig_list_for_ws(ws_b, ws_b.max_row or 1, max_col) if ws_b is not None else []
+            mine_to_base = _row_map_from_pairs(
+                _compute_row_pairs_from_signatures(mine_sigs, base_sigs)
+            ) if ws_b is not None else {}
+            theirs_to_base = _row_map_from_pairs(
+                _compute_row_pairs_from_signatures(theirs_sigs, base_sigs)
+            ) if ws_b is not None else {}
+            display_pairs = _compute_row_pairs_from_signatures(mine_sigs, theirs_sigs)
+            if ws_b is not None:
+                display_pairs = _split_tail_independent_append_pairs(
+                    display_pairs, mine_to_base, theirs_to_base,
+                    ws_m, ws_t, max_col,
+                )
+                display_pairs = _split_low_similarity_tail_pairs(
+                    display_pairs,
+                    mine_to_base,
+                    theirs_to_base,
+                    ws_m,
+                    ws_t,
+                    max_col,
+                )
 
-            it_m = ws_m.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
-            it_t = ws_t.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
-            it_b = ws_b.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True) if ws_b else ((None,) * max_col for _ in range(max_row))
+            for ra, rb in display_pairs:
+                base_row_m = mine_to_base.get(ra) if ra is not None else None
+                base_row_t = theirs_to_base.get(rb) if rb is not None else None
+                for c in range(1, max_col + 1):
+                    vm_cmp = _cmp_cell(ws_m, ws_m_e, ra, c)
+                    vt_cmp = _cmp_cell(ws_t, ws_t_e, rb, c)
+                    conflict_row = ra if ra is not None else (rb if rb is not None else 0)
 
-            for r, (row_m, row_t, row_b) in enumerate(zip(it_m, it_t, it_b), start=1):
-                if len(row_m) < max_col:
-                    row_m = tuple(row_m) + (None,) * (max_col - len(row_m))
-                if len(row_t) < max_col:
-                    row_t = tuple(row_t) + (None,) * (max_col - len(row_t))
-                if len(row_b) < max_col:
-                    row_b = tuple(row_b) + (None,) * (max_col - len(row_b))
+                    if ra is not None and rb is not None and base_row_m is not None and base_row_m == base_row_t:
+                        vb_cmp = _cmp_cell(ws_b, ws_b_e, base_row_m, c)
+                        if vb_cmp is None and vt_cmp is not None and ws_b_e is not None and ws_t_e is not None:
+                            try:
+                                if _same_formula(ws_b_e.cell(row=base_row_m, column=c).value, ws_t_e.cell(row=rb, column=c).value):
+                                    vb_cmp = vt_cmp
+                            except Exception:
+                                pass
+                        vm_key = _merge_cmp_value(vm_cmp)
+                        vt_key = _merge_cmp_value(vt_cmp)
+                        vb_key = _merge_cmp_value(vb_cmp)
+                        mine_changed = (vm_key != vb_key)
+                        theirs_changed = (vt_key != vb_key)
+                        if mine_changed and theirs_changed and vm_key != vt_key:
+                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
+                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
+                        continue
 
-                for c, (vm, vt, vb) in enumerate(zip(row_m, row_t, row_b), start=1):
-                    vm_cmp = vm
-                    vt_cmp = vt
-                    vb_cmp = vb
-                    try:
-                        if vm_cmp is None:
-                            vme = ws_m_e.cell(row=r, column=c).value
-                            if vme is not None and not _formula_text(vme):
-                                vm_cmp = vme
-                        if vt_cmp is None and ws_t_e is not None:
-                            vte = ws_t_e.cell(row=r, column=c).value
-                            if vte is not None and not _formula_text(vte):
-                                vt_cmp = vte
-                        if vb_cmp is None and ws_b_e is not None:
-                            vbe = ws_b_e.cell(row=r, column=c).value
-                            if vbe is not None and not _formula_text(vbe):
-                                vb_cmp = vbe
-                    except Exception:
-                        pass
-                    if vb_cmp is None and vt_cmp is not None and ws_b_e is not None and ws_t_e is not None:
-                        try:
-                            if _same_formula(ws_b_e.cell(row=r, column=c).value, ws_t_e.cell(row=r, column=c).value):
-                                vb_cmp = vt_cmp
-                        except Exception:
-                            pass
-
-                    vm_key = _merge_cmp_value(vm_cmp)
-                    vt_key = _merge_cmp_value(vt_cmp)
-                    vb_key = _merge_cmp_value(vb_cmp)
-                    mine_changed = (vm_key != vb_key)
-                    theirs_changed = (vt_key != vb_key)
-                    if mine_changed and theirs_changed and vm_key != vt_key:
-                        conflicts.append((name, r, c, vm_cmp, vt_cmp))
-                        conflict_cells_by_sheet.setdefault(name, {}).setdefault(r, set()).add(c)
+                    if ra is not None and rb is not None and base_row_m is None and base_row_t is None:
+                        vm_key = _merge_cmp_value(vm_cmp)
+                        vt_key = _merge_cmp_value(vt_cmp)
+                        if vm_key != vt_key:
+                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
+                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
 
         return conflicts, conflict_cells_by_sheet
     finally:
@@ -2039,6 +3035,8 @@ class SheetView:
 
         self.max_row = 1
         self.max_col = 1
+        self.col_max_a = 1  # column count of side A (may differ from B)
+        self.col_max_b = 1  # column count of side B
         self._bounds_checked = False
         # Per-column max display width (chars), computed during diff scan
         self.col_char_widths: dict[int, int] = {}
@@ -2056,8 +3054,13 @@ class SheetView:
         self.pair_text_a: dict[int, str] = {}
         self.pair_text_b: dict[int, str] = {}
         self.pair_diff_cols: dict[int, set[int]] = {}
+        self.pair_base_diff_cols: dict[int, set[int]] = {}
         self.row_a_to_pair_idx: dict[int, int] = {}
         self.row_b_to_pair_idx: dict[int, int] = {}
+        self.mine_to_base_row: dict[int, int] = {}
+        self.theirs_to_base_row: dict[int, int] = {}
+        self.pair_base_row_override: dict[int, int | None] = {}
+        self._missing_base_row_map: dict[int, int] = {}
 
         # Render state
         # display_rows stores pair indices (into row_pairs)
@@ -2068,6 +3071,12 @@ class SheetView:
         self._pending_yview: float | None = None
         self._render_cache = {}
         self._data_version = 0
+        # Minimap (diff map) throttle: cache diff rows/cols keyed by data version,
+        # debounce redraws triggered by scrolling.
+        self._diff_map_cache_version = None
+        self._diff_map_cache = None
+        self._diff_map_debounce_id = None
+        self._diff_map_debounce_ms = 40
         self.selected_excel_row: int | None = None
         self.selected_excel_row_a: int | None = None
         self.selected_excel_row_b: int | None = None
@@ -2079,6 +3088,10 @@ class SheetView:
         self._applied_main_sel_line: int | None = None
         self._cursor_cmp_sel_col: int | None = None
         self._cursor_cmp_sel_line: int | None = None
+        self.hover_pair_idx: int | None = None
+        self.hover_col_idx: int | None = None
+        self.hover_side: str | None = None
+        self._last_cursor_cmp_pair_idx: int | None = None
         self._trace_click_until: float = 0.0
         self._click_trace_seq: int = 0
         self._is_large_sheet = False
@@ -2089,6 +3102,7 @@ class SheetView:
         # After user-triggered rescan/toggle, ignore late background cache apply for this sheet
         # to avoid delayed stale overwrite (rows unexpectedly disappear a few seconds later).
         self._suppress_bg_apply = False
+        self._formula_copy_skips_pending = 0
         # Set to True once initial diff data has been computed (background or manual).
         # Prevents refresh(rescan=False) from triggering a full rescan on empty initial state.
         self._data_ready = False
@@ -2100,6 +3114,12 @@ class SheetView:
         # Snapshot mode: build the diff row list once, then keep the row list stable.
         # Overwrites only update per-row highlight (to show "已处理") and keep the row visible.
         self.snapshot_only_diff = True
+        self._only_diff_source_version = 0
+        self._only_diff_rows_cache: list[int] | None = None
+        self._only_diff_rows_cache_key: tuple | None = None
+        self._only_diff_async_build_key: tuple | None = None
+        self._only_diff_async_build_seq = 0
+        self._only_diff_async_building = False
 
         # Toolbar
         bar = ttk.Frame(self.frame)
@@ -2401,6 +3421,11 @@ class SheetView:
         self.vdiff_map.pack(side="left", fill="y", padx=(0, 2))
         self.vdiff_map.bind("<Button-1>", self._on_vdiff_map_click)
 
+        # Reserve the lower compare area before the main panes so C区 and hover
+        # panel do not get squeezed to 1px on first layout.
+        self.lower_area = ttk.Frame(self.frame)
+        self.lower_area.pack(side="bottom", fill="x")
+
         # Panes
         paned = ttk.PanedWindow(self.frame, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -2449,6 +3474,12 @@ class SheetView:
         mid_body.pack(fill="both", expand=True)
         right_body = ttk.Frame(right_wrap)
         right_body.pack(fill="both", expand=True)
+        left_footer = ttk.Frame(left_wrap)
+        left_footer.pack(side="bottom", fill="x", before=left_body)
+        mid_footer = ttk.Frame(mid_wrap)
+        mid_footer.pack(side="bottom", fill="x", before=mid_body)
+        right_footer = ttk.Frame(right_wrap)
+        right_footer.pack(side="bottom", fill="x", before=right_body)
 
         self.left_ln = tk.Text(left_body, width=self._row_header_width, wrap="none", undo=False, font=self.editor_font, bg="#efefef", fg="#666666", relief="flat", takefocus=0, cursor="arrow")
         self.base_ln = tk.Text(mid_body, width=self._row_header_width, wrap="none", undo=False, font=self.editor_font, bg="#efefef", fg="#666666", relief="flat", takefocus=0, cursor="arrow")
@@ -2504,7 +3535,7 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
@@ -2522,7 +3553,7 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
@@ -2540,7 +3571,7 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
@@ -2556,7 +3587,7 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
@@ -2571,7 +3602,7 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
@@ -2586,16 +3617,16 @@ class SheetView:
             finally:
                 self._xsyncing = False
             try:
-                self._update_diff_maps()
+                self._schedule_diff_maps()
             except Exception:
                 pass
 
-        self.hsb_left = ttk.Scrollbar(left_wrap, orient="horizontal", command=_xview_left)
-        self.hsb_mid = ttk.Scrollbar(mid_wrap, orient="horizontal", command=_xview_mid)
-        self.hsb_right = ttk.Scrollbar(right_wrap, orient="horizontal", command=_xview_right)
-        self.hdiff_left = tk.Canvas(left_wrap, height=10, highlightthickness=0, bg="#ebebeb")
-        self.hdiff_mid = tk.Canvas(mid_wrap, height=10, highlightthickness=0, bg="#ebebeb")
-        self.hdiff_right = tk.Canvas(right_wrap, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hsb_left = ttk.Scrollbar(left_footer, orient="horizontal", command=_xview_left)
+        self.hsb_mid = ttk.Scrollbar(mid_footer, orient="horizontal", command=_xview_mid)
+        self.hsb_right = ttk.Scrollbar(right_footer, orient="horizontal", command=_xview_right)
+        self.hdiff_left = tk.Canvas(left_footer, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hdiff_mid = tk.Canvas(mid_footer, height=10, highlightthickness=0, bg="#ebebeb")
+        self.hdiff_right = tk.Canvas(right_footer, height=10, highlightthickness=0, bg="#ebebeb")
         self.hdiff_left.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "left"))
         self.hdiff_mid.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "mid"))
         self.hdiff_right.bind("<Button-1>", lambda e: self._on_hdiff_map_click(e, "right"))
@@ -2686,7 +3717,7 @@ class SheetView:
         save_row_height = 34
 
         # Save A button (bottom-right of A pane)
-        save_a_row = ttk.Frame(left_wrap, height=save_row_height)
+        save_a_row = ttk.Frame(left_footer, height=save_row_height)
         save_a_row.pack(fill="x", pady=(2, 0))
         save_a_row.pack_propagate(False)
         if getattr(self.app, "merge_mode", False):
@@ -2699,7 +3730,7 @@ class SheetView:
                               command=self.app.save_a_inplace).pack(side="right")
 
         # Base pane spacer: maintain same bottom reserved height as A/B panes.
-        save_mid_row = ttk.Frame(mid_wrap, height=save_row_height)
+        save_mid_row = ttk.Frame(mid_footer, height=save_row_height)
         save_mid_row.pack(fill="x", pady=(2, 0))
         save_mid_row.pack_propagate(False)
 
@@ -2710,7 +3741,7 @@ class SheetView:
         self.hdiff_right.pack(fill="x")
 
         # Save B button (bottom-right of B pane)
-        save_b_row = ttk.Frame(right_wrap, height=save_row_height)
+        save_b_row = ttk.Frame(right_footer, height=save_row_height)
         save_b_row.pack(fill="x", pady=(2, 0))
         save_b_row.pack_propagate(False)
         if not getattr(self.app, "merge_mode", False):
@@ -2728,6 +3759,9 @@ class SheetView:
         self.left.tag_configure("diffcell", background=_DIFF_CELL_BG)
         self.base.tag_configure("diffcell", background=_DIFF_CELL_BG)
         self.right.tag_configure("diffcell", background=_DIFF_CELL_BG)
+        self.left.tag_raise("diffcell")
+        self.base.tag_raise("diffcell")
+        self.right.tag_raise("diffcell")
         # Alignment padding: grey slot for rows that exist only on the other side.
         # tag_raise ensures paddingrow background overrides diffrow on the empty slot.
         self.left.tag_configure("paddingrow", background="#A0A0A0")
@@ -2736,6 +3770,11 @@ class SheetView:
         self.left.tag_raise("paddingrow")
         self.base.tag_raise("paddingrow")
         self.right.tag_raise("paddingrow")
+        # paddingcol: grey span for columns that exist only on the other side (新增列).
+        self.left.tag_configure("paddingcol", background="#A0A0A0")
+        self.right.tag_configure("paddingcol", background="#A0A0A0")
+        self.left.tag_raise("paddingcol")
+        self.right.tag_raise("paddingcol")
 
         # selection should not overwrite diff colors
         self.left.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
@@ -2773,6 +3812,9 @@ class SheetView:
         self.left.bind("<Button-1>", lambda e, d=left_click_dir: self._on_click_with_arrow(self.left, e, d))
         self.base.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.base, e, "BASE2A"))
         self.right.bind("<Button-1>", lambda e: self._on_click_with_arrow(self.right, e, "B2A"))
+        self.left.bind("<Button-3>", lambda e: self._on_main_pane_right_click(self.left, e, "A"))
+        self.base.bind("<Button-3>", lambda e: self._on_main_pane_right_click(self.base, e, "BASE"))
+        self.right.bind("<Button-3>", lambda e: self._on_main_pane_right_click(self.right, e, "B"))
         self.left.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.left, e, "A"))
         self.base.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.base, e, "BASE"))
         self.right.bind("<Motion>", lambda e: self._on_cell_hover_tooltip(self.right, e, "B"))
@@ -2798,7 +3840,7 @@ class SheetView:
         self.right_ln.bind("<Leave>", lambda e: self._clear_row_header_hover(self.right_ln))
 
         # C区: compact cursor compare block + cell-aligned view
-        self.c_area = ttk.Notebook(self.frame)
+        self.c_area = ttk.Notebook(self.lower_area)
         self.c_area.pack(fill="x", padx=8, pady=(0, 4))
 
         # ---- C1: compact row compare (2 lines in 2-way, 3 lines in 3-way) ----
@@ -2857,6 +3899,7 @@ class SheetView:
         self.cursor_hsb.pack(side="top", fill="x")
         self.cursor_cmp.bind("<Button-1>", self._on_cursor_cmp_click)
         self.cursor_cmp.bind("<Double-Button-1>", self._on_cursor_cmp_double_click)
+        self.cursor_cmp.bind("<Button-3>", self._on_cursor_cmp_right_click)
         self.cursor_cmp.bind("<Motion>", self._on_cursor_cmp_hover_tooltip)
         self.cursor_cmp.bind("<Leave>", lambda e: self._on_hover_compare_leave())
 
@@ -2898,8 +3941,19 @@ class SheetView:
         self._hover_clear_after_id = None
         self._last_hover_compare_key = None
         self._hover_payload_cache = {}
-        hover_cmp_frame = ttk.LabelFrame(self.frame, text="悬停完整对比")
-        hover_cmp_frame.pack(fill="x", padx=8, pady=(0, 4))
+        # Hover throttle: dedup identical targets and debounce heavy panel refresh.
+        self._last_hover_target_key = None
+        self._hover_debounce_id = None
+        self._pending_hover_args = None
+        self._hover_debounce_ms = 30
+        self.hover_cmp_host = ttk.Frame(self.lower_area, height=self._hover_compare_reserved_height())
+        self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 4))
+        try:
+            self.hover_cmp_host.pack_propagate(False)
+        except Exception:
+            pass
+        hover_cmp_frame = ttk.LabelFrame(self.hover_cmp_host, text="悬停完整对比")
+        hover_cmp_frame.pack(fill="both", expand=True)
         self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比：-")
         self.hover_cmp_pin_var = tk.IntVar(value=0)
         hover_hdr = ttk.Frame(hover_cmp_frame)
@@ -2916,7 +3970,7 @@ class SheetView:
         ).pack(side="right")
         self.hover_cmp_text = tk.Text(
             hover_cmp_frame,
-            height=3 if self._is_three_way_enabled() else 2,
+            height=4 if self._is_three_way_enabled() else 2,
             wrap="none",
             font=self.editor_font,
             bd=1,
@@ -2926,6 +3980,8 @@ class SheetView:
         self.hover_cmp_text.tag_configure("hover_side_base", background=_BASE_BG)
         self.hover_cmp_text.tag_configure("hover_side_mine", background=_MINE_BG)
         self.hover_cmp_text.tag_configure("hover_side_theirs", background=_THEIRS_BG)
+        # Missing row (新增行对侧无数据): muted gray, no red highlights.
+        self.hover_cmp_text.tag_configure("hover_side_missing", background="#C8C8C8", foreground="#666666")
         # Char-level diff highlight inside each source line.
         self.hover_cmp_text.tag_configure("hover_diffchar", background=_DIFF_CELL_BG, foreground="#ffffff")
         self.hover_cmp_hsb = ttk.Scrollbar(hover_cmp_frame, orient="horizontal", command=self.hover_cmp_text.xview)
@@ -2956,6 +4012,29 @@ class SheetView:
         except Exception:
             return False
 
+    def _hover_compare_reserved_height(self, enabled: bool | None = None) -> int:
+        enabled = self._is_three_way_enabled() if enabled is None else bool(enabled)
+        line_count = 4 if enabled else 2
+        line_px = 18
+        try:
+            from tkinter import font as tkfont
+            line_px = max(16, int(tkfont.Font(font=self.editor_font).metrics("linespace")))
+        except Exception:
+            pass
+        # Reserve enough vertical room for the header row, text chrome and x-scrollbar.
+        baseline = 160 if enabled else 118
+        return max(baseline, int(line_px * line_count + 88))
+
+    def _sync_hover_compare_reserved_height(self, enabled: bool | None = None):
+        enabled = self._is_three_way_enabled() if enabled is None else bool(enabled)
+        host = getattr(self, "hover_cmp_host", None)
+        if host is None:
+            return
+        try:
+            host.configure(height=self._hover_compare_reserved_height(enabled))
+        except Exception:
+            pass
+
     @staticmethod
     def _source_display_name(path_like: str) -> str:
         """Prefer stable workbook names and keep SVN revision hints when available."""
@@ -2969,7 +4048,7 @@ class SheetView:
             return f"{os.path.basename(m.group(1))}@BASE"
 
         bn = os.path.basename(s)
-        ext_pat = r"(?:xlsx|xlsm|csv)"
+        ext_pat = r"(?:xlsx|xlsm)"
 
         # Exported revision snapshots created by this tool.
         m = re.match(rf"{re.escape(APP_NAME)}_svncat_r(\d+)_\d{{8}}_\d{{6}}_(.+?\.{ext_pat})$", bn, re.IGNORECASE)
@@ -2994,6 +4073,107 @@ class SheetView:
         if m and ".merge-" not in m.group(1).lower():
             return m.group(1)
         return bn
+
+    def _sheet_meta(self) -> dict[str, object]:
+        return self.app.get_sheet_meta(self.sheet)
+
+    def _is_missing_sheet_view(self) -> bool:
+        return str(self._sheet_meta().get("view_mode") or "") == "missing_sheet"
+
+    def _side_has_sheet(self, side: str) -> bool:
+        meta = self._sheet_meta()
+        side = str(side or "").upper()
+        if side == "A":
+            return bool(meta.get("has_a"))
+        if side in ("B", "THEIRS"):
+            return bool(meta.get("has_b"))
+        if side == "BASE":
+            return bool(meta.get("has_base"))
+        return False
+
+    def _display_ws(self, side: str, edit: bool = False):
+        side = str(side or "").upper()
+        ws = self.app.ws_for_side(side, self.sheet, edit=edit, allow_missing=True)
+        if ws is not None:
+            return ws
+        key = (side, bool(edit))
+        cache = getattr(self, "_blank_ws_cache", None)
+        if cache is None:
+            self._blank_ws_cache = {}
+            cache = self._blank_ws_cache
+        if key not in cache:
+            cache[key] = _blank_worksheet(self.sheet)
+        return cache[key][1]
+
+    def _base_row_for_pair(self, pair_idx: int, pair: tuple[int | None, int | None] | None = None) -> int | None:
+        if not self._is_three_way_enabled():
+            return None
+        if not getattr(self.app, "has_base", False):
+            return None
+        overrides = getattr(self, "pair_base_row_override", {}) or {}
+        if pair_idx in overrides:
+            return overrides.get(pair_idx)
+        if pair is None:
+            if not (0 <= pair_idx < len(self.row_pairs)):
+                return None
+            pair = self.row_pairs[pair_idx]
+        ra, rb = pair
+        if self._is_missing_sheet_view():
+            rows = getattr(self, "_missing_base_row_map", {}) or {}
+            return rows.get(pair_idx)
+        mine_map = getattr(self, "mine_to_base_row", {}) or {}
+        theirs_map = getattr(self, "theirs_to_base_row", {}) or {}
+        if ra is not None and ra in mine_map:
+            return mine_map.get(ra)
+        if rb is not None and rb in theirs_map:
+            return theirs_map.get(rb)
+        return None
+
+    def _update_sheet_role_labels(self):
+        enabled = self._is_three_way_enabled()
+        meta = self._sheet_meta()
+        try:
+            if enabled:
+                mine_src = getattr(self.app, "raw_mine", None) or self.app.file_a
+                base_src = getattr(self.app, "raw_base", None) or getattr(self.app, "base_path", "")
+                theirs_src = getattr(self.app, "raw_theirs", None) or self.app.file_b
+                mine_text = f"mine={self._source_display_name(mine_src)}" if meta.get("has_a") else "mine=空白(该侧无此Sheet)"
+                base_text = f"base={self._source_display_name(base_src)}" if (base_src and meta.get("has_base")) else "base=空白(该侧无此Sheet)"
+                theirs_text = f"theirs={self._source_display_name(theirs_src)}" if meta.get("has_b") else "theirs=空白(该侧无此Sheet)"
+                self.path_label_a.configure(text=mine_text, bg=_MINE_BG)
+                self.path_label_base.configure(text=base_text, bg=_BASE_BG)
+                self.path_label_b.configure(text=theirs_text, bg=_THEIRS_BG)
+            else:
+                base_src = getattr(self.app, "raw_base", None) or self.app.file_a
+                mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
+                left_text = f"base={self._source_display_name(base_src)}" if meta.get("has_a") else "base=空白(该侧无此Sheet)"
+                right_text = f"mine={self._source_display_name(mine_src)}" if meta.get("has_b") else "mine=空白(该侧无此Sheet)"
+                self.path_label_a.configure(text=left_text, bg=_BASE_BG)
+                self.path_label_b.configure(text=right_text, bg=_MINE_BG)
+        except Exception:
+            pass
+        try:
+            if self._is_missing_sheet_view():
+                if enabled:
+                    left_state = "normal" if (meta.get("has_base") or meta.get("has_a")) else "disabled"
+                else:
+                    left_state = "normal" if meta.get("has_a") else "disabled"
+                right_state = "normal" if meta.get("has_b") else "disabled"
+                mine_state = "normal" if meta.get("has_a") else "disabled"
+            else:
+                left_state = "normal"
+                right_state = "normal"
+                mine_state = "normal"
+            self.use_left_btn.configure(state=left_state)
+            self.use_right_btn.configure(state=right_state)
+            if self.use_base_btn is not None:
+                self.use_base_btn.configure(state=mine_state)
+        except Exception:
+            pass
+        try:
+            self._refresh_copy_scope_buttons()
+        except Exception:
+            pass
 
     def _toggle_three_way_view(self, init_only: bool = False):
         enabled = self._is_three_way_enabled()
@@ -3021,12 +4201,6 @@ class SheetView:
                 self.left_title.configure(text="Mine", background=_MINE_BG)
                 self.mid_title.configure(text="Base", background=_BASE_BG)
                 self.right_title.configure(text="Theirs", background=_THEIRS_BG)
-                mine_src = getattr(self.app, "raw_mine", None) or self.app.file_a
-                base_src = getattr(self.app, "raw_base", None) or getattr(self.app, "base_path", "")
-                theirs_src = getattr(self.app, "raw_theirs", None) or self.app.file_b
-                self.path_label_a.configure(text=f"mine={self._source_display_name(mine_src)}", bg=_MINE_BG)
-                self.path_label_base.configure(text=f"base={self._source_display_name(base_src)}" if base_src else "base=-", bg=_BASE_BG)
-                self.path_label_b.configure(text=f"theirs={self._source_display_name(theirs_src)}", bg=_THEIRS_BG)
             else:
                 self.path_label_base.grid_remove()
                 # Restore 2-way labels to left/right columns
@@ -3035,12 +4209,7 @@ class SheetView:
                 self.left_title.configure(text="Base", background=_BASE_BG)
                 self.right_title.configure(text="Mine", background=_MINE_BG)
                 self.mid_title.configure(text="Base", background=_BASE_BG)
-                base_src = getattr(self.app, "raw_base", None) or self.app.file_a
-                mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
-                base_disp = _one_line_text(str(base_src or "")) or "-"
-                mine_disp = _one_line_text(str(mine_src or "")) or "-"
-                self.path_label_a.configure(text=f"base={base_disp}", bg=_BASE_BG)
-                self.path_label_b.configure(text=f"mine={mine_disp}", bg=_MINE_BG)
+            self._update_sheet_role_labels()
         except Exception:
             pass
         try:
@@ -3053,11 +4222,18 @@ class SheetView:
             pass
         try:
             if hasattr(self, "hover_cmp_text"):
-                self.hover_cmp_text.configure(height=3 if enabled else 2)
+                # 3-way hover panel needs one extra visible line to fully show
+                # BASE / mine / theirs together after accounting for widget chrome.
+                self.hover_cmp_text.configure(height=4 if enabled else 2)
+        except Exception:
+            pass
+        try:
+            self._sync_hover_compare_reserved_height(enabled)
         except Exception:
             pass
         if not init_only:
             try:
+                self._invalidate_only_diff_snapshot_cache()
                 self.refresh(row_only=None, rescan=False)
                 self._update_cursor_lines()
             except Exception:
@@ -3298,7 +4474,7 @@ class SheetView:
         finally:
             self._xsyncing = False
         try:
-            self._update_diff_maps()
+            self._schedule_diff_maps()
         except Exception:
             pass
 
@@ -3327,7 +4503,7 @@ class SheetView:
         finally:
             self._xsyncing = False
         try:
-            self._update_diff_maps()
+            self._schedule_diff_maps()
         except Exception:
             pass
 
@@ -3370,7 +4546,7 @@ class SheetView:
             except Exception:
                 pass
         try:
-            self._update_diff_maps()
+            self._schedule_diff_maps()
         except Exception:
             pass
 
@@ -3459,9 +4635,46 @@ class SheetView:
         try:
             h = max(1, self.vdiff_map.winfo_height())
             frac = min(1.0, max(0.0, float(event.y) / float(h)))
+            total_pairs = len(self.row_pairs) if getattr(self, "row_pairs", None) else 0
+            if total_pairs > 0 and self.display_rows:
+                target_pair = min(total_pairs - 1, max(0, int(frac * total_pairs)))
+                pos = bisect.bisect_left(self.display_rows, target_pair)
+                if pos >= len(self.display_rows):
+                    pos = len(self.display_rows) - 1
+                elif pos > 0:
+                    prev_pair = self.display_rows[pos - 1]
+                    next_pair = self.display_rows[pos]
+                    if abs(prev_pair - target_pair) <= abs(next_pair - target_pair):
+                        pos -= 1
+                if pos >= 0:
+                    target_frac = float(pos) / float(max(1, len(self.display_rows)))
+                    self._yview_both("moveto", target_frac)
+                    return
             self._yview_both("moveto", frac)
         except Exception:
             pass
+
+    def _visible_pair_span(self):
+        if not self.display_rows:
+            return None
+        top_line = 1
+        bottom_line = len(self.display_rows)
+        try:
+            top_line = int(str(self.left.index("@0,0")).split(".")[0])
+        except Exception:
+            top_line = 1
+        try:
+            bottom_y = max(0, int(self.left.winfo_height()) - 1)
+            bottom_line = int(str(self.left.index(f"@0,{bottom_y}")).split(".")[0])
+        except Exception:
+            bottom_line = len(self.display_rows)
+        top_line = max(1, min(top_line, len(self.display_rows)))
+        bottom_line = max(top_line, min(bottom_line, len(self.display_rows)))
+        start_pair = self.display_rows[top_line - 1]
+        end_pair = self.display_rows[bottom_line - 1]
+        if end_pair < start_pair:
+            start_pair, end_pair = end_pair, start_pair
+        return start_pair, min(len(self.row_pairs), end_pair + 1)
 
     def _on_hdiff_map_click(self, event, pane: str):
         try:
@@ -3473,16 +4686,45 @@ class SheetView:
         except Exception:
             pass
 
-    def _update_diff_maps(self):
-        # Vertical diff map (by display row index)
+    def _compute_diff_map_data(self):
+        """Return (total_pairs, diff_rows, diff_cols) cached by data version.
+
+        The expensive O(N) scan over all pairs (``_pair_has_visual_diff``) only
+        runs when the underlying data changed (``_data_version`` bump), so plain
+        scrolling no longer pays for it on every frame.
+        """
+        ver = self._data_version
+        cached = getattr(self, "_diff_map_cache", None)
+        if cached is not None and getattr(self, "_diff_map_cache_version", None) == ver:
+            return cached
+        total_pairs = len(self.row_pairs) if getattr(self, "row_pairs", None) else 0
+        diff_rows = sorted(
+            int(pidx)
+            for pidx in range(total_pairs)
+            if self._pair_has_visual_diff(pidx)
+        )
+        diff_cols = set()
+        for cols in (self.pair_diff_cols or {}).values():
+            if cols:
+                diff_cols.update(c for c in cols if c > 0)
+        data = (total_pairs, diff_rows, sorted(diff_cols))
+        self._diff_map_cache = data
+        self._diff_map_cache_version = ver
+        return data
+
+    def _redraw_diff_markers(self):
+        """Redraw the data-dependent diff markers (tagged ``dmark``)."""
         try:
-            self.vdiff_map.delete("all")
+            total_pairs, diff_rows, diff_cols = self._compute_diff_map_data()
+        except Exception:
+            return
+        # Vertical diff map (by logical pair index across the full sheet)
+        try:
+            self.vdiff_map.delete("dmark")
             h = max(1, self.vdiff_map.winfo_height())
             w = max(1, self.vdiff_map.winfo_width())
-            rows = self._full_display_rows if self._full_display_rows else self.display_rows
-            n = max(1, len(rows))
-            diff_mask = [bool(self.pair_diff_cols.get(pidx)) for pidx in rows]
-            diff_count = sum(1 for v in diff_mask if v)
+            n = max(1, total_pairs)
+            diff_count = len(diff_rows)
             # Dynamic marker height:
             # - fewer diffs -> thicker marker for visibility
             # - many diffs -> thinner marker to reduce overlap
@@ -3490,41 +4732,30 @@ class SheetView:
 
             # Draw contiguous diff blocks as filled segments for better discoverability.
             i = 0
-            while i < n:
-                if not diff_mask[i]:
+            while i < diff_count:
+                start_pair = diff_rows[i]
+                end_pair = start_pair
+                while i + 1 < diff_count and diff_rows[i + 1] == end_pair + 1:
                     i += 1
-                    continue
-                j = i
-                while j + 1 < n and diff_mask[j + 1]:
-                    j += 1
-                y1 = int((i / n) * h)
-                y2 = int(((j + 1) / n) * h)
+                    end_pair = diff_rows[i]
+                y1 = int((start_pair / n) * h)
+                y2 = int(((end_pair + 1) / n) * h)
                 if y2 - y1 < marker_min_h:
                     y2 = min(h, y1 + marker_min_h)
-                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="", fill="#ff2d2d")
-                i = j + 1
-            try:
-                first, last = self.left.yview()
-                y1 = int(first * h)
-                y2 = max(y1 + 2, int(last * h))
-                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="#1e78ff")
-            except Exception:
-                pass
+                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="", fill="#ff2d2d", tags="dmark")
+                i += 1
+            self.vdiff_map.tag_raise("vpbox")
         except Exception:
             pass
 
         # Horizontal diff maps (under each pane scrollbar; by diff columns)
         try:
-            diff_cols = set()
-            for cols in (self.pair_diff_cols or {}).values():
-                if cols:
-                    diff_cols.update(cols)
             max_col = max(1, int(self.max_col or 1))
             canvases = [self.hdiff_left, self.hdiff_right]
             if self._is_three_way_enabled():
                 canvases.insert(1, self.hdiff_mid)
             for canvas in canvases:
-                canvas.delete("all")
+                canvas.delete("dmark")
                 cw = max(1, canvas.winfo_width())
                 ch = max(1, canvas.winfo_height())
                 if diff_cols:
@@ -3540,21 +4771,86 @@ class SheetView:
                             x2 = int((seg_end / max_col) * cw)
                             if x2 - x1 < marker_min_w:
                                 x2 = min(cw, x1 + marker_min_w)
-                            canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00")
+                            canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00", tags="dmark")
                             seg_start = c
                             seg_end = c
                     x1 = int(((seg_start - 1) / max_col) * cw)
                     x2 = int((seg_end / max_col) * cw)
                     if x2 - x1 < marker_min_w:
                         x2 = min(cw, x1 + marker_min_w)
-                    canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00")
-                try:
-                    lf, ll = self.left.xview()
-                    canvas.create_rectangle(int(lf * cw), 0, max(int(ll * cw), int(lf * cw) + 2), ch, outline="#1e78ff")
-                except Exception:
-                    pass
+                    canvas.create_rectangle(x1, 0, x2, ch, outline="", fill="#c46a00", tags="dmark")
+                canvas.tag_raise("vpbox")
         except Exception:
             pass
+
+    def _redraw_diff_viewport(self):
+        """Redraw only the viewport indicator boxes (tagged ``vpbox``, O(1))."""
+        # Vertical viewport box
+        try:
+            total_pairs = len(self.row_pairs) if getattr(self, "row_pairs", None) else 0
+            n = max(1, total_pairs)
+            self.vdiff_map.delete("vpbox")
+            h = max(1, self.vdiff_map.winfo_height())
+            w = max(1, self.vdiff_map.winfo_width())
+            span = self._visible_pair_span()
+            if span is not None:
+                start_pair, end_pair = span
+                y1 = int((start_pair / n) * h)
+                y2 = max(y1 + 2, int((end_pair / n) * h))
+                self.vdiff_map.create_rectangle(0, y1, w, y2, outline="#1e78ff", tags="vpbox")
+        except Exception:
+            pass
+
+        # Horizontal viewport boxes
+        try:
+            canvases = [self.hdiff_left, self.hdiff_right]
+            if self._is_three_way_enabled():
+                canvases.insert(1, self.hdiff_mid)
+            lf, ll = self.left.xview()
+            for canvas in canvases:
+                canvas.delete("vpbox")
+                cw = max(1, canvas.winfo_width())
+                ch = max(1, canvas.winfo_height())
+                canvas.create_rectangle(int(lf * cw), 0, max(int(ll * cw), int(lf * cw) + 2), ch, outline="#1e78ff", tags="vpbox")
+        except Exception:
+            pass
+
+    def _update_diff_maps(self):
+        """Full diff-map redraw (markers + viewport). For data-change callers."""
+        self._redraw_diff_markers()
+        self._redraw_diff_viewport()
+
+    def _run_diff_markers_debounced(self):
+        self._diff_map_debounce_id = None
+        try:
+            if not self.frame.winfo_exists():
+                return
+        except Exception:
+            return
+        self._redraw_diff_markers()
+
+    def _schedule_diff_maps(self):
+        """Scroll-driven diff-map update.
+
+        Redraws the cheap viewport box immediately for responsive feedback and
+        debounces the (cached) marker redraw to coalesce rapid scroll frames.
+        """
+        self._redraw_diff_viewport()
+        aid = getattr(self, "_diff_map_debounce_id", None)
+        if aid is not None:
+            try:
+                self.frame.after_cancel(aid)
+            except Exception:
+                pass
+        delay = int(getattr(self, "_diff_map_debounce_ms", 40) or 0)
+        if delay <= 0:
+            self._redraw_diff_markers()
+            return
+        try:
+            self._diff_map_debounce_id = self.frame.after(delay, self._run_diff_markers_debounced)
+        except Exception:
+            self._diff_map_debounce_id = None
+            self._redraw_diff_markers()
 
     # ---------- Selection + toolbar buttons ----------
     def _widget_line(self, w: tk.Text):
@@ -3608,6 +4904,199 @@ class SheetView:
         self._main_sel_line = ln
         self._main_sel_col = cc
 
+    def has_explicit_cell_selection(self) -> bool:
+        try:
+            if self._main_sel_line is not None and self._main_sel_col is not None:
+                return True
+            if self._cursor_cmp_sel_line is not None and self._cursor_cmp_sel_col is not None:
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _clear_selected_line_highlight(self):
+        prev = self._last_selected_line
+        if prev is None:
+            return
+        try:
+            for t in (self.left, self.base, self.right):
+                t.tag_remove("selrow", f"{prev}.0", f"{prev}.end")
+        except Exception:
+            pass
+        self._last_selected_line = None
+
+    def clear_explicit_cell_selection(self):
+        self._set_main_selected_cell(None, None)
+        self._cursor_cmp_sel_col = None
+        self._cursor_cmp_sel_line = None
+        self.selected_pair_idx = None
+        self.selected_excel_row = None
+        self.selected_excel_row_a = None
+        self.selected_excel_row_b = None
+        self._clear_selected_line_highlight()
+
+    def _clear_selection_visuals(self):
+        try:
+            for t in (self.left, self.base, self.right):
+                t.tag_remove("selrow", "1.0", "end")
+                t.tag_remove("selcell", "1.0", "end")
+        except Exception:
+            pass
+        try:
+            self.cursor_cmp.tag_remove("cselcell", "1.0", "end")
+        except Exception:
+            pass
+        self._last_selected_line = None
+        self._applied_main_sel_line = None
+        self._applied_main_sel_col = None
+
+    def _snapshot_explicit_selection_state(self):
+        if not self.has_explicit_cell_selection():
+            return None
+        return {
+            "pair_idx": self.selected_pair_idx,
+            "row_a": self.selected_excel_row_a,
+            "row_b": self.selected_excel_row_b,
+            "main_col": self._main_sel_col,
+            "cursor_cmp_sel_line": self._cursor_cmp_sel_line,
+            "cursor_cmp_sel_col": self._cursor_cmp_sel_col,
+        }
+
+    def _pair_idx_from_selection_snapshot(self, snapshot) -> int | None:
+        if not snapshot:
+            return None
+        try:
+            row_a = snapshot.get("row_a")
+            if row_a is not None:
+                pair_idx = self.row_a_to_pair_idx.get(int(row_a))
+                pair_idx = self._normalize_pair_idx(pair_idx)
+                if pair_idx is not None:
+                    return pair_idx
+        except Exception:
+            pass
+        try:
+            row_b = snapshot.get("row_b")
+            if row_b is not None:
+                pair_idx = self.row_b_to_pair_idx.get(int(row_b))
+                pair_idx = self._normalize_pair_idx(pair_idx)
+                if pair_idx is not None:
+                    return pair_idx
+        except Exception:
+            pass
+        return self._normalize_pair_idx(snapshot.get("pair_idx"))
+
+    def _restore_explicit_selection_state(self, snapshot) -> bool:
+        pair_idx = self._pair_idx_from_selection_snapshot(snapshot)
+        if pair_idx is None or pair_idx not in self.row_to_line:
+            return False
+        try:
+            line = int(self.row_to_line[pair_idx])
+        except Exception:
+            return False
+        try:
+            self._highlight_selected_line(line)
+            self.selected_pair_idx = int(pair_idx)
+            pair = self._pair_for_line(line)
+            self.selected_excel_row_a = self._row_for_side(pair, "A")
+            self.selected_excel_row_b = self._row_for_side(pair, "B")
+            self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
+            main_col = snapshot.get("main_col")
+            self._set_main_selected_cell(line, main_col)
+            cursor_col = snapshot.get("cursor_cmp_sel_col")
+            cursor_line = snapshot.get("cursor_cmp_sel_line")
+            self._cursor_cmp_sel_col = int(cursor_col) if cursor_col is not None else None
+            self._cursor_cmp_sel_line = int(cursor_line) if cursor_line is not None else None
+            self._last_cursor_cmp_pair_idx = int(pair_idx)
+            return True
+        except Exception:
+            return False
+
+    def _clear_hover_state(self, *, clear_panel: bool = False):
+        self.hover_pair_idx = None
+        self.hover_col_idx = None
+        self.hover_side = None
+        self._last_cursor_cmp_pair_idx = None
+        self._hide_hover_popup()
+        if clear_panel and (not self._hover_compare_is_pinned()):
+            self._clear_hover_compare_panel()
+        self._cell_tip_key = None
+
+    def _normalize_pair_idx(self, pair_idx) -> int | None:
+        try:
+            if pair_idx is None:
+                return None
+            pair_idx = int(pair_idx)
+            if pair_idx < 0 or pair_idx >= len(self.row_pairs):
+                return None
+            return pair_idx
+        except Exception:
+            return None
+
+    def resolved_pair_idx_for_c_area(self) -> int | None:
+        candidates = []
+        if self.has_explicit_cell_selection():
+            candidates.append(self.selected_pair_idx)
+        candidates.append(self.hover_pair_idx)
+        candidates.append(self.selected_pair_idx)
+        candidates.append(getattr(self, "_last_cursor_cmp_pair_idx", None))
+        try:
+            line_guess = int(str(self.left.index("insert")).split(".")[0])
+        except Exception:
+            line_guess = None
+        if line_guess is not None:
+            candidates.append(self._pair_idx_for_line(line_guess))
+        for pair_idx in candidates:
+            norm = self._normalize_pair_idx(pair_idx)
+            if norm is not None:
+                return norm
+        return None
+
+    def update_hover_driven_panels(
+        self,
+        pair_idx: int | None,
+        col_idx: int | None,
+        side: str,
+        *,
+        force_panel: bool = True,
+        popup_force_show: bool = False,
+        x_root: int | None = None,
+        y_root: int | None = None,
+        refresh_c_area: bool = True,
+    ):
+        pair_idx = self._normalize_pair_idx(pair_idx)
+        try:
+            col_idx = int(col_idx) if col_idx is not None else None
+        except Exception:
+            col_idx = None
+        self.hover_pair_idx = pair_idx
+        self.hover_col_idx = col_idx
+        self.hover_side = str(side or "").upper() if side is not None else None
+
+        if pair_idx is None or col_idx is None or col_idx <= 0:
+            self._hide_cell_tooltip(clear_panel=False)
+            if refresh_c_area and not self.has_explicit_cell_selection():
+                self._update_cursor_lines()
+            return
+
+        if refresh_c_area and not self.has_explicit_cell_selection():
+            self._update_cursor_lines()
+
+        panel_payload = self._cmp_tooltip_payload_by_pair_col(
+            pair_idx,
+            col_idx,
+            force_show=bool(popup_force_show),
+            force_panel=bool(force_panel),
+        )
+        if panel_payload:
+            panel_text, panel_key = panel_payload
+            self._set_hover_compare_panel(panel_text, panel_key)
+        popup_payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, col_idx, force_show=bool(popup_force_show))
+        if popup_payload and x_root is not None and y_root is not None:
+            tip_text, key = popup_payload
+            self._show_cell_tooltip(tip_text, int(x_root), int(y_root), key)
+        else:
+            self._hide_cell_tooltip(clear_panel=False)
+
     def _apply_main_selected_cell_highlight(self):
         # Remove previously applied selcell highlight in O(1).
         prev_line = self._applied_main_sel_line
@@ -3636,10 +5125,11 @@ class SheetView:
             if col not in spans:
                 return
             s, e = spans[col]
+            pair_idx = self.display_rows[int(line) - 1]
             pair = self._pair_for_line(int(line))
             ra = self._row_for_side(pair, "A")
             rb = self._row_for_side(pair, "B")
-            base_r = self._row_for_side(pair, "BASE") if self._is_three_way_enabled() else None
+            base_r = self._base_row_for_pair(pair_idx, pair) if self._is_three_way_enabled() else None
             if ra is not None:
                 self.left.tag_add("selcell", f"{line}.{s}", f"{line}.{e}")
             if self._is_three_way_enabled() and base_r is not None:
@@ -3719,6 +5209,9 @@ class SheetView:
         self._highlight_selected_line(line)
         pair = self._pair_for_line(line)
         self.selected_pair_idx = self._pair_idx_for_line(line)
+        self.hover_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+        self.hover_col_idx = int(hit_col) if hit_col is not None else None
+        self.hover_side = self._side_for_widget(w)
         self.selected_excel_row_a = self._row_for_side(pair, "A")
         self.selected_excel_row_b = self._row_for_side(pair, "B")
         self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
@@ -3744,6 +5237,9 @@ class SheetView:
         self._highlight_selected_line(line)
         pair = self._pair_for_line(line)
         self.selected_pair_idx = self._pair_idx_for_line(line)
+        self.hover_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+        self.hover_col_idx = None
+        self.hover_side = None
         self.selected_excel_row_a = self._row_for_side(pair, "A")
         self.selected_excel_row_b = self._row_for_side(pair, "B")
         self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
@@ -3805,7 +5301,7 @@ class SheetView:
         pair_idx = self._pair_idx_for_line(line)
         if pair_idx is None:
             return
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         side = self._row_header_side(w)
         txt = self._row_label_for_pair_idx(pair_idx, side).rjust(rn_w)
         self._set_row_header_text(w, line, txt)
@@ -3855,7 +5351,7 @@ class SheetView:
         if hover_line == line:
             return
         self._clear_row_header_hover(w)
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         arrow = _ROW_ARROW_RIGHT if direction in ("A2B", "MINE2A", "BASE2A") else _ROW_ARROW_LEFT
         self._set_row_header_text(w, line, arrow.rjust(rn_w))
         try:
@@ -4042,6 +5538,17 @@ class SheetView:
             return "hover_side_theirs" if has_base else "hover_side_mine"
         return "hover_side_base"
 
+    @staticmethod
+    def _side_label_for_hover_line(side: str, has_base: bool) -> str:
+        s = (side or "").upper()
+        if s == "BASE":
+            return "base"
+        if s == "A":
+            return "mine" if has_base else "base"
+        if s == "B":
+            return "theirs" if has_base else "mine"
+        return "base"
+
     def _render_hover_compare_panel(self, text: str, key):
         if not hasattr(self, "hover_cmp_text"):
             return
@@ -4058,16 +5565,24 @@ class SheetView:
             rows = list(payload.get("rows") or [])
             values = ["" if v is None else str(v) for v in (payload.get("values") or ())]
             has_base = any((str(s).upper() == "BASE") for s in sides)
-            masks = self._hover_diff_masks(values)
+            # 新增行对侧（row_no 为 None）用空串参与 diff 计算，
+            # 避免 "<missing>" 字面量被当作内容误比较。
+            diff_inputs = ["" if row_no is None else v for row_no, v in zip(rows, values)]
+            masks = self._hover_diff_masks(diff_inputs)
 
             for i, (side, row_no, val) in enumerate(zip(sides, rows, values), start=1):
                 row_label = "-" if row_no is None else str(row_no)
-                prefix = f"{side}[{row_label}]: "
+                side_label = self._side_label_for_hover_line(side, has_base)
+                prefix = f"{side_label}[{row_label}]: "
                 line_txt = f"{prefix}{val}"
                 if i > 1:
                     w.insert("end", "\n")
                 line_start = f"{i}.0"
                 w.insert("end", line_txt)
+                # 无数据侧（新增行对侧）：整行置灰，不显示字符级红色高亮。
+                if row_no is None:
+                    w.tag_add("hover_side_missing", line_start, f"{i}.end")
+                    continue
                 # Color the whole source line by provenance.
                 side_tag = self._side_tag_for_hover_line(side, has_base)
                 w.tag_add(side_tag, line_start, f"{i}.end")
@@ -4107,10 +5622,65 @@ class SheetView:
                 pass
 
     def _hide_cell_tooltip(self, clear_panel: bool = True):
+        # Reset hover dedup so re-entering the same cell re-triggers a refresh.
+        self._last_hover_target_key = None
         self._hide_hover_popup()
         if clear_panel:
             self._clear_hover_compare_panel()
         self._cell_tip_key = None
+
+    def _schedule_hover_panels(self, pair_idx, target_col, side, *,
+                               popup_force_show=False, x_root=None, y_root=None,
+                               refresh_c_area=True):
+        """Throttle hover-driven panel refreshes.
+
+        - Dedup: skip work entirely when the hovered (pair, col, side) is unchanged.
+        - Debounce: coalesce rapid cross-cell motion into a single refresh.
+        """
+        key = (pair_idx, target_col, str(side), bool(refresh_c_area))
+        # Always remember the freshest request so the debounced call uses latest position.
+        self._pending_hover_args = (
+            pair_idx, target_col, side, bool(popup_force_show),
+            x_root, y_root, bool(refresh_c_area),
+        )
+        if key == getattr(self, "_last_hover_target_key", None):
+            return
+        self._last_hover_target_key = key
+        # Coalesce bursts of Motion events: run the heavy panel refresh once when
+        # the event loop next goes idle, instead of on every pixel of movement.
+        aid = getattr(self, "_hover_debounce_id", None)
+        if aid is not None:
+            try:
+                self.frame.after_cancel(aid)
+            except Exception:
+                pass
+        try:
+            self._hover_debounce_id = self.frame.after_idle(self._run_pending_hover_panels)
+        except Exception:
+            self._hover_debounce_id = None
+            self._run_pending_hover_panels()
+
+    def _run_pending_hover_panels(self):
+        self._hover_debounce_id = None
+        args = getattr(self, "_pending_hover_args", None)
+        if not args:
+            return
+        try:
+            if not self.frame.winfo_exists():
+                return
+        except Exception:
+            return
+        pair_idx, target_col, side, popup_force_show, x_root, y_root, refresh_c_area = args
+        self.update_hover_driven_panels(
+            pair_idx,
+            target_col,
+            side,
+            force_panel=True,
+            popup_force_show=popup_force_show,
+            x_root=x_root,
+            y_root=y_root,
+            refresh_c_area=refresh_c_area,
+        )
 
     def _show_cell_tooltip(self, text: str, x_root: int, y_root: int, key):
         if not text:
@@ -4166,7 +5736,13 @@ class SheetView:
             except Exception:
                 self._hide_cell_tooltip(clear_panel=False)
 
-    def _cmp_tooltip_payload_by_pair_col(self, pair_idx: int, target_col: int, force_show: bool = False):
+    def _cmp_tooltip_payload_by_pair_col(
+        self,
+        pair_idx: int,
+        target_col: int,
+        force_show: bool = False,
+        force_panel: bool = False,
+    ):
         try:
             if pair_idx is None or int(pair_idx) < 0 or int(pair_idx) >= len(self.row_pairs):
                 return None
@@ -4179,7 +5755,12 @@ class SheetView:
         pair = self.row_pairs[int(pair_idx)]
         is_three = self._is_three_way_enabled()
         sides = ["BASE", "A", "B"] if is_three else ["A", "B"]
-        rows = [self._row_for_side(pair, side) for side in sides]
+        rows = []
+        for side in sides:
+            if side == "BASE" and is_three:
+                rows.append(self._base_row_for_pair(int(pair_idx), pair))
+            else:
+                rows.append(self._row_for_side(pair, side))
         ws_edit_cache = {}
 
         values = []
@@ -4227,14 +5808,16 @@ class SheetView:
                 return None
 
         width = max(1, int(self.col_char_widths.get(target_col, 1)))
-        need_tip = bool(force_show) or any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
-        if not need_tip:
+        # 新增行：只要有一侧 row_no 为 None（该侧无数据），面板必须显示
+        need_tip = bool(force_show) or any(row_no is None for row_no in rows) or any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
+        if not need_tip and not force_panel:
             return None
 
         lines = []
         for side, row_no, v in zip(sides, rows, values):
             row_label = "-" if row_no is None else str(row_no)
-            lines.append(f"{side}[{row_label}]: {v}")
+            side_label = self._side_label_for_hover_line(side, is_three)
+            lines.append(f"{side_label}[{row_label}]: {v}")
         tip_text = "\n".join(lines)
         key = (self.sheet, "CMP", int(pair_idx), target_col, tuple(values))
         try:
@@ -4319,35 +5902,26 @@ class SheetView:
                 pass
         except Exception:
             force_show = False
-        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
-        if not payload:
-            self._hide_cell_tooltip(clear_panel=False)
-            return
-        tip_text, key = payload
-        self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)
+        self._schedule_hover_panels(
+            pair_idx,
+            target_col,
+            side,
+            popup_force_show=force_show,
+            x_root=getattr(event, "x_root", None),
+            y_root=getattr(event, "y_root", None),
+            refresh_c_area=True,
+        )
 
     def _active_pair_idx_for_c_area(self) -> int | None:
-        pair_idx = self.selected_pair_idx
-        if pair_idx is None:
-            try:
-                line_guess = int(self.left.index("insert").split(".")[0])
-                pair_idx = self._pair_idx_for_line(line_guess)
-            except Exception:
-                pair_idx = None
-        try:
-            if pair_idx is None or int(pair_idx) < 0 or int(pair_idx) >= len(self.row_pairs):
-                return None
-            return int(pair_idx)
-        except Exception:
-            return None
+        return self.resolved_pair_idx_for_c_area()
 
-    def _cursor_cmp_tooltip_payload(self, char_no: int):
+    def _cursor_cmp_tooltip_payload(self, char_no: int, force_panel: bool = False):
         target_col, _s, _e = self._hit_col_from_char(char_no)
         if target_col is None:
             return None
 
         pair_idx = self._active_pair_idx_for_c_area()
-        return self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col)
+        return self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_panel=force_panel)
 
     def _on_cursor_cmp_hover_tooltip(self, event):
         try:
@@ -4376,12 +5950,28 @@ class SheetView:
         except Exception:
             force_show = False
         pair_idx = self._active_pair_idx_for_c_area()
-        payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_show=force_show)
-        if not payload:
-            self._hide_cell_tooltip(clear_panel=False)
-            return
-        tip_text, key = payload
-        self._show_cell_tooltip(tip_text, event.x_root, event.y_root, key)
+        self._schedule_hover_panels(
+            pair_idx,
+            target_col,
+            "C",
+            popup_force_show=force_show,
+            x_root=getattr(event, "x_root", None),
+            y_root=getattr(event, "y_root", None),
+            refresh_c_area=False,
+        )
+
+    def _on_main_pane_right_click(self, w: tk.Text, event, side: str):
+        self.clear_explicit_cell_selection()
+        self._update_cursor_lines()
+        self._update_diff_nav_state()
+        self._on_cell_hover_tooltip(w, event, side)
+        return "break"
+
+    def _on_cursor_cmp_right_click(self, event):
+        self.clear_explicit_cell_selection()
+        self._update_cursor_lines()
+        self._update_diff_nav_state()
+        return "break"
 
     def _on_click_with_arrow(self, w: tk.Text, event, direction: str):
         # Keep horizontal position stable on click; Tk default Text binding may call see(insert).
@@ -4549,10 +6139,7 @@ class SheetView:
 
     def _highlight_selected_line(self, line: int):
         # Remove highlight only from the previously selected line (O(1))
-        if self._last_selected_line is not None:
-            prev = self._last_selected_line
-            for t in (self.left, self.base, self.right):
-                t.tag_remove("selrow", f"{prev}.0", f"{prev}.end")
+        self._clear_selected_line_highlight()
         for t in (self.left, self.base, self.right):
             t.tag_add("selrow", f"{line}.0", f"{line}.end")
         self._last_selected_line = line
@@ -4660,7 +6247,13 @@ class SheetView:
             return cols
         if not getattr(self.app, "has_base", False):
             return cols
-        r = row_a if row_a is not None else row_b
+        if self._is_missing_sheet_view():
+            r = row_a if row_a is not None else row_b
+        else:
+            r = None
+            mine_map = getattr(self, "mine_to_base_row", {}) or {}
+            if row_a is not None:
+                r = mine_map.get(row_a)
         if r is None:
             return cols
         try:
@@ -4701,20 +6294,18 @@ class SheetView:
                 except Exception:
                     cell_first = 0.0
 
-            la = int(self.left.index("insert").split(".")[0])
-            lb = int(self.right.index("insert").split(".")[0])
-            lm = int(self.base.index("insert").split(".")[0])
-
-            a_text = self.left.get(f"{la}.0", f"{la}.end") if la >= 1 else ""
-            b_text = self.right.get(f"{lb}.0", f"{lb}.end") if lb >= 1 else ""
-
-            # Determine selected pair (based on line in the view)
-            pair_idx = self._pair_idx_for_line(la)
+            pair_idx = self.resolved_pair_idx_for_c_area()
+            if pair_idx is not None:
+                self._last_cursor_cmp_pair_idx = pair_idx
+            else:
+                pair_idx = self._normalize_pair_idx(getattr(self, "_last_cursor_cmp_pair_idx", None))
             pair = self.row_pairs[pair_idx] if pair_idx is not None and pair_idx < len(self.row_pairs) else None
             ra = self._row_for_side(pair, "A")
             rb = self._row_for_side(pair, "B")
-            diff_cols = self.pair_diff_cols.get(pair_idx, set()) if pair_idx is not None else set()
-            base_text = self.base.get(f"{lm}.0", f"{lm}.end") if lm >= 1 else ""
+            diff_cols = self._visual_diff_cols_for_pair(pair_idx) if pair_idx is not None else set()
+            a_text = self.pair_text_a.get(pair_idx, "") if pair_idx is not None else ""
+            b_text = self.pair_text_b.get(pair_idx, "") if pair_idx is not None else ""
+            base_text = ""
             if self._is_three_way_enabled() and pair_idx is not None:
                 base_text = self._build_base_line(pair_idx)
 
@@ -4738,7 +6329,7 @@ class SheetView:
             self.cursor_cmp.tag_remove("diffcell", "1.0", "end")
             self.cursor_cmp.tag_remove("cselcell", "1.0", "end")
             if is_three:
-                base_r = self._row_for_side(pair, "BASE")
+                base_r = self._base_row_for_pair(pair_idx, pair)
                 if base_r is None:
                     self.cursor_cmp.tag_add("missing", "1.0", "1.end")
                 else:
@@ -4964,6 +6555,7 @@ class SheetView:
             touched_r = ra or rb
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
+            self._invalidate_only_diff_snapshot_cache()
             self._invalidate_render_cache()
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
@@ -4998,13 +6590,7 @@ class SheetView:
             return "break"
 
         # Resolve current pair/line in the main panes.
-        pair_idx = self.selected_pair_idx
-        if pair_idx is None:
-            try:
-                line_guess = int(self.left.index("insert").split(".")[0])
-                pair_idx = self._pair_idx_for_line(line_guess)
-            except Exception:
-                pair_idx = None
+        pair_idx = self.resolved_pair_idx_for_c_area()
 
         target_line = None
         try:
@@ -5013,10 +6599,7 @@ class SheetView:
         except Exception:
             target_line = None
         if target_line is None:
-            try:
-                target_line = int(self.left.index("insert").split(".")[0])
-            except Exception:
-                target_line = 1
+            target_line = 1
         try:
             target_line = max(1, min(int(target_line), max(1, len(self.display_rows))))
         except Exception:
@@ -5039,6 +6622,9 @@ class SheetView:
             self._highlight_selected_line(target_line)
             self.selected_pair_idx = self._pair_idx_for_line(target_line)
             pair = self._pair_for_line(target_line)
+            self.hover_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+            self.hover_col_idx = int(hit_col)
+            self.hover_side = "C"
             self.selected_excel_row_a = self._row_for_side(pair, "A")
             self.selected_excel_row_b = self._row_for_side(pair, "B")
             self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
@@ -5068,33 +6654,28 @@ class SheetView:
         except Exception:
             return
 
-        pair_idx = self.selected_pair_idx
-        if pair_idx is None:
-            try:
-                line = int(self.left.index("insert").split(".")[0])
-                pair_idx = self._pair_idx_for_line(line)
-            except Exception:
-                pair_idx = None
+        pair_idx = self.resolved_pair_idx_for_c_area()
         if pair_idx is None or pair_idx >= len(self.row_pairs):
-            return
-
-        diff_cols = set(self.pair_diff_cols.get(pair_idx, set()))
-        if not diff_cols:
             return
 
         is_three = self._is_three_way_enabled()
         if is_three:
             if line_no == 1:
                 direction = "BASE2A"
+                diff_cols = self._visual_diff_cols_for_pair(pair_idx)
             elif line_no == 3:
                 direction = "B2A"
+                diff_cols = set(self.pair_diff_cols.get(pair_idx, set()))
             else:
                 return
         else:
             if line_no == 2:
                 direction = "B2A"
+                diff_cols = set(self.pair_diff_cols.get(pair_idx, set()))
             else:
                 return
+        if not diff_cols:
+            return
 
         line_text = self.cursor_cmp.get(f"{line_no}.0", f"{line_no}.end")
         spans = self._spans_for_line(line_text)
@@ -5118,6 +6699,18 @@ class SheetView:
         self._refresh_copy_scope_buttons()
 
     def _refresh_copy_scope_buttons(self):
+        if self._is_missing_sheet_view():
+            left_text = "使用左侧Sheet" if self._is_three_way_enabled() else "采用左侧Sheet"
+            right_text = "使用右侧Sheet" if self._is_three_way_enabled() else "采用右侧Sheet"
+            try:
+                self.use_left_btn.configure(text=left_text)
+            except Exception:
+                pass
+            try:
+                self.use_right_btn.configure(text=right_text)
+            except Exception:
+                pass
+            return
         mode = getattr(self, "_copy_scope_mode", "row")
         if mode == "region":
             left_text = "使用左侧区域"
@@ -5135,11 +6728,43 @@ class SheetView:
             pass
 
     def _run_copy_action_by_mode(self, direction: str):
+        if self._is_missing_sheet_view():
+            self._copy_missing_sheet(direction)
+            return
         mode = getattr(self, "_copy_scope_mode", "row")
         if mode == "region":
             self._copy_selected_region(direction)
         else:
             self._copy_selected_row(direction)
+
+    def _copy_missing_sheet(self, direction: str):
+        meta = self._sheet_meta()
+        try:
+            if direction == "A2B":
+                if meta.get("has_a") and (not meta.get("has_b")):
+                    self.app._copy_sheet_between_sides(self.sheet, "A", "B")
+            elif direction == "B2A":
+                if meta.get("has_b") and (not meta.get("has_a")):
+                    self.app._copy_sheet_between_sides(self.sheet, "B", "A")
+            elif direction == "BASE2A":
+                if meta.get("has_base"):
+                    self.app._copy_sheet_between_sides(self.sheet, "BASE", "A")
+                elif meta.get("has_a"):
+                    self.app._delete_sheet_on_side(self.sheet, "A")
+            elif direction == "MINE2A":
+                return
+            else:
+                return
+            self._data_ready = False
+            self._bounds_checked = False
+            self._invalidate_only_diff_snapshot_cache()
+            self._invalidate_render_cache()
+            self._update_sheet_role_labels()
+            self.app.refresh_sheet_nav()
+            self.refresh(row_only=None, rescan=True)
+            self._update_cursor_lines()
+        except Exception as e:
+            messagebox.showerror("Error", f"整Sheet操作失败：\n{e}")
 
     def _update_merge_buttons_for_row(self, excel_row: int):
         # Buttons are always visible; no UI updates needed.
@@ -5150,13 +6775,22 @@ class SheetView:
         """Return list of (start_line, end_line) diff blocks in current view."""
         blocks = []
         start = None
+        previous_diff_pair_idx = None
         for line_idx, pair_idx in enumerate(self.display_rows, start=1):
-            has = bool(self.pair_diff_cols.get(pair_idx, set()))
-            if has and start is None:
-                start = line_idx
+            has = self._pair_has_visual_diff(pair_idx)
+            if has:
+                # In only-diff mode, adjacent display lines can be thousands of
+                # worksheet rows apart. They must remain separate regions.
+                if start is None:
+                    start = line_idx
+                elif previous_diff_pair_idx is None or int(pair_idx) != int(previous_diff_pair_idx) + 1:
+                    blocks.append((start, line_idx - 1))
+                    start = line_idx
+                previous_diff_pair_idx = pair_idx
             elif (not has) and start is not None:
                 blocks.append((start, line_idx - 1))
                 start = None
+                previous_diff_pair_idx = None
         if start is not None:
             blocks.append((start, len(self.display_rows)))
         self._diff_blocks_cache = blocks
@@ -5178,6 +6812,7 @@ class SheetView:
     def _copy_selected_region(self, direction: str):
         """Copy contiguous diff block around current line using diff-cell columns only."""
         try:
+            formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
             line = self._current_line()
             block = self._current_diff_block_for_line(line)
             if not block:
@@ -5189,12 +6824,74 @@ class SheetView:
             undo_cells_region: list = []
             undo_target = "A" if direction in ("B2A", "BASE2A") else "B"
             changed_any = False
-            for ln in range(start, end + 1):
+            ln = start
+            while ln <= end:
                 if not (1 <= ln <= len(self.display_rows)):
+                    ln += 1
                     continue
                 pair_idx = self.display_rows[ln - 1]
                 cols = set(self.pair_diff_cols.get(pair_idx, set()))
                 if not cols:
+                    ln += 1
+                    continue
+                pair = self.row_pairs[pair_idx] if pair_idx < len(self.row_pairs) else None
+                ra = self._row_for_side(pair, "A")
+                rb = self._row_for_side(pair, "B")
+
+                if direction == "B2A" and ra is None and rb is not None and cols == {-1}:
+                    run: list[tuple[int, int]] = [(pair_idx, rb)]
+                    probe = ln + 1
+                    prev_rb = rb
+                    while probe <= end and probe <= len(self.display_rows):
+                        next_pair_idx = self.display_rows[probe - 1]
+                        next_cols = set(self.pair_diff_cols.get(next_pair_idx, set()))
+                        next_pair = self.row_pairs[next_pair_idx] if next_pair_idx < len(self.row_pairs) else None
+                        next_ra = self._row_for_side(next_pair, "A")
+                        next_rb = self._row_for_side(next_pair, "B")
+                        if next_cols != {-1} or next_ra is not None or next_rb is None:
+                            break
+                        if int(next_rb) != int(prev_rb) + 1:
+                            break
+                        run.append((next_pair_idx, next_rb))
+                        prev_rb = next_rb
+                        probe += 1
+                    row_changed = self._batch_insert_row_copy(
+                        run,
+                        direction="B2A",
+                        suppress_refresh=True,
+                        anchor=anchor,
+                    )
+                    if row_changed:
+                        changed_any = True
+                    ln = probe
+                    continue
+
+                if direction == "A2B" and rb is None and ra is not None and cols == {-1}:
+                    run = [(pair_idx, ra)]
+                    probe = ln + 1
+                    prev_ra = ra
+                    while probe <= end and probe <= len(self.display_rows):
+                        next_pair_idx = self.display_rows[probe - 1]
+                        next_cols = set(self.pair_diff_cols.get(next_pair_idx, set()))
+                        next_pair = self.row_pairs[next_pair_idx] if next_pair_idx < len(self.row_pairs) else None
+                        next_ra = self._row_for_side(next_pair, "A")
+                        next_rb = self._row_for_side(next_pair, "B")
+                        if next_cols != {-1} or next_rb is not None or next_ra is None:
+                            break
+                        if int(next_ra) != int(prev_ra) + 1:
+                            break
+                        run.append((next_pair_idx, next_ra))
+                        prev_ra = next_ra
+                        probe += 1
+                    row_changed = self._batch_insert_row_copy(
+                        run,
+                        direction="A2B",
+                        suppress_refresh=True,
+                        anchor=anchor,
+                    )
+                    if row_changed:
+                        changed_any = True
+                    ln = probe
                     continue
                 # In 3-way mode, "采用Base" is kept as its own button.
                 # Left/Right region actions follow left/right semantics only.
@@ -5208,9 +6905,11 @@ class SheetView:
                 )
                 if row_changed:
                     changed_any = True
+                ln += 1
             if changed_any:
                 if undo_cells_region:
                     self.app.push_undo({"sheet": self.sheet, "target": undo_target, "cells": undo_cells_region})
+                self._invalidate_only_diff_snapshot_cache()
                 self._invalidate_render_cache()
                 # pair_text_a/b were not updated during suppress_refresh loop;
                 # clear them so refresh rebuilds each row from the new cell values.
@@ -5219,6 +6918,9 @@ class SheetView:
                 self.refresh(row_only=None, rescan=False)
                 self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
+            formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
+            if formula_skipped > 0:
+                self._show_formula_copy_skip_notice(formula_skipped)
         except Exception as e:
             messagebox.showerror("Error", f"覆盖区域失败：\n{e}")
 
@@ -5338,6 +7040,10 @@ class SheetView:
             raw_b.append(_val_to_str(db))
             if not eq:
                 cols.add(c)
+        # 新增行/删除行：整行只存在于一侧，视为行级差异。
+        # 用哨兵值 -1 确保空行也出现在"只看差异"中，同时渲染层不对任一侧施加单元格红色高亮。
+        if (ra is None) != (rb is None):
+            cols = {-1}
         grid_on = self._is_grid_overlay_enabled()
         sep = _COL_SEP if grid_on else "   "
         trail = " \u2502" if grid_on else ""
@@ -5347,23 +7053,325 @@ class SheetView:
         line_b = cells_b
         return line_a, line_b, cols
 
+    def _render_line_from_raw_parts(self, raw_parts: list[str]) -> str:
+        grid_on = self._is_grid_overlay_enabled()
+        sep = _COL_SEP if grid_on else "   "
+        trail = " \u2502" if grid_on else ""
+        return sep.join(
+            _format_cell(raw_parts[i], self.col_char_widths.get(i + 1, 1))
+            for i in range(len(raw_parts))
+        ) + trail
+
+    def _raw_parts_from_row_values(self, row_vals) -> list[str]:
+        row_vals = _pad_row_values(row_vals, self.max_col)
+        return [_val_to_str(v) for v in row_vals]
+
+    def _quick_diff_cols_from_value_rows(self, row_left_vals, row_right_vals) -> tuple[set[int], bool]:
+        row_left_vals = _pad_row_values(row_left_vals, self.max_col)
+        row_right_vals = _pad_row_values(row_right_vals, self.max_col)
+        if row_left_vals == row_right_vals:
+            return set(), False
+        cols: set[int] = set()
+        need_exact = False
+        for offset in range(self.max_col):
+            vl = row_left_vals[offset]
+            vr = row_right_vals[offset]
+            if _merge_cmp_value(vl) != _merge_cmp_value(vr):
+                cols.add(offset + 1)
+                if (vl is None) != (vr is None):
+                    need_exact = True
+        return cols, need_exact
+
+    def _edit_row_values_cached(self, ws_edit, row_idx: int | None, cache: dict[int, tuple]) -> tuple:
+        if row_idx is None or ws_edit is None:
+            return (None,) * self.max_col
+        row_idx = int(row_idx)
+        cached = cache.get(row_idx)
+        if cached is not None:
+            return cached
+        try:
+            row = next(
+                ws_edit.iter_rows(
+                    min_row=row_idx,
+                    max_row=row_idx,
+                    min_col=1,
+                    max_col=self.max_col,
+                    values_only=True,
+                ),
+                (),
+            )
+        except Exception:
+            row = ()
+        cached = _pad_row_values(row, self.max_col)
+        cache[row_idx] = cached
+        return cached
+
+    def _build_row_and_diff_pair_from_values(
+        self,
+        row_a_vals,
+        row_b_vals,
+        *,
+        ra: int | None,
+        rb: int | None,
+        ws_a_edit=None,
+        ws_b_edit=None,
+        edit_cache_a=None,
+        edit_cache_b=None,
+        row_a_edit_vals=None,
+        row_b_edit_vals=None,
+    ):
+        raw_a, raw_b, cols = self._build_row_parts_and_diff_pair_from_values(
+            row_a_vals,
+            row_b_vals,
+            ra=ra,
+            rb=rb,
+            ws_a_edit=ws_a_edit,
+            ws_b_edit=ws_b_edit,
+            edit_cache_a=edit_cache_a,
+            edit_cache_b=edit_cache_b,
+            row_a_edit_vals=row_a_edit_vals,
+            row_b_edit_vals=row_b_edit_vals,
+        )
+        return self._render_line_from_raw_parts(raw_a), self._render_line_from_raw_parts(raw_b), cols
+
+    def _build_row_parts_and_diff_pair_from_values(
+        self,
+        row_a_vals,
+        row_b_vals,
+        *,
+        ra: int | None,
+        rb: int | None,
+        ws_a_edit=None,
+        ws_b_edit=None,
+        edit_cache_a=None,
+        edit_cache_b=None,
+        row_a_edit_vals=None,
+        row_b_edit_vals=None,
+    ):
+        row_a_vals = _pad_row_values(row_a_vals, self.max_col)
+        row_b_vals = _pad_row_values(row_b_vals, self.max_col)
+        if row_a_edit_vals is None:
+            row_a_edit_vals = self._edit_row_values_cached(ws_a_edit, ra, edit_cache_a if edit_cache_a is not None else {}) if ws_a_edit is not None else (None,) * self.max_col
+        else:
+            row_a_edit_vals = _pad_row_values(row_a_edit_vals, self.max_col)
+        if row_b_edit_vals is None:
+            row_b_edit_vals = self._edit_row_values_cached(ws_b_edit, rb, edit_cache_b if edit_cache_b is not None else {}) if ws_b_edit is not None else (None,) * self.max_col
+        else:
+            row_b_edit_vals = _pad_row_values(row_b_edit_vals, self.max_col)
+
+        raw_a: list[str] = []
+        raw_b: list[str] = []
+        cols: set[int] = set()
+        for offset in range(self.max_col):
+            da, db, eq = _cell_display_and_equal_from_values(
+                row_a_vals[offset],
+                row_b_vals[offset],
+                row_a_edit_vals[offset],
+                row_b_edit_vals[offset],
+            )
+            raw_a.append(_val_to_str(da))
+            raw_b.append(_val_to_str(db))
+            if not eq:
+                cols.add(offset + 1)
+        if (ra is None) != (rb is None):
+            cols = {-1}
+        return raw_a, raw_b, cols
+
+    def _compute_base_diff_cols_from_values(
+        self,
+        row_a_vals,
+        row_base_vals,
+        *,
+        ra: int | None,
+        base_row: int | None,
+        ws_a_edit=None,
+        ws_base_edit=None,
+        edit_cache_a=None,
+        edit_cache_base=None,
+        row_a_edit_vals=None,
+        row_base_edit_vals=None,
+    ) -> set[int]:
+        if ra is None:
+            return set()
+        if base_row is None:
+            return {-1}
+        row_a_vals = _pad_row_values(row_a_vals, self.max_col)
+        row_base_vals = _pad_row_values(row_base_vals, self.max_col)
+        if row_a_edit_vals is None:
+            row_a_edit_vals = self._edit_row_values_cached(ws_a_edit, ra, edit_cache_a if edit_cache_a is not None else {}) if ws_a_edit is not None else (None,) * self.max_col
+        else:
+            row_a_edit_vals = _pad_row_values(row_a_edit_vals, self.max_col)
+        if row_base_edit_vals is None:
+            row_base_edit_vals = self._edit_row_values_cached(ws_base_edit, base_row, edit_cache_base if edit_cache_base is not None else {}) if ws_base_edit is not None else (None,) * self.max_col
+        else:
+            row_base_edit_vals = _pad_row_values(row_base_edit_vals, self.max_col)
+        cols: set[int] = set()
+        for offset in range(self.max_col):
+            _va, _vb, eq = _cell_display_and_equal_from_values(
+                row_a_vals[offset],
+                row_base_vals[offset],
+                row_a_edit_vals[offset],
+                row_base_edit_vals[offset],
+            )
+            if not eq:
+                cols.add(offset + 1)
+        return cols
+
+    def _compute_base_diff_cols_for_pair(
+        self,
+        pair_idx: int,
+        pair: tuple[int | None, int | None] | None = None,
+        *,
+        max_col: int | None = None,
+        ws_a_val=None,
+        ws_a_edit=None,
+        ws_base_val=None,
+        ws_base_edit=None,
+    ) -> set[int]:
+        if not self._is_three_way_enabled():
+            return set()
+        if not getattr(self.app, "has_base", False):
+            return set()
+        if self._is_missing_sheet_view():
+            return set()
+        if pair is None:
+            if not (0 <= pair_idx < len(self.row_pairs)):
+                return set()
+            pair = self.row_pairs[pair_idx]
+        ra, _rb = pair
+        if ra is None:
+            return set()
+        base_row = self._base_row_for_pair(pair_idx, pair)
+        if base_row is None:
+            return {-1}
+        if ws_a_val is None:
+            ws_a_val = self.app.ws_a_val(self.sheet)
+        if ws_a_edit is None:
+            try:
+                ws_a_edit = self.app.ws_a_edit(self.sheet)
+            except Exception:
+                ws_a_edit = ws_a_val
+        if ws_base_val is None:
+            ws_base_val = self.app.ws_base_val(self.sheet)
+        if ws_base_edit is None:
+            try:
+                ws_base_edit = self.app.ws_base_edit(self.sheet)
+            except Exception:
+                ws_base_edit = ws_base_val
+        full_max_col = max(
+            int(max_col or 1),
+            ws_a_val.max_column or 1,
+            ws_base_val.max_column or 1,
+            ws_a_edit.max_column or 1,
+            ws_base_edit.max_column or 1,
+        )
+        cols: set[int] = set()
+        for c in range(1, full_max_col + 1):
+            _va, _vb, eq = _cell_display_and_equal_by_row(
+                ws_a_val,
+                ws_base_val,
+                ws_a_edit,
+                ws_base_edit,
+                ra,
+                base_row,
+                c,
+            )
+            if not eq:
+                cols.add(c)
+        return cols
+
+    def _ensure_base_diff_cache(
+        self,
+        *,
+        pair_indices=None,
+        max_col: int | None = None,
+        ws_a_val=None,
+        ws_a_edit=None,
+        ws_base_val=None,
+        ws_base_edit=None,
+    ):
+        if not self._is_three_way_enabled():
+            self.pair_base_diff_cols = {}
+            return False
+        if not getattr(self.app, "has_base", False):
+            self.pair_base_diff_cols = {}
+            return False
+        if self._is_missing_sheet_view():
+            self.pair_base_diff_cols = {}
+            return False
+        if ws_a_val is None:
+            ws_a_val = self.app.ws_a_val(self.sheet)
+        if ws_a_edit is None:
+            try:
+                ws_a_edit = self.app.ws_a_edit(self.sheet)
+            except Exception:
+                ws_a_edit = ws_a_val
+        if ws_base_val is None:
+            ws_base_val = self.app.ws_base_val(self.sheet)
+        if ws_base_edit is None:
+            try:
+                ws_base_edit = self.app.ws_base_edit(self.sheet)
+            except Exception:
+                ws_base_edit = ws_base_val
+        if pair_indices is None:
+            targets = range(len(self.row_pairs))
+        else:
+            targets = [int(idx) for idx in pair_indices if 0 <= int(idx) < len(self.row_pairs)]
+        added_any = False
+        for idx in targets:
+            if idx in self.pair_base_diff_cols:
+                continue
+            self.pair_base_diff_cols[idx] = self._compute_base_diff_cols_for_pair(
+                idx,
+                self.row_pairs[idx],
+                max_col=max_col,
+                ws_a_val=ws_a_val,
+                ws_a_edit=ws_a_edit,
+                ws_base_val=ws_base_val,
+                ws_base_edit=ws_base_edit,
+            )
+            added_any = True
+        return added_any
+
+    def _visual_diff_cols_for_pair(self, pair_idx: int) -> set[int]:
+        cols = set(self.pair_diff_cols.get(pair_idx, set()))
+        base_cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
+        if base_cols:
+            if -1 in base_cols:
+                cols.add(-1)
+            cols.update(c for c in base_cols if c > 0)
+        return cols
+
+    def _pair_has_visual_diff(self, pair_idx: int) -> bool:
+        return bool(self._visual_diff_cols_for_pair(pair_idx))
+
     def _prescan_col_widths(self, ws_a_val, ws_b_val, ws_base_val=None, max_pairs: int = 0):
         """Quick first-pass scan to populate col_char_widths before building formatted lines.
         max_pairs>0 limits scanning to first N pairs (for large sheets)."""
         self.col_char_widths = {}
         self._rownum_display_width = 0
         pairs = self.row_pairs[:max_pairs] if max_pairs > 0 else self.row_pairs
-        for ra, rb in pairs:
-            r_base = ra if ra is not None else rb
+        rows_a_cache = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in pairs if ra is not None], self.max_col)
+        rows_b_cache = _read_rows_into_cache(ws_b_val, [rb for _ra, rb in pairs if rb is not None], self.max_col)
+        base_rows_needed = []
+        if ws_base_val is not None:
+            for idx, (ra, rb) in enumerate(pairs):
+                r_base = self._base_row_for_pair(idx, (ra, rb))
+                if r_base is not None:
+                    base_rows_needed.append(r_base)
+        rows_base_cache = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if ws_base_val is not None else {}
+
+        for idx, (ra, rb) in enumerate(pairs):
+            row_a = _row_from_cache(rows_a_cache, ra, self.max_col)
+            row_b = _row_from_cache(rows_b_cache, rb, self.max_col)
+            r_base = self._base_row_for_pair(idx, (ra, rb))
+            row_base = _row_from_cache(rows_base_cache, r_base, self.max_col) if ws_base_val is not None else None
             for c in range(1, self.max_col + 1):
-                sa = _val_to_str(ws_a_val.cell(row=ra, column=c).value if ra is not None else None)
-                sb = _val_to_str(ws_b_val.cell(row=rb, column=c).value if rb is not None else None)
+                sa = _val_to_str(row_a[c - 1])
+                sb = _val_to_str(row_b[c - 1])
                 w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
-                if ws_base_val is not None and r_base is not None:
-                    try:
-                        sv = _val_to_str(ws_base_val.cell(row=r_base, column=c).value)
-                    except Exception:
-                        sv = ""
+                if row_base is not None and r_base is not None:
+                    sv = _val_to_str(row_base[c - 1])
                     w = min(max(w, len(sv)), _COL_MAX_DISPLAY_WIDTH)
                 if w > self.col_char_widths.get(c, 0):
                     self.col_char_widths[c] = w
@@ -5371,94 +7379,11 @@ class SheetView:
         # Keep a readable lower bound after grid on/off toggles.
         for c in range(1, self.max_col + 1):
             self.col_char_widths[c] = max(4, int(self.col_char_widths.get(c, 1)))
+        # Invalidate cached base spans: column widths just changed.
+        self._col_widths_version = int(getattr(self, "_col_widths_version", 0)) + 1
 
     def _build_row_pairs(self, ws_a_val, ws_b_val, force: bool = False):
-        # Align rows between A and B to avoid cascading diffs on insert/delete.
-        max_row_a = ws_a_val.max_row or 1
-        max_row_b = ws_b_val.max_row or 1
-        max_row = max(max_row_a, max_row_b)
-        if max_row <= 0:
-            return []
-        if not _should_auto_row_align(max_row_a, max_row_b, force=force):
-            # Large-sheet fast path: skip SequenceMatcher unless row-count drift suggests
-            # an insert/delete block that would otherwise cascade false diffs.
-            return self._build_row_pairs_direct(max_row_a, max_row_b)
-
-        def _row_sig_list(ws, max_row_local: int):
-            # Read all rows in one pass (much faster than per-row iter_rows calls)
-            try:
-                all_rows = list(ws.iter_rows(
-                    min_row=1, max_row=max_row_local,
-                    min_col=1, max_col=self.max_col,
-                    values_only=True,
-                ))
-            except Exception:
-                all_rows = []
-            sigs = []
-            for row in all_rows:
-                if row is None:
-                    row = ()
-                sigs.append("\x1f".join(_merge_cmp_value(v) for v in row))
-            return sigs
-
-        sig_a = _row_sig_list(ws_a_val, max_row_a)
-        sig_b = _row_sig_list(ws_b_val, max_row_b)
-
-        def _sim_score(sa: str, sb: str) -> float:
-            if sa == sb:
-                return 2.0
-            if (not sa) or (not sb):
-                return 0.0
-            # Non-exact similarity fallback for replace blocks:
-            # avoids mapping A[x] -> B[y] when B[z] is clearly closer.
-            try:
-                return difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).ratio()
-            except Exception:
-                return 0.0
-
-        sm = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False)
-        pairs: list[tuple[int | None, int | None]] = []
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                for i, j in zip(range(i1, i2), range(j1, j2)):
-                    pairs.append((i + 1, j + 1))
-            elif tag == "replace":
-                len_a = i2 - i1
-                len_b = j2 - j1
-                common = min(len_a, len_b)
-                # Choose head/tail mapping by similarity score (not only exact hits).
-                head_score = 0.0
-                tail_score = 0.0
-                for k in range(common):
-                    head_score += _sim_score(sig_a[i1 + k], sig_b[j1 + k])
-                    tail_score += _sim_score(sig_a[i2 - common + k], sig_b[j2 - common + k])
-                # Prefer tail on tie to better match append-heavy editing patterns.
-                use_tail = tail_score >= head_score
-                if use_tail:
-                    extra_a = len_a - common
-                    extra_b = len_b - common
-                    for k in range(extra_a):
-                        pairs.append((i1 + k + 1, None))
-                    for k in range(extra_b):
-                        pairs.append((None, j1 + k + 1))
-                    a_start = i2 - common
-                    b_start = j2 - common
-                    for k in range(common):
-                        pairs.append((a_start + k + 1, b_start + k + 1))
-                else:
-                    for k in range(common):
-                        pairs.append((i1 + k + 1, j1 + k + 1))
-                    for k in range(common, len_a):
-                        pairs.append((i1 + k + 1, None))
-                    for k in range(common, len_b):
-                        pairs.append((None, j1 + k + 1))
-            elif tag == "delete":
-                for i in range(i1, i2):
-                    pairs.append((i + 1, None))
-            elif tag == "insert":
-                for j in range(j1, j2):
-                    pairs.append((None, j + 1))
-        return pairs
+        return _compute_row_pairs_generic(ws_a_val, ws_b_val, self.max_col, force=force)
 
     @staticmethod
     def _build_row_pairs_direct(max_row_a: int, max_row_b: int):
@@ -5471,60 +7396,159 @@ class SheetView:
             pairs.append((ra, rb))
         return pairs
 
-    def _precompute_large_diff_by_blocks(self, ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, max_row_a: int, max_row_b: int):
+    def _precompute_large_diff_by_blocks(
+        self,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+        max_row_a: int,
+        max_row_b: int,
+        ws_base_val=None,
+        ws_base_edit=None,
+    ):
         """Large-sheet only-diff precompute using tail-first block scan."""
+        edit_cache_a: dict[int, tuple] = {}
+        edit_cache_b: dict[int, tuple] = {}
+        edit_cache_base: dict[int, tuple] = {}
+        has_base = bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False) and ws_base_val is not None)
+
+        if self._align_rows_enabled and self.row_pairs:
+            pair_count = len(self.row_pairs)
+            block = _LARGE_SHEET_BLOCK_ROWS
+            for block_end in range(pair_count, 0, -block):
+                block_start = max(0, block_end - block)
+                block_pairs = self.row_pairs[block_start:block_end]
+
+                rows_a = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in block_pairs if ra is not None], self.max_col)
+                rows_b = _read_rows_into_cache(ws_b_val, [rb for _ra, rb in block_pairs if rb is not None], self.max_col)
+                base_rows_needed = []
+                if has_base:
+                    for off, pair in enumerate(block_pairs):
+                        pair_idx = block_start + off
+                        base_row = self._base_row_for_pair(pair_idx, pair)
+                        if base_row is not None:
+                            base_rows_needed.append(base_row)
+                rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if has_base else {}
+                exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
+
+                for off in range(len(block_pairs) - 1, -1, -1):
+                    pair_idx = block_start + off
+                    if not (0 <= pair_idx < len(self.row_pairs)):
+                        continue
+                    ra, rb = self.row_pairs[pair_idx]
+                    row_a = _row_from_cache(rows_a, ra, self.max_col)
+                    row_b = _row_from_cache(rows_b, rb, self.max_col)
+                    if (ra is None) != (rb is None):
+                        cols = {-1}
+                        need_exact_ab = False
+                    else:
+                        cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                    base_cols = set()
+                    need_exact_base = False
+                    base_row = None
+                    if has_base and ra is not None:
+                        base_row = self._base_row_for_pair(pair_idx, (ra, rb))
+                        if base_row is None:
+                            base_cols = {-1}
+                        else:
+                            row_base = _row_from_cache(rows_base, base_row, self.max_col)
+                            base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                    if (not cols) and (not base_cols):
+                        continue
+                    if need_exact_ab or need_exact_base:
+                        exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
+                        continue
+                    self.pair_diff_cols[pair_idx] = cols
+                    if has_base:
+                        self.pair_base_diff_cols[pair_idx] = base_cols
+                    self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
+                    self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+
+                if exact_rows:
+                    exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
+                    exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
+                    exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
+                    rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, self.max_col) if ws_a_edit is not None else {}
+                    rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, self.max_col) if ws_b_edit is not None else {}
+                    rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, self.max_col) if (ws_base_edit is not None and has_base) else {}
+                    for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
+                        row_a = _row_from_cache(rows_a, ra, self.max_col)
+                        row_b = _row_from_cache(rows_b, rb, self.max_col)
+                        row_a_edit = _row_from_cache(rows_a_edit, ra, self.max_col)
+                        row_b_edit = _row_from_cache(rows_b_edit, rb, self.max_col)
+                        if need_exact_ab:
+                            line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+                                row_a,
+                                row_b,
+                                ra=ra,
+                                rb=rb,
+                                ws_a_edit=ws_a_edit,
+                                ws_b_edit=ws_b_edit,
+                                edit_cache_a=edit_cache_a,
+                                edit_cache_b=edit_cache_b,
+                                row_a_edit_vals=row_a_edit,
+                                row_b_edit_vals=row_b_edit,
+                            )
+                        else:
+                            line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
+                            line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                        if need_exact_base and has_base and ra is not None:
+                            row_base = _row_from_cache(rows_base, base_row, self.max_col)
+                            row_base_edit = _row_from_cache(rows_base_edit, base_row, self.max_col)
+                            base_cols = self._compute_base_diff_cols_from_values(
+                                row_a,
+                                row_base,
+                                ra=ra,
+                                base_row=base_row,
+                                ws_a_edit=ws_a_edit,
+                                ws_base_edit=ws_base_edit,
+                                edit_cache_a=edit_cache_a,
+                                edit_cache_base=edit_cache_base,
+                                row_a_edit_vals=row_a_edit,
+                                row_base_edit_vals=row_base_edit,
+                            )
+                        if (not cols) and (not base_cols):
+                            continue
+                        self.pair_diff_cols[pair_idx] = cols
+                        if has_base:
+                            self.pair_base_diff_cols[pair_idx] = base_cols
+                        self.pair_text_a[pair_idx] = line_a
+                        self.pair_text_b[pair_idx] = line_b
+            return
+
         max_row = max(max_row_a, max_row_b)
         block = _LARGE_SHEET_BLOCK_ROWS
         for block_end in range(max_row, 0, -block):
             block_start = max(1, block_end - block + 1)
             block_len = block_end - block_start + 1
 
-            rows_a = {}
-            rows_b = {}
-            if block_start <= max_row_a:
-                for idx, row in enumerate(
-                    ws_a_val.iter_rows(
-                        min_row=block_start,
-                        max_row=min(block_end, max_row_a),
-                        min_col=1,
-                        max_col=self.max_col,
-                        values_only=True,
-                    ),
-                    start=block_start,
-                ):
-                    rows_a[idx] = row or ()
-            if block_start <= max_row_b:
-                for idx, row in enumerate(
-                    ws_b_val.iter_rows(
-                        min_row=block_start,
-                        max_row=min(block_end, max_row_b),
-                        min_col=1,
-                        max_col=self.max_col,
-                        values_only=True,
-                    ),
-                    start=block_start,
-                ):
-                    rows_b[idx] = row or ()
-
-            sig_a = []
-            sig_b = []
-            for r in range(block_start, block_end + 1):
-                row_a = rows_a.get(r, ())
-                row_b = rows_b.get(r, ())
-                if len(row_a) < self.max_col:
-                    row_a = tuple(row_a) + (None,) * (self.max_col - len(row_a))
-                if len(row_b) < self.max_col:
-                    row_b = tuple(row_b) + (None,) * (self.max_col - len(row_b))
-                sig_a.append(tuple(_merge_cmp_value(v) for v in row_a))
-                sig_b.append(tuple(_merge_cmp_value(v) for v in row_b))
-
-            if sig_a == sig_b:
-                continue
+            rows_a = _read_rows_into_cache(
+                ws_a_val,
+                range(block_start, min(block_end, max_row_a) + 1),
+                self.max_col,
+            )
+            rows_b = _read_rows_into_cache(
+                ws_b_val,
+                range(block_start, min(block_end, max_row_b) + 1),
+                self.max_col,
+            )
+            base_rows_needed = []
+            if has_base:
+                for r in range(block_start, block_end + 1):
+                    pair_idx = self.row_a_to_pair_idx.get(r)
+                    if pair_idx is None:
+                        pair_idx = self.row_b_to_pair_idx.get(r)
+                    if pair_idx is None or pair_idx >= len(self.row_pairs):
+                        continue
+                    base_row = self._base_row_for_pair(pair_idx, self.row_pairs[pair_idx])
+                    if base_row is not None:
+                        base_rows_needed.append(base_row)
+            rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if has_base else {}
+            exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
 
             # Tail-first within changed block (newer rows first).
             for off in range(block_len - 1, -1, -1):
-                if sig_a[off] == sig_b[off]:
-                    continue
                 r = block_start + off
                 pair_idx = self.row_a_to_pair_idx.get(r)
                 if pair_idx is None:
@@ -5534,10 +7558,84 @@ class SheetView:
                 if pair_idx >= len(self.row_pairs):
                     continue
                 ra, rb = self.row_pairs[pair_idx]
-                line_a, line_b, cols = self._build_row_and_diff_pair(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra, rb)
+                row_a = _row_from_cache(rows_a, ra, self.max_col)
+                row_b = _row_from_cache(rows_b, rb, self.max_col)
+                if (ra is None) != (rb is None):
+                    cols = {-1}
+                    need_exact_ab = False
+                else:
+                    cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                base_cols = set()
+                need_exact_base = False
+                base_row = None
+                if has_base and ra is not None:
+                    base_row = self._base_row_for_pair(pair_idx, (ra, rb))
+                    if base_row is None:
+                        base_cols = {-1}
+                    else:
+                        row_base = _row_from_cache(rows_base, base_row, self.max_col)
+                        base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                if (not cols) and (not base_cols):
+                    continue
+                if need_exact_ab or need_exact_base:
+                    exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
+                    continue
                 self.pair_diff_cols[pair_idx] = cols
-                self.pair_text_a[pair_idx] = line_a
-                self.pair_text_b[pair_idx] = line_b
+                if has_base:
+                    self.pair_base_diff_cols[pair_idx] = base_cols
+                self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
+                self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+
+            if exact_rows:
+                exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
+                exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
+                exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
+                rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, self.max_col) if ws_a_edit is not None else {}
+                rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, self.max_col) if ws_b_edit is not None else {}
+                rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, self.max_col) if (has_base and ws_base_edit is not None) else {}
+                for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
+                    row_a = _row_from_cache(rows_a, ra, self.max_col)
+                    row_b = _row_from_cache(rows_b, rb, self.max_col)
+                    row_a_edit = _row_from_cache(rows_a_edit, ra, self.max_col)
+                    row_b_edit = _row_from_cache(rows_b_edit, rb, self.max_col)
+                    if need_exact_ab:
+                        line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+                            row_a,
+                            row_b,
+                            ra=ra,
+                            rb=rb,
+                            ws_a_edit=ws_a_edit,
+                            ws_b_edit=ws_b_edit,
+                            edit_cache_a=edit_cache_a,
+                            edit_cache_b=edit_cache_b,
+                            row_a_edit_vals=row_a_edit,
+                            row_b_edit_vals=row_b_edit,
+                        )
+                    else:
+                        line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
+                        line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                    if need_exact_base and has_base and ra is not None:
+                        row_base = _row_from_cache(rows_base, base_row, self.max_col)
+                        row_base_edit = _row_from_cache(rows_base_edit, base_row, self.max_col)
+                        base_cols = self._compute_base_diff_cols_from_values(
+                            row_a,
+                            row_base,
+                            ra=ra,
+                            base_row=base_row,
+                            ws_a_edit=ws_a_edit,
+                            ws_base_edit=ws_base_edit,
+                            edit_cache_a=edit_cache_a,
+                            edit_cache_base=edit_cache_base,
+                            row_a_edit_vals=row_a_edit,
+                            row_base_edit_vals=row_base_edit,
+                        )
+                    if (not cols) and (not base_cols):
+                        continue
+                    self.pair_diff_cols[pair_idx] = cols
+                    if has_base:
+                        self.pair_base_diff_cols[pair_idx] = base_cols
+                    self.pair_text_a[pair_idx] = line_a
+                    self.pair_text_b[pair_idx] = line_b
 
     def _build_row_and_diff(self, ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int):
         parts_a = []
@@ -5564,21 +7662,534 @@ class SheetView:
     def _build_line_from_row(self, r: int, row_vals) -> str:
         return str(r) + "\t" + "\t".join(_val_to_str(v) for v in row_vals)
 
-    def _spans_for_line(self, line: str = "") -> dict:
-        """Return {colIndex: (start, end)} character positions in the formatted line.
-        Computed directly from col_char_widths — no string parsing needed."""
+    def _base_spans(self) -> dict:
+        """Unclamped {colIndex: (start, end)} char positions, cached per refresh.
+
+        Depends only on max_col, grid-overlay state and the current column widths,
+        so it is recomputed only when those change (``_col_widths_version`` bump),
+        not once per rendered line in the tag phase."""
+        grid = self._is_grid_overlay_enabled()
+        key = (int(self.max_col or 0), bool(grid), int(getattr(self, "_col_widths_version", 0)))
+        if getattr(self, "_base_spans_cache", None) is not None \
+                and getattr(self, "_base_spans_cache_key", None) == key:
+            return self._base_spans_cache
+        sep_len = len(_COL_SEP) if grid else 3
         pos = 0
         spans = {}
         for c in range(1, self.max_col + 1):
             w = max(1, self.col_char_widths.get(c, 1))
             spans[c] = (pos, pos + w)
-            pos += w + _COL_SEP_LEN
+            pos += w
+            if c < self.max_col:
+                pos += sep_len
+        self._base_spans_cache = spans
+        self._base_spans_cache_key = key
         return spans
+
+    def _spans_for_line(self, line: str = "") -> dict:
+        """Return {colIndex: (start, end)} character positions in the rendered line.
+
+        When a concrete line string is available, clamp spans to the actual text length so
+        downstream tag ranges stay aligned with what Tk is really showing."""
+        base = self._base_spans()
+        text = str(line or "")
+        if not text:
+            # Copy so callers can't mutate the cached base spans.
+            return dict(base)
+        text_len = len(text)
+        return {c: (min(s, text_len), min(e, text_len)) for c, (s, e) in base.items()}
+
+    def _diffcell_tag_args_for_line(
+        self,
+        line_no: int,
+        pair_idx: int,
+        line_a: str = "",
+        line_base: str = "",
+        line_b: str = "",
+    ) -> tuple[list[str], list[str], list[str], list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
+        left_args: list[str] = []
+        base_args: list[str] = []
+        right_args: list[str] = []
+        left_ranges: list[tuple[int, int]] = []
+        base_ranges: list[tuple[int, int]] = []
+        right_ranges: list[tuple[int, int]] = []
+        if not (0 <= int(pair_idx) < len(self.row_pairs)):
+            return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+        pair = self.row_pairs[pair_idx]
+        ra, rb = pair
+        base_r = self._base_row_for_pair(pair_idx, pair) if self._is_three_way_enabled() else None
+        cols = self._visual_diff_cols_for_pair(pair_idx)
+        if not cols:
+            return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+        spans_a = self._spans_for_line(line_a)
+        spans_base = self._spans_for_line(line_base) if self._is_three_way_enabled() else {}
+        spans_b = self._spans_for_line(line_b)
+        for c in cols:
+            if c <= 0:
+                continue
+            if ra is not None and c in spans_a:
+                s, e = spans_a[c]
+                if s < e:
+                    left_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                    left_ranges.append((s, e))
+            if base_r is not None and c in spans_base:
+                s, e = spans_base[c]
+                if s < e:
+                    base_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                    base_ranges.append((s, e))
+            if rb is not None and c in spans_b:
+                s, e = spans_b[c]
+                if s < e:
+                    right_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                    right_ranges.append((s, e))
+        return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+
+    def _clear_diffrow_under_diffcells(self, left_args=None, base_args=None, right_args=None):
+        try:
+            for widget, args in ((self.left, left_args), (self.base, base_args), (self.right, right_args)):
+                if not args:
+                    continue
+                pairs = list(args)
+                for i in range(0, len(pairs), 2):
+                    if i + 1 >= len(pairs):
+                        break
+                    widget.tag_remove("diffrow", pairs[i], pairs[i + 1])
+        except Exception:
+            pass
 
     def _apply_rownum_diff_tag_line(self, line_idx: int, pair_idx: int):
         pass  # Row headers are rendered in dedicated widgets (left_ln/base_ln/right_ln).
 
     # ---------- Only-diff toggle ----------
+    def _invalidate_only_diff_snapshot_cache(self):
+        self._only_diff_source_version += 1
+        self._only_diff_rows_cache = None
+        self._only_diff_rows_cache_key = None
+        self._only_diff_async_build_key = None
+        self._only_diff_async_building = False
+        self._only_diff_async_build_seq += 1
+
+    def _current_only_diff_cache_key(self) -> tuple:
+        return (
+            self.sheet,
+            int(self._only_diff_source_version),
+            int(len(self.row_pairs)),
+            int(self.max_col or 0),
+            int(bool(self._align_rows_enabled)),
+            int(bool(self._force_sequence_align)),
+            int(bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False))),
+        )
+
+    def _has_valid_only_diff_snapshot_cache(self) -> bool:
+        rows = getattr(self, "_only_diff_rows_cache", None)
+        if rows is None:
+            return False
+        return self._only_diff_rows_cache_key == self._current_only_diff_cache_key()
+
+    def _cache_only_diff_rows_snapshot(self, rows):
+        normalized = sorted({int(idx) for idx in (rows or []) if 0 <= int(idx) < len(self.row_pairs)})
+        self._only_diff_rows_cache = normalized
+        self._only_diff_rows_cache_key = self._current_only_diff_cache_key()
+        return list(normalized)
+
+    def _only_diff_rows_with_touched(self, rows):
+        rows_set = set(int(idx) for idx in (rows or []) if 0 <= int(idx) < len(self.row_pairs))
+        for r in self.touched_rows:
+            idx = self.row_a_to_pair_idx.get(r)
+            if idx is None:
+                idx = self.row_b_to_pair_idx.get(r)
+            if idx is not None:
+                rows_set.add(int(idx))
+        return sorted(rows_set)
+
+    def _set_only_diff_pending_info(self):
+        try:
+            total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
+            self.info.configure(
+                text=f"只看差异 | 正在后台生成精确差异行...   Rows: {total_rows}   Cols: {self.max_col}"
+            )
+        except Exception:
+            pass
+
+    def _refresh_mode_switch_preserving_selection(self, *, rescan: bool):
+        saved_selection = self._snapshot_explicit_selection_state()
+        self._clear_selection_visuals()
+        self._set_main_selected_cell(None, None)
+        self._cursor_cmp_sel_col = None
+        self._cursor_cmp_sel_line = None
+        self.selected_pair_idx = None
+        self.selected_excel_row = None
+        self.selected_excel_row_a = None
+        self.selected_excel_row_b = None
+        self._clear_hover_state(clear_panel=True)
+        self._suppress_bg_apply = True
+        try:
+            self.refresh(row_only=None, rescan=rescan)
+        finally:
+            self._suppress_bg_apply = False  # Fresh data rendered; allow bg applies again.
+        if not self._restore_explicit_selection_state(saved_selection):
+            self.clear_explicit_cell_selection()
+        self._update_cursor_lines()
+        self._update_diff_nav_state()
+
+    def _start_async_large_only_diff_build(self) -> bool:
+        if not getattr(self, "_is_large_sheet", False):
+            return False
+        if not getattr(self, "_data_ready", False):
+            self._prefer_only_diff_when_ready = True
+            return False
+        if not self.row_pairs:
+            return False
+        cache_key = self._current_only_diff_cache_key()
+        if self._has_valid_only_diff_snapshot_cache():
+            return False
+        if self._only_diff_async_building and self._only_diff_async_build_key == cache_key:
+            self._set_only_diff_pending_info()
+            return True
+
+        self._only_diff_async_build_seq += 1
+        build_seq = int(self._only_diff_async_build_seq)
+        self._only_diff_async_build_key = cache_key
+        self._only_diff_async_building = True
+        self._set_only_diff_pending_info()
+
+        sheet_name = self.sheet
+        max_col = int(self.max_col or 1)
+        row_pairs = list(self.row_pairs)
+        row_a_to_pair_idx = dict(self.row_a_to_pair_idx)
+        row_b_to_pair_idx = dict(self.row_b_to_pair_idx)
+        mine_to_base_row = dict(self.mine_to_base_row)
+        theirs_to_base_row = dict(self.theirs_to_base_row)
+        missing_base_row_map = dict(getattr(self, "_missing_base_row_map", {}) or {})
+        has_base = bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False))
+        align_enabled = bool(self._align_rows_enabled)
+
+        def _base_row_for_snapshot(pair_idx: int, pair: tuple[int | None, int | None]) -> int | None:
+            if not has_base:
+                return None
+            ra, rb = pair
+            mapped = missing_base_row_map.get(pair_idx)
+            if mapped is not None:
+                return mapped
+            if ra is not None and ra in mine_to_base_row:
+                return mine_to_base_row.get(ra)
+            if rb is not None and rb in theirs_to_base_row:
+                return theirs_to_base_row.get(rb)
+            return None
+
+        def _worker():
+            wb_a_val = None
+            wb_b_val = None
+            wb_base_val = None
+            wb_a_edit = None
+            wb_b_edit = None
+            wb_base_edit = None
+            try:
+                wb_a_val = load_workbook(self.app._file_a_val_path, data_only=True, read_only=True)
+                wb_b_val = load_workbook(self.app._file_b_val_path, data_only=True, read_only=True)
+                if has_base and getattr(self.app, "_file_base_val_path", None):
+                    wb_base_val = load_workbook(self.app._file_base_val_path, data_only=True, read_only=True)
+                wb_a_edit = load_workbook(self.app.file_a, data_only=False, read_only=True)
+                wb_b_edit = load_workbook(self.app.file_b, data_only=False, read_only=True)
+                if has_base and getattr(self.app, "base_path", None):
+                    wb_base_edit = load_workbook(self.app.base_path, data_only=False, read_only=True)
+            except Exception as e:
+                _dlog(f"only-diff async open failed sheet={sheet_name}: {e}")
+                _wbs_close(wb_a_val, wb_b_val, wb_base_val, wb_a_edit, wb_b_edit, wb_base_edit)
+
+                def _apply_open_fail():
+                    if build_seq != self._only_diff_async_build_seq:
+                        return
+                    self._only_diff_async_building = False
+                    self._only_diff_async_build_key = None
+
+                try:
+                    self.app._queue_ui_task(_apply_open_fail)
+                except Exception:
+                    pass
+                return
+
+            result = {
+                "build_key": cache_key,
+                "build_seq": build_seq,
+                "sheet": sheet_name,
+                "diff_pair_indices": [],
+                "pair_diff_cols": {},
+                "pair_base_diff_cols": {},
+                "pair_parts_a": {},
+                "pair_parts_b": {},
+            }
+            try:
+                ws_a_val = wb_a_val[sheet_name]
+                ws_b_val = wb_b_val[sheet_name]
+                ws_a_edit = wb_a_edit[sheet_name]
+                ws_b_edit = wb_b_edit[sheet_name]
+                ws_base_val = wb_base_val[sheet_name] if wb_base_val is not None and sheet_name in wb_base_val.sheetnames else None
+                ws_base_edit = wb_base_edit[sheet_name] if wb_base_edit is not None and sheet_name in wb_base_edit.sheetnames else ws_base_val
+                edit_cache_a: dict[int, tuple] = {}
+                edit_cache_b: dict[int, tuple] = {}
+                edit_cache_base: dict[int, tuple] = {}
+
+                if align_enabled and row_pairs:
+                    pair_count = len(row_pairs)
+                    block = _LARGE_SHEET_BLOCK_ROWS
+                    for block_end in range(pair_count, 0, -block):
+                        block_start = max(0, block_end - block)
+                        block_pairs = row_pairs[block_start:block_end]
+                        rows_a = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in block_pairs if ra is not None], max_col)
+                        rows_b = _read_rows_into_cache(ws_b_val, [rb for _ra, rb in block_pairs if rb is not None], max_col)
+                        base_rows_needed = []
+                        if has_base and ws_base_val is not None:
+                            for off, pair in enumerate(block_pairs):
+                                base_row = _base_row_for_snapshot(block_start + off, pair)
+                                if base_row is not None:
+                                    base_rows_needed.append(base_row)
+                        rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, max_col) if (has_base and ws_base_val is not None) else {}
+                        exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
+
+                        for off in range(len(block_pairs) - 1, -1, -1):
+                            pair_idx = block_start + off
+                            ra, rb = block_pairs[off]
+                            row_a = _row_from_cache(rows_a, ra, max_col)
+                            row_b = _row_from_cache(rows_b, rb, max_col)
+                            if (ra is None) != (rb is None):
+                                cols = {-1}
+                                need_exact_ab = False
+                            else:
+                                cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                            base_cols = set()
+                            need_exact_base = False
+                            base_row = None
+                            if has_base and ws_base_val is not None and ra is not None:
+                                base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
+                                if base_row is None:
+                                    base_cols = {-1}
+                                else:
+                                    row_base = _row_from_cache(rows_base, base_row, max_col)
+                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                            if (not cols) and (not base_cols):
+                                continue
+                            if need_exact_ab or need_exact_base:
+                                exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
+                                continue
+                            result["diff_pair_indices"].append(pair_idx)
+                            result["pair_diff_cols"][pair_idx] = cols
+                            if has_base and base_cols:
+                                result["pair_base_diff_cols"][pair_idx] = base_cols
+                            result["pair_parts_a"][pair_idx] = self._raw_parts_from_row_values(row_a)
+                            result["pair_parts_b"][pair_idx] = self._raw_parts_from_row_values(row_b)
+
+                        if exact_rows:
+                            exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
+                            exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
+                            exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
+                            rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, max_col) if ws_a_edit is not None else {}
+                            rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, max_col) if ws_b_edit is not None else {}
+                            rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, max_col) if (has_base and ws_base_edit is not None) else {}
+                            for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
+                                row_a = _row_from_cache(rows_a, ra, max_col)
+                                row_b = _row_from_cache(rows_b, rb, max_col)
+                                row_a_edit = _row_from_cache(rows_a_edit, ra, max_col)
+                                row_b_edit = _row_from_cache(rows_b_edit, rb, max_col)
+                                if need_exact_ab:
+                                    raw_a, raw_b, cols = self._build_row_parts_and_diff_pair_from_values(
+                                        row_a,
+                                        row_b,
+                                        ra=ra,
+                                        rb=rb,
+                                        ws_a_edit=ws_a_edit,
+                                        ws_b_edit=ws_b_edit,
+                                        edit_cache_a=edit_cache_a,
+                                        edit_cache_b=edit_cache_b,
+                                        row_a_edit_vals=row_a_edit,
+                                        row_b_edit_vals=row_b_edit,
+                                    )
+                                else:
+                                    raw_a = self._raw_parts_from_row_values(row_a)
+                                    raw_b = self._raw_parts_from_row_values(row_b)
+                                if need_exact_base and has_base and ws_base_val is not None and ra is not None:
+                                    row_base = _row_from_cache(rows_base, base_row, max_col)
+                                    row_base_edit = _row_from_cache(rows_base_edit, base_row, max_col)
+                                    base_cols = self._compute_base_diff_cols_from_values(
+                                        row_a,
+                                        row_base,
+                                        ra=ra,
+                                        base_row=base_row,
+                                        ws_a_edit=ws_a_edit,
+                                        ws_base_edit=ws_base_edit,
+                                        edit_cache_a=edit_cache_a,
+                                        edit_cache_base=edit_cache_base,
+                                        row_a_edit_vals=row_a_edit,
+                                        row_base_edit_vals=row_base_edit,
+                                    )
+                                if (not cols) and (not base_cols):
+                                    continue
+                                result["diff_pair_indices"].append(pair_idx)
+                                result["pair_diff_cols"][pair_idx] = cols
+                                if has_base and base_cols:
+                                    result["pair_base_diff_cols"][pair_idx] = base_cols
+                                result["pair_parts_a"][pair_idx] = raw_a
+                                result["pair_parts_b"][pair_idx] = raw_b
+                else:
+                    max_row_a = ws_a_val.max_row or 1
+                    max_row_b = ws_b_val.max_row or 1
+                    max_row = max(max_row_a, max_row_b)
+                    block = _LARGE_SHEET_BLOCK_ROWS
+                    for block_end in range(max_row, 0, -block):
+                        block_start = max(1, block_end - block + 1)
+                        rows_a = _read_rows_into_cache(
+                            ws_a_val,
+                            range(block_start, min(block_end, max_row_a) + 1),
+                            max_col,
+                        )
+                        rows_b = _read_rows_into_cache(
+                            ws_b_val,
+                            range(block_start, min(block_end, max_row_b) + 1),
+                            max_col,
+                        )
+                        base_rows_needed = []
+                        if has_base and ws_base_val is not None:
+                            for r in range(block_start, block_end + 1):
+                                pair_idx = row_a_to_pair_idx.get(r)
+                                if pair_idx is None:
+                                    pair_idx = row_b_to_pair_idx.get(r)
+                                if pair_idx is None or pair_idx >= len(row_pairs):
+                                    continue
+                                base_row = _base_row_for_snapshot(pair_idx, row_pairs[pair_idx])
+                                if base_row is not None:
+                                    base_rows_needed.append(base_row)
+                        rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, max_col) if (has_base and ws_base_val is not None) else {}
+                        exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
+
+                        for r in range(block_end, block_start - 1, -1):
+                            pair_idx = row_a_to_pair_idx.get(r)
+                            if pair_idx is None:
+                                pair_idx = row_b_to_pair_idx.get(r)
+                            if pair_idx is None or pair_idx >= len(row_pairs):
+                                continue
+                            ra, rb = row_pairs[pair_idx]
+                            row_a = _row_from_cache(rows_a, ra, max_col)
+                            row_b = _row_from_cache(rows_b, rb, max_col)
+                            if (ra is None) != (rb is None):
+                                cols = {-1}
+                                need_exact_ab = False
+                            else:
+                                cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                            base_cols = set()
+                            need_exact_base = False
+                            base_row = None
+                            if has_base and ws_base_val is not None and ra is not None:
+                                base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
+                                if base_row is None:
+                                    base_cols = {-1}
+                                else:
+                                    row_base = _row_from_cache(rows_base, base_row, max_col)
+                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                            if (not cols) and (not base_cols):
+                                continue
+                            if need_exact_ab or need_exact_base:
+                                exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
+                                continue
+                            result["diff_pair_indices"].append(pair_idx)
+                            result["pair_diff_cols"][pair_idx] = cols
+                            if has_base and base_cols:
+                                result["pair_base_diff_cols"][pair_idx] = base_cols
+                            result["pair_parts_a"][pair_idx] = self._raw_parts_from_row_values(row_a)
+                            result["pair_parts_b"][pair_idx] = self._raw_parts_from_row_values(row_b)
+
+                        if exact_rows:
+                            exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
+                            exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
+                            exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
+                            rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, max_col) if ws_a_edit is not None else {}
+                            rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, max_col) if ws_b_edit is not None else {}
+                            rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, max_col) if (has_base and ws_base_edit is not None) else {}
+                            for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
+                                row_a = _row_from_cache(rows_a, ra, max_col)
+                                row_b = _row_from_cache(rows_b, rb, max_col)
+                                row_a_edit = _row_from_cache(rows_a_edit, ra, max_col)
+                                row_b_edit = _row_from_cache(rows_b_edit, rb, max_col)
+                                if need_exact_ab:
+                                    raw_a, raw_b, cols = self._build_row_parts_and_diff_pair_from_values(
+                                        row_a,
+                                        row_b,
+                                        ra=ra,
+                                        rb=rb,
+                                        ws_a_edit=ws_a_edit,
+                                        ws_b_edit=ws_b_edit,
+                                        edit_cache_a=edit_cache_a,
+                                        edit_cache_b=edit_cache_b,
+                                        row_a_edit_vals=row_a_edit,
+                                        row_b_edit_vals=row_b_edit,
+                                    )
+                                else:
+                                    raw_a = self._raw_parts_from_row_values(row_a)
+                                    raw_b = self._raw_parts_from_row_values(row_b)
+                                if need_exact_base and has_base and ws_base_val is not None and ra is not None:
+                                    row_base = _row_from_cache(rows_base, base_row, max_col)
+                                    row_base_edit = _row_from_cache(rows_base_edit, base_row, max_col)
+                                    base_cols = self._compute_base_diff_cols_from_values(
+                                        row_a,
+                                        row_base,
+                                        ra=ra,
+                                        base_row=base_row,
+                                        ws_a_edit=ws_a_edit,
+                                        ws_base_edit=ws_base_edit,
+                                        edit_cache_a=edit_cache_a,
+                                        edit_cache_base=edit_cache_base,
+                                        row_a_edit_vals=row_a_edit,
+                                        row_base_edit_vals=row_base_edit,
+                                    )
+                                if (not cols) and (not base_cols):
+                                    continue
+                                result["diff_pair_indices"].append(pair_idx)
+                                result["pair_diff_cols"][pair_idx] = cols
+                                if has_base and base_cols:
+                                    result["pair_base_diff_cols"][pair_idx] = base_cols
+                                result["pair_parts_a"][pair_idx] = raw_a
+                                result["pair_parts_b"][pair_idx] = raw_b
+
+                result["diff_pair_indices"] = sorted(set(result["diff_pair_indices"]))
+            except Exception as e:
+                _dlog(f"only-diff async build failed sheet={sheet_name}: {e}")
+                result["error"] = str(e)
+            finally:
+                _wbs_close(wb_a_val, wb_b_val, wb_base_val, wb_a_edit, wb_b_edit, wb_base_edit)
+
+            def _apply_result(res=result):
+                if res.get("build_seq") != self._only_diff_async_build_seq:
+                    return
+                if res.get("build_key") != self._current_only_diff_cache_key():
+                    self._only_diff_async_building = False
+                    self._only_diff_async_build_key = None
+                    return
+                self._only_diff_async_building = False
+                self._only_diff_async_build_key = None
+                if res.get("error"):
+                    return
+                for pair_idx, cols in (res.get("pair_diff_cols") or {}).items():
+                    self.pair_diff_cols[int(pair_idx)] = set(cols)
+                for pair_idx, cols in (res.get("pair_base_diff_cols") or {}).items():
+                    self.pair_base_diff_cols[int(pair_idx)] = set(cols)
+                for pair_idx, parts in (res.get("pair_parts_a") or {}).items():
+                    self.pair_text_a[int(pair_idx)] = self._render_line_from_raw_parts(list(parts))
+                for pair_idx, parts in (res.get("pair_parts_b") or {}).items():
+                    self.pair_text_b[int(pair_idx)] = self._render_line_from_raw_parts(list(parts))
+                self._cache_only_diff_rows_snapshot(res.get("diff_pair_indices") or [])
+                self._invalidate_render_cache()
+                if bool(self.only_diff_var.get()):
+                    self._refresh_mode_switch_preserving_selection(rescan=False)
+                else:
+                    self._update_diff_nav_state()
+
+            try:
+                self.app._queue_ui_task(_apply_result)
+            except Exception as e:
+                _dlog(f"only-diff async queue failed sheet={sheet_name}: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
     def _toggle_only_diff(self):
         # Snapshot mode confirmed by user: diff rows list is generated once when opening (or manual refresh).
         # Toggling "只看差异" only switches display, without recomputing the diff map.
@@ -5595,13 +8206,29 @@ class SheetView:
         # Performance optimization:
         # - For normal sheets with ready diff data, toggling only-diff only changes
         #   display mode and does not need a full rescan.
-        # - For large sheets when enabling only-diff, keep the existing rescan path
-        #   to build the diff snapshot deterministically.
+        # - For large sheets when enabling only-diff, build the exact diff snapshot
+        #   in background and keep the current full view responsive until ready.
         need_rescan = False
         if not getattr(self, "_data_ready", False):
             need_rescan = True
         elif bool(cur) and bool(getattr(self, "_is_large_sheet", False)):
-            need_rescan = True
+            if not self._has_valid_only_diff_snapshot_cache():
+                if self._start_async_large_only_diff_build():
+                    self._update_diff_nav_state()
+                    try:
+                        self.app.only_diff_default = int(self.only_diff_var.get())
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self, "_settings_save_id") and self._settings_save_id:
+                            self.frame.after_cancel(self._settings_save_id)
+                    except Exception:
+                        pass
+                    try:
+                        self._settings_save_id = self.frame.after(1000, self._flush_settings)
+                    except Exception as e:
+                        _dlog(f"settings debounce failed: {e}")
+                    return
         try:
             _dlog(
                 f"TOGGLE only_diff refresh: rescan={need_rescan} "
@@ -5612,13 +8239,7 @@ class SheetView:
         except Exception:
             pass
 
-        self._suppress_bg_apply = True
-        try:
-            self.refresh(row_only=None, rescan=need_rescan)
-        finally:
-            self._suppress_bg_apply = False  # Fresh data rendered; allow bg applies again.
-        self._update_cursor_lines()
-        self._update_diff_nav_state()
+        self._refresh_mode_switch_preserving_selection(rescan=need_rescan)
 
         # Persist setting (debounced: write 1 s after last toggle to avoid per-keypress I/O)
         try:
@@ -5639,6 +8260,7 @@ class SheetView:
             _dlog(f"TOGGLE force_align={self._force_sequence_align} sheet={self.sheet}")
         except Exception:
             self._force_sequence_align = bool(self.force_align_var.get())
+        self._invalidate_only_diff_snapshot_cache()
         self._suppress_bg_apply = True
         try:
             self.refresh(row_only=None, rescan=True)
@@ -5657,6 +8279,7 @@ class SheetView:
             _dlog(f"settings save failed: {e}")
 
     def _manual_rescan(self):
+        self._invalidate_only_diff_snapshot_cache()
         self._suppress_bg_apply = True
         try:
             self.refresh(row_only=None, rescan=True)
@@ -5666,8 +8289,35 @@ class SheetView:
         self._update_diff_nav_state()
 
     # ---------- Merge operations ----------
+    def _skip_same_formula_copy(self, src_edit, dst_edit) -> bool:
+        if not _is_same_formula_copy_noop(src_edit, dst_edit):
+            return False
+        self._formula_copy_skips_pending += 1
+        return True
+
+    def _show_formula_copy_skip_notice(self, count: int):
+        if count <= 0:
+            return
+        msg = (
+            f"已保留 {count} 个单元格的原公式，并采用 theirs 的当前计算结果。\n\n"
+            "这些结果来自其他输入单元格。为保证以后重新计算仍一致，"
+            "请同时在产生差异的依赖 Sheet/输入列中采用对应数据。"
+        )
+        _dlog(f"FORMULA_RESULT_CACHE_ADOPTED sheet={self.sheet} count={count}")
+        try:
+            self.info.configure(text=f"已采用 {count} 个公式缓存结果并保留公式；请同步合并依赖数据")
+        except Exception:
+            pass
+        try:
+            messagebox.showinfo("已保留公式并采用计算结果", msg)
+        except Exception:
+            pass
+
     def _copy_cell(self, direction: str, event):
         try:
+            if self._is_missing_sheet_view():
+                self._copy_missing_sheet(direction)
+                return
             anchor = self._capture_view_anchor()
             if direction == "A2B":
                 src = self.left
@@ -5705,7 +8355,8 @@ class SheetView:
             elif direction == "BASE2A":
                 if ra is None:
                     return
-                src_r = ra
+                pair_idx = self.display_rows[line - 1]
+                src_r = self._base_row_for_pair(pair_idx, pair)
                 dst_r = ra
             else:
                 if rb is None:
@@ -5745,12 +8396,19 @@ class SheetView:
                 old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=c).value
-                # Cached-value mode: always write the cached value
-                self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
-                self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
-                self.app.modified_b = True
-                self.app.modified_sheets_b.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
+                if self._skip_same_formula_copy(v_edit, old_edit):
+                    self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.modified_b = True
+                    self.app.modified_sheets_b.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
+                    self._show_formula_copy_skip_notice(1)
+                else:
+                    # Cached-value mode: always write the cached value
+                    self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
+                    self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.modified_b = True
+                    self.app.modified_sheets_b.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
             elif direction == "MINE2A":
                 # Keep mine value; in conflict mode this means "accept mine".
                 if getattr(self.app, "merge_conflict_mode", False):
@@ -5762,13 +8420,21 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
-                new_edit = _choose_edit_value(v_val, v_edit)
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
-                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
-                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                self.app.modified_a = True
-                self.app.modified_sheets_a.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                if self._skip_same_formula_copy(v_edit, old_edit):
+                    self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                    self._show_formula_copy_skip_notice(1)
+                else:
+                    new_edit = _choose_edit_value(v_val, v_edit)
+                    self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                    self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
                 # In conflict mode, B2A applies theirs; mark conflict resolved.
                 if getattr(self.app, "merge_conflict_mode", False):
                     self.app.user_touched_conflicts = True
@@ -5777,21 +8443,34 @@ class SheetView:
             else:
                 old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
-                v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
-                v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
-                new_edit = _choose_edit_value(v_val, v_edit)
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
-                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
-                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                self.app.modified_a = True
-                self.app.modified_sheets_a.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                if src_r is None:
+                    v_edit = None
+                    v_val = None
+                else:
+                    v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
+                    v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
+                if self._skip_same_formula_copy(v_edit, old_edit):
+                    self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                    self._show_formula_copy_skip_notice(1)
+                else:
+                    new_edit = _choose_edit_value(v_val, v_edit)
+                    self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                    self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
+                    self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
 
             # Mark as touched: keep row visible in "只看差异" even if diffs are resolved.
             pair = self._pair_for_line(line)
             touched_r = self._row_for_side(pair, "A") or self._row_for_side(pair, "B")
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
+            self._invalidate_only_diff_snapshot_cache()
             self._invalidate_render_cache()
 
             # Minimize flicker: use row-only incremental refresh after overwrite.
@@ -5821,6 +8500,477 @@ class SheetView:
                 last_row = r
         return last_row + 1
 
+    def _find_base_row_insert_position(self, pair_idx: int) -> int:
+        """Return the BASE worksheet row index at which to insert a new row.
+
+        Uses the BASE row mapping (mine_to_base_row / theirs_to_base_row via
+        _base_row_for_pair) instead of mine's row number, so that when mine and
+        base are not identity-aligned (mine has prior inserts/deletes vs base)
+        the blank base row lands at the correct BASE position. Returns
+        last_base_row + 1, or 1 if no prior pair maps to a base row.
+        """
+        last_base = 0
+        for i in range(pair_idx):
+            try:
+                br = self._base_row_for_pair(i, self.row_pairs[i])
+            except Exception:
+                br = None
+            if br is not None:
+                last_base = int(br)
+        return last_base + 1
+
+    @staticmethod
+    def _shift_row_number_for_insert(row_num: int | None, insert_pos: int, amount: int = 1) -> int | None:
+        if row_num is None:
+            return None
+        try:
+            row_num = int(row_num)
+        except Exception:
+            return row_num
+        amount = max(0, int(amount))
+        return row_num + amount if row_num >= int(insert_pos) else row_num
+
+    def _rebuild_row_pair_lookup_maps(self):
+        self.row_a_to_pair_idx = {}
+        self.row_b_to_pair_idx = {}
+        for idx, (ra, rb) in enumerate(self.row_pairs):
+            if ra is not None:
+                self.row_a_to_pair_idx[int(ra)] = idx
+            if rb is not None:
+                self.row_b_to_pair_idx[int(rb)] = idx
+
+    def _update_row_model_after_insert(
+        self,
+        *,
+        pair_idx: int,
+        direction: str,
+        insert_pos: int,
+        base_insert_pos: int | None = None,
+        old_pair: tuple[int | None, int | None] | None,
+        base_inserted: bool,
+    ):
+        if not (0 <= int(pair_idx) < len(self.row_pairs)):
+            return
+
+        pair_idx = int(pair_idx)
+        insert_pos = int(insert_pos)
+        # Base rows shift at the base-coordinate insert position (defaults to
+        # insert_pos for backward compatibility / identity mine-base alignment).
+        base_insert_pos = int(base_insert_pos) if base_insert_pos is not None else insert_pos
+        old_pair = old_pair if old_pair is not None else self.row_pairs[pair_idx]
+        old_base_row = None
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            try:
+                old_base_row = self._base_row_for_pair(pair_idx, old_pair)
+            except Exception:
+                old_base_row = None
+
+        updated_pairs: list[tuple[int | None, int | None]] = []
+        for idx, (ra, rb) in enumerate(self.row_pairs):
+            if direction == "B2A":
+                ra = self._shift_row_number_for_insert(ra, insert_pos)
+                if idx == pair_idx:
+                    ra = insert_pos
+            else:
+                rb = self._shift_row_number_for_insert(rb, insert_pos)
+                if idx == pair_idx:
+                    rb = insert_pos
+            updated_pairs.append((ra, rb))
+        self.row_pairs = updated_pairs
+        self._rebuild_row_pair_lookup_maps()
+
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            def _shift_base_row(base_row: int | None) -> int | None:
+                if not base_inserted:
+                    return base_row
+                return self._shift_row_number_for_insert(base_row, base_insert_pos)
+
+            shifted_base_row = _shift_base_row(old_base_row)
+            mine_map_old = dict(getattr(self, "mine_to_base_row", {}) or {})
+            theirs_map_old = dict(getattr(self, "theirs_to_base_row", {}) or {})
+            overrides_old = dict(getattr(self, "pair_base_row_override", {}) or {})
+
+            if direction == "B2A":
+                mine_map_new: dict[int, int] = {}
+                for ra, base_row in mine_map_old.items():
+                    new_ra = self._shift_row_number_for_insert(ra, insert_pos)
+                    if new_ra is None:
+                        continue
+                    mine_map_new[int(new_ra)] = _shift_base_row(base_row)
+                if shifted_base_row is not None:
+                    mine_map_new[insert_pos] = int(shifted_base_row)
+                self.mine_to_base_row = mine_map_new
+
+                theirs_map_new: dict[int, int] = {}
+                for rb, base_row in theirs_map_old.items():
+                    if rb is None:
+                        continue
+                    theirs_map_new[int(rb)] = _shift_base_row(base_row)
+                self.theirs_to_base_row = theirs_map_new
+            else:
+                mine_map_new = {}
+                for ra, base_row in mine_map_old.items():
+                    if ra is None:
+                        continue
+                    mine_map_new[int(ra)] = _shift_base_row(base_row)
+                self.mine_to_base_row = mine_map_new
+
+                theirs_map_new: dict[int, int] = {}
+                for rb, base_row in theirs_map_old.items():
+                    new_rb = self._shift_row_number_for_insert(rb, insert_pos)
+                    if new_rb is None:
+                        continue
+                    theirs_map_new[int(new_rb)] = _shift_base_row(base_row)
+                if shifted_base_row is not None:
+                    theirs_map_new[insert_pos] = int(shifted_base_row)
+                self.theirs_to_base_row = theirs_map_new
+
+            overrides_new: dict[int, int | None] = {}
+            for idx, base_row in overrides_old.items():
+                overrides_new[int(idx)] = _shift_base_row(base_row)
+            if shifted_base_row is not None:
+                overrides_new[pair_idx] = int(shifted_base_row)
+            else:
+                overrides_new.pop(pair_idx, None)
+            self.pair_base_row_override = overrides_new
+
+        try:
+            self.max_row = max(
+                int(self.max_row or 1),
+                int(getattr(self.app.ws_a_val(self.sheet), "max_row", 1) or 1),
+                int(getattr(self.app.ws_b_val(self.sheet), "max_row", 1) or 1),
+            )
+        except Exception:
+            pass
+
+    def _prime_pair_cache_after_insert(
+        self,
+        *,
+        pair_idx: int,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+    ):
+        if not (0 <= int(pair_idx) < len(self.row_pairs)):
+            return
+        pair_idx = int(pair_idx)
+        ra, rb = self.row_pairs[pair_idx]
+        line_a, line_b, cols = self._build_row_and_diff_pair(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra, rb)
+        self.pair_text_a[pair_idx] = line_a
+        self.pair_text_b[pair_idx] = line_b
+        self.pair_diff_cols[pair_idx] = cols
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            try:
+                self.pair_base_diff_cols[pair_idx] = self._compute_base_diff_cols_for_pair(
+                    pair_idx,
+                    (ra, rb),
+                    max_col=self.max_col,
+                    ws_a_val=ws_a_val,
+                    ws_a_edit=ws_a_edit,
+                    ws_base_val=self.app.ws_base_val(self.sheet),
+                    ws_base_edit=self.app.ws_base_edit(self.sheet),
+                )
+            except Exception:
+                self.pair_base_diff_cols.pop(pair_idx, None)
+        else:
+            self.pair_base_diff_cols.pop(pair_idx, None)
+
+    def _try_fast_refresh_after_row_insert(
+        self,
+        *,
+        pair_idx: int,
+        direction: str,
+        insert_pos: int,
+        base_insert_pos: int | None = None,
+        old_pair: tuple[int | None, int | None] | None,
+        base_inserted: bool,
+        suppress_refresh: bool,
+        anchor,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+    ) -> bool:
+        if suppress_refresh:
+            return False
+        if not getattr(self, "_is_large_sheet", False):
+            return False
+        if not getattr(self, "_data_ready", False):
+            return False
+        try:
+            self._update_row_model_after_insert(
+                pair_idx=pair_idx,
+                direction=direction,
+                insert_pos=insert_pos,
+                base_insert_pos=base_insert_pos,
+                old_pair=old_pair,
+                base_inserted=base_inserted,
+            )
+            self._prime_pair_cache_after_insert(
+                pair_idx=pair_idx,
+                ws_a_val=ws_a_val,
+                ws_b_val=ws_b_val,
+                ws_a_edit=ws_a_edit,
+                ws_b_edit=ws_b_edit,
+            )
+            if direction == "B2A":
+                touched_r = insert_pos
+            else:
+                touched_r = self.row_pairs[pair_idx][0] or self.row_pairs[pair_idx][1]
+            if touched_r is not None:
+                self.touched_rows.add(int(touched_r))
+            self._invalidate_only_diff_snapshot_cache()
+            self._invalidate_render_cache()
+            self.refresh(row_only=None, rescan=False)
+            if anchor is not None:
+                self._restore_view_anchor(anchor)
+            self._update_cursor_lines()
+            return True
+        except Exception as e:
+            _dlog(f"FAST_INSERT_REFRESH_FAILED sheet={self.sheet} pair_idx={pair_idx} err={e}")
+            return False
+
+    def _batch_insert_row_copy(
+        self,
+        run: list[tuple[int, int]],
+        direction: str,
+        suppress_refresh: bool,
+        anchor,
+    ) -> bool:
+        if not run:
+            return False
+        try:
+            run = [(int(pair_idx), int(src_row)) for pair_idx, src_row in run]
+            ws_a_val = self.app.ws_a_val(self.sheet)
+            ws_b_val = self.app.ws_b_val(self.sheet)
+            ws_a_edit = self.app.ws_a_edit(self.sheet)
+            ws_b_edit = self.app.ws_b_edit(self.sheet)
+
+            first_pair_idx = run[0][0]
+            old_pairs = {
+                pair_idx: self.row_pairs[pair_idx]
+                for pair_idx, _src_row in run
+                if 0 <= pair_idx < len(self.row_pairs)
+            }
+            old_base_rows = {
+                pair_idx: self._base_row_for_pair(pair_idx, old_pairs.get(pair_idx))
+                for pair_idx, _src_row in run
+                if pair_idx in old_pairs
+            }
+
+            if direction == "B2A":
+                ws_dst_val = ws_a_val
+                ws_dst_edit = ws_a_edit
+                ws_src_val = ws_b_val
+                ws_src_edit = ws_b_edit
+                insert_pos = self._find_row_insert_position(first_pair_idx, "A")
+            else:
+                ws_dst_val = ws_b_val
+                ws_dst_edit = ws_b_edit
+                ws_src_val = ws_a_val
+                ws_src_edit = ws_a_edit
+                insert_pos = self._find_row_insert_position(first_pair_idx, "B")
+
+            count = len(run)
+            ws_dst_val.insert_rows(idx=insert_pos, amount=count)
+            ws_dst_edit.insert_rows(idx=insert_pos, amount=count)
+
+            if direction == "B2A":
+                try:
+                    for op_map in (
+                        self.app.manual_a_cell_ops,
+                        self.app.manual_a_formula_cache_ops,
+                    ):
+                        to_shift = {
+                            k: v for k, v in op_map.items()
+                            if k[0] == self.sheet and k[1] >= insert_pos
+                        }
+                        for k in to_shift:
+                            del op_map[k]
+                        for (s, r, c), v in to_shift.items():
+                            op_map[(s, r + count, c)] = v
+                except Exception as _e_shift:
+                    # Failing to shift recorded edits would write them to the wrong
+                    # rows in the merge output; make it visible rather than silent.
+                    _dlog(f"manual_a_cell_ops shift failed (batch insert): sheet={self.sheet} pos={insert_pos} err={_e_shift}")
+                self.app.record_manual_a_row_insert(self.sheet, insert_pos, count)
+
+            base_inserted = False
+            # BASE insert position is computed in BASE coordinates (not mine's
+            # insert_pos) so that non-identity mine/base alignment inserts the
+            # blank base row at the right place; the row-model base shifts below
+            # use the same base_insert_pos to stay consistent.
+            base_insert_pos = insert_pos
+            if direction == "B2A" and self._is_three_way_enabled():
+                try:
+                    base_insert_pos = self._find_base_row_insert_position(first_pair_idx)
+                    ws_bv = self.app.ws_base_val(self.sheet)
+                    ws_be = self.app.ws_base_edit(self.sheet)
+                    if ws_bv is not None and ws_be is not None:
+                        ws_bv.insert_rows(idx=base_insert_pos, amount=count)
+                        ws_be.insert_rows(idx=base_insert_pos, amount=count)
+                        base_inserted = True
+                except Exception as _e_base_ins:
+                    # A base insert failure leaves A and BASE misaligned for the
+                    # rest of the session (BASE2A would target wrong rows): surface
+                    # it instead of silently corrupting the 3-way view.
+                    _dlog(f"batch base insert failed: sheet={self.sheet} pos={base_insert_pos} err={_e_base_ins}")
+                    try:
+                        messagebox.showwarning(
+                            "基准行插入失败",
+                            "向 BASE 插入对齐行失败，三方对齐可能不准确，请重新加载后再操作。\n"
+                            f"详情：{_e_base_ins}",
+                        )
+                    except Exception:
+                        pass
+
+            src_rows = [src_row for _pair_idx, src_row in run]
+            max_col = max(1, ws_src_val.max_column or 1, ws_src_edit.max_column or 1)
+            src_val_cache = _read_rows_into_cache(ws_src_val, src_rows, max_col)
+            src_edit_cache = _read_rows_into_cache(ws_src_edit, src_rows, max_col)
+            for offset, (_pair_idx, src_row) in enumerate(run):
+                dst_row = insert_pos + offset
+                row_val = _row_from_cache(src_val_cache, src_row, max_col)
+                row_edit = _row_from_cache(src_edit_cache, src_row, max_col)
+                for c in range(1, max_col + 1):
+                    v_val = row_val[c - 1]
+                    v_edit = row_edit[c - 1]
+                    new_edit = _choose_edit_value(v_val, v_edit)
+                    ws_dst_val.cell(row=dst_row, column=c).value = v_val
+                    ws_dst_edit.cell(row=dst_row, column=c).value = new_edit
+                    if direction == "B2A":
+                        self.app.record_manual_a_cell(self.sheet, dst_row, c, new_edit)
+
+            if direction == "B2A":
+                self.app.modified_a = True
+                self.app.modified_sheets_a.add(self.sheet)
+                self.app.push_undo({
+                    "sheet": self.sheet,
+                    "target": "A_INSERT_ROW",
+                    "row": insert_pos,
+                    "base_row": base_insert_pos,
+                    "count": count,
+                    "base_inserted": base_inserted,
+                })
+            else:
+                self.app.modified_b = True
+                self.app.modified_sheets_b.add(self.sheet)
+                self.app.push_undo({
+                    "sheet": self.sheet,
+                    "target": "B_INSERT_ROW",
+                    "row": insert_pos,
+                    "count": count,
+                    "base_inserted": False,
+                })
+
+            amount = count
+            run_pair_to_dst = {pair_idx: insert_pos + offset for offset, (pair_idx, _src_row) in enumerate(run)}
+            updated_pairs: list[tuple[int | None, int | None]] = []
+            for idx, (ra, rb) in enumerate(self.row_pairs):
+                if direction == "B2A":
+                    ra = self._shift_row_number_for_insert(ra, insert_pos, amount)
+                    if idx in run_pair_to_dst:
+                        ra = run_pair_to_dst[idx]
+                else:
+                    rb = self._shift_row_number_for_insert(rb, insert_pos, amount)
+                    if idx in run_pair_to_dst:
+                        rb = run_pair_to_dst[idx]
+                updated_pairs.append((ra, rb))
+            self.row_pairs = updated_pairs
+            self._rebuild_row_pair_lookup_maps()
+
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                def _shift_base_row(base_row: int | None) -> int | None:
+                    if not base_inserted:
+                        return base_row
+                    return self._shift_row_number_for_insert(base_row, base_insert_pos, amount)
+
+                mine_map_old = dict(getattr(self, "mine_to_base_row", {}) or {})
+                theirs_map_old = dict(getattr(self, "theirs_to_base_row", {}) or {})
+                overrides_old = dict(getattr(self, "pair_base_row_override", {}) or {})
+
+                if direction == "B2A":
+                    mine_map_new: dict[int, int] = {}
+                    for ra, base_row in mine_map_old.items():
+                        new_ra = self._shift_row_number_for_insert(ra, insert_pos, amount)
+                        if new_ra is None:
+                            continue
+                        mine_map_new[int(new_ra)] = _shift_base_row(base_row)
+                    for pair_idx, dst_row in run_pair_to_dst.items():
+                        base_row = _shift_base_row(old_base_rows.get(pair_idx))
+                        if base_row is not None:
+                            mine_map_new[int(dst_row)] = int(base_row)
+                    self.mine_to_base_row = mine_map_new
+
+                    theirs_map_new: dict[int, int] = {}
+                    for rb, base_row in theirs_map_old.items():
+                        if rb is None:
+                            continue
+                        theirs_map_new[int(rb)] = _shift_base_row(base_row)
+                    self.theirs_to_base_row = theirs_map_new
+                else:
+                    mine_map_new: dict[int, int] = {}
+                    for ra, base_row in mine_map_old.items():
+                        if ra is None:
+                            continue
+                        mine_map_new[int(ra)] = _shift_base_row(base_row)
+                    self.mine_to_base_row = mine_map_new
+
+                    theirs_map_new: dict[int, int] = {}
+                    for rb, base_row in theirs_map_old.items():
+                        new_rb = self._shift_row_number_for_insert(rb, insert_pos, amount)
+                        if new_rb is None:
+                            continue
+                        theirs_map_new[int(new_rb)] = _shift_base_row(base_row)
+                    for pair_idx, dst_row in run_pair_to_dst.items():
+                        base_row = _shift_base_row(old_base_rows.get(pair_idx))
+                        if base_row is not None:
+                            theirs_map_new[int(dst_row)] = int(base_row)
+                    self.theirs_to_base_row = theirs_map_new
+
+                overrides_new: dict[int, int | None] = {}
+                for idx, base_row in overrides_old.items():
+                    overrides_new[int(idx)] = _shift_base_row(base_row)
+                for pair_idx in run_pair_to_dst:
+                    base_row = _shift_base_row(old_base_rows.get(pair_idx))
+                    if base_row is not None:
+                        overrides_new[int(pair_idx)] = int(base_row)
+                    else:
+                        overrides_new.pop(int(pair_idx), None)
+                self.pair_base_row_override = overrides_new
+
+            try:
+                self.max_row = max(
+                    int(self.max_row or 1),
+                    int(getattr(self.app.ws_a_val(self.sheet), "max_row", 1) or 1),
+                    int(getattr(self.app.ws_b_val(self.sheet), "max_row", 1) or 1),
+                )
+            except Exception:
+                pass
+
+            for pair_idx, src_row in run:
+                self.touched_rows.add(int(src_row))
+                self._prime_pair_cache_after_insert(
+                    pair_idx=pair_idx,
+                    ws_a_val=ws_a_val,
+                    ws_b_val=ws_b_val,
+                    ws_a_edit=ws_a_edit,
+                    ws_b_edit=ws_b_edit,
+                )
+
+            if not suppress_refresh:
+                self._invalidate_only_diff_snapshot_cache()
+                self._invalidate_render_cache()
+                self.refresh(row_only=None, rescan=False)
+                if anchor is not None:
+                    self._restore_view_anchor(anchor)
+                self._update_cursor_lines()
+            return True
+        except Exception as e:
+            messagebox.showerror("Error", f"批量插入行失败：\n{e}")
+            return False
+
     def _insert_row_copy(
         self,
         pair_idx: int,
@@ -5844,6 +8994,7 @@ class SheetView:
             ws_b_val = self.app.ws_b_val(self.sheet)
             ws_a_edit = self.app.ws_a_edit(self.sheet)
             ws_b_edit = self.app.ws_b_edit(self.sheet)
+            old_pair = self.row_pairs[pair_idx] if 0 <= int(pair_idx) < len(self.row_pairs) else None
 
             if direction == "B2A":
                 ws_dst_val = ws_a_val
@@ -5866,28 +9017,45 @@ class SheetView:
             # row numbers are >= insert_pos (they moved up by one in the worksheet).
             if direction == "B2A":
                 try:
-                    to_shift = {k: v for k, v in self.app.manual_a_cell_ops.items()
-                                if k[0] == self.sheet and k[1] >= insert_pos}
-                    for k in to_shift:
-                        del self.app.manual_a_cell_ops[k]
-                    for (s, r, c), v in to_shift.items():
-                        self.app.manual_a_cell_ops[(s, r + 1, c)] = v
-                except Exception:
-                    pass
+                    for op_map in (
+                        self.app.manual_a_cell_ops,
+                        self.app.manual_a_formula_cache_ops,
+                    ):
+                        to_shift = {k: v for k, v in op_map.items()
+                                    if k[0] == self.sheet and k[1] >= insert_pos}
+                        for k in to_shift:
+                            del op_map[k]
+                        for (s, r, c), v in to_shift.items():
+                            op_map[(s, r + 1, c)] = v
+                except Exception as _e_shift:
+                    _dlog(f"manual_a_cell_ops shift failed (row insert): sheet={self.sheet} pos={insert_pos} err={_e_shift}")
+                self.app.record_manual_a_row_insert(self.sheet, insert_pos, 1)
 
-            # In 3-way mode, inserting into A also inserts an empty row in Base
-            # so that A-Base row-number alignment is preserved for BASE2A operations.
+            # In 3-way mode, inserting into A also inserts an empty row in Base.
+            # The base position is mapped via base coordinates (not mine's
+            # insert_pos) so non-identity mine/base alignment stays correct; the
+            # row-model update shifts base rows using the same base_insert_pos.
             base_inserted = False
+            base_insert_pos = insert_pos
             if direction == "B2A" and self._is_three_way_enabled():
                 try:
+                    base_insert_pos = self._find_base_row_insert_position(pair_idx)
                     ws_bv = self.app.ws_base_val(self.sheet)
                     ws_be = self.app.ws_base_edit(self.sheet)
                     if ws_bv is not None and ws_be is not None:
-                        ws_bv.insert_rows(idx=insert_pos)
-                        ws_be.insert_rows(idx=insert_pos)
+                        ws_bv.insert_rows(idx=base_insert_pos)
+                        ws_be.insert_rows(idx=base_insert_pos)
                         base_inserted = True
-                except Exception:
-                    pass
+                except Exception as _e_base_ins:
+                    _dlog(f"base insert failed: sheet={self.sheet} pos={base_insert_pos} err={_e_base_ins}")
+                    try:
+                        messagebox.showwarning(
+                            "基准行插入失败",
+                            "向 BASE 插入对齐行失败，三方对齐可能不准确，请重新加载后再操作。\n"
+                            f"详情：{_e_base_ins}",
+                        )
+                    except Exception:
+                        pass
 
             # Copy cell values from src_row into the newly inserted row.
             max_col = max(1, ws_src_val.max_column or 1, ws_src_edit.max_column or 1)
@@ -5912,16 +9080,33 @@ class SheetView:
                 "sheet": self.sheet,
                 "target": target_tag,
                 "row": insert_pos,
+                "base_row": base_insert_pos,
                 "count": 1,
                 "base_inserted": base_inserted,
             })
 
             if not suppress_refresh:
-                self._invalidate_render_cache()
-                self.refresh(row_only=None, rescan=True)
-                if anchor is not None:
-                    self._restore_view_anchor(anchor)
-                self._update_cursor_lines()
+                fast_done = self._try_fast_refresh_after_row_insert(
+                    pair_idx=pair_idx,
+                    direction=direction,
+                    insert_pos=insert_pos,
+                    base_insert_pos=base_insert_pos,
+                    old_pair=old_pair,
+                    base_inserted=base_inserted,
+                    suppress_refresh=suppress_refresh,
+                    anchor=anchor,
+                    ws_a_val=ws_a_val,
+                    ws_b_val=ws_b_val,
+                    ws_a_edit=ws_a_edit,
+                    ws_b_edit=ws_b_edit,
+                )
+                if not fast_done:
+                    self._invalidate_only_diff_snapshot_cache()
+                    self._invalidate_render_cache()
+                    self.refresh(row_only=None, rescan=True)
+                    if anchor is not None:
+                        self._restore_view_anchor(anchor)
+                    self._update_cursor_lines()
             return True
         except Exception as e:
             messagebox.showerror("Error", f"插入行失败：\n{e}")
@@ -5937,7 +9122,11 @@ class SheetView:
         _undo_out: list | None = None,
     ) -> bool:
         t0 = datetime.now()
+        formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
         try:
+            if self._is_missing_sheet_view():
+                self._copy_missing_sheet(direction)
+                return True
             anchor = None if suppress_refresh else self._capture_view_anchor()
             resolved_only = False
             changed = False
@@ -5974,7 +9163,7 @@ class SheetView:
             elif direction == "BASE2A":
                 if ra is None:
                     return False
-                src_r = ra
+                src_r = self._base_row_for_pair(pair_idx, pair)
                 dst_r = ra
             else:
                 if rb is None:
@@ -6025,7 +9214,7 @@ class SheetView:
             elif action_direction == "BASE2A":
                 if ra is None:
                     return False
-                src_r = ra
+                src_r = self._base_row_for_pair(pair_idx, pair)
                 dst_r = ra
             else:
                 if rb is None:
@@ -6066,6 +9255,10 @@ class SheetView:
                         old_val = ws_b_val.cell(row=dst_r, column=c).value
                         v_edit = ws_a_edit.cell(row=src_r, column=c).value
                         v_val = ws_a_val.cell(row=src_r, column=c).value
+                        if self._skip_same_formula_copy(v_edit, old_edit):
+                            ws_b_val.cell(row=dst_r, column=c).value = v_val
+                            undo_cells.append((dst_r, c, old_edit, old_val))
+                            continue
                         ws_b_edit.cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
                         ws_b_val.cell(row=dst_r, column=c).value = v_val
                         undo_cells.append((dst_r, c, old_edit, old_val))
@@ -6083,59 +9276,82 @@ class SheetView:
                 return bool(changed)
             elif action_direction == "B2A":
                 undo_cells = []
+                applied_cols = set()
                 for c in cols:
                     old_edit = ws_a_edit.cell(row=dst_r, column=c).value
                     old_val = ws_a_val.cell(row=dst_r, column=c).value
                     v_edit = ws_b_edit.cell(row=src_r, column=c).value
                     v_val = ws_b_val.cell(row=src_r, column=c).value
+                    if self._skip_same_formula_copy(v_edit, old_edit):
+                        ws_a_val.cell(row=dst_r, column=c).value = v_val
+                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                        undo_cells.append((dst_r, c, old_edit, old_val))
+                        applied_cols.add(c)
+                        continue
                     new_edit = _choose_edit_value(v_val, v_edit)
                     ws_a_edit.cell(row=dst_r, column=c).value = new_edit
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
-                self.app.modified_a = True
-                self.app.modified_sheets_a.add(self.sheet)
+                    applied_cols.add(c)
                 if undo_cells:
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
                     changed = True
                     if _undo_out is not None:
                         _undo_out.extend(undo_cells)
                     else:
                         self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": undo_cells})
                 # In conflict mode, B2A applies theirs; mark conflict resolved.
-                if getattr(self.app, "merge_conflict_mode", False):
+                if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(conflict_row, cols)
+                    self._resolve_conflict_row(conflict_row, applied_cols)
                     resolved_only = True
                     changed = True
             else:
                 undo_cells = []
+                applied_cols = set()
                 if ws_base_edit is None or ws_base_val is None:
                     return False
                 for c in cols:
                     old_edit = ws_a_edit.cell(row=dst_r, column=c).value
                     old_val = ws_a_val.cell(row=dst_r, column=c).value
-                    v_edit = ws_base_edit.cell(row=src_r, column=c).value
-                    v_val = ws_base_val.cell(row=src_r, column=c).value
+                    if src_r is None:
+                        v_edit = None
+                        v_val = None
+                    else:
+                        v_edit = ws_base_edit.cell(row=src_r, column=c).value
+                        v_val = ws_base_val.cell(row=src_r, column=c).value
+                    if self._skip_same_formula_copy(v_edit, old_edit):
+                        ws_a_val.cell(row=dst_r, column=c).value = v_val
+                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                        undo_cells.append((dst_r, c, old_edit, old_val))
+                        applied_cols.add(c)
+                        continue
                     new_edit = _choose_edit_value(v_val, v_edit)
                     ws_a_edit.cell(row=dst_r, column=c).value = new_edit
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
-                self.app.modified_a = True
-                self.app.modified_sheets_a.add(self.sheet)
+                    applied_cols.add(c)
                 if undo_cells:
+                    self.app.modified_a = True
+                    self.app.modified_sheets_a.add(self.sheet)
                     changed = True
                     if _undo_out is not None:
                         _undo_out.extend(undo_cells)
                     else:
                         self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": undo_cells})
-                if getattr(self.app, "merge_conflict_mode", False):
+                if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(dst_r, cols)
+                    self._resolve_conflict_row(dst_r, applied_cols)
                     resolved_only = True
                     changed = True
 
             if not changed:
+                formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
+                if formula_skipped > 0 and not suppress_refresh:
+                    self._show_formula_copy_skip_notice(formula_skipped)
                 return False
 
             # Mark as touched: keep row visible in "只看差异" even if diffs are resolved.
@@ -6143,6 +9359,7 @@ class SheetView:
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
             if not suppress_refresh:
+                self._invalidate_only_diff_snapshot_cache()
                 self._invalidate_render_cache()
                 # Minimize flicker: use row-only incremental refresh after overwrite.
                 if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
@@ -6150,6 +9367,9 @@ class SheetView:
                 self.refresh(row_only=dst_r, rescan=False)
                 self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
+                formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
+                if formula_skipped > 0:
+                    self._show_formula_copy_skip_notice(formula_skipped)
             return True
         except Exception as e:
             messagebox.showerror("Error", f"覆盖整行失败：\n{e}")
@@ -6178,14 +9398,19 @@ class SheetView:
                 ws_edit.delete_rows(start_row, count)
                 ws_val.delete_rows(start_row, count)
                 try:
-                    keys_to_drop = [k for k in self.app.manual_a_cell_ops.keys() if k[0] == sheet and k[1] >= int(start_row)]
-                    for k in keys_to_drop:
-                        self.app.manual_a_cell_ops.pop(k, None)
+                    for op_map in (
+                        self.app.manual_a_cell_ops,
+                        self.app.manual_a_formula_cache_ops,
+                    ):
+                        keys_to_drop = [k for k in op_map.keys() if k[0] == sheet and k[1] >= int(start_row)]
+                        for k in keys_to_drop:
+                            op_map.pop(k, None)
                 except Exception:
                     pass
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(sheet)
                 if sheet == self.sheet:
+                    self._invalidate_only_diff_snapshot_cache()
                     self._invalidate_render_cache()
                     self.refresh(row_only=None, rescan=True)
                     self._update_cursor_lines()
@@ -6194,6 +9419,7 @@ class SheetView:
                 row = action.get("row", 1)
                 count = action.get("count", 1)
                 base_inserted = action.get("base_inserted", False)
+                base_row_del = action.get("base_row", row)
                 if target == "A_INSERT_ROW":
                     ws_edit = self.app.ws_a_edit(sheet)
                     ws_val = self.app.ws_a_val(sheet)
@@ -6202,19 +9428,24 @@ class SheetView:
                     try:
                         row_int = int(row)
                         # Drop manual-edit records for the deleted row(s).
-                        to_drop = [k for k in self.app.manual_a_cell_ops
-                                   if k[0] == sheet and row_int <= k[1] < row_int + count]
-                        for k in to_drop:
-                            del self.app.manual_a_cell_ops[k]
-                        # Shift records for rows that moved down after the delete.
-                        to_shift = {k: v for k, v in self.app.manual_a_cell_ops.items()
-                                    if k[0] == sheet and k[1] >= row_int + count}
-                        for k in to_shift:
-                            del self.app.manual_a_cell_ops[k]
-                        for (s, r, c), v in to_shift.items():
-                            self.app.manual_a_cell_ops[(s, r - count, c)] = v
+                        for op_map in (
+                            self.app.manual_a_cell_ops,
+                            self.app.manual_a_formula_cache_ops,
+                        ):
+                            to_drop = [k for k in op_map
+                                       if k[0] == sheet and row_int <= k[1] < row_int + count]
+                            for k in to_drop:
+                                del op_map[k]
+                            # Shift records for rows that moved up after the delete.
+                            to_shift = {k: v for k, v in op_map.items()
+                                        if k[0] == sheet and k[1] >= row_int + count}
+                            for k in to_shift:
+                                del op_map[k]
+                            for (s, r, c), v in to_shift.items():
+                                op_map[(s, r - count, c)] = v
                     except Exception:
                         pass
+                    self.app.remove_last_manual_a_row_insert(sheet, row, count)
                     self.app.modified_a = True
                     self.app.modified_sheets_a.add(sheet)
                 else:
@@ -6229,11 +9460,12 @@ class SheetView:
                         ws_bv = self.app.ws_base_val(sheet)
                         ws_be = self.app.ws_base_edit(sheet)
                         if ws_bv is not None and ws_be is not None:
-                            ws_bv.delete_rows(row, count)
-                            ws_be.delete_rows(row, count)
+                            ws_bv.delete_rows(base_row_del, count)
+                            ws_be.delete_rows(base_row_del, count)
                     except Exception:
                         pass
                 if sheet == self.sheet:
+                    self._invalidate_only_diff_snapshot_cache()
                     self._invalidate_render_cache()
                     self.refresh(row_only=None, rescan=True)
                     self._update_cursor_lines()
@@ -6262,6 +9494,7 @@ class SheetView:
             if sheet == self.sheet:
                 for r in rows:
                     self.touched_rows.add(r)
+                self._invalidate_only_diff_snapshot_cache()
                 if self._align_rows_enabled:
                     # Full refresh supersedes per-row work; avoid N redundant partial renders.
                     self.refresh(row_only=None, rescan=True)
@@ -6300,6 +9533,8 @@ class SheetView:
             ws_b_edit = self.app.ws_b_edit(self.sheet)
 
             self.max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+            self.col_max_a = ws_a.max_column or 1
+            self.col_max_b = ws_b.max_column or 1
 
             pair_idx = self.row_a_to_pair_idx.get(r)
             if pair_idx is None:
@@ -6333,6 +9568,8 @@ class SheetView:
             ws_b_edit = self.app.ws_b_edit(self.sheet)
 
             self.max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+            self.col_max_a = ws_a.max_column or 1
+            self.col_max_b = ws_b.max_column or 1
             pair_idx = self.row_a_to_pair_idx.get(r)
             if pair_idx is None:
                 pair_idx = self.row_b_to_pair_idx.get(r)
@@ -6343,6 +9580,18 @@ class SheetView:
             ra, rb = self.row_pairs[pair_idx]
             line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
             self.pair_diff_cols[pair_idx] = cols
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                self.pair_base_diff_cols[pair_idx] = self._compute_base_diff_cols_for_pair(
+                    pair_idx,
+                    (ra, rb),
+                    max_col=self.max_col,
+                    ws_a_val=ws_a,
+                    ws_a_edit=ws_a_edit,
+                    ws_base_val=self.app.ws_base_val(self.sheet),
+                    ws_base_edit=self.app.ws_base_edit(self.sheet),
+                )
+            else:
+                self.pair_base_diff_cols.pop(pair_idx, None)
             self.pair_text_a[pair_idx] = line_a
             self.pair_text_b[pair_idx] = line_b
 
@@ -6366,16 +9615,26 @@ class SheetView:
                 w.tag_remove("diffrow", f"{line}.0", f"{line}.end")
                 w.tag_remove("diffcell", f"{line}.0", f"{line}.end")
 
-            if cols:
+            visual_cols = self._visual_diff_cols_for_pair(pair_idx)
+            if visual_cols:
                 self.left.tag_add("diffrow", f"{line}.0", f"{line}.end")
                 self.right.tag_add("diffrow", f"{line}.0", f"{line}.end")
-
-                spans = self._spans_for_line()
-                for c in cols:
-                    if c in spans:
-                        s, e = spans[c]
-                        self.left.tag_add("diffcell", f"{line}.{s}", f"{line}.{e}")
-                        self.right.tag_add("diffcell", f"{line}.{s}", f"{line}.{e}")
+                self.base.tag_add("diffrow", f"{line}.0", f"{line}.end")
+                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                left_args, base_args, right_args, _lr, _br, _rr = self._diffcell_tag_args_for_line(
+                    line,
+                    pair_idx,
+                    self.pair_text_a.get(pair_idx, ""),
+                    base_line,
+                    self.pair_text_b.get(pair_idx, ""),
+                )
+                if left_args:
+                    self.left.tag_add("diffcell", *left_args)
+                if base_args:
+                    self.base.tag_add("diffcell", *base_args)
+                if right_args:
+                    self.right.tag_add("diffcell", *right_args)
+                self._clear_diffrow_under_diffcells(left_args, base_args, right_args)
         except Exception:
             pass
 
@@ -6394,12 +9653,11 @@ class SheetView:
         pair = self.row_pairs[pair_idx]
         if not pair:
             return ""
-        ra, rb = pair
-        r = ra
+        r = self._base_row_for_pair(pair_idx, pair)
         if r is None:
             return ""
         try:
-            ws_base = self.app.ws_base_val(self.sheet)
+            ws_base = self._display_ws("BASE", edit=False)
         except Exception:
             return ""
         raw = []
@@ -6423,7 +9681,28 @@ class SheetView:
             except Exception:
                 pass
             return
-        lines = [self._build_base_line(pair_idx) for pair_idx in self.display_rows]
+        lines = []
+        if self.display_rows and getattr(self, "_is_large_sheet", False):
+            try:
+                ws_base = self._display_ws("BASE", edit=False)
+                base_rows_needed = []
+                for pair_idx in self.display_rows:
+                    base_row = self._base_row_for_pair(pair_idx)
+                    if base_row is not None:
+                        base_rows_needed.append(base_row)
+                rows_base = _read_rows_into_cache(ws_base, base_rows_needed, self.max_col)
+                for pair_idx in self.display_rows:
+                    base_row = self._base_row_for_pair(pair_idx)
+                    if base_row is None:
+                        lines.append("")
+                        continue
+                    row_base = _row_from_cache(rows_base, base_row, self.max_col)
+                    raw = [_val_to_str(v) for v in row_base]
+                    lines.append(self._render_line_from_raw_parts(raw))
+            except Exception:
+                lines = [self._build_base_line(pair_idx) for pair_idx in self.display_rows]
+        else:
+            lines = [self._build_base_line(pair_idx) for pair_idx in self.display_rows]
         try:
             self.base.delete("1.0", "end")
             self.base.insert("1.0", "\n".join(lines) + ("\n" if lines else ""))
@@ -6442,14 +9721,59 @@ class SheetView:
 
     def _row_label_for_pair_idx(self, pair_idx: int, side: str) -> str:
         try:
-            pair = self.row_pairs[pair_idx]
-            r = self._row_for_side(pair, side)
+            if side == "BASE":
+                r = self._base_row_for_pair(pair_idx)
+            else:
+                pair = self.row_pairs[pair_idx]
+                r = self._row_for_side(pair, side)
             return str(r) if r is not None else ""
         except Exception:
             return ""
 
+    def _rownum_render_width(self) -> int:
+        max_label = int(self.max_row or 0)
+        try:
+            mine_base = getattr(self, "mine_to_base_row", {}) or {}
+            theirs_base = getattr(self, "theirs_to_base_row", {}) or {}
+            missing_base = getattr(self, "_missing_base_row_map", {}) or {}
+            if mine_base:
+                max_label = max(max_label, max(int(v) for v in mine_base.values() if v is not None))
+            if theirs_base:
+                max_label = max(max_label, max(int(v) for v in theirs_base.values() if v is not None))
+            if missing_base:
+                max_label = max(max_label, max(int(v) for v in missing_base.values() if v is not None))
+        except Exception:
+            pass
+        return max(3, len(str(max(0, max_label))))
+
+    def _sync_row_header_width_widgets(self):
+        rn_w = self._rownum_render_width()
+        header_w = max(4, rn_w + 1)
+        self._rownum_display_width = rn_w
+        if getattr(self, "_row_header_width", None) == header_w:
+            return rn_w
+        self._row_header_width = header_w
+        widgets = [
+            getattr(self, "left_ln", None),
+            getattr(self, "base_ln", None),
+            getattr(self, "right_ln", None),
+            getattr(self, "left_corner_hdr", None),
+            getattr(self, "base_corner_hdr", None),
+            getattr(self, "right_corner_hdr", None),
+            getattr(self, "cursor_cmp_corner", None),
+            getattr(self, "cursor_cmp_ln", None),
+        ]
+        for w in widgets:
+            if w is None:
+                continue
+            try:
+                w.configure(width=header_w)
+            except Exception:
+                pass
+        return rn_w
+
     def _render_row_headers_full(self):
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         left_lines = []
         base_lines = []
         right_lines = []
@@ -6468,7 +9792,7 @@ class SheetView:
                 pass
 
     def _render_row_header_line(self, line: int, pair_idx: int):
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         vals = (
             self._row_label_for_pair_idx(pair_idx, "A").rjust(rn_w),
             self._row_label_for_pair_idx(pair_idx, "BASE").rjust(rn_w),
@@ -6497,7 +9821,7 @@ class SheetView:
 
     def _render_col_headers(self):
         hdr = self._build_col_header_line()
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         corner = "".rjust(rn_w)
         for w in (self.left_corner_hdr, self.base_corner_hdr, self.right_corner_hdr, self.cursor_cmp_corner):
             try:
@@ -6519,12 +9843,13 @@ class SheetView:
     def _render_cursor_row_headers(self, pair, is_three: bool):
         if not hasattr(self, "cursor_cmp_ln"):
             return
-        rn_w = max(3, len(str(self.max_row)))
+        rn_w = self._sync_row_header_width_widgets()
         ra = self._row_for_side(pair, "A") if pair else None
         rb = self._row_for_side(pair, "B") if pair else None
         rows = []
         if is_three:
-            base_r = self._row_for_side(pair, "BASE") if pair else None
+            pair_idx = self._normalize_pair_idx(getattr(self, "_last_cursor_cmp_pair_idx", None))
+            base_r = self._base_row_for_pair(pair_idx, pair) if pair and pair_idx is not None else None
             rows.append(str(base_r) if base_r is not None else "")
             rows.append(str(ra) if ra is not None else "")
         else:
@@ -6559,6 +9884,11 @@ class SheetView:
             ws_b_edit = wb_b_edit[self.sheet] if wb_b_edit is not None else None
         except Exception:
             ws_b_edit = None
+        try:
+            wb_base_edit = getattr(self.app, "_wb_base_edit", None)
+            ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
+        except Exception:
+            ws_base_edit_ready = None
 
         # Accuracy guard:
         # cached-value mode may read formula cells as None when cache is missing.
@@ -6579,8 +9909,15 @@ class SheetView:
         except Exception:
             first = None
 
-        # _spans_for_line() result depends only on col_char_widths (invariant during this call)
-        _col_spans = self._spans_for_line()
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            self._ensure_base_diff_cache(
+                pair_indices=new_rows,
+                max_col=self.max_col,
+                ws_a_val=ws_a,
+                ws_a_edit=ws_a_edit,
+                ws_base_val=self.app.ws_base_val(self.sheet),
+                ws_base_edit=self.app.ws_base_edit(self.sheet),
+            )
 
         for idx, pair_idx in enumerate(new_rows, start=0):
             if pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b:
@@ -6590,9 +9927,9 @@ class SheetView:
                 self.pair_text_a[pair_idx] = line_a
                 self.pair_text_b[pair_idx] = line_b
             else:
-                cols = self.pair_diff_cols.get(pair_idx, set())
                 line_a = self.pair_text_a.get(pair_idx, "")
                 line_b = self.pair_text_b.get(pair_idx, "")
+            visual_cols = self._visual_diff_cols_for_pair(pair_idx)
 
             line_no = start_line + idx
             self.left.insert("end", line_a + "\n")
@@ -6601,16 +9938,25 @@ class SheetView:
             self.right.insert("end", line_b + "\n")
             self._render_row_header_line(line_no, pair_idx)
 
-            if cols:
+            if visual_cols:
                 self._display_diff_row_count += 1
                 self.left.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.base.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.right.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
-                for c in cols:
-                    if c in _col_spans:
-                        s, e = _col_spans[c]
-                        self.left.tag_add("diffcell", f"{line_no}.{s}", f"{line_no}.{e}")
-                        self.right.tag_add("diffcell", f"{line_no}.{s}", f"{line_no}.{e}")
+                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                left_args, base_args, right_args, _lr, _br, _rr = self._diffcell_tag_args_for_line(
+                    line_no,
+                    pair_idx,
+                    line_a,
+                    base_line,
+                    line_b,
+                )
+                if left_args:
+                    self.left.tag_add("diffcell", *left_args)
+                if base_args:
+                    self.base.tag_add("diffcell", *base_args)
+                if right_args:
+                    self.right.tag_add("diffcell", *right_args)
 
         self.display_rows.extend(new_rows)
         for i, pair_idx in enumerate(new_rows, start=start_line):
@@ -6659,10 +10005,123 @@ class SheetView:
         new_rows = self._full_display_rows[old_limit:new_limit]
         self._append_rows(new_rows)
 
+    def _refresh_missing_sheet_view(self, row_only: int | None, rescan: bool):
+        meta = self._sheet_meta()
+        ws_a = self._display_ws("A", edit=False)
+        ws_b = self._display_ws("B", edit=False)
+        ws_a_edit = self._display_ws("A", edit=True)
+        ws_b_edit = self._display_ws("B", edit=True)
+        ws_base = self._display_ws("BASE", edit=False) if getattr(self.app, "has_base", False) else None
+
+        a_r, a_c = _effective_bounds(ws_a) if meta.get("has_a") else (0, 0)
+        b_r, b_c = _effective_bounds(ws_b) if meta.get("has_b") else (0, 0)
+        base_r, base_c = _effective_bounds(ws_base) if (ws_base is not None and meta.get("has_base")) else (0, 0)
+        self.max_row = max(1, a_r, b_r, base_r)
+        self.max_col = max(1, a_c, b_c, base_c)
+        self.col_max_a = max(1, a_c)
+        self.col_max_b = max(1, b_c)
+        self._bounds_checked = True
+        self._is_large_sheet = False
+        self._align_rows_enabled = False
+        self._diff_partial = False
+        self._full_render = True
+        self._missing_base_row_map = {}
+        self.mine_to_base_row = {r: r for r in range(1, min(a_r, base_r) + 1)} if meta.get("has_a") and meta.get("has_base") else {}
+        self.theirs_to_base_row = {r: r for r in range(1, min(b_r, base_r) + 1)} if meta.get("has_b") and meta.get("has_base") else {}
+        self.pair_base_row_override = {}
+
+        self.row_pairs = []
+        self.row_a_to_pair_idx = {}
+        self.row_b_to_pair_idx = {}
+        self.pair_text_a = {}
+        self.pair_text_b = {}
+        self.pair_diff_cols = {}
+        self.pair_base_diff_cols = {}
+
+        for r in range(1, self.max_row + 1):
+            ra = r if meta.get("has_a") and r <= a_r else None
+            rb = r if meta.get("has_b") and r <= b_r else None
+            idx = len(self.row_pairs)
+            self.row_pairs.append((ra, rb))
+            if ra is not None:
+                self.row_a_to_pair_idx[ra] = idx
+            if rb is not None:
+                self.row_b_to_pair_idx[rb] = idx
+            if meta.get("has_base") and r <= base_r:
+                self._missing_base_row_map[idx] = r
+
+        self._prescan_col_widths(ws_a, ws_b, ws_base)
+        for idx, (ra, rb) in enumerate(self.row_pairs):
+            line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
+            if (ra is None and rb is None and idx in self._missing_base_row_map) or ((ra is None) != (rb is None)):
+                cols = {-1}
+            self.pair_text_a[idx] = line_a
+            self.pair_text_b[idx] = line_b
+            self.pair_diff_cols[idx] = cols
+
+        self._data_ready = True
+        self._full_display_rows = list(range(0, len(self.row_pairs)))
+        self.display_rows = list(self._full_display_rows)
+        self.row_to_line = {r: i + 1 for i, r in enumerate(self.display_rows)}
+
+        try:
+            self._render_col_headers()
+        except Exception:
+            pass
+        self.left.delete("1.0", "end")
+        self.base.delete("1.0", "end")
+        self.right.delete("1.0", "end")
+        for w in (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln):
+            try:
+                w.tag_remove("diffrow", "1.0", "end")
+                w.tag_remove("diffcell", "1.0", "end")
+                w.tag_remove("paddingrow", "1.0", "end")
+            except Exception:
+                pass
+        lines_a = [self.pair_text_a.get(pair_idx, "") for pair_idx in self.display_rows]
+        lines_b = [self.pair_text_b.get(pair_idx, "") for pair_idx in self.display_rows]
+        self.left.insert("1.0", "\n".join(lines_a) + ("\n" if lines_a else ""))
+        self._render_base_full()
+        self.right.insert("1.0", "\n".join(lines_b) + ("\n" if lines_b else ""))
+        self._render_row_headers_full()
+
+        diffrow_args = []
+        pad_left = []
+        pad_right = []
+        for line_idx, pair_idx in enumerate(self.display_rows, start=1):
+            if self._pair_has_visual_diff(pair_idx):
+                diffrow_args.extend([f"{line_idx}.0", f"{line_idx}.end"])
+            ra, rb = self.row_pairs[pair_idx]
+            if ra is None:
+                pad_left.extend([f"{line_idx}.0", f"{line_idx}.end"])
+            if rb is None:
+                pad_right.extend([f"{line_idx}.0", f"{line_idx}.end"])
+        if diffrow_args:
+            for w in (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln):
+                w.tag_add("diffrow", *diffrow_args)
+        if pad_left:
+            self.left.tag_add("paddingrow", *pad_left)
+        if pad_right:
+            self.right.tag_add("paddingrow", *pad_right)
+
+        diff_count = len(self.display_rows)
+        self.info.configure(text=f"缺失Sheet对照 | RowsShown: {len(self.display_rows)} / {len(self.row_pairs)}   Cols: {self.max_col}   DiffRows: {diff_count}")
+        self._display_diff_row_count = diff_count
+        self.app.set_sheet_has_diff(self.sheet, diff_count > 0, confirmed=True)
+        self.app.refresh_sheet_nav()
+        self._update_diff_nav_state()
+        try:
+            self._update_diff_maps()
+        except Exception:
+            pass
+        return
+
     def refresh(self, row_only: int | None, rescan: bool):
         _dlog(f"REFRESH sheet={self.sheet} row_only={row_only} rescan={rescan} only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()}")
         if rescan and (not self._full_render):
             self._render_limit = _FAST_RENDER_ROW_LIMIT
+        if self._is_missing_sheet_view():
+            return self._refresh_missing_sheet_view(row_only, rescan)
         conflict_cells_by_row = None
         if getattr(self.app, "merge_conflict_mode", False):
             rows_map = getattr(self.app, "merge_conflict_cells_by_sheet", None)
@@ -6681,12 +10140,19 @@ class SheetView:
             ws_b_edit = wb_b_edit[self.sheet] if wb_b_edit is not None else None
         except Exception:
             ws_b_edit = None
+        try:
+            wb_base_edit = getattr(self.app, "_wb_base_edit", None)
+            ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
+        except Exception:
+            ws_base_edit_ready = None
 
         if rescan or (not self._bounds_checked):
             a_r, a_c = _effective_bounds(ws_a)
             b_r, b_c = _effective_bounds(ws_b)
             self.max_row = max(a_r, b_r)
             self.max_col = max(a_c, b_c)
+            self.col_max_a = a_c
+            self.col_max_b = b_c
             self._bounds_checked = True
             self._is_large_sheet = self.max_row >= _LARGE_SHEET_ROW_THRESHOLD
             if self._is_large_sheet:
@@ -6701,10 +10167,12 @@ class SheetView:
                 # Skip this call; _apply_sheet_cache will call refresh() when done.
                 return
             self.pair_diff_cols = {}
+            self.pair_base_diff_cols = {}
             self.pair_text_a = {}
             self.pair_text_b = {}
             self.row_a_to_pair_idx = {}
             self.row_b_to_pair_idx = {}
+            self.pair_base_row_override = {}
             self._diff_partial = False
 
             if conflict_cells_by_row is not None:
@@ -6728,6 +10196,8 @@ class SheetView:
                 for idx, (ra, rb) in enumerate(self.row_pairs):
                     line_a, line_b, _cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
                     cols = set(conflict_cells_by_row.get(ra, set())) if ra is not None else set()
+                    if not cols and _cols:  # preserve sentinel {-1} for one-sided rows
+                        cols = _cols
                     self.pair_diff_cols[idx] = cols
                     self.pair_text_a[idx] = line_a
                     self.pair_text_b[idx] = line_b
@@ -6746,7 +10216,49 @@ class SheetView:
                     self.row_pairs = self._build_row_pairs(ws_a, ws_b, force=force_align)
                 else:
                     self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
-
+                self.mine_to_base_row = {}
+                self.theirs_to_base_row = {}
+                if getattr(self.app, "has_base", False):
+                    try:
+                        ws_base_map = self.app.ws_base_val(self.sheet)
+                    except Exception:
+                        ws_base_map = None
+                    if ws_base_map is not None:
+                        try:
+                            self.mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_generic(ws_a, ws_base_map, self.max_col, force=force_align))
+                        except Exception:
+                            self.mine_to_base_row = {}
+                        try:
+                            self.theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_generic(ws_b, ws_base_map, self.max_col, force=force_align))
+                        except Exception:
+                            self.theirs_to_base_row = {}
+                        self.row_pairs = _split_tail_independent_append_pairs(
+                            self.row_pairs,
+                            self.mine_to_base_row,
+                            self.theirs_to_base_row,
+                            ws_a,
+                            ws_b,
+                            self.max_col,
+                        )
+                        self.row_pairs = _split_low_similarity_tail_pairs(
+                            self.row_pairs,
+                            self.mine_to_base_row,
+                            self.theirs_to_base_row,
+                            ws_a,
+                            ws_b,
+                            self.max_col,
+                        )
+                        self.pair_base_row_override = _build_pair_base_row_overrides(
+                            self.row_pairs,
+                            self.mine_to_base_row,
+                            self.theirs_to_base_row,
+                            ws_base_map,
+                            ws_a,
+                            ws_b,
+                            self.max_col,
+                        )
+                self.row_a_to_pair_idx = {}
+                self.row_b_to_pair_idx = {}
                 for idx, (ra, rb) in enumerate(self.row_pairs):
                     if ra is not None:
                         self.row_a_to_pair_idx[ra] = idx
@@ -6755,11 +10267,13 @@ class SheetView:
 
                 # Pre-scan column widths for aligned display before building any formatted lines.
                 ws_base_val_opt = None
+                ws_base_edit_opt = None
                 if getattr(self.app, "has_base", False):
                     try:
                         ws_base_val_opt = self.app.ws_base_val(self.sheet)
                     except Exception:
                         pass
+                    ws_base_edit_opt = ws_base_edit_ready if ws_base_edit_ready is not None else ws_base_val_opt
                 _prescan_limit = _FAST_RENDER_ROW_LIMIT if self._is_large_sheet else 0
                 self._prescan_col_widths(ws_a, ws_b, ws_base_val_opt, max_pairs=_prescan_limit)
 
@@ -6767,7 +10281,16 @@ class SheetView:
                 # - full mode: lazy row compute (first 200 visible rows only)
                 # - only-diff mode: block scan from tail to head (1000 rows/block)
                 if self._is_large_sheet and bool(self.only_diff_var.get()):
-                    self._precompute_large_diff_by_blocks(ws_a, ws_b, ws_a_edit, ws_b_edit, max_row_a, max_row_b)
+                    self._precompute_large_diff_by_blocks(
+                        ws_a,
+                        ws_b,
+                        ws_a_edit,
+                        ws_b_edit,
+                        max_row_a,
+                        max_row_b,
+                        ws_base_val=ws_base_val_opt,
+                        ws_base_edit=ws_base_edit_opt,
+                    )
                 elif not self._is_large_sheet:
                     for idx, (ra, rb) in enumerate(self.row_pairs):
                         line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
@@ -6776,6 +10299,19 @@ class SheetView:
                         self.pair_text_b[idx] = line_b
 
             self._data_ready = True
+
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            need_full_base_diff = (not self._is_large_sheet) and (bool(self.only_diff_var.get()) or (not self._is_large_sheet))
+            if need_full_base_diff:
+                added_base_diff = self._ensure_base_diff_cache(
+                    max_col=self.max_col,
+                    ws_a_val=ws_a,
+                    ws_a_edit=ws_a_edit,
+                    ws_base_val=self.app.ws_base_val(self.sheet),
+                    ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
+                )
+                if added_base_diff:
+                    self._invalidate_render_cache()
 
         # Build display rows list (pair indices)
         if conflict_cells_by_row is not None:
@@ -6787,9 +10323,20 @@ class SheetView:
                     rows.append(idx)
             self._full_display_rows = rows
         elif bool(self.only_diff_var.get()):
-            if (not self.snapshot_only_diff) or rescan or (row_only is None) or (not self.display_rows):
+            cached_only_diff_rows = self._only_diff_rows_cache if self._has_valid_only_diff_snapshot_cache() else None
+            if self.snapshot_only_diff and cached_only_diff_rows is not None and (not rescan):
+                self._full_display_rows = self._only_diff_rows_with_touched(cached_only_diff_rows)
+            elif self.snapshot_only_diff and self._is_large_sheet and (not rescan):
+                started_async = self._start_async_large_only_diff_build()
+                if started_async:
+                    keep_rows = list(self.display_rows) if self.display_rows else list(self._full_display_rows)
+                    self._full_display_rows = keep_rows
+                else:
+                    fallback_rows = cached_only_diff_rows if cached_only_diff_rows is not None else []
+                    self._full_display_rows = self._only_diff_rows_with_touched(fallback_rows)
+            elif (not self.snapshot_only_diff) or rescan or (cached_only_diff_rows is None):
                 # Build snapshot: diff rows + touched rows.
-                rows = [idx for idx, cols in self.pair_diff_cols.items() if cols]
+                rows = [idx for idx in range(len(self.row_pairs)) if self._pair_has_visual_diff(idx)]
 
                 # Recovery path:
                 # In fast-open/background scenarios (especially large sheets), pair_diff_cols can be
@@ -6824,7 +10371,7 @@ class SheetView:
                                 self.pair_diff_cols[idx] = cols
                                 self.pair_text_a[idx] = line_a
                                 self.pair_text_b[idx] = line_b
-                        rows = [idx for idx, cols in self.pair_diff_cols.items() if cols]
+                        rows = [idx for idx in range(len(self.row_pairs)) if self._pair_has_visual_diff(idx)]
                         # If recovery found no diffs, the sheet_diff_state was stale.
                         # Clear it so subsequent refreshes do not re-trigger recovery.
                         if not rows:
@@ -6834,12 +10381,8 @@ class SheetView:
                             except Exception:
                                 pass
 
-                rows_set = set(rows)
-                for r in self.touched_rows:
-                    idx = self.row_a_to_pair_idx.get(r)
-                    if idx is not None:
-                        rows_set.add(idx)
-                self._full_display_rows = sorted(rows_set)
+                self._cache_only_diff_rows_snapshot(rows)
+                self._full_display_rows = self._only_diff_rows_with_touched(rows)
             else:
                 # snapshot mode: keep existing row list stable
                 pass
@@ -6852,12 +10395,31 @@ class SheetView:
         else:
             # reset render limit if full list shrank
             self._render_limit = min(self._render_limit, len(self._full_display_rows)) if self._full_display_rows else _FAST_RENDER_ROW_LIMIT
+            if self._full_display_rows:
+                target_limit = min(
+                    _LARGE_SHEET_INITIAL_ROWS if self._is_large_sheet else _FAST_RENDER_ROW_LIMIT,
+                    len(self._full_display_rows),
+                )
+                if self._render_limit < target_limit:
+                    self._render_limit = target_limit
             if len(self._full_display_rows) > _FAST_RENDER_ROW_LIMIT and self._render_limit < _FAST_RENDER_ROW_LIMIT:
                 self._render_limit = _FAST_RENDER_ROW_LIMIT
             if self._is_large_sheet and rescan:
                 self._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, len(self._full_display_rows)) if self._full_display_rows else _LARGE_SHEET_INITIAL_ROWS
             self.display_rows = self._full_display_rows[:self._render_limit]
         _dlog(f"  build display_rows: {len(self.display_rows)} / {self.max_row} (only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()})")
+
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False) and self.display_rows:
+            added_base_diff = self._ensure_base_diff_cache(
+                pair_indices=self.display_rows,
+                max_col=self.max_col,
+                ws_a_val=ws_a,
+                ws_a_edit=ws_a_edit,
+                ws_base_val=self.app.ws_base_val(self.sheet),
+                ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
+            )
+            if added_base_diff:
+                self._invalidate_render_cache()
 
         # Ensure pair text/diff exists for currently displayed rows (lazy fill)
         if self.display_rows:
@@ -6904,11 +10466,23 @@ class SheetView:
                 self.pair_diff_cols[pair_idx] = set(conflict_cells_by_row.get(ra, set()))
             else:
                 self.pair_diff_cols[pair_idx] = cols
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                self.pair_base_diff_cols[pair_idx] = self._compute_base_diff_cols_for_pair(
+                    pair_idx,
+                    (ra, rb),
+                    max_col=self.max_col,
+                    ws_a_val=ws_a,
+                    ws_a_edit=ws_a_edit,
+                    ws_base_val=self.app.ws_base_val(self.sheet),
+                    ws_base_edit=self.app.ws_base_edit(self.sheet),
+                )
+            else:
+                self.pair_base_diff_cols.pop(pair_idx, None)
 
             # If only-diff enabled, row might need to be added/removed
             if bool(self.only_diff_var.get()):
                 visible = pair_idx in self.row_to_line
-                has = bool(self.pair_diff_cols[pair_idx])
+                has = self._pair_has_visual_diff(pair_idx)
 
                 # If diffs are resolved but this row was touched, keep it visible as a record.
                 keep = (r in self.touched_rows)
@@ -6956,23 +10530,31 @@ class SheetView:
                 w.tag_remove("diffrow", f"{line}.0", f"{line}.end")
                 w.tag_remove("diffcell", f"{line}.0", f"{line}.end")
 
-            cols = self.pair_diff_cols.get(pair_idx, set())
+            cols = self._visual_diff_cols_for_pair(pair_idx)
             # If this row was touched and has no diffs anymore, keep it visible but don't show diff highlight.
             show_diff = bool(cols)
             if show_diff:
                 self.left.tag_add("diffrow", f"{line}.0", f"{line}.end")
                 self.base.tag_add("diffrow", f"{line}.0", f"{line}.end")
                 self.right.tag_add("diffrow", f"{line}.0", f"{line}.end")
-
-                spans = self._spans_for_line()
-                for c in cols:
-                    if c in spans:
-                        s, e = spans[c]
-                        self.left.tag_add("diffcell", f"{line}.{s}", f"{line}.{e}")
-                        self.right.tag_add("diffcell", f"{line}.{s}", f"{line}.{e}")
+                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                left_args, base_args, right_args, _lr, _br, _rr = self._diffcell_tag_args_for_line(
+                    line,
+                    pair_idx,
+                    line_a,
+                    base_line,
+                    line_b,
+                )
+                if left_args:
+                    self.left.tag_add("diffcell", *left_args)
+                if base_args:
+                    self.base.tag_add("diffcell", *base_args)
+                if right_args:
+                    self.right.tag_add("diffcell", *right_args)
+                self._clear_diffrow_under_diffcells(left_args, base_args, right_args)
             # keep fast; do not rebuild sheet nav here
             try:
-                self._display_diff_row_count = sum(1 for idx in self.display_rows if self.pair_diff_cols.get(idx))
+                self._display_diff_row_count = sum(1 for idx in self.display_rows if self._pair_has_visual_diff(idx))
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
                 self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {self._display_diff_row_count}")
@@ -7023,16 +10605,22 @@ class SheetView:
                     self.right_ln.tag_add("diffrow", *cached_diffrow_args)
                 if tag_cells:
                     cached_cell_left = []
+                    cached_cell_base = []
                     cached_cell_right = []
-                    for line_idx, spans_a, spans_b in tag_cells:
+                    for line_idx, spans_a, spans_base, spans_b in tag_cells:
                         for s, e in spans_a:
                             cached_cell_left.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
+                        for s, e in spans_base:
+                            cached_cell_base.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
                         for s, e in spans_b:
                             cached_cell_right.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
                     if cached_cell_left:
                         self.left.tag_add("diffcell", *cached_cell_left)
+                    if cached_cell_base:
+                        self.base.tag_add("diffcell", *cached_cell_base)
                     if cached_cell_right:
                         self.right.tag_add("diffcell", *cached_cell_right)
+                    self._clear_diffrow_under_diffcells(cached_cell_left, cached_cell_base, cached_cell_right)
 
                 # paddingrow: grey slot for one-sided pairs (computed from row_pairs, not cached)
                 _padding_left = []
@@ -7049,6 +10637,26 @@ class SheetView:
                     self.left.tag_add("paddingrow", *_padding_left)
                 if _padding_right:
                     self.right.tag_add("paddingrow", *_padding_right)
+                # paddingcol: grey out column positions that don't exist on one side (新增列).
+                _col_max_a = getattr(self, "col_max_a", self.max_col)
+                _col_max_b = getattr(self, "col_max_b", self.max_col)
+                if _col_max_a < self.max_col or _col_max_b < self.max_col:
+                    _cspans = self._spans_for_line()
+                    _n_lines = len(self.display_rows)
+                    _pcol_left = []
+                    _pcol_right = []
+                    if _col_max_a < self.max_col and _col_max_a in _cspans:
+                        _gs = _cspans[_col_max_a][1]
+                        for _ln in range(1, _n_lines + 1):
+                            _pcol_left.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
+                    if _col_max_b < self.max_col and _col_max_b in _cspans:
+                        _gs = _cspans[_col_max_b][1]
+                        for _ln in range(1, _n_lines + 1):
+                            _pcol_right.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
+                    if _pcol_left:
+                        self.left.tag_add("paddingcol", *_pcol_left)
+                    if _pcol_right:
+                        self.right.tag_add("paddingcol", *_pcol_right)
                 # rownum gutter tags are unused when row headers are separate
 
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
@@ -7108,6 +10716,18 @@ class SheetView:
                 pass
             self._pending_yview = None
 
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            added_base_diff = self._ensure_base_diff_cache(
+                pair_indices=self.display_rows,
+                max_col=self.max_col,
+                ws_a_val=ws_a,
+                ws_a_edit=ws_a_edit,
+                ws_base_val=self.app.ws_base_val(self.sheet),
+                ws_base_edit=self.app.ws_base_edit(self.sheet),
+            )
+            if added_base_diff:
+                self._invalidate_render_cache()
+
         diff_row_count = 0
         tag_rows = []
         tag_cells = []
@@ -7115,9 +10735,11 @@ class SheetView:
         # tag_add(tagName, index1, *args) accepts multiple index pairs in a single call.
         diffrow_args = []
         diffcell_args_left = []
+        diffcell_args_base = []
         diffcell_args_right = []
         for line_idx, pair_idx in enumerate(self.display_rows, start=1):
-            cols = self.pair_diff_cols.get(pair_idx, set())
+            ra, rb = self.row_pairs[pair_idx] if pair_idx < len(self.row_pairs) else (None, None)
+            cols = self._visual_diff_cols_for_pair(pair_idx)
             if cols:
                 diff_row_count += 1
                 diffrow_args.extend([f"{line_idx}.0", f"{line_idx}.end"])
@@ -7125,21 +10747,19 @@ class SheetView:
 
                 line_a = lines_a[line_idx - 1] if (line_idx - 1) < len(lines_a) else ""
                 line_b = lines_b[line_idx - 1] if (line_idx - 1) < len(lines_b) else ""
-
-                spans_a = spans_b = self._spans_for_line()  # result is argument-independent; compute once
-                spans_a_ranges = []
-                spans_b_ranges = []
-                for c in cols:
-                    if c in spans_a:
-                        s, e = spans_a[c]
-                        diffcell_args_left.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
-                        spans_a_ranges.append((s, e))
-                    if c in spans_b:
-                        s, e = spans_b[c]
-                        diffcell_args_right.extend([f"{line_idx}.{s}", f"{line_idx}.{e}"])
-                        spans_b_ranges.append((s, e))
-                if spans_a_ranges or spans_b_ranges:
-                    tag_cells.append((line_idx, spans_a_ranges, spans_b_ranges))
+                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                left_args, base_args, right_args, left_ranges, base_ranges, right_ranges = self._diffcell_tag_args_for_line(
+                    line_idx,
+                    pair_idx,
+                    line_a,
+                    base_line,
+                    line_b,
+                )
+                diffcell_args_left.extend(left_args)
+                diffcell_args_base.extend(base_args)
+                diffcell_args_right.extend(right_args)
+                if left_ranges or base_ranges or right_ranges:
+                    tag_cells.append((line_idx, left_ranges, base_ranges, right_ranges))
 
         # Apply all diffrow tags in one call per widget
         if diffrow_args:
@@ -7158,8 +10778,11 @@ class SheetView:
         # Apply all diffcell tags in one call per widget
         if diffcell_args_left:
             self.left.tag_add("diffcell", *diffcell_args_left)
+        if diffcell_args_base:
+            self.base.tag_add("diffcell", *diffcell_args_base)
         if diffcell_args_right:
             self.right.tag_add("diffcell", *diffcell_args_right)
+        self._clear_diffrow_under_diffcells(diffcell_args_left, diffcell_args_base, diffcell_args_right)
         # Apply paddingrow (grey) to empty slots of one-sided pairs
         _padding_left = []
         _padding_right = []
@@ -7175,6 +10798,26 @@ class SheetView:
             self.left.tag_add("paddingrow", *_padding_left)
         if _padding_right:
             self.right.tag_add("paddingrow", *_padding_right)
+        # paddingcol: grey out column positions that don't exist on one side (新增列).
+        _col_max_a = getattr(self, "col_max_a", self.max_col)
+        _col_max_b = getattr(self, "col_max_b", self.max_col)
+        if _col_max_a < self.max_col or _col_max_b < self.max_col:
+            _cspans = self._spans_for_line()
+            _n_lines = len(self.display_rows)
+            _pcol_left = []
+            _pcol_right = []
+            if _col_max_a < self.max_col and _col_max_a in _cspans:
+                _gs = _cspans[_col_max_a][1]
+                for _ln in range(1, _n_lines + 1):
+                    _pcol_left.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
+            if _col_max_b < self.max_col and _col_max_b in _cspans:
+                _gs = _cspans[_col_max_b][1]
+                for _ln in range(1, _n_lines + 1):
+                    _pcol_right.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
+            if _pcol_left:
+                self.left.tag_add("paddingcol", *_pcol_left)
+            if _pcol_right:
+                self.right.tag_add("paddingcol", *_pcol_right)
         # row-number styling handled by dedicated row-header widgets
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
@@ -7223,6 +10866,14 @@ class SowMergeApp:
         # In 3-way manual merge mode, persist only explicitly operated A-side cells on save.
         # key: (sheet, row, col) -> edit value to write
         self.manual_a_cell_ops: dict[tuple[str, int, int], object] = {}
+        # Same-formula cells can have intentionally adopted cached results in
+        # manual-calculation workbooks. Keep them separate from formula edits.
+        self.manual_a_formula_cache_ops: dict[tuple[str, int, int], object] = {}
+        self.manual_a_row_ops: list[dict[str, object]] = []
+        self.manual_sheet_ops: list[dict[str, object]] = []
+        self.auto_sheet_ops: list[dict[str, object]] = []
+        self.sheet_level_conflicts: list[dict[str, object]] = []
+        self.sheet_level_summary: list[str] = []
         self._merge_mine_snapshot = None
         self.undo_stack = []
         self._auto_recalc_started = False
@@ -7282,7 +10933,7 @@ class SowMergeApp:
         if self.has_base:
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                snap = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_mine_snapshot_{os.getpid()}_{ts}.xlsx")
+                snap = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_mine_snapshot_{os.getpid()}_{ts}{_workbook_ext(self.file_a)}")
                 shutil.copy2(self.file_a, snap)
                 self._merge_mine_snapshot = snap
                 _dlog(f"mine snapshot created: {snap}")
@@ -7318,24 +10969,12 @@ class SowMergeApp:
         self._edit_loading_started = True
         threading.Thread(target=_preload_edit, daemon=True).start()
 
-        # Determine sheets from value workbooks (available immediately)
-        set_a = set(self._wb_a_val.sheetnames)
-        set_b = set(self._wb_b_val.sheetnames)
-        self.common_sheets = sorted(set_a & set_b)
-        if self.merge_conflict_mode and self.merge_conflict_cells_by_sheet:
-            # Only keep sheets that actually have conflicts
-            conflict_sheets = sorted(self.merge_conflict_cells_by_sheet.keys())
-            self.common_sheets = [s for s in conflict_sheets if s in self.common_sheets]
-        self.only_a = sorted(set_a - set_b)
-        self.only_b = sorted(set_b - set_a)
-
         self.modified_a = False
         self.modified_b = False
         self.modified_sheets_a = set()
         self.modified_sheets_b = set()
 
-        # sheet diff state: 0=none, 1=maybe (sampled), 2=confirmed
-        self.sheet_diff_state = {s: 0 for s in self.common_sheets}
+        self._refresh_sheet_catalog()
 
         self.root = tk.Tk()
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
@@ -7356,6 +10995,137 @@ class SowMergeApp:
 
         self._build_ui()
         self._schedule_auto_recalc()
+
+    def _sheet_names_for_side(self, side: str) -> list[str]:
+        side = str(side or "").upper()
+        if side == "A":
+            wb = getattr(self, "_wb_a_val", None)
+        elif side in ("B", "THEIRS"):
+            wb = getattr(self, "_wb_b_val", None)
+        elif side == "BASE":
+            wb = getattr(self, "_wb_base_val", None)
+        else:
+            wb = None
+        try:
+            return list(getattr(wb, "sheetnames", []) or [])
+        except Exception:
+            return []
+
+    def _refresh_sheet_catalog(self):
+        names_a = self._sheet_names_for_side("A")
+        names_b = self._sheet_names_for_side("B")
+        names_base = self._sheet_names_for_side("BASE")
+        set_a = set(names_a)
+        set_b = set(names_b)
+        set_base = set(names_base)
+
+        ordered = []
+        for seq in (names_a, names_b, names_base):
+            for name in seq:
+                if name not in ordered:
+                    ordered.append(name)
+
+        if self.merge_conflict_mode and self.merge_conflict_cells_by_sheet:
+            conflict_sheets = set(self.merge_conflict_cells_by_sheet.keys())
+            ordered = [s for s in ordered if s in conflict_sheets]
+
+        self.common_sheets = sorted(set_a & set_b)
+        if self.merge_conflict_mode and self.merge_conflict_cells_by_sheet:
+            self.common_sheets = [s for s in self.common_sheets if s in set(self.merge_conflict_cells_by_sheet.keys())]
+        self.only_a = sorted(set_a - set_b)
+        self.only_b = sorted(set_b - set_a)
+        self.display_sheets = ordered
+        self.compare_sheets = [s for s in ordered if (s in set_a and s in set_b)]
+        self.sheet_meta: dict[str, dict[str, object]] = {}
+        for s in ordered:
+            has_a = s in set_a
+            has_b = s in set_b
+            has_base = s in set_base
+            self.sheet_meta[s] = {
+                "has_a": has_a,
+                "has_b": has_b,
+                "has_base": has_base,
+                "view_mode": "normal" if (has_a and has_b) else "missing_sheet",
+            }
+        self.sheet_diff_state = {s: int(getattr(self, "sheet_diff_state", {}).get(s, 0)) for s in ordered}
+        self._recompute_auto_sheet_ops()
+
+    def _recompute_auto_sheet_ops(self):
+        self.auto_sheet_ops = []
+        self.sheet_level_conflicts = []
+        self.sheet_level_summary = []
+        if not (self.merge_mode and self.has_base):
+            return
+        set_a = set(self._sheet_names_for_side("A"))
+        set_b = set(self._sheet_names_for_side("B"))
+        set_base = set(self._sheet_names_for_side("BASE"))
+        ordered = list(getattr(self, "display_sheets", []) or [])
+        for sheet in ordered:
+            in_a = sheet in set_a
+            in_b = sheet in set_b
+            in_base = sheet in set_base
+            if in_b and (not in_a) and (not in_base):
+                self.auto_sheet_ops.append({"kind": "copy_sheet", "sheet": sheet, "source_side": "B", "target_side": "A"})
+                self.sheet_level_summary.append(f"自动并入 theirs 新增 Sheet: {sheet}")
+            elif in_base and (not in_a) and (not in_b):
+                self.sheet_level_summary.append(f"保留双方均已删除的 Sheet: {sheet}")
+            elif in_base and in_a and (not in_b):
+                if self._sheet_values_equal("A", "BASE", sheet):
+                    self.auto_sheet_ops.append({"kind": "delete_sheet", "sheet": sheet, "target_side": "A"})
+                    self.sheet_level_summary.append(f"自动删除 theirs 已删除且 mine 未修改的 Sheet: {sheet}")
+                else:
+                    self.sheet_level_conflicts.append({"kind": "sheet_deleted_or_missing_in_theirs", "sheet": sheet})
+            elif in_base and in_b and (not in_a):
+                if self._sheet_values_equal("B", "BASE", sheet):
+                    # Mine deleted the sheet while theirs kept base unchanged:
+                    # preserve the local deletion instead of silently restoring it.
+                    self.sheet_level_summary.append(f"保留 mine 已删除、theirs 未修改的 Sheet: {sheet}")
+                else:
+                    # Mine deleted while theirs modified: neither side can be
+                    # chosen safely. Keep mine by default and surface a conflict.
+                    self.sheet_level_conflicts.append({
+                        "kind": "sheet_deleted_in_mine_modified_in_theirs",
+                        "sheet": sheet,
+                    })
+            elif in_a and (not in_base) and (not in_b):
+                self.sheet_level_summary.append(f"保留 mine 独有 Sheet: {sheet}")
+
+    def get_sheet_meta(self, sheet: str) -> dict[str, object]:
+        return dict(getattr(self, "sheet_meta", {}).get(sheet, {}))
+
+    def _sheet_values_equal(self, side_a: str, side_b: str, sheet: str) -> bool:
+        ws_a = self.ws_for_side(side_a, sheet, edit=False, allow_missing=True)
+        ws_b = self.ws_for_side(side_b, sheet, edit=False, allow_missing=True)
+        if ws_a is None or ws_b is None:
+            return False
+        max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
+        max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+        for r in range(1, max_row + 1):
+            for c in range(1, max_col + 1):
+                va = ws_a.cell(row=r, column=c).value
+                vb = ws_b.cell(row=r, column=c).value
+                if _merge_cmp_value(va) != _merge_cmp_value(vb):
+                    return False
+        return True
+
+    def ws_for_side(self, side: str, sheet: str, edit: bool = False, allow_missing: bool = False):
+        side = str(side or "").upper()
+        if side == "A":
+            getter = self.ws_a_edit if edit else self.ws_a_val
+        elif side in ("B", "THEIRS"):
+            getter = self.ws_b_edit if edit else self.ws_b_val
+        elif side == "BASE":
+            getter = self.ws_base_edit if edit else self.ws_base_val
+        else:
+            getter = None
+        if getter is None:
+            return None
+        try:
+            return getter(sheet)
+        except Exception:
+            if allow_missing:
+                return None
+            raise
 
     def _safe_root_after(self, delay_ms: int, callback):
         if getattr(self, "_is_closing", False):
@@ -7401,6 +11171,60 @@ class SowMergeApp:
             return
         self._is_closing = True
         self._cancel_root_afters()
+        try:
+            _wbs_close(
+                getattr(self, "_wb_a_val", None),
+                getattr(self, "_wb_b_val", None),
+                getattr(self, "_wb_base_val", None),
+                getattr(self, "_wb_a_edit", None),
+                getattr(self, "_wb_b_edit", None),
+                getattr(self, "_wb_base_edit", None),
+            )
+        except Exception:
+            pass
+        try:
+            for view in list(getattr(self, "sheet_views", {}).values()):
+                for attr in ("_settings_save_id", "_hover_debounce_id", "_diff_map_debounce_id"):
+                    aid = getattr(view, attr, None)
+                    if not aid:
+                        continue
+                    try:
+                        view.frame.after_cancel(aid)
+                    except Exception:
+                        pass
+                    try:
+                        setattr(view, attr, None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            temp_specs = [
+                (getattr(self, "_file_a_val_path", None), getattr(self, "file_a", None)),
+                (getattr(self, "_file_b_val_path", None), getattr(self, "file_b", None)),
+                (getattr(self, "_file_base_val_path", None), getattr(self, "base_path", None)),
+            ]
+            for temp_path, original_path in temp_specs:
+                if not temp_path:
+                    continue
+                try:
+                    if original_path and os.path.abspath(temp_path) == os.path.abspath(original_path):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            snap = getattr(self, "_merge_mine_snapshot", None)
+            if snap and os.path.exists(snap):
+                os.remove(snap)
+        except Exception:
+            pass
         try:
             if self.root.winfo_exists():
                 # Ensure Tk mainloop exits and the window is actually closed.
@@ -7474,27 +11298,211 @@ class SowMergeApp:
 
     def record_manual_a_cell(self, sheet: str, r: int, c: int, edit_value):
         try:
-            self.manual_a_cell_ops[(sheet, int(r), int(c))] = edit_value
+            key = (sheet, int(r), int(c))
+            self.manual_a_cell_ops[key] = edit_value
+            self.manual_a_formula_cache_ops.pop(key, None)
         except Exception:
             pass
+
+    def record_manual_a_formula_cache(self, sheet: str, r: int, c: int, cached_value):
+        try:
+            key = (sheet, int(r), int(c))
+            self.manual_a_formula_cache_ops[key] = cached_value
+        except Exception:
+            pass
+
+    def record_manual_a_row_insert(self, sheet: str, row: int, count: int = 1):
+        try:
+            self.manual_a_row_ops.append({
+                "sheet": sheet,
+                "kind": "insert_rows",
+                "row": int(row),
+                "count": max(1, int(count)),
+            })
+        except Exception:
+            pass
+
+    def remove_last_manual_a_row_insert(self, sheet: str, row: int, count: int = 1) -> bool:
+        row = int(row)
+        count = max(1, int(count))
+        for i in range(len(self.manual_a_row_ops) - 1, -1, -1):
+            op = self.manual_a_row_ops[i]
+            try:
+                if (
+                    op.get("sheet") == sheet and
+                    op.get("kind") == "insert_rows" and
+                    int(op.get("row", 0)) == row and
+                    int(op.get("count", 1)) == count
+                ):
+                    del self.manual_a_row_ops[i]
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def record_manual_sheet_copy(self, sheet: str, source_side: str, target_side: str):
+        try:
+            self.manual_sheet_ops.append({
+                "kind": "copy_sheet",
+                "sheet": sheet,
+                "source_side": str(source_side or "").upper(),
+                "target_side": str(target_side or "").upper(),
+            })
+        except Exception:
+            pass
+
+    def record_manual_sheet_delete(self, sheet: str, target_side: str):
+        try:
+            self.manual_sheet_ops.append({
+                "kind": "delete_sheet",
+                "sheet": sheet,
+                "target_side": str(target_side or "").upper(),
+            })
+        except Exception:
+            pass
+
+    def _workbooks_for_side(self, side: str):
+        side = str(side or "").upper()
+        if side == "A":
+            return getattr(self, "_wb_a_val", None), getattr(self, "_wb_a_edit", None)
+        if side in ("B", "THEIRS"):
+            return getattr(self, "_wb_b_val", None), getattr(self, "_wb_b_edit", None)
+        if side == "BASE":
+            return getattr(self, "_wb_base_val", None), getattr(self, "_wb_base_edit", None)
+        return None, None
+
+    def _copy_sheet_between_sides(self, sheet: str, source_side: str, target_side: str):
+        self._ensure_edit_loaded()
+        source_side = str(source_side or "").upper()
+        target_side = str(target_side or "").upper()
+        src_val_wb, src_edit_wb = self._workbooks_for_side(source_side)
+        dst_val_wb, dst_edit_wb = self._workbooks_for_side(target_side)
+        if src_edit_wb is None or dst_edit_wb is None or sheet not in src_edit_wb.sheetnames:
+            raise KeyError(f"sheet copy unavailable: {sheet} {source_side}->{target_side}")
+        src_val_ws = src_val_wb[sheet] if src_val_wb is not None and sheet in src_val_wb.sheetnames else src_edit_wb[sheet]
+        src_edit_ws = src_edit_wb[sheet]
+        _create_sheet_from_source(dst_edit_wb, src_edit_ws, sheet)
+        _create_sheet_from_source(dst_val_wb, src_val_ws, sheet)
+        if target_side == "A":
+            self.modified_a = True
+            self.modified_sheets_a.add(sheet)
+            if self.merge_mode and self.has_base:
+                self.record_manual_sheet_copy(sheet, source_side, target_side)
+        elif target_side == "B":
+            self.modified_b = True
+            self.modified_sheets_b.add(sheet)
+        self._refresh_sheet_catalog()
+
+    def _delete_sheet_on_side(self, sheet: str, target_side: str):
+        self._ensure_edit_loaded()
+        target_side = str(target_side or "").upper()
+        dst_val_wb, dst_edit_wb = self._workbooks_for_side(target_side)
+        changed = _remove_sheet_if_exists(dst_edit_wb, sheet)
+        _remove_sheet_if_exists(dst_val_wb, sheet)
+        if not changed:
+            return False
+        if target_side == "A":
+            self.modified_a = True
+            self.modified_sheets_a.add(sheet)
+            if self.merge_mode and self.has_base:
+                self.record_manual_sheet_delete(sheet, target_side)
+        elif target_side == "B":
+            self.modified_b = True
+            self.modified_sheets_b.add(sheet)
+        self._refresh_sheet_catalog()
+        if sheet not in self.sheet_meta:
+            self.display_sheets.append(sheet)
+            self.sheet_meta[sheet] = {"has_a": False, "has_b": False, "has_base": False, "view_mode": "missing_sheet"}
+            self.sheet_diff_state[sheet] = 0
+        return True
 
     def build_manual_merge_output_file(self):
         """Build merge output by XML-level patching from pristine mine snapshot."""
         src = self._merge_mine_snapshot if (self._merge_mine_snapshot and os.path.exists(self._merge_mine_snapshot)) else self.file_a
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merged_output_{os.getpid()}_{ts}.xlsx")
-        if not self.manual_a_cell_ops:
+        out = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merged_output_{os.getpid()}_{ts}{_workbook_ext(src)}")
+        sheet_ops = list(getattr(self, "auto_sheet_ops", []) or []) + list(getattr(self, "manual_sheet_ops", []) or [])
+        manual_ops = _filter_noop_manual_ops(src, self.manual_a_cell_ops)
+        formula_cache_values = dict(getattr(self, "manual_a_formula_cache_ops", {}) or {})
+        cached_values = dict(formula_cache_values)
+        for sheet, row_idx, col_idx in manual_ops.keys():
+            try:
+                cached_values[(sheet, row_idx, col_idx)] = self.ws_a_val(sheet).cell(
+                    row=int(row_idx), column=int(col_idx)
+                ).value
+            except Exception:
+                pass
+        zip_ops = dict(manual_ops)
+        for key in formula_cache_values.keys():
+            sheet, row_idx, col_idx = key
+            try:
+                formula = _formula_text(
+                    self.ws_a_edit(sheet).cell(row=int(row_idx), column=int(col_idx)).value
+                )
+                if formula:
+                    zip_ops[key] = formula
+            except Exception:
+                pass
+        source_paths = {"B": self.file_b}
+        if getattr(self, "base_path", None):
+            source_paths["BASE"] = self.base_path
+        if not zip_ops and not self.manual_a_row_ops and not sheet_ops:
             shutil.copy2(src, out)
             return out
+
+        # Cell-only replay is safer at OOXML level: untouched formula caches and
+        # shared-formula metadata stay intact, and text values keep their type.
+        if not self.manual_a_row_ops and not sheet_ops:
+            try:
+                _build_manual_merge_xlsx_via_zip(
+                    src, out, zip_ops, cached_values=cached_values
+                )
+                return out
+            except Exception as e:
+                _dlog(f"validated cell-only ZIP patch failed; trying Excel native save: {e}")
+
         if _EXCEL_NATIVE_SAVE_ON_MERGE:
-            ok = _build_manual_merge_output_with_excel(src, out, self.manual_a_cell_ops)
+            ok = _build_manual_merge_output_with_excel(
+                src,
+                out,
+                manual_ops,
+                self.manual_a_row_ops,
+                sheet_ops=sheet_ops,
+                source_paths=source_paths,
+            )
+            if ok:
+                if formula_cache_values:
+                    cache_out = out + ".formula-cache.xlsx"
+                    _build_manual_merge_xlsx_via_zip(
+                        out,
+                        cache_out,
+                        {key: zip_ops[key] for key in formula_cache_values if key in zip_ops},
+                        cached_values=formula_cache_values,
+                    )
+                    os.replace(cache_out, out)
+                return out
+            _dlog("WARNING: excel native save failed, trying openpyxl replay fallback")
+        if self.manual_a_row_ops or sheet_ops:
+            if _xlsx_contains_formulas(src):
+                raise RuntimeError(
+                    "Excel 原生保存失败。为避免 openpyxl 回退丢失公式缓存，"
+                    "已停止保存且未替换目标文件；请关闭占用文件的 Excel 后重试。"
+                )
+            ok = _build_manual_merge_output_with_openpyxl(
+                src,
+                out,
+                manual_ops,
+                self.manual_a_row_ops,
+                sheet_ops=sheet_ops,
+                source_paths=source_paths,
+            )
             if ok:
                 return out
-            _dlog("WARNING: excel native save failed, falling back to zip patch (may cause Excel repair on files with complex formulas)")
-        _build_manual_merge_xlsx_via_zip(src, out, self.manual_a_cell_ops)
-        if not os.path.exists(out):
-            raise RuntimeError(f"zip patch produced no output: {out}")
-        return out
+            raise RuntimeError("manual merge output fallback failed for sheet/row operations")
+        raise RuntimeError(
+            "无法安全保存所选公式单元格：ZIP 校验未通过且 Excel 原生保存不可用。"
+            "目标文件未被替换。"
+        )
 
     def set_sheet_has_diff(self, sheet: str, has: bool, confirmed: bool = True):
         # Keep API: mark sheet diff state
@@ -7571,7 +11579,6 @@ class SowMergeApp:
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 6))
 
         self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(8, 6))
         try:
             self.root.bind("<F4>", self._on_global_f4)
         except Exception:
@@ -7579,7 +11586,7 @@ class SowMergeApp:
 
         # Bottom bar: sheet nav (only)
         self.bottom = ttk.Frame(self.root)
-        self.bottom.pack(fill="x", padx=10, pady=(0, 10))
+        self.bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
 
         self.nav = ttk.Frame(self.bottom)
         self.nav.pack(side="left", fill="x", expand=True)
@@ -7592,17 +11599,13 @@ class SowMergeApp:
         self.nav_inner = ttk.Frame(self.nav_canvas)
         self.nav_canvas.create_window((0, 0), window=self.nav_inner, anchor="nw")
         self.nav_inner.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
-
-        if self.only_a:
-            self._add_missing_tab("仅在A存在", self.only_a)
-        if self.only_b:
-            self._add_missing_tab("仅在B存在", self.only_b)
+        self.nb.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 6))
 
         # Tabs are created up-front, but heavy SheetView is created lazily on first activation.
         self.sheet_views = {}
         self._sheet_loaded = {}
         self._sheet_containers = {}
-        for s in self.common_sheets:
+        for s in self.display_sheets:
             container = ttk.Frame(self.nb)
             self._sheet_containers[s] = container
             self.nb.add(container, text=s)
@@ -7823,13 +11826,82 @@ class SowMergeApp:
                             return True
             return False
 
-        def _compute_sheet_cache(wb_a_val, wb_b_val, wb_a_edit, wb_b_edit, sheet: str):
+        def _pairs_have_diff_bg(ws_left, ws_right, row_pairs, max_col: int):
+            if not row_pairs:
+                return False
+            block = _LARGE_SHEET_BLOCK_ROWS
+            pair_count = len(row_pairs)
+            for block_end in range(pair_count, 0, -block):
+                block_start = max(0, block_end - block)
+                block_pairs = row_pairs[block_start:block_end]
+                left_rows_needed = sorted({left for left, _right in block_pairs if left is not None})
+                right_rows_needed = sorted({right for _left, right in block_pairs if right is not None})
+                rows_left = {}
+                rows_right = {}
+
+                if left_rows_needed:
+                    min_left = left_rows_needed[0]
+                    max_left = left_rows_needed[-1]
+                    for idx, row in enumerate(
+                        ws_left.iter_rows(
+                            min_row=min_left,
+                            max_row=max_left,
+                            min_col=1,
+                            max_col=max_col,
+                            values_only=True,
+                        ),
+                        start=min_left,
+                    ):
+                        rows_left[idx] = row or ()
+                if right_rows_needed:
+                    min_right = right_rows_needed[0]
+                    max_right = right_rows_needed[-1]
+                    for idx, row in enumerate(
+                        ws_right.iter_rows(
+                            min_row=min_right,
+                            max_row=max_right,
+                            min_col=1,
+                            max_col=max_col,
+                            values_only=True,
+                        ),
+                        start=min_right,
+                    ):
+                        rows_right[idx] = row or ()
+
+                for left_row, right_row in reversed(block_pairs):
+                    row_left = rows_left.get(left_row, ()) if left_row is not None else ()
+                    row_right = rows_right.get(right_row, ()) if right_row is not None else ()
+                    for ci in range(max_col):
+                        vl = row_left[ci] if ci < len(row_left) else None
+                        vr = row_right[ci] if ci < len(row_right) else None
+                        if _merge_cmp_value(vl) != _merge_cmp_value(vr):
+                            return True
+            return False
+
+        def _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a: int, max_r_b: int, max_r_base: int, max_col: int):
+            if ws_base is None:
+                return True
+            row_pairs_a_base = _compute_row_pairs_bg(ws_a, ws_base, max_r_a, max_r_base, max_col)
+            if _pairs_have_diff_bg(ws_a, ws_base, row_pairs_a_base, max_col):
+                return True
+            row_pairs_b_base = _compute_row_pairs_bg(ws_b, ws_base, max_r_b, max_r_base, max_col)
+            if _pairs_have_diff_bg(ws_b, ws_base, row_pairs_b_base, max_col):
+                return True
+            return False
+
+        def _compute_sheet_cache(wb_a_val, wb_b_val, wb_a_edit, wb_b_edit, sheet: str, wb_base_val=None):
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
             max_r_a, max_c_a = _compute_trim_bounds(ws_a)
             max_r_b, max_c_b = _compute_trim_bounds(ws_b)
-            max_row = max(max_r_a, max_r_b)
-            max_col = max(max_c_a, max_c_b)
+            ws_base = None
+            max_r_base = 0
+            max_c_base = 0
+            if wb_base_val is not None and sheet in wb_base_val.sheetnames:
+                ws_base = wb_base_val[sheet]
+                max_r_base, max_c_base = _compute_trim_bounds(ws_base)
+            max_row = max(max_r_a, max_r_b, max_r_base)
+            max_col = max(max_c_a, max_c_b, max_c_base)
 
             # Compute row-aligned pairs (same algorithm as SheetView._build_row_pairs)
             row_pairs = _compute_row_pairs_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
@@ -7841,6 +11913,40 @@ class SowMergeApp:
             col_char_widths: dict[int, int] = {}
             row_a_to_pair_idx: dict[int, int] = {}
             row_b_to_pair_idx: dict[int, int] = {}
+            mine_to_base_row: dict[int, int] = {}
+            theirs_to_base_row: dict[int, int] = {}
+            pair_base_row_override: dict[int, int | None] = {}
+
+            if ws_base is not None:
+                try:
+                    mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(ws_a, ws_base, max_r_a, max_r_base, max_col))
+                except Exception:
+                    mine_to_base_row = {}
+                try:
+                    theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(ws_b, ws_base, max_r_b, max_r_base, max_col))
+                except Exception:
+                    theirs_to_base_row = {}
+                row_pairs = _split_tail_independent_append_pairs(
+                    row_pairs, mine_to_base_row, theirs_to_base_row,
+                    ws_a, ws_b, max_col,
+                )
+                row_pairs = _split_low_similarity_tail_pairs(
+                    row_pairs,
+                    mine_to_base_row,
+                    theirs_to_base_row,
+                    ws_a,
+                    ws_b,
+                    max_col,
+                )
+                pair_base_row_override = _build_pair_base_row_overrides(
+                    row_pairs,
+                    mine_to_base_row,
+                    theirs_to_base_row,
+                    ws_base,
+                    ws_a,
+                    ws_b,
+                    max_col,
+                )
 
             for idx, (ra, rb) in enumerate(row_pairs):
                 if ra is not None:
@@ -7852,6 +11958,8 @@ class SowMergeApp:
             # Still estimate display widths from head + tail samples to prevent 4-char collapse.
             if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
                 has_diff = _has_diff_by_blocks_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
+                if (not has_diff) and getattr(self, "has_base", False):
+                    has_diff = _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a, max_r_b, max_r_base, max_col)
 
                 sample_head = min(_LARGE_SHEET_INITIAL_ROWS, len(row_pairs))
                 sample_indices = list(range(sample_head))
@@ -7909,10 +12017,14 @@ class SowMergeApp:
                             col_char_widths[c] = w
                         if not eq:
                             cols.add(c)
+                    if (ra is None) != (rb is None):
+                        cols = {-1}
                     pair_parts_a[idx] = parts_a
                     pair_parts_b[idx] = parts_b
                     pair_diff_cols[idx] = cols
                 has_diff = any(bool(v) for v in pair_diff_cols.values())
+                if (not has_diff) and getattr(self, "has_base", False):
+                    has_diff = _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a, max_r_b, max_r_base, max_col)
 
             # Keep a readable lower bound and normalize missing columns.
             for c in range(1, max_col + 1):
@@ -7922,6 +12034,8 @@ class SowMergeApp:
                 "sheet": sheet,
                 "max_row": max_row,
                 "max_col": max_col,
+                "col_max_a": max_c_a,
+                "col_max_b": max_c_b,
                 "row_pairs": row_pairs,
                 "pair_diff_cols": pair_diff_cols,
                 "pair_parts_a": pair_parts_a,
@@ -7929,6 +12043,9 @@ class SowMergeApp:
                 "col_char_widths": col_char_widths,
                 "row_a_to_pair_idx": row_a_to_pair_idx,
                 "row_b_to_pair_idx": row_b_to_pair_idx,
+                "mine_to_base_row": mine_to_base_row,
+                "theirs_to_base_row": theirs_to_base_row,
+                "pair_base_row_override": pair_base_row_override,
                 "has_diff": has_diff,
             }
 
@@ -7965,15 +12082,24 @@ class SowMergeApp:
                 return
             # From this point we will apply this cache to the visible view.
             self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+            view._invalidate_only_diff_snapshot_cache()
             view.max_row = cache["max_row"]
             view.max_col = cache["max_col"]
+            view.col_max_a = max(1, int(cache.get("col_max_a", view.max_col)))
+            view.col_max_b = max(1, int(cache.get("col_max_b", view.max_col)))
             view._is_large_sheet = view.max_row >= _LARGE_SHEET_ROW_THRESHOLD
             view._bounds_checked = True
 
             # Apply row-aligned pair data (computed in background with row alignment)
             view.row_pairs = cache["row_pairs"]
             view.pair_diff_cols = cache["pair_diff_cols"]
+            view.pair_base_diff_cols = {}
             view.col_char_widths = cache.get("col_char_widths", {}) or {c: 4 for c in range(1, view.max_col + 1)}
+            # Invalidate cached base spans: column widths replaced by background result.
+            view._col_widths_version = int(getattr(view, "_col_widths_version", 0)) + 1
+            view.mine_to_base_row = cache.get("mine_to_base_row", {}) or {}
+            view.theirs_to_base_row = cache.get("theirs_to_base_row", {}) or {}
+            view.pair_base_row_override = cache.get("pair_base_row_override", {}) or {}
 
             pair_parts_a = cache.get("pair_parts_a", {}) or {}
             pair_parts_b = cache.get("pair_parts_b", {}) or {}
@@ -8071,6 +12197,7 @@ class SowMergeApp:
         def _compute_worker():
             wb_a_ro = None
             wb_b_ro = None
+            wb_base_ro = None
             wb_a_e = None
             wb_b_e = None
             try:
@@ -8078,6 +12205,8 @@ class SowMergeApp:
                     # Use separate read-only workbooks to avoid threading issues
                     wb_a_ro = load_workbook(self._file_a_val_path, data_only=True, read_only=True)
                     wb_b_ro = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
+                    if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                        wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
                     wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
                     wb_b_e = load_workbook(self.file_b, data_only=False, read_only=True)
                 except Exception as e:
@@ -8095,7 +12224,7 @@ class SowMergeApp:
                         self._compute_inflight.add(sheet)
                     try:
                         _dlog(f"bg compute sheet: {sheet}")
-                        cache = _compute_sheet_cache(wb_a_ro, wb_b_ro, wb_a_e, wb_b_e, sheet)
+                        cache = _compute_sheet_cache(wb_a_ro, wb_b_ro, wb_a_e, wb_b_e, sheet, wb_base_ro)
                         # Never call tkinter APIs from background threads.
                         _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
                     except Exception as e:
@@ -8104,7 +12233,7 @@ class SowMergeApp:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
             finally:
-                _wbs_close(wb_a_ro, wb_b_ro, wb_a_e, wb_b_e)
+                _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e)
                 with self._compute_lock:
                     if self._compute_thread is threading.current_thread():
                         self._compute_thread = None
@@ -8120,6 +12249,7 @@ class SowMergeApp:
                 th = threading.Thread(target=_compute_worker, daemon=True)
                 self._compute_thread = th
                 th.start()
+        self._queue_ui_task = _queue_ui_task
         self._kick_worker = _kick_worker
 
         # Lazy-create SheetView UI immediately; compute diff in background.
@@ -8142,7 +12272,12 @@ class SowMergeApp:
                     # Skip background recompute if data is already ready (no edits pending).
                     # Reopening workbooks on every tab switch is the main perf regression.
                     _view = self.sheet_views.get(tab_text)
-                    if not (_view and getattr(_view, "_data_ready", False)):
+                    meta = self.get_sheet_meta(tab_text)
+                    if meta.get("view_mode") == "missing_sheet":
+                        if _view and (not getattr(_view, "_data_ready", False)):
+                            _view.refresh(row_only=None, rescan=True)
+                            _view._update_cursor_lines()
+                    elif not (_view and getattr(_view, "_data_ready", False)):
                         _enqueue_sheet(tab_text, front=True)
                         _kick_worker()
                         # Fallback: if background path stalls, force sync refresh on UI thread.
@@ -8261,6 +12396,7 @@ class SowMergeApp:
         def _scan_sheet_has_diff_fast():
             wb_a_ro = None
             wb_b_ro = None
+            wb_base_ro = None
             try:
                 try:
                     a_sz = os.path.getsize(self._file_a_val_path)
@@ -8276,7 +12412,12 @@ class SowMergeApp:
 
                 wb_a_ro = load_workbook(self._file_a_val_path, data_only=True, read_only=True)
                 wb_b_ro = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
-                ordered = list(self.common_sheets)
+                if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                    try:
+                        wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
+                    except Exception:
+                        wb_base_ro = None
+                ordered = list(self.compare_sheets)
                 if ordered:
                     # Prefer currently selected sheet first, then newer tabs first.
                     cur = getattr(self, "selected_sheet", None)
@@ -8295,6 +12436,9 @@ class SowMergeApp:
                     max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
                     max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
                     has_quick = _sheet_has_diff_quick_tail(ws_a, ws_b, max_row, max_col)
+                    if (not has_quick) and getattr(self, "has_base", False):
+                        if wb_base_ro is not None and s not in wb_base_ro.sheetnames:
+                            has_quick = True
                     if has_quick:
                         _queue_ui_task(lambda s=s: _apply_fast_mark_result(s, True))
                     else:
@@ -8316,6 +12460,8 @@ class SowMergeApp:
                         wb_a_ro.close()
                     if wb_b_ro:
                         wb_b_ro.close()
+                    if wb_base_ro:
+                        wb_base_ro.close()
                 except Exception:
                     pass
 
@@ -8326,7 +12472,7 @@ class SowMergeApp:
 
         # Enqueue all sheets for background confirmation (slow compute)
         try:
-            for s in self.common_sheets:
+            for s in self.compare_sheets:
                 _enqueue_sheet(s, front=False)
             _kick_worker()
         except Exception as e:
@@ -8364,6 +12510,24 @@ class SowMergeApp:
                 return
 
     def refresh_sheet_nav(self):
+        # Skip the (expensive) destroy/rebuild of all sheet buttons when nothing
+        # that affects them has changed. refresh() calls this on every full
+        # render, so for large sheets this avoids rebuilding the whole nav bar
+        # on edits/scroll-driven refreshes where the sheet set is unchanged.
+        try:
+            nav_sig = (
+                tuple(self.display_sheets),
+                tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in self.display_sheets),
+                tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in self.display_sheets),
+                getattr(self, "selected_sheet", None),
+            )
+        except Exception:
+            nav_sig = None
+        if nav_sig is not None and nav_sig == getattr(self, "_nav_sig", None) \
+                and self.nav_inner.winfo_children():
+            return
+        self._nav_sig = nav_sig
+
         for child in list(self.nav_inner.winfo_children()):
             child.destroy()
 
@@ -8378,7 +12542,7 @@ class SowMergeApp:
             self._nav_font_bold = None
 
         def add_btn(label: str, tab_text: str, kind: str, state: int = 0):
-            if kind in ("onlyA", "onlyB"):
+            if kind == "missing":
                 bg = "#FFE5E5"
             else:
                 # 0=none, 1=maybe (pale), 2=confirmed (bright)
@@ -8405,13 +12569,10 @@ class SowMergeApp:
                 pass
             b.pack(side="left", padx=4)
 
-        if self.only_a:
-            add_btn(f"仅A({len(self.only_a)})", "仅在A存在", "onlyA")
-        if self.only_b:
-            add_btn(f"仅B({len(self.only_b)})", "仅在B存在", "onlyB")
-
-        for s in self.common_sheets:
-            add_btn(s, s, "common", state=int(self.sheet_diff_state.get(s, 0)))
+        for s in self.display_sheets:
+            meta = self.get_sheet_meta(s)
+            kind = "missing" if meta.get("view_mode") == "missing_sheet" else "common"
+            add_btn(s, s, kind, state=int(self.sheet_diff_state.get(s, 0)))
 
         self.nav_canvas.update_idletasks()
         self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
@@ -8723,6 +12884,7 @@ class SowMergeApp:
                 [svn_exe, "info", update_target],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=12,
                 creationflags=no_window,
             )
@@ -8740,6 +12902,7 @@ class SowMergeApp:
                 [svn_exe, "info", "--show-item", "wc-root", wc_root],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=10,
                 creationflags=no_window,
             )
@@ -8779,6 +12942,7 @@ class SowMergeApp:
                 [svn_exe, "status", "-q", status_target],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=20,
                 creationflags=no_window,
             )
@@ -8790,6 +12954,7 @@ class SowMergeApp:
                     [svn_exe, "status", "-q", status_target],
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=20,
                     creationflags=no_window,
                 )
@@ -9199,10 +13364,11 @@ class SowMergeApp:
         except Exception:
             pass
         try:
-            for s in self.common_sheets:
+            self._refresh_sheet_catalog()
+            for s in self.compare_sheets:
                 self.set_sheet_has_diff(s, False, confirmed=False)
             with self._compute_lock:
-                self._compute_queue = [s for s in self.common_sheets if s not in self._compute_inflight]
+                self._compute_queue = [s for s in self.compare_sheets if s not in self._compute_inflight]
             self._kick_worker()
         except Exception:
             pass
@@ -9350,6 +13516,18 @@ class SowMergeApp:
                     "\n\n请确认你已完成需要处理的冲突数据。是否继续保存？",
                 ):
                     return
+            if self.merge_mode and getattr(self, "sheet_level_conflicts", None):
+                names = ", ".join(str(item.get("sheet")) for item in self.sheet_level_conflicts[:6] if item.get("sheet"))
+                if len(self.sheet_level_conflicts) > 6:
+                    names += " ..."
+                if not messagebox.askyesno(
+                    "确认整Sheet变更",
+                    f"检测到 {len(self.sheet_level_conflicts)} 个无法自动归类的整Sheet变更。"
+                    f"\n默认将保留 mine 版本继续保存。"
+                    f"\n涉及：{names or '-'}"
+                    "\n\n是否继续保存？",
+                ):
+                    return
             if not messagebox.askyesno("确认保存", f"将保存合并结果到：\n\n{self.merged_path}\n\n继续吗？"):
                 return
         wb_to_save = self._wb_a_edit
@@ -9372,6 +13550,8 @@ class SowMergeApp:
                     f"SAVE_MERGED path={self.merged_path} "
                     f"merge_mode={self.merge_mode} has_base={self.has_base} "
                     f"manual_a_ops={len(getattr(self, 'manual_a_cell_ops', {}))} "
+                    f"manual_sheet_ops={len(getattr(self, 'manual_sheet_ops', []))} "
+                    f"auto_sheet_ops={len(getattr(self, 'auto_sheet_ops', []))} "
                     f"manual_ops_by_sheet={by_sheet} "
                     f"snapshot={getattr(self, '_merge_mine_snapshot', None)}"
                 )
@@ -9410,7 +13590,22 @@ class SowMergeApp:
                         wb_to_save.save(tmp_path)
                     if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
                         raise RuntimeError(f"临时文件写入失败或为空：{tmp_path}")
-                    _launch_deferred_copy(tmp_path, self.merged_path)
+                    if not _launch_deferred_copy(tmp_path, self.merged_path):
+                        # Deferred copy could not even be launched: do NOT claim
+                        # success or silently exit. Surface the temp path so the
+                        # user can recover the merge result manually, then fall
+                        # through to the save-as recovery offer below.
+                        try:
+                            messagebox.showerror(
+                                "保存失败",
+                                "无法启动后台延迟复制进程，合并结果尚未写入目标文件。\n"
+                                f"已保留临时文件：\n{tmp_path}\n\n"
+                                "请关闭占用目标文件的程序后，手动将该临时文件复制到：\n"
+                                f"{self.merged_path}",
+                            )
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"deferred copy launch failed; temp preserved at {tmp_path}")
                     messagebox.showinfo("保存中", f"目标文件被占用，已写入临时文件并将在关闭后自动覆盖：\n{self.merged_path}")
                     try:
                         self._shutdown_root()
@@ -9659,7 +13854,7 @@ def main():
             # Need second file for diff mode
             root = tk.Tk()
             root.withdraw()
-            b = filedialog.askopenfilename(title="Select second .xlsx file (same filename)", filetypes=[("Excel Workbook", "*.xlsx")])
+            b = filedialog.askopenfilename(title="Select second Excel workbook (same filename)", filetypes=[("Excel Workbook", "*.xlsx *.xlsm")])
             if not b:
                 root.destroy()
                 return
