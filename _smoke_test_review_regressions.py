@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -130,12 +131,44 @@ def _test_large_alignment_fast_and_exact():
     assert elapsed < 2.0, elapsed
 
 
+def _test_stable_copy_waits_for_complete_zip():
+    root = make_temp_dir("sow_partial_svn_export_")
+    complete = os.path.join(root, "complete.xlsx")
+    partial = os.path.join(root, "WorldMonster.xlsx-revBASE.tmp.xlsx")
+    wb = Workbook()
+    wb.active["A1"] = "complete"
+    wb.save(complete)
+    wb.close()
+
+    with open(complete, "rb") as src:
+        payload = src.read()
+    split_at = len(payload) // 2
+    with open(partial, "wb") as dst:
+        dst.write(payload[:split_at])
+        dst.flush()
+
+    def _finish_export():
+        time.sleep(0.35)
+        with open(partial, "ab") as dst:
+            dst.write(payload[split_at:])
+            dst.flush()
+
+    writer = threading.Thread(target=_finish_export, daemon=True)
+    writer.start()
+    stable = mod._ensure_stable_copy(partial)
+    writer.join(timeout=2.0)
+    assert stable != partial
+    assert os.path.getsize(stable) == len(payload)
+    assert mod._workbook_package_ready(stable)
+
+
 def main():
     _test_only_diff_region_boundaries()
     _test_tail_identical_append_stays_paired()
     _test_shared_formula_is_not_destroyed()
     _test_formula_noop_filter()
     _test_large_alignment_fast_and_exact()
+    _test_stable_copy_waits_for_complete_zip()
     print("SMOKE_REVIEW_REGRESSIONS_OK")
 
 

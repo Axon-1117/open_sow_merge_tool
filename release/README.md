@@ -1,10 +1,14 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-07-21.update46`
-- Build Tag：`new123-formula-cache-safe-merge-fix`
+- 版本号：`2026-07-21.update47`
+- Build Tag：`new124-svn-export-zip-ready-fix`
 
 ### 本次修复
+- 修复 TortoiseSVN 手动 merge 大文件时偶发 `File is not a zip file` 的问题；此前只要异步导出文件已经出现就会立即复制，可能把仍在写入的 BASE 截成半个 ZIP。
+- BASE 现在优先从 working copy 的 `.svn\\pristine` 同步读取；Tortoise 异步导出必须等待文件大小稳定，并通过完整 ZIP、`[Content_Types].xml`、`xl/workbook.xml` 和压缩成员校验后才允许进入比较。
+- 所有 `.merge-left/.merge-right/.r####` sidecar 和 stable 临时副本增加统一完整性门禁，并避免 stable 临时文件被重复复制；不完整文件会给出明确的 SVN 临时文件错误，不再把底层 `BadZipFile` 直接暴露给用户。
+- 使用 `C:\\GM15\\design\\sheets\\release` 当前 `WorldMonster.xlsx` 冲突现场回放通过：BASE/mine/theirs 三方完整性校验及 3-way 冲突扫描均成功。
 - 修复 `WorldMonster.xlsx` 在“只看差异”下采用右侧区域后，相同公式的计算结果会被刷新流程恢复为 mine 旧缓存的问题；现在保留原公式、采用 theirs 当前缓存值，并提示同步合并公式依赖数据。
 - 修复公式工作簿保存后 Excel 提示修复、修复后公式缓存结果丢失的问题；单元格覆盖优先使用经过结构校验的 OOXML 定点写回，保留共享公式元数据和未改动公式缓存，无法安全保存时会停止而不是生成风险文件。
 - 公式与缓存结果采用独立操作记录，插入/删除行时会同步迁移记录；保存后仍保留公式，且不会为了采用缓存结果主动触发整本工作簿重算。
@@ -62,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
 ```
 
 可选参数：
-- `-GitCommitMessage "release: 2026-07-21.update46 (new123-formula-cache-safe-merge-fix)"`：自定义提交信息。
+- `-GitCommitMessage "release: 2026-07-21.update47 (new124-svn-export-zip-ready-fix)"`：自定义提交信息。
 - `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
 - `-GitRemote origin`：指定推送远端，默认 `origin`。
 - `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。

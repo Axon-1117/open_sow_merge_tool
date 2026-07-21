@@ -29,8 +29,8 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-21.update46"
-APP_BUILD_TAG = "new123-formula-cache-safe-merge-fix"
+APP_VERSION = "2026-07-21.update47"
+APP_BUILD_TAG = "new124-svn-export-zip-ready-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -1996,6 +1996,47 @@ def _query_svn_version(svn_exe: str) -> str:
     return ""
 
 
+def _workbook_package_ready(path: str) -> bool:
+    """Return True only for a complete, readable OOXML workbook package."""
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return False
+        with zipfile.ZipFile(path, "r") as zf:
+            names = set(zf.namelist())
+            if "[Content_Types].xml" not in names or "xl/workbook.xml" not in names:
+                return False
+            return zf.testzip() is None
+    except (OSError, zipfile.BadZipFile, EOFError):
+        return False
+
+
+def _wait_for_complete_workbook(path: str, timeout_seconds: float | None = None) -> bool:
+    """Wait for asynchronous SVN exports to finish writing a valid OOXML ZIP."""
+    timeout = float(_SVN_EXPORT_TIMEOUT_SECS if timeout_seconds is None else timeout_seconds)
+    deadline = time.monotonic() + max(0.1, timeout)
+    previous_size = -1
+    stable_polls = 0
+    while time.monotonic() < deadline:
+        try:
+            size = os.path.getsize(path) if os.path.isfile(path) else -1
+        except OSError:
+            size = -1
+        if size > 0 and size == previous_size:
+            stable_polls += 1
+        else:
+            previous_size = size
+            stable_polls = 0
+        # A ZIP central directory is written at the end, so a successful full
+        # package test is the definitive signal that TortoiseProc has finished.
+        if stable_polls >= 2 and _workbook_package_ready(path):
+            return True
+        time.sleep(0.1)
+    ready = _workbook_package_ready(path)
+    if not ready:
+        _dlog(f"workbook export incomplete: path={path} size={previous_size}")
+    return ready
+
+
 def _try_export_svn_revision_from_merge_temp(path: str) -> str:
     """If path looks like *.merge-left.r#### or *.merge-right.r####, export that revision from WC.
 
@@ -2044,16 +2085,10 @@ def _try_export_svn_revision_from_merge_temp(path: str) -> str:
             _dlog(f"svn export failed launch: {e}")
             return path
 
-        # Wait for file to be created (best-effort)
-        for _ in range(int(_SVN_EXPORT_TIMEOUT_SECS / 0.1)):
-            try:
-                if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-                    return save_path
-            except Exception:
-                pass
-            time.sleep(0.1)
+        if _wait_for_complete_workbook(save_path):
+            return save_path
 
-        _dlog(f"svn export timeout: {save_path}")
+        _dlog(f"svn export timeout or invalid workbook: {save_path}")
         return path
     except Exception as e:
         _dlog(f"svn export error: {e}")
@@ -2093,7 +2128,7 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
                         timeout=30,
                         creationflags=no_window,
                     )
-                if r.returncode == 0 and os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                if r.returncode == 0 and _workbook_package_ready(save_path):
                     _dlog(f"svn base export(cli): {p} -> {save_path}")
                     return save_path
                 try:
@@ -2108,25 +2143,8 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
             except Exception as e:
                 _dlog(f"svn base export(cli) exception: {e}")
 
-        # Fallback: TortoiseProc cat BASE
-        try:
-            proc_exe = _find_tortoise_proc_exe()
-            subprocess.Popen([
-                proc_exe,
-                "/command:cat",
-                f"/path:{p}",
-                "/revision:BASE",
-                f"/savepath:{save_path}",
-                "/closeonend:1",
-            ])
-            for _ in range(50):
-                if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-                    _dlog(f"svn base export(tortoise): {p} -> {save_path}")
-                    return save_path
-                time.sleep(0.1)
-        except Exception as e:
-            _dlog(f"svn base export(tortoise) exception: {e}")
-        # Fallback: read WC metadata directly and copy the pristine blob.
+        # Prefer the working-copy pristine blob over asynchronous TortoiseProc
+        # export. It is the exact WC BASE and copying it is synchronous.
         try:
             import sqlite3
 
@@ -2143,7 +2161,7 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
                     break
                 probe = parent
             if wc_root is None:
-                return None
+                raise FileNotFoundError(f"working-copy metadata not found for {p}")
 
             rel_path = os.path.relpath(p, wc_root).replace("\\", "/")
             wc_db = os.path.join(wc_root, ".svn", "wc.db")
@@ -2171,18 +2189,39 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
             checksum = row[0] if row else None
             m = re.match(r"^\$sha1\$([0-9a-fA-F]{40})$", str(checksum or ""))
             if not m:
-                return None
+                raise RuntimeError(f"working-copy pristine checksum not found for {p}")
             sha1 = m.group(1).lower()
             pristine_path = os.path.join(wc_root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
             if not os.path.exists(pristine_path):
-                return None
-            shutil.copyfile(pristine_path, save_path)
-            if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+                raise FileNotFoundError(f"working-copy pristine file not found: {pristine_path}")
+            part_path = save_path + ".part"
+            shutil.copyfile(pristine_path, part_path)
+            os.replace(part_path, save_path)
+            if _workbook_package_ready(save_path):
                 _dlog(f"svn base export(pristine): {p} -> {save_path}")
                 return save_path
+            _dlog(f"svn base export(pristine) invalid workbook: {pristine_path}")
         except Exception as e:
             _dlog(f"svn base export(pristine) exception: {e}")
-            return None
+
+        # Last fallback: TortoiseProc cat BASE. TortoiseProc writes the output
+        # asynchronously, so file existence alone is not sufficient here.
+        try:
+            proc_exe = _find_tortoise_proc_exe()
+            subprocess.Popen([
+                proc_exe,
+                "/command:cat",
+                f"/path:{p}",
+                "/revision:BASE",
+                f"/savepath:{save_path}",
+                "/closeonend:1",
+            ])
+            if _wait_for_complete_workbook(save_path):
+                _dlog(f"svn base export(tortoise): {p} -> {save_path}")
+                return save_path
+            _dlog(f"svn base export(tortoise) incomplete: {save_path}")
+        except Exception as e:
+            _dlog(f"svn base export(tortoise) exception: {e}")
     except Exception as e:
         _dlog(f"svn base export error: {e}")
         return None
@@ -2640,6 +2679,8 @@ def _ensure_xlsx_copy(path: str) -> str:
     if os.path.splitext(path)[1].lower() in _SUPPORTED_WORKBOOK_EXTS:
         return _ensure_stable_copy(path)
     try:
+        if not _wait_for_complete_workbook(path):
+            raise RuntimeError(f"SVN 临时 Excel 文件尚未完整生成或已损坏：{path}")
         base = os.path.basename(path)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ext = _workbook_ext(path)
@@ -2647,9 +2688,13 @@ def _ensure_xlsx_copy(path: str) -> str:
         if not tmp.lower().endswith(ext):
             tmp += ext
         shutil.copy2(path, tmp)
+        if not _workbook_package_ready(tmp):
+            raise RuntimeError(f"SVN 临时 Excel 文件复制后校验失败：{path}")
         return tmp
-    except Exception:
-        return path
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"无法准备 SVN 临时 Excel 文件：{path}\n{e}") from e
 
 
 def _ensure_stable_copy(path: str) -> str:
@@ -2664,13 +2709,21 @@ def _ensure_stable_copy(path: str) -> str:
         looks_temp = p_low.startswith(temp_root)
         looks_svn = ".svn" in p_low or ".r" in base or "revbase" in base.lower() or "rev" in base.lower()
         if looks_temp or looks_svn:
+            if not _wait_for_complete_workbook(p_abs):
+                raise RuntimeError(f"SVN 临时 Excel 文件尚未完整生成或已损坏：{path}")
+            if base.lower().startswith(f"{APP_NAME}_stable_"):
+                return p_abs
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_stable_{ts}_{base}")
             ext = _workbook_ext(path)
             if not tmp.lower().endswith(ext):
                 tmp += ext
             shutil.copy2(path, tmp)
+            if not _workbook_package_ready(tmp):
+                raise RuntimeError(f"SVN 临时 Excel 文件稳定副本校验失败：{path}")
             return tmp
+    except RuntimeError:
+        raise
     except Exception:
         pass
     return path
