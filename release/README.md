@@ -1,10 +1,16 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-07-21.update47`
-- Build Tag：`new124-svn-export-zip-ready-fix`
+- 版本号：`2026-07-21.update48`
+- Build Tag：`new125-region-stale-recalc-fix`
 
 ### 本次修复
+- 修复大公式表点击“使用右侧区域”后先延迟生效、随后又恢复 mine 旧值的问题；日志确认旧版本会在打开后依次后台重算 mine/theirs/base，并把较早启动的 mine 结果回灌到用户操作后的界面。
+- merge 模式不再自动启动 Excel 全表重算；自动重算策略现在严格遵守配置，存在未保存覆盖操作时也会阻止手动重算，避免磁盘旧文件覆盖内存合并结果。
+- 后台 Sheet 差异缓存现在只要检测到该 Sheet 有任何用户操作就拒绝应用，不再要求初始 `_data_ready` 已完成，消除首屏后台结果延迟覆盖用户操作的竞态。
+- 为已对齐的 `theirs -> mine` 区域增加批量写回路径和每 200 行进度反馈；真实 `WorldMonster@design` 完整 1200 行差异块约 1.5 秒，`WorldMonsterSurvivor@design` 完整 6000 行差异块约 2.0 秒。
+- 区域采用不再受主视区 800 行渲染上限截断；只要属于同一逻辑连续差异块，屏幕外的尾部行也会一并采用并进入保存记录。
+- 公式缓存保存增加严格 `cache-only` 模式，只更新 `<v>` 并原样保留现有 `<f>` 及共享公式组；真实区域采用后的 merged 输出已通过公式、缓存、ZIP 和共享公式结构校验。
 - 修复 TortoiseSVN 手动 merge 大文件时偶发 `File is not a zip file` 的问题；此前只要异步导出文件已经出现就会立即复制，可能把仍在写入的 BASE 截成半个 ZIP。
 - BASE 现在优先从 working copy 的 `.svn\\pristine` 同步读取；Tortoise 异步导出必须等待文件大小稳定，并通过完整 ZIP、`[Content_Types].xml`、`xl/workbook.xml` 和压缩成员校验后才允许进入比较。
 - 所有 `.merge-left/.merge-right/.r####` sidecar 和 stable 临时副本增加统一完整性门禁，并避免 stable 临时文件被重复复制；不完整文件会给出明确的 SVN 临时文件错误，不再把底层 `BadZipFile` 直接暴露给用户。
@@ -66,7 +72,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
 ```
 
 可选参数：
-- `-GitCommitMessage "release: 2026-07-21.update47 (new124-svn-export-zip-ready-fix)"`：自定义提交信息。
+- `-GitCommitMessage "release: 2026-07-21.update48 (new125-region-stale-recalc-fix)"`：自定义提交信息。
 - `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
 - `-GitRemote origin`：指定推送远端，默认 `origin`。
 - `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。

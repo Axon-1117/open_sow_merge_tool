@@ -23,6 +23,21 @@ def _test_only_diff_region_boundaries():
     assert blocks == [(1, 1), (2, 3), (4, 4)], blocks
 
 
+def _test_logical_region_extends_beyond_render_limit():
+    class DummyView:
+        # The UI rendered only a small window inside a much larger logical block.
+        display_rows = [3, 4, 5]
+        row_pairs = [(idx + 1, idx + 1) for idx in range(12)]
+
+        @staticmethod
+        def _pair_has_visual_diff(pair_idx):
+            return 2 <= pair_idx <= 9
+
+    view = DummyView()
+    block = mod.SheetView._logical_diff_pair_block_for_line(view, 2)
+    assert block == list(range(2, 10)), block
+
+
 def _test_tail_identical_append_stays_paired():
     wb_mine = Workbook()
     wb_theirs = Workbook()
@@ -76,6 +91,22 @@ def _test_shared_formula_is_not_destroyed():
     v = root.find(f".//{{{ns}}}c[@r='A1']/{{{ns}}}v")
     assert f is not None and f.attrib == {"t": "shared", "ref": "A1:A2", "si": "7"}, f.attrib
     assert v is not None and v.text == "9"
+
+    # A cache-only adoption must preserve even a shared member formula whose
+    # formula text is stored only on the group master.
+    mod._sheet_xml_set_cell(
+        root,
+        2,
+        1,
+        "=IGNORED_FOR_CACHE_ONLY()",
+        11,
+        preserve_existing_formula=True,
+    )
+    member_f = root.find(f".//{{{ns}}}c[@r='A2']/{{{ns}}}f")
+    member_v = root.find(f".//{{{ns}}}c[@r='A2']/{{{ns}}}v")
+    assert member_f is not None and member_f.attrib == {"t": "shared", "si": "7"}
+    assert member_f.text in (None, "")
+    assert member_v is not None and member_v.text == "11"
 
     try:
         mod._sheet_xml_set_cell(root, 1, 1, "=SUM(B1:D1)", 4)
@@ -162,13 +193,34 @@ def _test_stable_copy_waits_for_complete_zip():
     assert mod._workbook_package_ready(stable)
 
 
+def _test_background_recalc_policy_is_explicit():
+    old_always = mod._AUTO_RECALC_FORMULAS_ALWAYS
+    old_missing = mod._AUTO_RECALC_MISSING_CACHE
+    old_recalc = mod._recalc_and_prepare_val_path
+    calls = []
+    try:
+        mod._AUTO_RECALC_FORMULAS_ALWAYS = False
+        mod._AUTO_RECALC_MISSING_CACHE = False
+        mod._recalc_and_prepare_val_path = lambda path: calls.append(path) or "recalc.xlsx"
+        assert mod._maybe_recalc_and_prepare_val_path("formula.xlsx", force=False) is None
+        assert not calls
+        assert mod._maybe_recalc_and_prepare_val_path("formula.xlsx", force=True) == "recalc.xlsx"
+        assert calls == ["formula.xlsx"]
+    finally:
+        mod._AUTO_RECALC_FORMULAS_ALWAYS = old_always
+        mod._AUTO_RECALC_MISSING_CACHE = old_missing
+        mod._recalc_and_prepare_val_path = old_recalc
+
+
 def main():
     _test_only_diff_region_boundaries()
+    _test_logical_region_extends_beyond_render_limit()
     _test_tail_identical_append_stays_paired()
     _test_shared_formula_is_not_destroyed()
     _test_formula_noop_filter()
     _test_large_alignment_fast_and_exact()
     _test_stable_copy_waits_for_complete_zip()
+    _test_background_recalc_policy_is_explicit()
     print("SMOKE_REVIEW_REGRESSIONS_OK")
 
 

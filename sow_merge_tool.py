@@ -29,13 +29,13 @@ from openpyxl.utils import get_column_letter
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-21.update47"
-APP_BUILD_TAG = "new124-svn-export-zip-ready-fix"
+APP_VERSION = "2026-07-21.update48"
+APP_BUILD_TAG = "new125-region-stale-recalc-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
 _DEBUG_LOG_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_debug.log")
-_DEBUG_ENABLED = False
+_DEBUG_ENABLED = True
 _LAUNCH_TRACE_PATH = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_launch_trace.log")
 
 # Save safety: default to atomic "write tmp + os.replace" so an interrupted save
@@ -52,7 +52,10 @@ _USE_CACHED_VALUES_ONLY = True
 # When cached values are missing for formulas, try to recalc via Excel (if available)
 _AUTO_RECALC_MISSING_CACHE = False
 _AUTO_RECALC_FORMULAS_ALWAYS = False
-_AUTO_RECALC_ON_OPEN = True
+# Recalculation is explicit. Automatic Excel recalculation is both expensive on
+# large workbooks and unsafe during merge because a late result can overwrite
+# cache values the user has just adopted from theirs.
+_AUTO_RECALC_ON_OPEN = False
 _EXCEL_NATIVE_SAVE_ON_MERGE = True
 _CACHE_CHECK_MAX_CELLS = 3000
 # Render performance: limit initial rows rendered (user can load full)
@@ -1201,6 +1204,7 @@ def _sheet_xml_set_cell(
     col_idx: int,
     value,
     cached_value=_MISSING_VALUE,
+    preserve_existing_formula: bool = False,
 ):
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     q = lambda t: f"{{{ns}}}{t}"
@@ -1249,8 +1253,30 @@ def _sheet_xml_set_cell(
         else:
             target_row.insert(insert_cell_at, target_cell)
 
-    formula = _formula_text(value)
     existing_formula = target_cell.find(q("f"))
+    if preserve_existing_formula:
+        if existing_formula is None:
+            raise RuntimeError(f"Cache-only update target is not a formula cell: {cell_ref}")
+        if cached_value is _MISSING_VALUE:
+            raise RuntimeError(f"Cache-only update has no cached value: {cell_ref}")
+        for child in list(target_cell):
+            if child.tag == q("v"):
+                target_cell.remove(child)
+        target_cell.attrib.pop("t", None)
+        if cached_value is not None:
+            if isinstance(cached_value, bool):
+                target_cell.attrib["t"] = "b"
+                cache_text = "1" if cached_value else "0"
+            elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
+                cache_text = str(cached_value)
+            else:
+                cache_text = str(cached_value)
+                target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
+            v = ET.SubElement(target_cell, q("v"))
+            v.text = cache_text
+        return
+
+    formula = _formula_text(value)
     if existing_formula is not None:
         existing_text = existing_formula.text or ""
         existing_full = ("=" + existing_text) if existing_text else None
@@ -1404,6 +1430,7 @@ def _build_manual_merge_xlsx_via_zip(
     out_xlsx: str,
     manual_ops: dict,
     cached_values: dict | None = None,
+    cache_only_keys: set[tuple[str, int, int]] | None = None,
 ):
     """Patch only selected cells at XML level; keep untouched parts byte-identical."""
     with zipfile.ZipFile(src_xlsx, "r") as zf:
@@ -1451,9 +1478,14 @@ def _build_manual_merge_xlsx_via_zip(
 
     ops_by_sheet = {}
     cached_values = cached_values or {}
+    cache_only_keys = {
+        (str(sheet), int(r), int(c))
+        for sheet, r, c in (cache_only_keys or set())
+    }
     for (sheet, r, c), v in manual_ops.items():
+        key = (str(sheet), int(r), int(c))
         cached = cached_values.get((sheet, int(r), int(c)), _MISSING_VALUE)
-        ops_by_sheet.setdefault(sheet, []).append((int(r), int(c), v, cached))
+        ops_by_sheet.setdefault(sheet, []).append((int(r), int(c), v, cached, key in cache_only_keys))
 
     for sheet, ops in ops_by_sheet.items():
         part = sheet_to_part.get(sheet)
@@ -1464,8 +1496,15 @@ def _build_manual_merge_xlsx_via_zip(
         for pfx, uri in ns_map.items():
             ET.register_namespace(pfx, uri)
         ws_root = ET.fromstring(files[part])
-        for r, c, v, cached in sorted(ops, key=lambda x: (x[0], x[1])):
-            _sheet_xml_set_cell(ws_root, r, c, v, cached)
+        for r, c, v, cached, cache_only in sorted(ops, key=lambda x: (x[0], x[1])):
+            _sheet_xml_set_cell(
+                ws_root,
+                r,
+                c,
+                v,
+                cached,
+                preserve_existing_formula=cache_only,
+            )
         xml_bytes = ET.tostring(ws_root, encoding="utf-8", xml_declaration=True)
         xml_bytes = re.sub(
             rb'<\?xml[^?]*\?>',
@@ -1901,8 +1940,12 @@ def _maybe_recalc_and_prepare_val_path(path: str, force: bool = False) -> str | 
         return None
     try:
         if not force:
-            has_formula, _missing_cache = _scan_formula_cache(path)
+            if not (_AUTO_RECALC_FORMULAS_ALWAYS or _AUTO_RECALC_MISSING_CACHE):
+                return None
+            has_formula, missing_cache = _scan_formula_cache(path)
             if not has_formula:
+                return None
+            if not (_AUTO_RECALC_FORMULAS_ALWAYS or (_AUTO_RECALC_MISSING_CACHE and missing_cache)):
                 return None
         return _recalc_and_prepare_val_path(path)
     except Exception as e:
@@ -6862,30 +6905,74 @@ class SheetView:
                 return (start, end)
         return None
 
+    def _logical_diff_pair_block_for_line(self, line: int) -> list[int]:
+        """Expand the selected diff to its full pair block, beyond render limits."""
+        if not (1 <= int(line) <= len(self.display_rows)):
+            return []
+        anchor_pair_idx = int(self.display_rows[int(line) - 1])
+        if not self._pair_has_visual_diff(anchor_pair_idx):
+            return []
+        start_pair_idx = anchor_pair_idx
+        end_pair_idx = anchor_pair_idx
+        while start_pair_idx > 0 and self._pair_has_visual_diff(start_pair_idx - 1):
+            start_pair_idx -= 1
+        last_pair_idx = len(self.row_pairs) - 1
+        while end_pair_idx < last_pair_idx and self._pair_has_visual_diff(end_pair_idx + 1):
+            end_pair_idx += 1
+        return list(range(start_pair_idx, end_pair_idx + 1))
+
     def _copy_selected_region(self, direction: str):
         """Copy contiguous diff block around current line using diff-cell columns only."""
+        started = time.perf_counter()
+        processed_rows = 0
+        changed_any = False
+        direction_text = {
+            "B2A": "右侧区域到 mine",
+            "A2B": "左侧区域到 theirs",
+            "BASE2A": "Base 区域到 mine",
+        }.get(direction, direction)
         try:
             formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
             line = self._current_line()
-            block = self._current_diff_block_for_line(line)
-            if not block:
+            region_pair_indices = self._logical_diff_pair_block_for_line(line)
+            if not region_pair_indices:
+                _dlog(f"OVERWRITE_REGION_NO_BLOCK sheet={self.sheet} dir={direction} line={line}")
                 return
-            start, end = block
+            total_region_rows = len(region_pair_indices)
+            _dlog(
+                f"OVERWRITE_REGION_START sheet={self.sheet} dir={direction} "
+                f"pairs={region_pair_indices[0]}-{region_pair_indices[-1]} rows={total_region_rows}"
+            )
+            try:
+                self.info.configure(text=f"正在采用{direction_text}：0/{total_region_rows} 行...")
+                self.root.configure(cursor="watch")
+                self.root.update_idletasks()
+            except Exception:
+                pass
             anchor = self._capture_view_anchor()
             # Collect all undo cells into one list so the entire region is a
             # single undo entry regardless of how many rows it spans.
             undo_cells_region: list = []
             undo_target = "A" if direction in ("B2A", "BASE2A") else "B"
-            changed_any = False
-            ln = start
-            while ln <= end:
-                if not (1 <= ln <= len(self.display_rows)):
-                    ln += 1
-                    continue
-                pair_idx = self.display_rows[ln - 1]
+            # The common large-formula case is thousands of already aligned
+            # rows copied from theirs to mine. Resolve worksheet objects once
+            # and bypass the full single-row command setup for every row.
+            fast_b2a = direction == "B2A"
+            ws_a_val_fast = None
+            ws_b_val_fast = None
+            ws_a_edit_fast = None
+            ws_b_edit_fast = None
+            if fast_b2a:
+                ws_a_val_fast = self.app.ws_a_val(self.sheet)
+                ws_b_val_fast = self.app.ws_b_val(self.sheet)
+                ws_a_edit_fast = self.app.ws_a_edit(self.sheet)
+                ws_b_edit_fast = self.app.ws_b_edit(self.sheet)
+            region_pos = 0
+            while region_pos < total_region_rows:
+                pair_idx = region_pair_indices[region_pos]
                 cols = set(self.pair_diff_cols.get(pair_idx, set()))
                 if not cols:
-                    ln += 1
+                    region_pos += 1
                     continue
                 pair = self.row_pairs[pair_idx] if pair_idx < len(self.row_pairs) else None
                 ra = self._row_for_side(pair, "A")
@@ -6893,10 +6980,10 @@ class SheetView:
 
                 if direction == "B2A" and ra is None and rb is not None and cols == {-1}:
                     run: list[tuple[int, int]] = [(pair_idx, rb)]
-                    probe = ln + 1
+                    probe = region_pos + 1
                     prev_rb = rb
-                    while probe <= end and probe <= len(self.display_rows):
-                        next_pair_idx = self.display_rows[probe - 1]
+                    while probe < total_region_rows:
+                        next_pair_idx = region_pair_indices[probe]
                         next_cols = set(self.pair_diff_cols.get(next_pair_idx, set()))
                         next_pair = self.row_pairs[next_pair_idx] if next_pair_idx < len(self.row_pairs) else None
                         next_ra = self._row_for_side(next_pair, "A")
@@ -6916,15 +7003,16 @@ class SheetView:
                     )
                     if row_changed:
                         changed_any = True
-                    ln = probe
+                    processed_rows += len(run)
+                    region_pos = probe
                     continue
 
                 if direction == "A2B" and rb is None and ra is not None and cols == {-1}:
                     run = [(pair_idx, ra)]
-                    probe = ln + 1
+                    probe = region_pos + 1
                     prev_ra = ra
-                    while probe <= end and probe <= len(self.display_rows):
-                        next_pair_idx = self.display_rows[probe - 1]
+                    while probe < total_region_rows:
+                        next_pair_idx = region_pair_indices[probe]
                         next_cols = set(self.pair_diff_cols.get(next_pair_idx, set()))
                         next_pair = self.row_pairs[next_pair_idx] if next_pair_idx < len(self.row_pairs) else None
                         next_ra = self._row_for_side(next_pair, "A")
@@ -6944,7 +7032,53 @@ class SheetView:
                     )
                     if row_changed:
                         changed_any = True
-                    ln = probe
+                    processed_rows += len(run)
+                    region_pos = probe
+                    continue
+
+                if (
+                    fast_b2a
+                    and ra is not None
+                    and rb is not None
+                    and cols
+                    and all(int(c) > 0 for c in cols)
+                ):
+                    applied_cols = set()
+                    row_undo = []
+                    for c in sorted(int(c) for c in cols):
+                        old_edit = ws_a_edit_fast.cell(row=ra, column=c).value
+                        old_val = ws_a_val_fast.cell(row=ra, column=c).value
+                        source_edit = ws_b_edit_fast.cell(row=rb, column=c).value
+                        source_val = ws_b_val_fast.cell(row=rb, column=c).value
+                        if self._skip_same_formula_copy(source_edit, old_edit):
+                            ws_a_val_fast.cell(row=ra, column=c).value = source_val
+                            self.app.record_manual_a_formula_cache(self.sheet, ra, c, source_val)
+                        else:
+                            new_edit = _choose_edit_value(source_val, source_edit)
+                            ws_a_edit_fast.cell(row=ra, column=c).value = new_edit
+                            ws_a_val_fast.cell(row=ra, column=c).value = source_val
+                            self.app.record_manual_a_cell(self.sheet, ra, c, new_edit)
+                        row_undo.append((ra, c, old_edit, old_val))
+                        applied_cols.add(c)
+                    if row_undo:
+                        undo_cells_region.extend(row_undo)
+                        self.app.modified_a = True
+                        self.app.modified_sheets_a.add(self.sheet)
+                        self.touched_rows.add(int(ra))
+                        changed_any = True
+                    if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
+                        self.app.user_touched_conflicts = True
+                        self._resolve_conflict_row(ra, applied_cols)
+                    processed_rows += 1
+                    if processed_rows % 200 == 0:
+                        try:
+                            self.info.configure(
+                                text=f"正在采用{direction_text}：{processed_rows}/{total_region_rows} 行..."
+                            )
+                            self.root.update_idletasks()
+                        except Exception:
+                            pass
+                    region_pos += 1
                     continue
                 # In 3-way mode, "采用Base" is kept as its own button.
                 # Left/Right region actions follow left/right semantics only.
@@ -6958,7 +7092,16 @@ class SheetView:
                 )
                 if row_changed:
                     changed_any = True
-                ln += 1
+                processed_rows += 1
+                if processed_rows % 200 == 0:
+                    try:
+                        self.info.configure(
+                            text=f"正在采用{direction_text}：{processed_rows}/{total_region_rows} 行..."
+                        )
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+                region_pos += 1
             if changed_any:
                 if undo_cells_region:
                     self.app.push_undo({"sheet": self.sheet, "target": undo_target, "cells": undo_cells_region})
@@ -6971,11 +7114,28 @@ class SheetView:
                 self.refresh(row_only=None, rescan=False)
                 self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
+                try:
+                    elapsed = time.perf_counter() - started
+                    self.info.configure(
+                        text=f"已采用{direction_text}：{processed_rows} 行，耗时 {elapsed:.1f} 秒"
+                    )
+                except Exception:
+                    pass
             formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
             if formula_skipped > 0:
                 self._show_formula_copy_skip_notice(formula_skipped)
         except Exception as e:
             messagebox.showerror("Error", f"覆盖区域失败：\n{e}")
+        finally:
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
+            _dlog(
+                f"OVERWRITE_REGION_END sheet={self.sheet} dir={direction} "
+                f"processed={processed_rows} changed={int(bool(changed_any))} "
+                f"ms={(time.perf_counter() - started) * 1000.0:.1f}"
+            )
 
     def _update_diff_nav_state(self):
         blocks = self._compute_diff_blocks()
@@ -11508,7 +11668,11 @@ class SowMergeApp:
         if not self.manual_a_row_ops and not sheet_ops:
             try:
                 _build_manual_merge_xlsx_via_zip(
-                    src, out, zip_ops, cached_values=cached_values
+                    src,
+                    out,
+                    zip_ops,
+                    cached_values=cached_values,
+                    cache_only_keys=set(formula_cache_values),
                 )
                 return out
             except Exception as e:
@@ -11531,6 +11695,7 @@ class SowMergeApp:
                         cache_out,
                         {key: zip_ops[key] for key in formula_cache_values if key in zip_ops},
                         cached_values=formula_cache_values,
+                        cache_only_keys=set(formula_cache_values),
                     )
                     os.replace(cache_out, out)
                 return out
@@ -12116,7 +12281,11 @@ class SowMergeApp:
                 return
             # Skip if the user has made edits in this view; background data (from read-only copies)
             # would be stale relative to the user's in-memory changes.
-            if getattr(view, "_data_ready", False) and view.touched_rows:
+            has_user_edits = bool(view.touched_rows)
+            has_user_edits = has_user_edits or sheet in getattr(self, "modified_sheets_a", set())
+            has_user_edits = has_user_edits or sheet in getattr(self, "modified_sheets_b", set())
+            if has_user_edits:
+                _dlog(f"skip stale bg cache after user action: sheet={sheet}")
                 self.refresh_sheet_nav()
                 return
             # Guard against late background cache downgrading an already rendered sheet to no-diff.
@@ -13141,6 +13310,14 @@ class SowMergeApp:
 
     def recalc_and_refresh(self):
         # Manual: force Excel recalc to refresh cached values, then reload view.
+        if self.modified_a or self.modified_b:
+            messagebox.showwarning(
+                "存在未保存操作",
+                "当前存在尚未保存的覆盖操作。此时重算会基于磁盘旧文件，可能覆盖刚采用的结果。\n\n"
+                "为保护合并结果，本次重算已取消。请先完成并保存当前合并。",
+            )
+            return
+
         def _do_recalc():
             new_a = _maybe_recalc_and_prepare_val_path(self.file_a, force=True)
             new_b = _maybe_recalc_and_prepare_val_path(self.file_b, force=True)
@@ -13154,6 +13331,9 @@ class SowMergeApp:
 
     def _schedule_auto_recalc(self):
         if not (_AUTO_RECALC_ON_OPEN and _USE_CACHED_VALUES_ONLY):
+            return
+        if self.merge_mode:
+            _dlog("auto recalc skipped in merge mode")
             return
         if self._auto_recalc_started:
             return
@@ -13174,7 +13354,12 @@ class SowMergeApp:
 
             def _apply():
                 try:
-                    self._apply_recalc_results(new_a=new_a, new_b=new_b, new_base=new_base)
+                    self._apply_recalc_results(
+                        new_a=new_a,
+                        new_b=new_b,
+                        new_base=new_base,
+                        respect_user_edits=True,
+                    )
                 except Exception as e:
                     _dlog(f"auto recalc apply failed: {e}")
 
@@ -13426,7 +13611,20 @@ class SowMergeApp:
         except Exception:
             pass
 
-    def _apply_recalc_results(self, new_a=None, new_b=None, new_base=None):
+    def _apply_recalc_results(
+        self,
+        new_a=None,
+        new_b=None,
+        new_base=None,
+        respect_user_edits: bool = False,
+    ):
+        if respect_user_edits:
+            if self.modified_a and new_a:
+                _dlog("skip stale auto-recalc result for mine: user edits already exist")
+                new_a = None
+            if self.modified_b and new_b:
+                _dlog("skip stale auto-recalc result for theirs: user edits already exist")
+                new_b = None
         specs = []
         if new_a:
             specs.append(("_wb_a_val", "_file_a_val_path", new_a))
