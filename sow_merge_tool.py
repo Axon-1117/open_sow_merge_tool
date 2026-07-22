@@ -34,8 +34,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-22.update52"
-APP_BUILD_TAG = "new129-fast-ui-and-sheet-premark-fix"
+APP_VERSION = "2026-07-22.update53"
+APP_BUILD_TAG = "new130-nonblocking-notice-region-anchor-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -2913,38 +2913,6 @@ def open_tortoise_merge(left_txt: str, right_txt: str, title: str):
     exe = _find_tortoise_merge_exe()
     args = [exe, "/base", left_txt, "/mine", right_txt, "/title", title]
     subprocess.Popen(args)
-
-
-def _show_conflict_popup(conflicts):
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        win = tk.Toplevel(root)
-        win.title("发现冲突")
-        win.resizable(False, False)
-        win.geometry("+{}+{}".format(root.winfo_screenwidth() // 2 - 220, root.winfo_screenheight() // 2 - 180))
-        msg = "与其他同学冲突，请联系确认后再修改保存！！！"
-        lbl = tk.Label(win, text=msg, fg="red", font=("Microsoft YaHei", 12, "bold"), padx=16, pady=10)
-        lbl.pack()
-
-        detail_lines = []
-        for sheet, r, c, _vm, _vt in conflicts[:3]:
-            col = get_column_letter(c)
-            detail_lines.append(f"{sheet}!{col}{r}")
-        if len(conflicts) > 3:
-            detail_lines.append("...")
-        detail_text = "\n".join(detail_lines) if detail_lines else "（无）"
-        txt = tk.Text(win, height=12, width=60)
-        txt.insert("1.0", detail_text)
-        txt.configure(state="disabled")
-        txt.pack(padx=12, pady=(0, 10))
-
-        tk.Button(win, text="确定", command=win.destroy).pack(pady=(0, 10))
-        win.grab_set()
-        win.wait_window()
-        root.destroy()
-    except Exception:
-        pass
 
 
 def _run_startup_progress_task(title: str, message: str, fn):
@@ -7778,6 +7746,13 @@ class SheetView:
         if not (1 <= int(line) <= len(self.display_rows)):
             return []
         anchor_pair_idx = int(self.display_rows[int(line) - 1])
+        return self._logical_diff_pair_block_for_pair(anchor_pair_idx)
+
+    def _logical_diff_pair_block_for_pair(self, anchor_pair_idx: int) -> list[int]:
+        """Expand a pair anchor to its full contiguous visual-diff block."""
+        anchor_pair_idx = self._normalize_pair_idx(anchor_pair_idx)
+        if anchor_pair_idx is None:
+            return []
         if not self._pair_has_visual_diff(anchor_pair_idx):
             return []
         start_pair_idx = anchor_pair_idx
@@ -7808,14 +7783,23 @@ class SheetView:
         try:
             formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
             line = self._current_line()
-            region_pair_indices = self._logical_diff_pair_block_for_line(line)
+            # A toolbar click can leave Tk's insert mark on the synthetic line
+            # after the last rendered row (for example line 801 when a large
+            # sheet initially renders 800 rows). Single-row actions already use
+            # the selected/hovered pair first; region actions must do the same.
+            anchor_pair_idx = self.resolved_pair_idx_for_c_area()
+            region_pair_indices = self._logical_diff_pair_block_for_pair(anchor_pair_idx)
             if not region_pair_indices:
-                _dlog(f"OVERWRITE_REGION_NO_BLOCK sheet={self.sheet} dir={direction} line={line}")
+                _dlog(
+                    f"OVERWRITE_REGION_NO_BLOCK sheet={self.sheet} dir={direction} "
+                    f"line={line} pair={anchor_pair_idx}"
+                )
                 return
             total_region_rows = len(region_pair_indices)
             _dlog(
                 f"OVERWRITE_REGION_START sheet={self.sheet} dir={direction} "
-                f"pairs={region_pair_indices[0]}-{region_pair_indices[-1]} rows={total_region_rows}"
+                f"anchor={anchor_pair_idx} pairs={region_pair_indices[0]}-"
+                f"{region_pair_indices[-1]} rows={total_region_rows}"
             )
             try:
                 self.info.configure(text=f"正在采用{direction_text}：0/{total_region_rows} 行...")
@@ -13815,6 +13799,49 @@ class SowMergeApp:
         except Exception:
             pass
 
+    def _hide_nonblocking_notice(self):
+        aid = getattr(self, "_notice_after_id", None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._notice_after_id = None
+        try:
+            self.notice_frame.pack_forget()
+        except Exception:
+            pass
+
+    def show_nonblocking_notice(
+        self,
+        message: str,
+        *,
+        warning: bool = False,
+        duration_ms: int = 15000,
+    ):
+        """Show an in-window reminder without focus, grab, or wait_window."""
+        self._hide_nonblocking_notice()
+        bg = "#FDE2E2" if warning else "#E8F2FF"
+        fg = "#A40000" if warning else "#174A7E"
+        try:
+            self.notice_frame.configure(bg=bg)
+            self.notice_label.configure(bg=bg, fg=fg)
+            self.notice_close.configure(bg=bg, activebackground=bg, fg=fg)
+            self.notice_var.set(str(message or ""))
+            self.notice_frame.pack(
+                fill="x",
+                padx=10,
+                pady=(0, 4),
+                before=self.nb,
+            )
+            if int(duration_ms or 0) > 0:
+                self._notice_after_id = self._safe_root_after(
+                    int(duration_ms),
+                    self._hide_nonblocking_notice,
+                )
+        except Exception as e:
+            _dlog(f"nonblocking notice failed: {e}")
+
     def _build_ui(self):
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=8)
@@ -13856,6 +13883,33 @@ class SowMergeApp:
         self.task_progress = ttk.Progressbar(self.task_status_frame, mode="indeterminate", length=240)
         self.task_progress.pack(side="right", padx=(12, 0))
         self.task_progress.start(12)
+
+        # Non-modal startup/merge reminder. It is packed only when needed and
+        # never grabs focus, so workbook loading and user interaction continue.
+        self.notice_frame = tk.Frame(self.root, bg="#E8F2FF", bd=1, relief="solid")
+        self.notice_var = tk.StringVar(value="")
+        self.notice_label = tk.Label(
+            self.notice_frame,
+            textvariable=self.notice_var,
+            bg="#E8F2FF",
+            fg="#174A7E",
+            anchor="w",
+            justify="left",
+            padx=10,
+            pady=6,
+        )
+        self.notice_label.pack(side="left", fill="x", expand=True)
+        self.notice_close = tk.Button(
+            self.notice_frame,
+            text="关闭",
+            command=self._hide_nonblocking_notice,
+            bd=0,
+            padx=10,
+            bg="#E8F2FF",
+            activebackground="#E8F2FF",
+        )
+        self.notice_close.pack(side="right")
+        self._notice_after_id = None
 
         self.nb = ttk.Notebook(self.root)
         try:
@@ -16872,23 +16926,24 @@ def main():
                 sys.exit(1)
 
             if conflicts:
-                _show_conflict_popup(conflicts)
-
-                try:
-                    messagebox.showinfo(
-                        "进入手动处理",
-                        f"检测到 {len(conflicts)} 个冲突单元格。\n将进入手动 3 视图处理界面。",
-                    )
-                except Exception:
-                    pass
+                detail_lines = []
+                for sheet, row_idx, col_idx, _mine_value, _theirs_value in conflicts[:3]:
+                    detail_lines.append(f"{sheet}!{get_column_letter(col_idx)}{row_idx}")
+                if len(conflicts) > 3:
+                    detail_lines.append("...")
+                startup_notice = (
+                    f"检测到 {len(conflicts)} 个冲突单元格，已进入手动 3 视图。"
+                    "请与协作者确认后再保存。"
+                )
+                if detail_lines:
+                    startup_notice += "  示例：" + "、".join(detail_lines)
+                startup_notice_warning = True
             else:
-                try:
-                    messagebox.showinfo(
-                        "进入手动处理",
-                        "未检测到直接冲突。\n仍将进入手动 3 视图，所有差异由你确认后保存。"
-                    )
-                except Exception:
-                    pass
+                startup_notice = (
+                    "未检测到直接冲突，已进入手动 3 视图。"
+                    "所有差异仍由你确认后保存。"
+                )
+                startup_notice_warning = False
 
             app = SowMergeApp(
                 args.mine,
@@ -16906,6 +16961,11 @@ def main():
                 _dlog("open UI: manual 3-way mode")
             except Exception:
                 pass
+            app.show_nonblocking_notice(
+                startup_notice,
+                warning=startup_notice_warning,
+                duration_ms=20000 if conflicts else 12000,
+            )
             app.run()
             sys.exit(0)
 

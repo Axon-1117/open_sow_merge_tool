@@ -48,6 +48,15 @@ def main():
         if sys.platform.startswith("win"):
             assert app.root.state() == "zoomed", app.root.state()
 
+        app.show_nonblocking_notice("未检测到直接冲突，继续进入手动处理。", duration_ms=0)
+        app.root.update()
+        assert app.notice_frame.winfo_manager() == "pack"
+        assert "未检测到直接冲突" in app.notice_var.get()
+        assert app.root.grab_current() is None
+        app._hide_nonblocking_notice()
+        app.root.update()
+        assert not app.notice_frame.winfo_manager()
+
         app._set_task_status("正在加载 Sheet：Data（1/3）", active=True, current=0, total=3)
         app.root.update()
         assert "Data" in app.task_status_var.get()

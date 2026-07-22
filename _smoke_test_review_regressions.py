@@ -34,12 +34,60 @@ def _test_logical_region_extends_beyond_render_limit():
         row_pairs = [(idx + 1, idx + 1) for idx in range(12)]
 
         @staticmethod
+        def _normalize_pair_idx(pair_idx):
+            return int(pair_idx) if pair_idx is not None and 0 <= int(pair_idx) < 12 else None
+
+        @staticmethod
         def _pair_has_visual_diff(pair_idx):
             return 2 <= pair_idx <= 9
+
+        _logical_diff_pair_block_for_pair = mod.SheetView._logical_diff_pair_block_for_pair
 
     view = DummyView()
     block = mod.SheetView._logical_diff_pair_block_for_line(view, 2)
     assert block == list(range(2, 10)), block
+
+
+def _test_region_anchor_uses_selected_pair_before_trailing_insert_line():
+    class DummyText:
+        @staticmethod
+        def index(_mark):
+            # Tk Text uses the line after the rendered content as its end mark.
+            return "801.0"
+
+    class DummyView:
+        display_rows = list(range(800))
+        row_pairs = [(idx + 1, idx + 1) for idx in range(1714)]
+        selected_pair_idx = 152
+        hover_pair_idx = 152
+        _last_cursor_cmp_pair_idx = 152
+        _main_sel_line = 153
+        _main_sel_col = 1
+        _cursor_cmp_sel_line = None
+        _cursor_cmp_sel_col = None
+        left = DummyText()
+
+        @staticmethod
+        def _normalize_pair_idx(pair_idx):
+            return int(pair_idx) if pair_idx is not None and 0 <= int(pair_idx) < 1714 else None
+
+        @staticmethod
+        def _pair_idx_for_line(line):
+            return int(line) - 1 if 1 <= int(line) <= 800 else None
+
+        @staticmethod
+        def _pair_has_visual_diff(pair_idx):
+            return 151 <= int(pair_idx) <= 1351
+
+        has_explicit_cell_selection = mod.SheetView.has_explicit_cell_selection
+        resolved_pair_idx_for_c_area = mod.SheetView.resolved_pair_idx_for_c_area
+        _logical_diff_pair_block_for_pair = mod.SheetView._logical_diff_pair_block_for_pair
+
+    view = DummyView()
+    anchor = view.resolved_pair_idx_for_c_area()
+    assert anchor == 152, anchor
+    block = view._logical_diff_pair_block_for_pair(anchor)
+    assert block == list(range(151, 1352)), (block[:2], block[-2:], len(block))
 
 
 def _test_tail_identical_append_stays_paired():
@@ -546,6 +594,7 @@ def _test_structural_replay_risk_detection():
 def main():
     _test_only_diff_region_boundaries()
     _test_logical_region_extends_beyond_render_limit()
+    _test_region_anchor_uses_selected_pair_before_trailing_insert_line()
     _test_tail_identical_append_stays_paired()
     _test_shared_formula_is_not_destroyed()
     _test_formula_and_value_comparison_is_conservative()
