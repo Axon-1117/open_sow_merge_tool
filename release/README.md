@@ -1,10 +1,16 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-07-22.update50`
-- Build Tag：`new127-row-formula-structural-merge-fix`
+- 版本号：`2026-07-22.update51`
+- Build Tag：`new128-responsive-progress-feedback`
 
 ### 本次修复
+- 新增完整的耗时任务进度反馈：启动时显示 SVN 来源解析、三方冲突扫描和 mine/base/theirs 工作簿加载阶段，主界面持续显示当前后台计算的 Sheet 与总体进度。
+- merged 保存现在从等待可编辑数据、重放整 Sheet/插行/公式缓存操作、写入目标文件到 OOXML/ZIP 完整性校验全程显示阶段、进度和已用时间，不再只在最后复制文件时短暂显示静态进度窗。
+- 启动加载和 merged 保存改为后台执行，Tk 事件循环保持响应；保存期间会暂停低优先级 Sheet 扫描，优先完成用户操作并阻止重复点击。
+- 启动进度窗与主应用复用同一个 Tk 解释器，修复 Python 3.14 下临时窗口跨线程析构可能导致的 `Tcl_AsyncDelete`，并保持 F4 等根窗口快捷键正常工作。
+- `Language.xlsx` 真实三方副本回放：冲突扫描约 7.53 秒，首个大 Sheet ready 约 16.84 秒，保存并校验约 1.71 秒；merged 输出完整可读。
+- `WorldMonster.xlsx` 真实三方副本回放：冲突扫描约 9.46 秒，首个 Sheet ready 约 8.06 秒，保存并校验约 1.94 秒；merged 输出完整可读。
 - 深入修复 2-way/3-way 的单元格覆盖、插行、批量插行和双方独立尾部新增；插入目标行会记录真实来源侧与来源行，撤销和最终保存按相同结构操作回放。
 - 公式复制现在按 Excel 语义平移相对引用；相同公式且计算结果不同会保留公式、采用来源缓存值并提示同步依赖数据，公式和缓存完全相同则真正跳过，不再生成误导提示。
 - 公式结构已纳入 3-way 冲突判断；不同公式即使当前缓存结果相同也不会被误判为相等，数组公式和数据表公式无法安全移动时会阻止覆盖。
@@ -84,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
 ```
 
 可选参数：
-- `-GitCommitMessage "release: 2026-07-22.update50 (new127-row-formula-structural-merge-fix)"`：自定义提交信息。
+- `-GitCommitMessage "release: 2026-07-22.update51 (new128-responsive-progress-feedback)"`：自定义提交信息。
 - `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
 - `-GitRemote origin`：指定推送远端，默认 `origin`。
 - `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。

@@ -33,8 +33,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-22.update50"
-APP_BUILD_TAG = "new127-row-formula-structural-merge-fix"
+APP_VERSION = "2026-07-22.update51"
+APP_BUILD_TAG = "new128-responsive-progress-feedback"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -93,6 +93,7 @@ _ROW_ARROW_LEFT = "⬅"
 
 # Settings (persist UI prefs)
 _SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME, "settings.json")
+_STARTUP_PROGRESS_ROOT = None
 
 
 def _workbook_ext(path: str | None, default: str = ".xlsx") -> str:
@@ -2891,6 +2892,182 @@ def _show_conflict_popup(conflicts):
         pass
 
 
+def _run_startup_progress_task(title: str, message: str, fn):
+    """Run startup work off the Tk thread while keeping a progress window alive.
+
+    ``fn`` receives ``report(message, detail=None, percent=None)``.  The helper is
+    intentionally independent from ``SowMergeApp`` because merge conflict scanning
+    happens before the main application object exists.
+    """
+    global _STARTUP_PROGRESS_ROOT
+    root = _STARTUP_PROGRESS_ROOT
+    try:
+        root_exists = root is not None and bool(root.winfo_exists())
+    except Exception:
+        root_exists = False
+    if not root_exists:
+        root = tk.Tk()
+        _STARTUP_PROGRESS_ROOT = root
+    else:
+        for child in list(root.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+    root.title(title)
+    root.resizable(False, False)
+    root.protocol("WM_DELETE_WINDOW", lambda: None)
+    root.deiconify()
+
+    frame = ttk.Frame(root, padding=18)
+    frame.pack(fill="both", expand=True)
+    title_label = ttk.Label(frame, text=message, font=("Microsoft YaHei", 11, "bold"))
+    title_label.pack(anchor="w")
+    detail_label = ttk.Label(frame, text="正在准备...", foreground="#555", wraplength=500)
+    detail_label.pack(
+        anchor="w", fill="x", pady=(8, 10)
+    )
+    progress = ttk.Progressbar(frame, mode="indeterminate", length=500)
+    progress.pack(fill="x")
+    elapsed_label = ttk.Label(frame, text="已用时 0.0 秒", foreground="#777")
+    elapsed_label.pack(anchor="e", pady=(7, 0))
+    progress.start(12)
+
+    root.update_idletasks()
+    width = 550
+    height = 155
+    x = max(0, (root.winfo_screenwidth() - width) // 2)
+    y = max(0, (root.winfo_screenheight() - height) // 2)
+    root.geometry(f"{width}x{height}+{x}+{y}")
+
+    updates_lock = threading.Lock()
+    updates: list[tuple[str | None, str | None, float | None]] = []
+    state: dict[str, object] = {}
+    done = threading.Event()
+    started = time.monotonic()
+
+    def report(text=None, detail=None, percent=None):
+        pct = None
+        if percent is not None:
+            try:
+                pct = max(0.0, min(100.0, float(percent)))
+            except Exception:
+                pct = None
+        with updates_lock:
+            updates.append((text, detail, pct))
+
+    def worker():
+        try:
+            state["result"] = fn(report)
+        except BaseException as exc:
+            state["error"] = exc
+            state["traceback"] = traceback.format_exc()
+        finally:
+            done.set()
+
+    # Tk objects must be finalized on the UI thread. openpyxl's XML parsing can
+    # trigger cyclic GC in the worker, so defer cyclic collection until the
+    # temporary Tk interpreter has been destroyed on this thread.
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    thread = threading.Thread(target=worker, daemon=True, name="sow-startup-progress")
+    thread.start()
+
+    def poll():
+        latest = None
+        with updates_lock:
+            if updates:
+                latest = updates[-1]
+                updates.clear()
+        if latest is not None:
+            text_value, detail_value, percent_value = latest
+            if text_value:
+                title_label.configure(text=str(text_value))
+            if detail_value is not None:
+                detail_label.configure(text=str(detail_value))
+            if percent_value is not None:
+                progress.stop()
+                progress.configure(mode="determinate", maximum=100, value=percent_value)
+        elapsed_label.configure(text=f"已用时 {time.monotonic() - started:.1f} 秒")
+        if done.is_set():
+            try:
+                progress.stop()
+                root.quit()
+            except Exception:
+                pass
+            return
+        root.after(80, poll)
+
+    root.after(50, poll)
+    try:
+        root.mainloop()
+    finally:
+        try:
+            root.withdraw()
+        except Exception:
+            pass
+        if gc_was_enabled:
+            gc.enable()
+            gc.collect()
+    if "error" in state:
+        _dlog(f"startup task failed: {state.get('traceback', state['error'])}")
+        raise state["error"]
+    return state.get("result")
+
+
+def _destroy_startup_progress_root():
+    global _STARTUP_PROGRESS_ROOT
+    root = _STARTUP_PROGRESS_ROOT
+    _STARTUP_PROGRESS_ROOT = None
+    if root is None:
+        return
+    try:
+        for aid in list(root.tk.call("after", "info") or ()):
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if root.winfo_exists():
+            root.destroy()
+    except Exception:
+        pass
+
+
+def _take_startup_progress_root():
+    """Promote the startup Tk interpreter to the application's main window."""
+    global _STARTUP_PROGRESS_ROOT
+    root = _STARTUP_PROGRESS_ROOT
+    _STARTUP_PROGRESS_ROOT = None
+    try:
+        root_exists = root is not None and bool(root.winfo_exists())
+    except Exception:
+        root_exists = False
+    if not root_exists:
+        return tk.Tk()
+    try:
+        for aid in list(root.tk.call("after", "info") or ()):
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    for child in list(root.winfo_children()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
+    try:
+        root.deiconify()
+    except Exception:
+        pass
+    return root
+
+
 def excel_to_text(path: str, out_path: str, thick_sep_char: str = "="):
     val_path = _prepare_val_path(path)
     wb = load_workbook(val_path, data_only=True)
@@ -3794,6 +3971,7 @@ class SheetView:
         ttk.Label(bar, text=f"Sheet: {sheet_name}", font=("Segoe UI", 11, "bold")).pack(side="left")
         self.info = ttk.Label(bar, text="", foreground="#444")
         self.info.pack(side="left", padx=(10, 0))
+        self.loading_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
         # Diff block navigation (fixed position on the right; does not shift with label lengths)
         self.next_diff_btn = tk.Button(bar, text="下一处差异", padx=10, pady=2, command=self._goto_next_diff_block)
@@ -7870,19 +8048,29 @@ class SheetView:
             row = tuple(row) + (None,) * (self.max_col - len(row))
         return row
 
-    def _show_loading(self):
+    def _show_loading(self, message: str = "正在后台计算差异，请稍候..."):
         """Show a loading placeholder while background diff computation is in progress."""
         try:
+            if not self.loading_progress.winfo_manager():
+                self.loading_progress.pack(side="left", padx=(10, 0))
+            self.loading_progress.start(12)
             for w in (self.left, self.right):
                 w.configure(state="normal")
                 w.delete("1.0", "end")
-                w.insert("1.0", "计算中...\n")
+                w.insert("1.0", "正在加载并计算差异...\n")
             for w in (self.left_ln, self.base_ln, self.right_ln):
                 w.configure(state="normal")
                 w.delete("1.0", "end")
                 w.insert("1.0", "\n")
                 w.configure(state="disabled")
-            self.info.configure(text="正在后台计算差异，请稍候...")
+            self.info.configure(text=message)
+        except Exception:
+            pass
+
+    def _hide_loading(self):
+        try:
+            self.loading_progress.stop()
+            self.loading_progress.pack_forget()
         except Exception:
             pass
 
@@ -12393,38 +12581,9 @@ class SowMergeApp:
         self._edit_loaded_event = threading.Event()
         self._edit_loading_started = False
         self._edit_fallback_lock = threading.Lock()
-
-        try:
-            t0 = datetime.now()
-            self._file_a_val_path = _prepare_val_path(file_a)
-            self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True)
-            _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
-            t0 = datetime.now()
-            self._file_b_val_path = _prepare_val_path(file_b)
-            self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True)
-            _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
-            self._wb_base_val = None
-            if self.has_base:
-                t0 = datetime.now()
-                self._file_base_val_path = _prepare_val_path(self.base_path)
-                self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True)
-                _dlog(f"load wb_base_val: {(datetime.now()-t0).total_seconds():.3f}s")
-        except Exception:
-            _wbs_close(
-                getattr(self, "_wb_a_val", None),
-                getattr(self, "_wb_b_val", None),
-                getattr(self, "_wb_base_val", None),
-            )
-            raise
-        if self.has_base:
-            try:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                snap = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_mine_snapshot_{os.getpid()}_{ts}{_workbook_ext(self.file_a)}")
-                shutil.copy2(self.file_a, snap)
-                self._merge_mine_snapshot = snap
-                _dlog(f"mine snapshot created: {snap}")
-            except Exception as e:
-                _dlog(f"mine snapshot failed: {e}")
+        self._wb_a_val = None
+        self._wb_b_val = None
+        self._wb_base_val = None
 
         # Preload editable workbooks in background to make the first overwrite fast.
         # Always run regardless of _FAST_OPEN_ENABLED: fast-open defers value loading
@@ -12460,10 +12619,60 @@ class SowMergeApp:
                 self._edit_loaded_event.set()
                 _dlog("preload edit workbooks (background) done")
 
-        self._edit_loading_started = True
-        self._edit_preload_thread = self._start_background_thread(
-            _preload_edit,
-            name="sow-edit-preload",
+        def _load_initial_state(report):
+            try:
+                report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(file_a)}", 8)
+                t0 = datetime.now()
+                self._file_a_val_path = _prepare_val_path(file_a)
+                self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True)
+                _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
+
+                report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(file_b)}", 30)
+                t0 = datetime.now()
+                self._file_b_val_path = _prepare_val_path(file_b)
+                self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True)
+                _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
+
+                if self.has_base:
+                    report("正在打开 Excel 合并工具", f"加载 base：{os.path.basename(self.base_path)}", 52)
+                    t0 = datetime.now()
+                    self._file_base_val_path = _prepare_val_path(self.base_path)
+                    self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True)
+                    _dlog(f"load wb_base_val: {(datetime.now()-t0).total_seconds():.3f}s")
+
+                    report("正在准备三方合并", "创建 mine 安全快照...", 68)
+                    try:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        snap = os.path.join(
+                            tempfile.gettempdir(),
+                            f"{APP_NAME}_mine_snapshot_{os.getpid()}_{ts}{_workbook_ext(self.file_a)}",
+                        )
+                        shutil.copy2(self.file_a, snap)
+                        self._merge_mine_snapshot = snap
+                        _dlog(f"mine snapshot created: {snap}")
+                    except Exception as e:
+                        _dlog(f"mine snapshot failed: {e}")
+
+                report("正在准备可编辑数据", "后台加载公式、样式和批注...", 76)
+                self._edit_loading_started = True
+                self._edit_preload_thread = self._start_background_thread(
+                    _preload_edit,
+                    name="sow-edit-preload",
+                )
+
+                report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 86)
+                self._refresh_sheet_catalog()
+                report("正在完成数据加载", "等待公式、样式和批注数据加载完成...", 94)
+                self._edit_loaded_event.wait()
+                report("工作簿加载完成", f"共 {len(self.display_sheets)} 个 Sheet，正在创建主界面...", 100)
+            except Exception:
+                _wbs_close(self._wb_a_val, self._wb_b_val, self._wb_base_val)
+                raise
+
+        _run_startup_progress_task(
+            "Excel 合并工具 - 正在打开",
+            "正在读取工作簿，请稍候...",
+            _load_initial_state,
         )
 
         self.modified_a = False
@@ -12471,9 +12680,7 @@ class SowMergeApp:
         self.modified_sheets_a = set()
         self.modified_sheets_b = set()
 
-        self._refresh_sheet_catalog()
-
-        self.root = tk.Tk()
+        self.root = _take_startup_progress_root()
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
         self.root.title(self._window_title_suffix)
         ttk.Style().theme_use("clam")
@@ -12809,6 +13016,12 @@ class SowMergeApp:
         self._is_closing = True
         self._cancel_root_afters()
         try:
+            progress = getattr(self, "task_progress", None)
+            if progress is not None:
+                progress.stop()
+        except Exception:
+            pass
+        try:
             with self._compute_lock:
                 self._compute_queue.clear()
         except Exception:
@@ -12820,6 +13033,10 @@ class SowMergeApp:
                 view._only_diff_async_build_seq += 1
                 view._only_diff_async_building = False
                 view._only_diff_async_build_key = None
+                try:
+                    view._hide_loading()
+                except Exception:
+                    pass
                 for attr in ("_settings_save_id", "_hover_debounce_id", "_diff_map_debounce_id"):
                     aid = getattr(view, attr, None)
                     if not aid:
@@ -12834,12 +13051,27 @@ class SowMergeApp:
                         pass
         except Exception:
             pass
+        # Widgets and ttk progressbars can schedule Tcl-level callbacks that are
+        # not registered through _safe_root_after. Cancel every remaining callback
+        # before destroying the interpreter to avoid stale-command warnings.
+        try:
+            for aid in list(self.root.tk.call("after", "info") or ()):
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             with self._ui_task_lock:
                 self._ui_tasks.clear()
         except Exception:
             pass
         self._join_background_threads(timeout=5.0)
+        try:
+            _destroy_startup_progress_root()
+        except Exception:
+            pass
         try:
             with self._edit_fallback_lock:
                 _wbs_close(
@@ -13426,6 +13658,37 @@ class SowMergeApp:
         except Exception:
             return None
 
+    def _set_task_status(
+        self,
+        message: str,
+        *,
+        active: bool = False,
+        current: int | None = None,
+        total: int | None = None,
+    ):
+        """Update the always-visible application task status strip."""
+        label = getattr(self, "task_status_var", None)
+        progress = getattr(self, "task_progress", None)
+        if label is None or progress is None:
+            return
+        try:
+            label.set(message)
+            if active:
+                if total and total > 0 and current is not None:
+                    progress.stop()
+                    progress.configure(mode="determinate", maximum=max(1, total), value=max(0, min(current, total)))
+                else:
+                    progress.configure(mode="indeterminate")
+                    progress.start(12)
+            else:
+                progress.stop()
+                if total and total > 0:
+                    progress.configure(mode="determinate", maximum=total, value=total)
+                else:
+                    progress.configure(mode="determinate", maximum=100, value=0)
+        except Exception:
+            pass
+
     def _build_ui(self):
         top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=8)
@@ -13456,7 +13719,17 @@ class SowMergeApp:
         self.update_btn = ttk.Button(top, text="检查更新", command=self._do_svn_update)
         self.update_btn.grid(row=0, column=6, sticky="ne", padx=(10, 0))
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 4))
+
+        self.task_status_frame = ttk.Frame(self.root)
+        self.task_status_frame.pack(fill="x", padx=10, pady=(0, 4))
+        self.task_status_var = tk.StringVar(value="正在准备 Sheet 数据...")
+        ttk.Label(self.task_status_frame, textvariable=self.task_status_var, foreground="#555").pack(
+            side="left", fill="x", expand=True
+        )
+        self.task_progress = ttk.Progressbar(self.task_status_frame, mode="indeterminate", length=240)
+        self.task_progress.pack(side="right", padx=(12, 0))
+        self.task_progress.start(12)
 
         self.nb = ttk.Notebook(self.root)
         try:
@@ -13497,6 +13770,8 @@ class SowMergeApp:
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
         self._compute_thread = None
+        self._compute_total = max(1, len(self.compare_sheets))
+        self._compute_done = 0
         self._ui_task_lock = threading.Lock()
         self._ui_tasks = []
 
@@ -13973,6 +14248,7 @@ class SowMergeApp:
                 return
             if getattr(view, "_suppress_bg_apply", False):
                 _dlog(f"skip bg cache apply by user action: sheet={sheet}")
+                view._hide_loading()
                 self.refresh_sheet_nav()
                 return
             # Skip if the user has made edits in this view; background data (from read-only copies)
@@ -13982,6 +14258,7 @@ class SowMergeApp:
             has_user_edits = has_user_edits or sheet in getattr(self, "modified_sheets_b", set())
             if has_user_edits:
                 _dlog(f"skip stale bg cache after user action: sheet={sheet}")
+                view._hide_loading()
                 self.refresh_sheet_nav()
                 return
             # Guard against late background cache downgrading an already rendered sheet to no-diff.
@@ -13996,6 +14273,7 @@ class SowMergeApp:
                 new_diff_count = 0
             if getattr(view, "_data_ready", False) and old_diff_count > 0 and new_diff_count == 0:
                 _dlog(f"skip stale cache downgrade: sheet={sheet} old_diff={old_diff_count} new_diff={new_diff_count}")
+                view._hide_loading()
                 self.refresh_sheet_nav()
                 return
             # From this point we will apply this cache to the visible view.
@@ -14110,6 +14388,7 @@ class SowMergeApp:
             except Exception:
                 pass
             view._update_cursor_lines()
+            view._hide_loading()
             self.refresh_sheet_nav()
 
         def _compute_worker():
@@ -14145,6 +14424,16 @@ class SowMergeApp:
                             break
                         sheet = self._compute_queue.pop(0)
                         self._compute_inflight.add(sheet)
+                        progress_current = min(self._compute_done + 1, self._compute_total)
+                        progress_total = self._compute_total
+                    _queue_ui_task(
+                        lambda s=sheet, cur=progress_current, total=progress_total: self._set_task_status(
+                            f"正在加载 Sheet：{s}（{cur}/{total}）",
+                            active=True,
+                            current=max(0, cur - 1),
+                            total=total,
+                        )
+                    )
                     try:
                         _dlog(f"bg compute sheet: {sheet}")
                         cache = _compute_sheet_cache(
@@ -14167,6 +14456,19 @@ class SowMergeApp:
                     finally:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
+                            self._compute_done = min(self._compute_total, self._compute_done + 1)
+                            progress_done = self._compute_done
+                            progress_total = self._compute_total
+                            all_done = not self._compute_queue and not self._compute_inflight
+                        if all_done:
+                            _queue_ui_task(
+                                lambda done=progress_done, total=progress_total: self._set_task_status(
+                                    f"数据加载完成：已计算 {done}/{total} 个 Sheet",
+                                    active=False,
+                                    current=done,
+                                    total=total,
+                                )
+                            )
             finally:
                 _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
                 with self._compute_lock:
@@ -14216,6 +14518,7 @@ class SowMergeApp:
                         if _view and (not getattr(_view, "_data_ready", False)):
                             _view.refresh(row_only=None, rescan=True)
                             _view._update_cursor_lines()
+                            _view._hide_loading()
                     elif not (_view and getattr(_view, "_data_ready", False)):
                         _enqueue_sheet(tab_text, front=True)
                         _kick_worker()
@@ -14232,8 +14535,15 @@ class SowMergeApp:
                                     return
                                 if getattr(v, "_data_ready", False):
                                     return
+                                with self._compute_lock:
+                                    still_background = sheet_name in self._compute_inflight or sheet_name in self._compute_queue
+                                if still_background:
+                                    v._show_loading(f"正在后台精确计算 {sheet_name}，界面仍可操作...")
+                                    self._safe_root_after(1500, _force_refresh_if_still_loading)
+                                    return
                                 v.refresh(row_only=None, rescan=True)
                                 v._update_cursor_lines()
+                                v._hide_loading()
                             except Exception as e:
                                 _dlog(f"force refresh fallback failed {sheet_name}: {e}")
                         try:
@@ -14418,7 +14728,10 @@ class SowMergeApp:
         try:
             for s in self.compare_sheets:
                 _enqueue_sheet(s, front=False)
-            _kick_worker()
+            if self.compare_sheets:
+                _kick_worker()
+            else:
+                self._set_task_status("数据加载完成：没有需要逐行计算的同名 Sheet", active=False)
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
 
@@ -15096,26 +15409,134 @@ class SowMergeApp:
         )
 
 
-    def _with_progress(self, title: str, message: str, fn):
+    def _with_progress(
+        self,
+        title: str,
+        message: str,
+        fn,
+        *,
+        run_in_background: bool = False,
+        pass_reporter: bool = False,
+    ):
         dlg = tk.Toplevel(self.root)
         dlg.title(title)
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(False, False)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
         dlg.geometry("+{}+{}".format(self.root.winfo_rootx() + 200, self.root.winfo_rooty() + 150))
-        ttk.Label(dlg, text=message, padding=10).pack(fill="x")
+        message_label = ttk.Label(dlg, text=message, padding=(12, 12, 12, 4), wraplength=520)
+        message_label.pack(fill="x")
+        detail_label = ttk.Label(
+            dlg,
+            text="正在准备...",
+            foreground="#555",
+            padding=(12, 0, 12, 8),
+            wraplength=520,
+        )
+        detail_label.pack(fill="x")
         pb = ttk.Progressbar(dlg, mode="indeterminate")
-        pb.pack(fill="x", padx=10, pady=(0, 10))
-        pb.start(10)
+        pb.pack(fill="x", padx=12, pady=(0, 6))
+        elapsed_label = ttk.Label(dlg, text="已用时 0.0 秒", foreground="#777", padding=(12, 0, 12, 10))
+        elapsed_label.pack(anchor="e")
+        pb.start(12)
         self.root.update_idletasks()
-        try:
-            fn()
-        finally:
+
+        if not run_in_background:
             try:
-                pb.stop()
+                return fn()
+            finally:
+                try:
+                    pb.stop()
+                    dlg.destroy()
+                except Exception:
+                    pass
+
+        updates_lock = threading.Lock()
+        updates: list[tuple[str | None, str | None, float | None]] = []
+        state: dict[str, object] = {}
+        done = threading.Event()
+        started = time.monotonic()
+
+        def report(text=None, detail=None, percent=None):
+            pct = None
+            if percent is not None:
+                try:
+                    pct = max(0.0, min(100.0, float(percent)))
+                except Exception:
+                    pct = None
+            with updates_lock:
+                updates.append((text, detail, pct))
+
+        def _worker():
+            try:
+                if pass_reporter:
+                    state["result"] = fn(report)
+                else:
+                    state["result"] = fn()
+            except BaseException as exc:
+                state["error"] = exc
+                state["traceback"] = traceback.format_exc()
+            finally:
+                done.set()
+
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        thread = self._start_background_thread(_worker, name="sow-progress-task")
+        if thread is None:
+            if gc_was_enabled:
+                gc.enable()
+                gc.collect()
+            try:
                 dlg.destroy()
             except Exception:
                 pass
+            raise RuntimeError("任务未能启动：应用正在关闭")
+
+        def _poll():
+            latest = None
+            with updates_lock:
+                if updates:
+                    latest = updates[-1]
+                    updates.clear()
+            if latest is not None:
+                text_value, detail_value, percent_value = latest
+                if text_value:
+                    message_label.configure(text=str(text_value))
+                if detail_value is not None:
+                    detail_label.configure(text=str(detail_value))
+                if percent_value is not None:
+                    pb.stop()
+                    pb.configure(mode="determinate", maximum=100, value=percent_value)
+            elapsed_label.configure(text=f"已用时 {time.monotonic() - started:.1f} 秒")
+            if done.is_set():
+                try:
+                    pb.stop()
+                    dlg.destroy()
+                except Exception:
+                    pass
+                return
+            try:
+                dlg.after(80, _poll)
+            except Exception:
+                pass
+
+        dlg.after(50, _poll)
+        try:
+            dlg.wait_window()
+        finally:
+            try:
+                pb.stop()
+            except Exception:
+                pass
+            if gc_was_enabled:
+                gc.enable()
+                gc.collect()
+        if "error" in state:
+            _dlog(f"progress task failed: {state.get('traceback', state['error'])}")
+            raise state["error"]
+        return state.get("result")
 
     def _atomic_save(self, wb, target_path: str):
         """Safely overwrite a workbook.
@@ -15332,6 +15753,8 @@ class SowMergeApp:
                 self.set_sheet_has_diff(s, False, confirmed=False)
             with self._compute_lock:
                 self._compute_queue = [s for s in self.compare_sheets if s not in self._compute_inflight]
+                self._compute_total = max(1, len(self.compare_sheets))
+                self._compute_done = 0
             self._kick_worker()
         except Exception:
             pass
@@ -15579,7 +16002,6 @@ class SowMergeApp:
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:
             return
-        self._ensure_edit_loaded()
         if not auto:
             if self.merge_mode and self.initial_conflict_cell_count > 0:
                 unresolved = sum(
@@ -15608,39 +16030,65 @@ class SowMergeApp:
                     return
             if not messagebox.askyesno("确认保存", f"将保存合并结果到：\n\n{self.merged_path}\n\n继续吗？"):
                 return
-        wb_to_save = self._wb_a_edit
+        wb_to_save = None
         merged_source_path = None
         try:
-            # Small delay to allow SVN/Tortoise to release file locks
-            try:
+            def _save_merged_task(report):
+                nonlocal wb_to_save, merged_source_path
+                report("正在保存 merged 文件", "等待可编辑工作簿准备完成...", 5)
+                self._ensure_edit_loaded()
+                wb_to_save = self._wb_a_edit
+
+                # Give SVN/Tortoise a short chance to release transient locks,
+                # but keep the UI event loop alive while waiting.
+                report("正在保存 merged 文件", "等待 SVN/Tortoise 释放临时文件锁...", 12)
                 time.sleep(1.2)
-            except Exception:
-                pass
-            if self.merge_mode and self.has_base:
-                # Safety guard for manual 3-way mode:
-                # save from pristine mine + explicit operations only.
-                merged_source_path = self.build_manual_merge_output_file()
+
+                if self.merge_mode and self.has_base:
+                    # Manual 3-way output is rebuilt from pristine mine plus the
+                    # recorded operations. This is the expensive part of save and
+                    # must be covered by the visible progress window.
+                    report("正在构建合并结果", "重放整 Sheet、插入行、单元格和公式缓存操作...", 25)
+                    merged_source_path = self.build_manual_merge_output_file()
+
+                try:
+                    by_sheet = {}
+                    for (s, _r, _c) in getattr(self, "manual_a_cell_ops", {}).keys():
+                        by_sheet[s] = by_sheet.get(s, 0) + 1
+                    _dlog(
+                        f"SAVE_MERGED path={self.merged_path} "
+                        f"merge_mode={self.merge_mode} has_base={self.has_base} "
+                        f"manual_a_ops={len(getattr(self, 'manual_a_cell_ops', {}))} "
+                        f"manual_sheet_ops={len(getattr(self, 'manual_sheet_ops', []))} "
+                        f"auto_sheet_ops={len(getattr(self, 'auto_sheet_ops', []))} "
+                        f"manual_ops_by_sheet={by_sheet} "
+                        f"snapshot={getattr(self, '_merge_mine_snapshot', None)}"
+                    )
+                except Exception:
+                    pass
+
+                report("正在写入 merged 文件", os.path.basename(self.merged_path), 82)
+                if merged_source_path:
+                    self._atomic_replace_file_with_retry(merged_source_path, self.merged_path)
+                else:
+                    self._atomic_save_with_retry(wb_to_save, self.merged_path)
+
+                report("正在校验保存结果", "检查 OOXML/ZIP 结构和文件完整性...", 95)
+                if not _workbook_package_ready(self.merged_path):
+                    raise RuntimeError(f"保存后的工作簿完整性校验失败：{self.merged_path}")
+                report("保存完成", self.merged_path, 100)
+
+            self._begin_interactive_action()
             try:
-                by_sheet = {}
-                for (s, _r, _c) in getattr(self, "manual_a_cell_ops", {}).keys():
-                    by_sheet[s] = by_sheet.get(s, 0) + 1
-                _dlog(
-                    f"SAVE_MERGED path={self.merged_path} "
-                    f"merge_mode={self.merge_mode} has_base={self.has_base} "
-                    f"manual_a_ops={len(getattr(self, 'manual_a_cell_ops', {}))} "
-                    f"manual_sheet_ops={len(getattr(self, 'manual_sheet_ops', []))} "
-                    f"auto_sheet_ops={len(getattr(self, 'auto_sheet_ops', []))} "
-                    f"manual_ops_by_sheet={by_sheet} "
-                    f"snapshot={getattr(self, '_merge_mine_snapshot', None)}"
+                self._with_progress(
+                    "保存 merged",
+                    f"正在保存合并结果：\n{self.merged_path}",
+                    _save_merged_task,
+                    run_in_background=True,
+                    pass_reporter=True,
                 )
-            except Exception:
-                pass
-            if merged_source_path:
-                self._with_progress("保存中", f"正在保存合并结果：\n{self.merged_path}",
-                                    lambda: self._atomic_replace_file_with_retry(merged_source_path, self.merged_path))
-            else:
-                self._with_progress("保存中", f"正在保存合并结果：\n{self.merged_path}",
-                                    lambda: self._atomic_save_with_retry(wb_to_save, self.merged_path))
+            finally:
+                self._end_interactive_action()
             self.modified_a = False
             try:
                 messagebox.showinfo("Saved", f"已保存合并结果：\n{self.merged_path}")
@@ -15955,32 +16403,14 @@ def main():
         # - base/theirs may legitimately be revision snapshots.
         # - mine must stay as the working-copy side; do NOT rewrite mine to a revision export,
         #   otherwise local edits can be replaced by an old revision file.
-        if args.base:
-            base_from_wc = None
-            try:
-                # Prefer WC BASE from the conflicted working-copy file.
-                if args.merged:
-                    base_from_wc = _try_export_svn_base_from_working_copy(args.merged)
-            except Exception:
-                base_from_wc = None
-            if base_from_wc:
-                try:
-                    _dlog(f"merge base selected from WC BASE: {base_from_wc}")
-                except Exception:
-                    pass
-                args.base = base_from_wc
-                try:
-                    mine_for_note = raw_mine_arg or args.mine or args.merged or "-"
-                    raw_base_arg = f"{mine_for_note}@BASE(.svn)"
-                except Exception:
-                    raw_base_arg = "BASE(.svn)"
-            else:
-                args.base = _try_export_svn_revision_from_merge_temp(args.base)
+        full_merge_args = bool(args.base and args.mine and args.theirs and args.merged)
+        if (not full_merge_args) and args.base:
+            args.base = _try_export_svn_revision_from_merge_temp(args.base)
         if args.theirs:
             # In merge mode, keep "theirs" exactly as passed by SVN/Tortoise wrapper.
             # This avoids accidental re-export to another revision snapshot and ensures
             # content matches the user-visible *.merge-right.r#### sidecar file.
-            if not (args.base and args.mine and args.merged):
+            if not full_merge_args:
                 try:
                     args.theirs = _try_export_svn_revision_from_merge_temp(args.theirs)
                 except Exception:
@@ -16009,15 +16439,45 @@ def main():
             except Exception:
                 pass
             try:
-                # Ensure .r#### / .mine files are converted to temp .xlsx for openpyxl
-                args.base = _ensure_xlsx_copy(args.base)
-                args.mine = _ensure_xlsx_copy(args.mine)
-                args.theirs = _ensure_xlsx_copy(args.theirs)
-                try:
+                def _prepare_merge_inputs(report):
+                    nonlocal raw_base_arg
+                    report("正在读取 SVN 合并来源", "从工作副本的 .svn 数据读取 BASE...", 5)
+                    base_source = None
+                    try:
+                        base_source = _try_export_svn_base_from_working_copy(args.merged)
+                    except Exception:
+                        base_source = None
+                    if base_source:
+                        _dlog(f"merge base selected from WC BASE: {base_source}")
+                        mine_for_note = raw_mine_arg or args.mine or args.merged or "-"
+                        raw_base_arg = f"{mine_for_note}@BASE(.svn)"
+                    else:
+                        report("正在读取 SVN 合并来源", "准备 TortoiseSVN 提供的 base 版本...", 15)
+                        base_source = _try_export_svn_revision_from_merge_temp(args.base)
+
+                    report("正在准备三方合并", "规范化 base 版本文件...", 22)
+                    base_path = _ensure_xlsx_copy(base_source)
+                    report("正在准备三方合并", "规范化 mine 工作副本...", 30)
+                    mine_path = _ensure_xlsx_copy(args.mine)
+                    report("正在准备三方合并", "规范化 theirs 版本文件...", 38)
+                    theirs_path = _ensure_xlsx_copy(args.theirs)
                     _dlog("merge start: calling _scan_three_way_conflicts (no pre-merge)")
-                except Exception:
-                    pass
-                conflicts, conflict_map = _scan_three_way_conflicts(args.base, args.mine, args.theirs)
+                    report("正在扫描三方冲突", "精确比较 base、mine 和 theirs，请稍候...", 45)
+                    scan_conflicts, scan_map = _scan_three_way_conflicts(base_path, mine_path, theirs_path)
+                    report("三方扫描完成", f"检测到 {len(scan_conflicts)} 个冲突单元格", 100)
+                    return base_path, mine_path, theirs_path, scan_conflicts, scan_map
+
+                (
+                    args.base,
+                    args.mine,
+                    args.theirs,
+                    conflicts,
+                    conflict_map,
+                ) = _run_startup_progress_task(
+                    "Excel 合并工具 - 三方扫描",
+                    "正在准备 SVN 合并数据...",
+                    _prepare_merge_inputs,
+                )
                 try:
                     _dlog(f"merge scan result: conflicts={len(conflicts)} conflict_sheets={len(conflict_map)}")
                 except Exception:
@@ -16097,6 +16557,10 @@ def main():
 
     except Exception:
         err = traceback.format_exc()
+        try:
+            _destroy_startup_progress_root()
+        except Exception:
+            pass
         try:
             messagebox.showerror("Error", err)
         except Exception:
