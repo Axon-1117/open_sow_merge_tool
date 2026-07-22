@@ -1,10 +1,18 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-07-22.update51`
-- Build Tag：`new128-responsive-progress-feedback`
+- 版本号：`2026-07-22.update52`
+- Build Tag：`new129-fast-ui-and-sheet-premark-fix`
 
 ### 本次修复
+- 修复启动进度交互优化后主窗口无法全屏/最大化的问题；启动进度窗切换为主界面后会恢复窗口缩放能力，并在 Windows 下自动最大化。
+- 修复主视区加载和差异计算明显变慢的问题；后台计算结果会保留给尚未打开的 Sheet 复用，小/中型 Sheet 改为顺序批量读取行缓存，避免 read-only worksheet 逐格随机访问和首次切换页签的重复计算。
+- 3-way 的 `mine -> base` 精确差异列一并进入后台 Sheet 缓存，主视区纯渲染不再等待可编辑工作簿加载；Base 行文本在一次重绘内批量读取并复用，不再为差异着色重复回扫 XML。
+- “只看差异”切换改为非阻塞状态机：数据未 ready 时只记录用户选择并提升当前 Sheet 优先级，不再在 Tk 回调内执行同步全表 rescan；当前 Sheet 精确差异计算期间会暂停未打开 Sheet 的低优先级扫描。
+- 下方 Sheet 页签升级为两阶段着色：ZIP Sheet 指纹预检在不解压工作表 XML 的情况下快速标记浅黄色候选，精确单元格/公式比较后确认亮黄色或清除候选；迟到的预检结果不会覆盖精确结论。
+- Sheet 导航新增“浅黄=预检，亮黄=确认”提示。真实 `WorldMonster.xlsx` 回放中，候选 Sheet 在窗口出现后约 0.66 秒完成预标记，第二个差异 Sheet 无需等待完整精确扫描后才出现差异提示。
+- 真实性能回放：`WorldMonster.xlsx` 首个 Sheet ready 约 6.89 秒，取消/勾选“只看差异”回调约 0.130/0.016 秒，精确 only-diff 约 6.62 秒；`Language.xlsx` 20,340 行首屏约 16.02 秒，勾选回调约 0.021 秒，精确 only-diff 约 8.30 秒。
+- 初始化项目级 OpenSpec 目录与 Codex OpenSpec skills，后续规格变更可在仓库内直接使用 propose/apply/archive 工作流。
 - 新增完整的耗时任务进度反馈：启动时显示 SVN 来源解析、三方冲突扫描和 mine/base/theirs 工作簿加载阶段，主界面持续显示当前后台计算的 Sheet 与总体进度。
 - merged 保存现在从等待可编辑数据、重放整 Sheet/插行/公式缓存操作、写入目标文件到 OOXML/ZIP 完整性校验全程显示阶段、进度和已用时间，不再只在最后复制文件时短暂显示静态进度窗。
 - 启动加载和 merged 保存改为后台执行，Tk 事件循环保持响应；保存期间会暂停低优先级 Sheet 扫描，优先完成用户操作并阻止重复点击。
@@ -90,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1 -GitCommit -GitPush `
 ```
 
 可选参数：
-- `-GitCommitMessage "release: 2026-07-22.update51 (new128-responsive-progress-feedback)"`：自定义提交信息。
+- `-GitCommitMessage "release: 2026-07-22.update52 (new129-fast-ui-and-sheet-premark-fix)"`：自定义提交信息。
 - `-GitInclude <path1,path2,...>`：必须显式指定要暂存的发布文件，避免把工作区中无关改动一并提交。
 - `-GitRemote origin`：指定推送远端，默认 `origin`。
 - `-GitBranch main`：指定推送分支；不传时默认使用当前检出的分支。

@@ -44,6 +44,9 @@ def main():
 
         app = sm.SowMergeApp(left, right, merge_mode=False, merged_path=merged)
         app.root.update()
+        assert tuple(int(v) for v in app.root.resizable()) == (1, 1)
+        if sys.platform.startswith("win"):
+            assert app.root.state() == "zoomed", app.root.state()
 
         app._set_task_status("正在加载 Sheet：Data（1/3）", active=True, current=0, total=3)
         app.root.update()
@@ -63,6 +66,28 @@ def main():
         app.root.update()
         assert not view.loading_progress.winfo_manager()
         view._suppress_bg_apply = False
+
+        # A checkbox click while the Sheet cache is still pending must never
+        # run refresh(rescan=True) on the Tk callback.
+        old_ready = view._data_ready
+        old_enqueue = app._enqueue_sheet
+        old_kick = app._kick_worker
+        old_refresh = view.refresh
+        refresh_calls = []
+        app._enqueue_sheet = lambda *args, **kwargs: None
+        app._kick_worker = lambda: None
+        view.refresh = lambda row_only, rescan: refresh_calls.append((row_only, rescan))
+        view._data_ready = False
+        view.only_diff_var.set(1)
+        started = time.monotonic()
+        view._toggle_only_diff()
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.2, elapsed
+        assert refresh_calls == [], refresh_calls
+        view.refresh = old_refresh
+        view._data_ready = old_ready
+        app._enqueue_sheet = old_enqueue
+        app._kick_worker = old_kick
 
         ticks = []
 

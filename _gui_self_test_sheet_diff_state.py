@@ -54,7 +54,31 @@ def main():
 
     import sow_merge_tool as mod
 
+    # Stage-1 uses ZIP entry fingerprints only: equal Sheet XML remains equal,
+    # while changed Sheet XML is marked as a provisional difference candidate.
+    fp_a = mod._xlsx_sheet_part_fingerprints(fa)
+    fp_b = mod._xlsx_sheet_part_fingerprints(fb)
+    assert fp_a.get("S_ok") == fp_b.get("S_ok")
+    assert fp_a.get("S_diff") != fp_b.get("S_diff")
+    assert fp_a.get("S_diff2") != fp_b.get("S_diff2")
+
     app = mod.SowMergeApp(fa, fb)
+
+    # A late provisional callback cannot overwrite either flavor of exact state.
+    app.set_sheet_has_diff("S_ok", False, confirmed=True)
+    app.set_sheet_has_diff("S_ok", True, confirmed=False)
+    assert app.sheet_diff_state["S_ok"] == 0
+
+    app._sheet_diff_confirmed.discard("S_diff")
+    app.sheet_diff_state["S_diff"] = 0
+    app.set_sheet_has_diff("S_diff", True, confirmed=False)
+    app.refresh_sheet_nav()
+    assert app.sheet_diff_state["S_diff"] == 1
+    provisional_buttons = [
+        child for child in app.nav_inner.winfo_children()
+        if str(child.cget("text")) == "S_diff"
+    ]
+    assert provisional_buttons and provisional_buttons[0].cget("bg").upper() == "#FFF3B0"
 
     # Give sample scan + background compute some time
     _pump(app.root, seconds=2.5)

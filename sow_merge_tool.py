@@ -16,6 +16,7 @@ import time
 import stat
 import shutil
 import zipfile
+import posixpath
 import platform
 import xml.etree.ElementTree as ET
 
@@ -33,8 +34,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-22.update51"
-APP_BUILD_TAG = "new128-responsive-progress-feedback"
+APP_VERSION = "2026-07-22.update52"
+APP_BUILD_TAG = "new129-fast-ui-and-sheet-premark-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -71,9 +72,11 @@ _LARGE_SHEET_BLOCK_ROWS = 1000
 _ROW_ALIGN_MAX_ROWS = 2000
 _ROW_ALIGN_SOFT_MAX_ROWS = 50000
 _TABMARK_QUICK_TAIL_ROWS = 2000
-# Fast tab-mark pre-scan can duplicate workbook open cost on huge files.
-# Skip it above this size and rely on the normal background compute path.
+# Retained for the disabled legacy row-tail scanner below.
 _FAST_TABMARK_SCAN_SKIP_MB = 25
+# Stage-1 tab coloring reads only XLSX ZIP metadata and never parses worksheet
+# XML. Exact background compute later confirms bright-yellow state or clears it.
+_FAST_TABMARK_ENABLED = True
 _FAST_TABMARK_PHASE2_ENABLED = False
 _SVN_EXPORT_TIMEOUT_SECS = 15
 # Grid display: max chars shown per cell before truncation, and column separator
@@ -1737,6 +1740,58 @@ def _xlsx_contains_formulas(path: str) -> bool:
     except Exception:
         return True
     return False
+
+
+def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, tuple[int, int]]:
+    """Return cheap per-Sheet XML fingerprints from the ZIP central directory.
+
+    A mismatch is only a provisional difference signal: worksheet XML also
+    contains non-value metadata. Exact cell/formula comparison remains the
+    authority and will confirm or clear the tab state later.
+    """
+    fingerprints: dict[str, tuple[int, int]] = {}
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            workbook_name = "xl/workbook.xml"
+            rels_name = "xl/_rels/workbook.xml.rels"
+            if workbook_name not in zf.namelist() or rels_name not in zf.namelist():
+                return fingerprints
+            workbook_root = ET.fromstring(zf.read(workbook_name))
+            rels_root = ET.fromstring(zf.read(rels_name))
+            rel_targets = {
+                str(rel.attrib.get("Id") or ""): str(rel.attrib.get("Target") or "")
+                for rel in rels_root.iter()
+                if rel.tag.rsplit("}", 1)[-1] == "Relationship"
+            }
+            rel_id_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            for sheet_node in workbook_root.iter():
+                if sheet_node.tag.rsplit("}", 1)[-1] != "sheet":
+                    continue
+                sheet_name = str(sheet_node.attrib.get("name") or "")
+                rel_id = str(sheet_node.attrib.get(rel_id_attr) or "")
+                if not rel_id:
+                    rel_id = str(next(
+                        (
+                            value for key, value in sheet_node.attrib.items()
+                            if key == "id" or key.rsplit("}", 1)[-1] == "id"
+                        ),
+                        "",
+                    ))
+                target = rel_targets.get(rel_id, "").replace("\\", "/")
+                if not sheet_name or not target:
+                    continue
+                if target.startswith("/"):
+                    part_name = target.lstrip("/")
+                else:
+                    part_name = posixpath.normpath(posixpath.join("xl", target))
+                try:
+                    info = zf.getinfo(part_name)
+                except KeyError:
+                    continue
+                fingerprints[sheet_name] = (int(info.CRC), int(info.file_size))
+    except Exception as e:
+        _dlog(f"sheet fingerprint premark failed: path={path} err={e}")
+    return fingerprints
 
 
 def _xlsx_requires_native_structural_replay(path: str) -> bool:
@@ -3938,6 +3993,7 @@ class SheetView:
         self._click_trace_seq: int = 0
         self._is_large_sheet = False
         self._prefer_only_diff_when_ready = False
+        self._pending_only_diff_value: int | None = None
         self._diff_partial = False
         self._align_rows_enabled = True
         self._force_sequence_align = False
@@ -8907,8 +8963,6 @@ class SheetView:
         self._update_diff_nav_state()
 
     def _start_async_large_only_diff_build(self) -> bool:
-        if not getattr(self, "_is_large_sheet", False):
-            return False
         # This worker opens disk snapshots. Once the user has adopted any data,
         # those files are stale and must never be allowed to rebuild UI text.
         if self._has_user_edits_for_current_sheet():
@@ -8959,7 +9013,7 @@ class SheetView:
                 return theirs_to_base_row.get(rb)
             return None
 
-        def _worker():
+        def _worker_impl():
             wb_a_val = None
             wb_b_val = None
             wb_base_val = None
@@ -9360,15 +9414,35 @@ class SheetView:
             except Exception as e:
                 _dlog(f"only-diff async queue failed sheet={sheet_name}: {e}")
 
+        def _priority_worker():
+            try:
+                _worker_impl()
+            finally:
+                self.app._end_priority_diff_compute()
+
+        self.app._begin_priority_diff_compute()
         self._only_diff_async_thread = self.app._start_background_thread(
-            _worker,
+            _priority_worker,
             name=f"sow-only-diff-{sheet_name[:30]}",
         )
         if self._only_diff_async_thread is None:
+            self.app._end_priority_diff_compute()
             self._only_diff_async_building = False
             self._only_diff_async_build_key = None
             return False
         return True
+
+    def _persist_only_diff_setting_debounced(self):
+        try:
+            self.app.only_diff_default = int(self.only_diff_var.get())
+            if getattr(self, "_settings_save_id", None):
+                try:
+                    self.frame.after_cancel(self._settings_save_id)
+                except Exception:
+                    pass
+            self._settings_save_id = self.frame.after(1000, self._flush_settings)
+        except Exception as e:
+            _dlog(f"settings debounce failed: {e}")
 
     def _toggle_only_diff(self):
         # Snapshot mode confirmed by user: diff rows list is generated once when opening (or manual refresh).
@@ -9388,30 +9462,35 @@ class SheetView:
         #   display mode and does not need a full rescan.
         # - For large sheets when enabling only-diff, build the exact diff snapshot
         #   in background and keep the current full view responsive until ready.
-        need_rescan = False
         if not getattr(self, "_data_ready", False):
-            need_rescan = True
-        elif bool(cur) and bool(getattr(self, "_is_large_sheet", False)):
-            if not self._has_valid_only_diff_snapshot_cache():
-                if self._start_async_large_only_diff_build():
-                    self._update_diff_nav_state()
-                    try:
-                        self.app.only_diff_default = int(self.only_diff_var.get())
-                    except Exception:
-                        pass
-                    try:
-                        if hasattr(self, "_settings_save_id") and self._settings_save_id:
-                            self.frame.after_cancel(self._settings_save_id)
-                    except Exception:
-                        pass
-                    try:
-                        self._settings_save_id = self.frame.after(1000, self._flush_settings)
-                    except Exception as e:
-                        _dlog(f"settings debounce failed: {e}")
-                    return
+            # Never perform a full rescan on the Tk callback. Preserve the
+            # checkbox state, prioritize this Sheet's worker, and apply it when
+            # the exact cache arrives.
+            self._pending_only_diff_value = cur
+            self._prefer_only_diff_when_ready = bool(cur)
+            if cur:
+                self._set_only_diff_pending_info()
+            else:
+                try:
+                    self.info.configure(text="正在后台加载当前 Sheet；完成后显示全量数据...")
+                except Exception:
+                    pass
+            try:
+                self.app._enqueue_sheet(self.sheet, front=True)
+                self.app._kick_worker()
+            except Exception as e:
+                _dlog(f"only-diff prioritize failed sheet={self.sheet}: {e}")
+            self._update_diff_nav_state()
+            self._persist_only_diff_setting_debounced()
+            return
+        if bool(cur) and not self._has_valid_only_diff_snapshot_cache():
+            if self._start_async_large_only_diff_build():
+                self._update_diff_nav_state()
+                self._persist_only_diff_setting_debounced()
+                return
         try:
             _dlog(
-                f"TOGGLE only_diff refresh: rescan={need_rescan} "
+                "TOGGLE only_diff refresh: rescan=False "
                 f"data_ready={getattr(self, '_data_ready', False)} "
                 f"large={getattr(self, '_is_large_sheet', False)} "
                 f"sheet={self.sheet}"
@@ -9419,28 +9498,19 @@ class SheetView:
         except Exception:
             pass
 
-        if bool(cur) and bool(getattr(self, "_is_large_sheet", False)) and not self._full_render:
-            # A formula-result sheet can legitimately have thousands of diff rows.
-            # Rendering 800 tagged Text lines blocks the toggle for several seconds;
-            # render the same 200-row first window used by large full-mode sheets.
+        if bool(getattr(self, "_is_large_sheet", False)) and not self._full_render:
+            # Both directions can expose thousands of rows. Rendering 800 tagged
+            # Text lines makes the checkbox callback feel stuck, so switch modes
+            # with the same 200-row first window used by large-sheet initial load.
             self._render_limit = min(
                 max(1, int(self._render_limit or _LARGE_SHEET_INITIAL_ROWS)),
                 _LARGE_SHEET_INITIAL_ROWS,
             )
 
-        self._refresh_mode_switch_preserving_selection(rescan=need_rescan)
+        self._refresh_mode_switch_preserving_selection(rescan=False)
 
         # Persist setting (debounced: write 1 s after last toggle to avoid per-keypress I/O)
-        try:
-            self.app.only_diff_default = int(self.only_diff_var.get())
-            if hasattr(self, "_settings_save_id"):
-                try:
-                    self.frame.after_cancel(self._settings_save_id)
-                except Exception:
-                    pass
-            self._settings_save_id = self.frame.after(1000, self._flush_settings)
-        except Exception as e:
-            _dlog(f"settings debounce failed: {e}")
+        self._persist_only_diff_setting_debounced()
 
     def _toggle_force_align(self):
         """Manual override for large-sheet row pairing accuracy."""
@@ -11324,7 +11394,7 @@ class SheetView:
                 self.base.tag_remove("selrow", "1.0", "end")
             except Exception:
                 pass
-            return
+            return []
         lines = []
         if self.display_rows and getattr(self, "_is_large_sheet", False):
             try:
@@ -11352,6 +11422,7 @@ class SheetView:
             self.base.insert("1.0", "\n".join(lines) + ("\n" if lines else ""))
         except Exception:
             pass
+        return lines
 
     def _render_base_line(self, line: int, pair_idx: int):
         if not self._is_three_way_enabled():
@@ -11534,10 +11605,13 @@ class SheetView:
         except Exception:
             ws_base_edit_ready = None
 
-        # Accuracy guard:
-        # cached-value mode may read formula cells as None when cache is missing.
-        # Load edit workbooks so formula-text fallback can suppress false diffs.
-        if _USE_CACHED_VALUES_ONLY and (ws_a_edit is None or ws_b_edit is None):
+        missing_pair_text = any(
+            pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b
+            for pair_idx in new_rows
+        )
+        # Only rows not covered by the exact background cache need formula-text
+        # fallback. Cached rows must never block scrolling/rendering on workbook I/O.
+        if missing_pair_text and _USE_CACHED_VALUES_ONLY and (ws_a_edit is None or ws_b_edit is None):
             try:
                 self.app._ensure_edit_loaded()
                 ws_a_edit = self.app.ws_a_edit(self.sheet)
@@ -11558,9 +11632,9 @@ class SheetView:
                 pair_indices=new_rows,
                 max_col=self.max_col,
                 ws_a_val=ws_a,
-                ws_a_edit=ws_a_edit,
+                ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                 ws_base_val=self.app.ws_base_val(self.sheet),
-                ws_base_edit=self.app.ws_base_edit(self.sheet),
+                ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
             )
 
         for idx, pair_idx in enumerate(new_rows, start=0):
@@ -11728,7 +11802,7 @@ class SheetView:
         lines_a = [self.pair_text_a.get(pair_idx, "") for pair_idx in self.display_rows]
         lines_b = [self.pair_text_b.get(pair_idx, "") for pair_idx in self.display_rows]
         self.left.insert("1.0", "\n".join(lines_a) + ("\n" if lines_a else ""))
-        self._render_base_full()
+        lines_base = self._render_base_full()
         self.right.insert("1.0", "\n".join(lines_b) + ("\n" if lines_b else ""))
         self._render_row_headers_full()
 
@@ -11953,7 +12027,7 @@ class SheetView:
                 added_base_diff = self._ensure_base_diff_cache(
                     max_col=self.max_col,
                     ws_a_val=ws_a,
-                    ws_a_edit=ws_a_edit,
+                    ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                     ws_base_val=self.app.ws_base_val(self.sheet),
                     ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
                 )
@@ -12075,7 +12149,7 @@ class SheetView:
                 pair_indices=self.display_rows,
                 max_col=self.max_col,
                 ws_a_val=ws_a,
-                ws_a_edit=ws_a_edit,
+                ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                 ws_base_val=self.app.ws_base_val(self.sheet),
                 ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
             )
@@ -12354,7 +12428,7 @@ class SheetView:
             lines_a.append(self.pair_text_a.get(pair_idx, ""))
             lines_b.append(self.pair_text_b.get(pair_idx, ""))
         self.left.insert("1.0", "\n".join(lines_a) + ("\n" if lines_a else ""))
-        self._render_base_full()
+        lines_base = self._render_base_full()
         self.right.insert("1.0", "\n".join(lines_b) + ("\n" if lines_b else ""))
         self._render_row_headers_full()
 
@@ -12382,9 +12456,9 @@ class SheetView:
                 pair_indices=self.display_rows,
                 max_col=self.max_col,
                 ws_a_val=ws_a,
-                ws_a_edit=ws_a_edit,
+                ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                 ws_base_val=self.app.ws_base_val(self.sheet),
-                ws_base_edit=self.app.ws_base_edit(self.sheet),
+                ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
             )
             if added_base_diff:
                 self._invalidate_render_cache()
@@ -12408,7 +12482,11 @@ class SheetView:
 
                 line_a = lines_a[line_idx - 1] if (line_idx - 1) < len(lines_a) else ""
                 line_b = lines_b[line_idx - 1] if (line_idx - 1) < len(lines_b) else ""
-                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                base_line = (
+                    lines_base[line_idx - 1]
+                    if self._is_three_way_enabled() and (line_idx - 1) < len(lines_base)
+                    else ""
+                )
                 left_args, base_args, right_args, left_ranges, base_ranges, right_ranges = self._diffcell_tag_args_for_line(
                     line_idx,
                     pair_idx,
@@ -12516,6 +12594,9 @@ class SowMergeApp:
         self._interactive_action_lock = threading.Lock()
         self._interactive_action_depth = 0
         self._interactive_action_event = threading.Event()
+        self._priority_diff_lock = threading.Lock()
+        self._priority_diff_depth = 0
+        self._priority_diff_event = threading.Event()
         self.file_a = file_a
         self.file_b = file_b
         self.base_path = base_path
@@ -12579,6 +12660,7 @@ class SowMergeApp:
         self._wb_b_edit = None
         self._wb_base_edit = None
         self._edit_loaded_event = threading.Event()
+        self._initial_sheet_ready_event = threading.Event()
         self._edit_loading_started = False
         self._edit_fallback_lock = threading.Lock()
         self._wb_a_val = None
@@ -12593,6 +12675,10 @@ class SowMergeApp:
             b_edit = None
             base_edit = None
             try:
+                _dlog("preload edit workbooks waiting for initial Sheet")
+                while not self._initial_sheet_ready_event.wait(timeout=0.05):
+                    if self._is_closing:
+                        return
                 _dlog("preload edit workbooks (background) start")
                 t1 = datetime.now()
                 a_edit = load_workbook(self.file_a, data_only=False)
@@ -12653,18 +12739,21 @@ class SowMergeApp:
                     except Exception as e:
                         _dlog(f"mine snapshot failed: {e}")
 
-                report("正在准备可编辑数据", "后台加载公式、样式和批注...", 76)
-                self._edit_loading_started = True
-                self._edit_preload_thread = self._start_background_thread(
-                    _preload_edit,
-                    name="sow-edit-preload",
-                )
-
-                report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 86)
+                report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 76)
                 self._refresh_sheet_catalog()
-                report("正在完成数据加载", "等待公式、样式和批注数据加载完成...", 94)
-                self._edit_loaded_event.wait()
-                report("工作簿加载完成", f"共 {len(self.display_sheets)} 个 Sheet，正在创建主界面...", 100)
+                if self._wb_a_edit is None or self._wb_b_edit is None or (self.has_base and self._wb_base_edit is None):
+                    self._edit_loading_started = True
+                    self._edit_preload_thread = self._start_background_thread(
+                        _preload_edit,
+                        name="sow-edit-preload",
+                    )
+                else:
+                    self._edit_loaded_event.set()
+                report(
+                    "工作簿值数据加载完成",
+                    f"共 {len(self.display_sheets)} 个 Sheet；公式、样式和批注将在后台继续预载...",
+                    100,
+                )
             except Exception:
                 _wbs_close(self._wb_a_val, self._wb_b_val, self._wb_base_val)
                 raise
@@ -12683,12 +12772,17 @@ class SowMergeApp:
         self.root = _take_startup_progress_root()
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
         self.root.title(self._window_title_suffix)
+        self.root.resizable(True, True)
         ttk.Style().theme_use("clam")
         if self.merge_mode:
             self.root.title(f"{self._window_title_suffix} (SVN Merge)")
         else:
             self.root.title(f"{self._window_title_suffix} (TortoiseMerge-like)")
         self.root.geometry("1450x860")
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            pass
 
         self._root_after_ids: set[str] = set()
         try:
@@ -12751,6 +12845,8 @@ class SowMergeApp:
                 "view_mode": "normal" if (has_a and has_b) else "missing_sheet",
             }
         self.sheet_diff_state = {s: int(getattr(self, "sheet_diff_state", {}).get(s, 0)) for s in ordered}
+        previous_confirmed = set(getattr(self, "_sheet_diff_confirmed", set()) or set())
+        self._sheet_diff_confirmed = {s for s in previous_confirmed if s in self.sheet_diff_state}
         self._recompute_auto_sheet_ops()
 
     def _recompute_auto_sheet_ops(self):
@@ -12958,6 +13054,18 @@ class SowMergeApp:
             if self._interactive_action_depth == 0:
                 self._interactive_action_event.clear()
 
+    def _begin_priority_diff_compute(self):
+        """Pause lower-priority tab scans while the active Sheet builds exact diffs."""
+        with self._priority_diff_lock:
+            self._priority_diff_depth += 1
+            self._priority_diff_event.set()
+
+    def _end_priority_diff_compute(self):
+        with self._priority_diff_lock:
+            self._priority_diff_depth = max(0, self._priority_diff_depth - 1)
+            if self._priority_diff_depth == 0:
+                self._priority_diff_event.clear()
+
     def _join_background_threads(self, timeout: float = 5.0):
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._background_threads_lock:
@@ -13014,6 +13122,10 @@ class SowMergeApp:
         if getattr(self, "_is_closing", False):
             return
         self._is_closing = True
+        try:
+            self._initial_sheet_ready_event.set()
+        except Exception:
+            pass
         self._cancel_root_afters()
         try:
             progress = getattr(self, "task_progress", None)
@@ -13024,6 +13136,7 @@ class SowMergeApp:
         try:
             with self._compute_lock:
                 self._compute_queue.clear()
+                self._sheet_cache_store.clear()
         except Exception:
             pass
         try:
@@ -13134,6 +13247,10 @@ class SowMergeApp:
 
         # If background preload is running, wait briefly.
         if getattr(self, "_edit_loading_started", False):
+            try:
+                self._initial_sheet_ready_event.set()
+            except Exception:
+                pass
             _dlog("waiting for background edit preload")
             self._edit_loaded_event.wait(timeout=10)
             if self._wb_a_edit is not None and self._wb_b_edit is not None and (not self.has_base or self._wb_base_edit is not None):
@@ -13620,6 +13737,15 @@ class SowMergeApp:
         # Keep API: mark sheet diff state
         if sheet not in self.sheet_diff_state:
             return
+        confirmed_sheets = getattr(self, "_sheet_diff_confirmed", None)
+        if confirmed_sheets is None:
+            self._sheet_diff_confirmed = set()
+            confirmed_sheets = self._sheet_diff_confirmed
+        if not confirmed and sheet in confirmed_sheets:
+            # A late Stage-1 callback must never overwrite an exact result.
+            return
+        if confirmed:
+            confirmed_sheets.add(sheet)
         if has:
             self.sheet_diff_state[sheet] = 2 if confirmed else max(self.sheet_diff_state[sheet], 1)
         else:
@@ -13743,7 +13869,7 @@ class SowMergeApp:
 
         self.nav = ttk.Frame(self.bottom)
         self.nav.pack(side="left", fill="x", expand=True)
-        ttk.Label(self.nav, text="Sheets:").pack(side="left")
+        ttk.Label(self.nav, text="Sheets（浅黄=预检，亮黄=确认）:").pack(side="left")
         self.nav_canvas = tk.Canvas(self.nav, height=28, highlightthickness=0)
         self.nav_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.nav_scroll = ttk.Scrollbar(self.nav, orient="horizontal", command=self.nav_canvas.xview)
@@ -13772,6 +13898,9 @@ class SowMergeApp:
         self._compute_thread = None
         self._compute_total = max(1, len(self.compare_sheets))
         self._compute_done = 0
+        # Keep completed background results for tabs that have not been opened yet.
+        # Discarding them forced a second full scan on first tab activation.
+        self._sheet_cache_store: dict[str, dict] = {}
         self._ui_task_lock = threading.Lock()
         self._ui_tasks = []
 
@@ -13829,13 +13958,14 @@ class SowMergeApp:
             if self._is_closing:
                 raise InterruptedError("background compute cancelled during shutdown")
             # Openpyxl XML parsing is CPU/GIL heavy. Yield while a user-triggered
-            # overwrite/insert is active so button feedback and redraw stay prompt.
-            while self._interactive_action_event.is_set():
+            # overwrite/insert or active-Sheet exact diff is running so button
+            # feedback and the selected Sheet always win over unopened tabs.
+            while self._interactive_action_event.is_set() or self._priority_diff_event.is_set():
                 if self._is_closing:
                     raise InterruptedError("background compute cancelled during shutdown")
                 time.sleep(0.01)
 
-        def _compute_trim_bounds(ws):
+        def _compute_trim_bounds(ws, row_cache=None):
             # Find the true last non-empty row for this sheet. Empty strings are
             # treated as empty so formulas returning "" do not expand the bounds.
             # Keep max_c on read-only fallback paths so earlier wide rows are preserved.
@@ -13850,12 +13980,15 @@ class SowMergeApp:
             # stream from the beginning. A single forward pass is both exact and
             # avoids the old worst case of doing that up to 5000 times.
             if ws.__class__.__name__ == "ReadOnlyWorksheet":
+                captured_rows = [] if row_cache is not None else None
                 for row_idx, row in enumerate(
                     ws.iter_rows(min_row=1, max_row=max_r, min_col=1, max_col=max_c, values_only=True),
                     start=1,
                 ):
                     if (row_idx & 127) == 0:
                         _check_bg_cancel()
+                    if captured_rows is not None:
+                        captured_rows.append(tuple(row or ()))
                     row_last_col = 0
                     for col_idx, value in enumerate(row, start=1):
                         if value not in (None, ""):
@@ -13864,6 +13997,8 @@ class SowMergeApp:
                         found = True
                         last_r = row_idx
                         last_c = max(last_c, row_last_col)
+                if row_cache is not None:
+                    row_cache[id(ws)] = captured_rows
                 if not found:
                     return 1, max(1, max_c)
                 return max(1, last_r), max(1, last_c)
@@ -13907,7 +14042,15 @@ class SowMergeApp:
                 return max(1, last_r), max(1, last_c)
             return max(1, last_r), max(1, max_c)
 
-        def _compute_row_pairs_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
+        def _compute_row_pairs_bg(
+            ws_a,
+            ws_b,
+            max_row_a: int,
+            max_row_b: int,
+            max_col: int,
+            signature_cache=None,
+            rows_cache=None,
+        ):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
             if not _should_auto_row_align(max_row_a, max_row_b, force=False):
                 max_row = max(max_row_a, max_row_b)
@@ -13919,22 +14062,35 @@ class SowMergeApp:
                 return pairs
 
             def _bulk_sig_list(ws, max_row_local: int):
-                sigs = []
-                try:
-                    for row_idx, row in enumerate(ws.iter_rows(
-                        min_row=1,
-                        max_row=max_row_local,
-                        min_col=1,
-                        max_col=max_col,
-                        values_only=True,
-                    ), start=1):
+                cache_key = (id(ws), int(max_row_local), int(max_col))
+                if signature_cache is not None and cache_key in signature_cache:
+                    return signature_cache[cache_key]
+                cached_rows = rows_cache.get(id(ws)) if rows_cache is not None else None
+                if cached_rows is not None and len(cached_rows) >= max_row_local:
+                    sigs = []
+                    for row_idx, row in enumerate(cached_rows[:max_row_local], start=1):
                         if (row_idx & 127) == 0:
                             _check_bg_cancel()
-                        sigs.append(_row_signature(row or ()))
-                except InterruptedError:
-                    raise
-                except Exception:
-                    return []
+                        sigs.append(_row_signature(_pad_row_values(row, max_col)))
+                else:
+                    sigs = []
+                    try:
+                        for row_idx, row in enumerate(ws.iter_rows(
+                            min_row=1,
+                            max_row=max_row_local,
+                            min_col=1,
+                            max_col=max_col,
+                            values_only=True,
+                        ), start=1):
+                            if (row_idx & 127) == 0:
+                                _check_bg_cancel()
+                            sigs.append(_row_signature(row or ()))
+                    except InterruptedError:
+                        raise
+                    except Exception:
+                        return []
+                if signature_cache is not None:
+                    signature_cache[cache_key] = sigs
                 return sigs
             sig_a = _bulk_sig_list(ws_a, max_row_a)
             sig_b = _bulk_sig_list(ws_b, max_row_b)
@@ -14043,13 +14199,27 @@ class SowMergeApp:
                             return True
             return False
 
-        def _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a: int, max_r_b: int, max_r_base: int, max_col: int):
+        def _sheet_has_base_diff_bg(
+            ws_a,
+            ws_b,
+            ws_base,
+            max_r_a: int,
+            max_r_b: int,
+            max_r_base: int,
+            max_col: int,
+            signature_cache=None,
+            rows_cache=None,
+        ):
             if ws_base is None:
                 return True
-            row_pairs_a_base = _compute_row_pairs_bg(ws_a, ws_base, max_r_a, max_r_base, max_col)
+            row_pairs_a_base = _compute_row_pairs_bg(
+                ws_a, ws_base, max_r_a, max_r_base, max_col, signature_cache, rows_cache
+            )
             if _pairs_have_diff_bg(ws_a, ws_base, row_pairs_a_base, max_col):
                 return True
-            row_pairs_b_base = _compute_row_pairs_bg(ws_b, ws_base, max_r_b, max_r_base, max_col)
+            row_pairs_b_base = _compute_row_pairs_bg(
+                ws_b, ws_base, max_r_b, max_r_base, max_col, signature_cache, rows_cache
+            )
             if _pairs_have_diff_bg(ws_b, ws_base, row_pairs_b_base, max_col):
                 return True
             return False
@@ -14064,10 +14234,11 @@ class SowMergeApp:
             wb_base_edit=None,
         ):
             _check_bg_cancel()
+            trimmed_rows_cache = {}
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
-            max_r_a, max_c_a = _compute_trim_bounds(ws_a)
-            max_r_b, max_c_b = _compute_trim_bounds(ws_b)
+            max_r_a, max_c_a = _compute_trim_bounds(ws_a, trimmed_rows_cache)
+            max_r_b, max_c_b = _compute_trim_bounds(ws_b, trimmed_rows_cache)
             _check_bg_cancel()
             ws_a_edit = wb_a_edit[sheet]
             ws_b_edit = wb_b_edit[sheet]
@@ -14081,7 +14252,7 @@ class SowMergeApp:
             max_c_base = 0
             if wb_base_val is not None and sheet in wb_base_val.sheetnames:
                 ws_base = wb_base_val[sheet]
-                max_r_base, max_c_base = _compute_trim_bounds(ws_base)
+                max_r_base, max_c_base = _compute_trim_bounds(ws_base, trimmed_rows_cache)
                 if wb_base_edit is not None and sheet in wb_base_edit.sheetnames:
                     ws_base_edit = wb_base_edit[sheet]
                     edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit)
@@ -14090,12 +14261,16 @@ class SowMergeApp:
             _check_bg_cancel()
             max_row = max(max_r_a, max_r_b, max_r_base)
             max_col = max(max_c_a, max_c_b, max_c_base)
+            signature_cache = {}
 
             # Compute row-aligned pairs (same algorithm as SheetView._build_row_pairs)
-            row_pairs = _compute_row_pairs_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
+            row_pairs = _compute_row_pairs_bg(
+                ws_a, ws_b, max_r_a, max_r_b, max_col, signature_cache, trimmed_rows_cache
+            )
             _check_bg_cancel()
 
             pair_diff_cols: dict[int, set] = {}
+            pair_base_diff_cols: dict[int, set] = {}
             # Keep raw per-cell display parts in cache; render with current grid mode on UI thread.
             pair_parts_a: dict[int, list[str]] = {}
             pair_parts_b: dict[int, list[str]] = {}
@@ -14108,11 +14283,15 @@ class SowMergeApp:
 
             if ws_base is not None:
                 try:
-                    mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(ws_a, ws_base, max_r_a, max_r_base, max_col))
+                    mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(
+                        ws_a, ws_base, max_r_a, max_r_base, max_col, signature_cache, trimmed_rows_cache
+                    ))
                 except Exception:
                     mine_to_base_row = {}
                 try:
-                    theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(ws_b, ws_base, max_r_b, max_r_base, max_col))
+                    theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(
+                        ws_b, ws_base, max_r_b, max_r_base, max_col, signature_cache, trimmed_rows_cache
+                    ))
                 except Exception:
                     theirs_to_base_row = {}
                 row_pairs = _split_tail_independent_append_pairs(
@@ -14149,7 +14328,17 @@ class SowMergeApp:
             if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
                 has_diff = _has_diff_by_blocks_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
                 if (not has_diff) and getattr(self, "has_base", False):
-                    has_diff = _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a, max_r_b, max_r_base, max_col)
+                    has_diff = _sheet_has_base_diff_bg(
+                        ws_a,
+                        ws_b,
+                        ws_base,
+                        max_r_a,
+                        max_r_b,
+                        max_r_base,
+                        max_col,
+                        signature_cache,
+                        trimmed_rows_cache,
+                    )
 
                 sample_head = min(_LARGE_SHEET_INITIAL_ROWS, len(row_pairs))
                 sample_indices = list(range(sample_head))
@@ -14187,16 +14376,91 @@ class SowMergeApp:
                         if w > col_char_widths.get(col_idx, 0):
                             col_char_widths[col_idx] = w
             else:
-                ws_a_e = ws_a_edit
-                ws_b_e = ws_b_edit
+                rows_needed_a = [ra for ra, _rb in row_pairs if ra is not None]
+                rows_needed_b = [rb for _ra, rb in row_pairs if rb is not None]
+                rows_a_val = _read_rows_into_cache(
+                    ws_a,
+                    rows_needed_a,
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+                rows_b_val = _read_rows_into_cache(
+                    ws_b,
+                    rows_needed_b,
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+                rows_a_edit = _read_rows_into_cache(
+                    ws_a_edit,
+                    rows_needed_a,
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+                rows_b_edit = _read_rows_into_cache(
+                    ws_b_edit,
+                    rows_needed_b,
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+                base_row_by_pair: dict[int, int | None] = {}
+                if ws_base is not None:
+                    for idx, (ra, rb) in enumerate(row_pairs):
+                        if idx in pair_base_row_override:
+                            base_row = pair_base_row_override.get(idx)
+                        elif ra is not None and ra in mine_to_base_row:
+                            base_row = mine_to_base_row.get(ra)
+                        elif rb is not None and rb in theirs_to_base_row:
+                            base_row = theirs_to_base_row.get(rb)
+                        else:
+                            base_row = None
+                        base_row_by_pair[idx] = base_row
+                    base_rows_needed = [r for r in base_row_by_pair.values() if r is not None]
+                    rows_base_val = _read_rows_into_cache(
+                        ws_base,
+                        base_rows_needed,
+                        max_col,
+                        cancel_check=_check_bg_cancel,
+                    )
+                    rows_base_edit = _read_rows_into_cache(
+                        ws_base_edit,
+                        base_rows_needed,
+                        max_col,
+                        cancel_check=_check_bg_cancel,
+                    ) if ws_base_edit is not None else {}
+                else:
+                    rows_base_val = {}
+                    rows_base_edit = {}
                 for idx, (ra, rb) in enumerate(row_pairs):
                     if (idx & 127) == 0:
                         _check_bg_cancel()
                     cols = set()
                     parts_a = []
                     parts_b = []
+                    row_a_val = _row_from_cache(rows_a_val, ra, max_col)
+                    row_b_val = _row_from_cache(rows_b_val, rb, max_col)
+                    row_a_edit = _row_from_cache(rows_a_edit, ra, max_col)
+                    row_b_edit = _row_from_cache(rows_b_edit, rb, max_col)
                     for c in range(1, max_col + 1):
-                        da, db, eq = _cell_display_and_equal_by_row(ws_a, ws_b, ws_a_e, ws_b_e, ra, rb, c)
+                        offset = c - 1
+                        va_val = row_a_val[offset]
+                        vb_val = row_b_val[offset]
+                        va_edit = row_a_edit[offset]
+                        vb_edit = row_b_edit[offset]
+                        if ra is not None and rb is not None and ra != rb:
+                            vb_edit = _translate_normal_formula_for_compare(
+                                vb_val,
+                                vb_edit,
+                                rb,
+                                c,
+                                ra,
+                                c,
+                            )
+                        da, db, eq = _cell_display_and_equal_from_values(
+                            va_val,
+                            vb_val,
+                            va_edit,
+                            vb_edit,
+                        )
                         sa = _val_to_str(da)
                         sb = _val_to_str(db)
                         parts_a.append(sa)
@@ -14211,9 +14475,48 @@ class SowMergeApp:
                     pair_parts_a[idx] = parts_a
                     pair_parts_b[idx] = parts_b
                     pair_diff_cols[idx] = cols
+                    if ws_base is not None and ra is not None:
+                        base_row = base_row_by_pair.get(idx)
+                        if base_row is None:
+                            pair_base_diff_cols[idx] = {-1}
+                        else:
+                            row_base_val = _row_from_cache(rows_base_val, base_row, max_col)
+                            row_base_edit = _row_from_cache(rows_base_edit, base_row, max_col)
+                            base_cols = set()
+                            for c in range(1, max_col + 1):
+                                offset = c - 1
+                                base_edit = row_base_edit[offset]
+                                if ra != base_row:
+                                    base_edit = _translate_normal_formula_for_compare(
+                                        row_base_val[offset],
+                                        base_edit,
+                                        base_row,
+                                        c,
+                                        ra,
+                                        c,
+                                    )
+                                _mine_display, _base_display, equal = _cell_display_and_equal_from_values(
+                                    row_a_val[offset],
+                                    row_base_val[offset],
+                                    row_a_edit[offset],
+                                    base_edit,
+                                )
+                                if not equal:
+                                    base_cols.add(c)
+                            pair_base_diff_cols[idx] = base_cols
                 has_diff = any(bool(v) for v in pair_diff_cols.values())
                 if (not has_diff) and getattr(self, "has_base", False):
-                    has_diff = _sheet_has_base_diff_bg(ws_a, ws_b, ws_base, max_r_a, max_r_b, max_r_base, max_col)
+                    has_diff = _sheet_has_base_diff_bg(
+                        ws_a,
+                        ws_b,
+                        ws_base,
+                        max_r_a,
+                        max_r_b,
+                        max_r_base,
+                        max_col,
+                        signature_cache,
+                        trimmed_rows_cache,
+                    )
 
             # Keep a readable lower bound and normalize missing columns.
             for c in range(1, max_col + 1):
@@ -14227,6 +14530,7 @@ class SowMergeApp:
                 "col_max_b": max_c_b,
                 "row_pairs": row_pairs,
                 "pair_diff_cols": pair_diff_cols,
+                "pair_base_diff_cols": pair_base_diff_cols,
                 "pair_parts_a": pair_parts_a,
                 "pair_parts_b": pair_parts_b,
                 "col_char_widths": col_char_widths,
@@ -14242,7 +14546,9 @@ class SowMergeApp:
             sheet = cache["sheet"]
             view = self.sheet_views.get(sheet)
             if view is None:
-                # No visible view yet: safe to update tab mark directly.
+                # Preserve the exact result for lazy tab creation. The previous
+                # implementation discarded it and recomputed the whole Sheet.
+                self._sheet_cache_store[sheet] = cache
                 self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
                 self.refresh_sheet_nav()
                 return
@@ -14289,7 +14595,10 @@ class SowMergeApp:
             # Apply row-aligned pair data (computed in background with row alignment)
             view.row_pairs = cache["row_pairs"]
             view.pair_diff_cols = cache["pair_diff_cols"]
-            view.pair_base_diff_cols = {}
+            view.pair_base_diff_cols = {
+                int(idx): set(cols)
+                for idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items()
+            }
             view.col_char_widths = cache.get("col_char_widths", {}) or {c: 4 for c in range(1, view.max_col + 1)}
             # Invalidate cached base spans: column widths replaced by background result.
             view._col_widths_version = int(getattr(view, "_col_widths_version", 0)) + 1
@@ -14327,20 +14636,33 @@ class SowMergeApp:
             # Mark data as ready so refresh(rescan=False) uses it without rescanning
             view._data_ready = True
             view._invalidate_render_cache()
+            if not view._is_three_way_enabled() and not view._is_large_sheet:
+                view._cache_only_diff_rows_snapshot(
+                    idx for idx, cols in view.pair_diff_cols.items() if cols
+                )
 
-            if view._prefer_only_diff_when_ready:
-                # For large sheets, keep full-mode initial render (first 200 rows) for responsiveness.
-                if view.max_row >= _LARGE_SHEET_ROW_THRESHOLD:
-                    view.only_diff_var.set(0)
-                    view._full_render = False
-                    view._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, view.max_row)
-                elif cache.get("has_diff", False):
-                    view.only_diff_var.set(1)
-                else:
-                    view.only_diff_var.set(0)
-                    view._full_render = False
-                    view._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, view.max_row)
-                view._prefer_only_diff_when_ready = False
+            requested_only_diff = (
+                int(view._pending_only_diff_value)
+                if view._pending_only_diff_value is not None
+                else int(view.only_diff_var.get())
+            )
+            needs_exact_only_diff = bool(
+                requested_only_diff and not view._has_valid_only_diff_snapshot_cache()
+            )
+            view._pending_only_diff_value = None
+            view._prefer_only_diff_when_ready = False
+            # Render a useful full first page while an exact 3-way snapshot is
+            # built in the background. Temporarily changing the variable avoids
+            # synchronous base-diff expansion inside refresh().
+            render_only_diff_value = requested_only_diff
+            if needs_exact_only_diff:
+                render_only_diff_value = 0
+                view._full_render = False
+                view._render_limit = min(
+                    _LARGE_SHEET_INITIAL_ROWS if view._is_large_sheet else _FAST_RENDER_ROW_LIMIT,
+                    view.max_row,
+                )
+            view.only_diff_var.set(render_only_diff_value)
             # Preserve viewport/cursor when background cache is applied; otherwise
             # user operations (overwrite/resolve) appear to "jump to first row/first column".
             prev_first = 0.0
@@ -14389,6 +14711,9 @@ class SowMergeApp:
                 pass
             view._update_cursor_lines()
             view._hide_loading()
+            if needs_exact_only_diff:
+                view.only_diff_var.set(requested_only_diff)
+                view._start_async_large_only_diff_build()
             self.refresh_sheet_nav()
 
         def _compute_worker():
@@ -14469,6 +14794,10 @@ class SowMergeApp:
                                     total=total,
                                 )
                             )
+                            # Queue behind the final cache-apply callback. This
+                            # keeps editable-workbook parsing from contending
+                            # with the first usable render and checkbox actions.
+                            _queue_ui_task(self._initial_sheet_ready_event.set)
             finally:
                 _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
                 with self._compute_lock:
@@ -14491,6 +14820,7 @@ class SowMergeApp:
                     return
                 self._compute_thread = th
         self._queue_ui_task = _queue_ui_task
+        self._enqueue_sheet = _enqueue_sheet
         self._kick_worker = _kick_worker
 
         # Lazy-create SheetView UI immediately; compute diff in background.
@@ -14505,10 +14835,14 @@ class SowMergeApp:
                     view = SheetView(self._sheet_containers[tab_text], self, tab_text)
                     self.sheet_views[tab_text] = view
                     self._sheet_loaded[tab_text] = True
-                    # Show loading placeholder immediately (non-blocking).
-                    # The background worker will compute diffs and call _apply_sheet_cache
-                    # which sets _data_ready=True and calls refresh(rescan=False).
-                    view._show_loading()
+                    cached = self._sheet_cache_store.pop(tab_text, None)
+                    if cached is not None:
+                        _dlog(f"apply retained sheet cache: {tab_text}")
+                        _apply_sheet_cache(cached)
+                    else:
+                        # The background worker will compute diffs and call
+                        # _apply_sheet_cache without blocking the UI thread.
+                        view._show_loading()
                 if tab_text in self._sheet_containers:
                     # Skip background recompute if data is already ready (no edits pending).
                     # Reopening workbooks on every tab switch is the main perf regression.
@@ -14522,8 +14856,8 @@ class SowMergeApp:
                     elif not (_view and getattr(_view, "_data_ready", False)):
                         _enqueue_sheet(tab_text, front=True)
                         _kick_worker()
-                        # Fallback: if background path stalls, force sync refresh on UI thread.
-                        # This guarantees that switching tabs eventually shows compare results.
+                        # Watchdog: restart stalled background work, but never fall
+                        # back to a synchronous full rescan on the Tk thread.
                         def _force_refresh_if_still_loading(sheet_name=tab_text):
                             try:
                                 cur_id = self.nb.select()
@@ -14535,17 +14869,21 @@ class SowMergeApp:
                                     return
                                 if getattr(v, "_data_ready", False):
                                     return
+                                cached_result = self._sheet_cache_store.pop(sheet_name, None)
+                                if cached_result is not None:
+                                    _apply_sheet_cache(cached_result)
+                                    return
                                 with self._compute_lock:
                                     still_background = sheet_name in self._compute_inflight or sheet_name in self._compute_queue
-                                if still_background:
-                                    v._show_loading(f"正在后台精确计算 {sheet_name}，界面仍可操作...")
-                                    self._safe_root_after(1500, _force_refresh_if_still_loading)
-                                    return
-                                v.refresh(row_only=None, rescan=True)
-                                v._update_cursor_lines()
-                                v._hide_loading()
+                                with self._ui_task_lock:
+                                    pending_ui_result = bool(self._ui_tasks)
+                                if not still_background and not pending_ui_result:
+                                    _enqueue_sheet(sheet_name, front=True)
+                                    _kick_worker()
+                                v._show_loading(f"正在后台精确计算 {sheet_name}，界面仍可操作...")
+                                self._safe_root_after(1500, _force_refresh_if_still_loading)
                             except Exception as e:
-                                _dlog(f"force refresh fallback failed {sheet_name}: {e}")
+                                _dlog(f"background refresh watchdog failed {sheet_name}: {e}")
                         try:
                             self._safe_root_after(700, _force_refresh_if_still_loading)
                         except Exception:
@@ -14569,17 +14907,52 @@ class SowMergeApp:
 
         self.refresh_sheet_nav()
 
-        # Background fast pre-mark for sheet tabs:
-        # exact by cached values (tail-first block scan), no random sampling.
+        # Stage-1 tab coloring is provisional. Stage-2 exact background compute
+        # changes state 1 (pale) to state 2 (bright) or clears it to state 0.
         def _apply_fast_mark_result(sheet: str, has: bool):
-            self.set_sheet_has_diff(sheet, has, confirmed=True)
-            view = self.sheet_views.get(sheet)
-            if has and view and view._prefer_only_diff_when_ready and view.only_diff_var.get() == 0:
-                if not getattr(view, "_is_large_sheet", False) and getattr(view, "_data_ready", False):
-                    view.only_diff_var.set(1)
-                    view.refresh(row_only=None, rescan=False)
-                    view._update_cursor_lines()
-            self.refresh_sheet_nav()
+            if has:
+                self.set_sheet_has_diff(sheet, True, confirmed=False)
+                self.refresh_sheet_nav()
+
+        def _scan_sheet_fingerprint_marks():
+            started = time.monotonic()
+            try:
+                fp_a = _xlsx_sheet_part_fingerprints(self._file_a_val_path)
+                fp_b = _xlsx_sheet_part_fingerprints(self._file_b_val_path)
+                fp_base = (
+                    _xlsx_sheet_part_fingerprints(self._file_base_val_path)
+                    if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None)
+                    else {}
+                )
+                if not fp_a or not fp_b:
+                    _dlog(
+                        f"sheet fingerprint premark skipped: "
+                        f"a_parts={len(fp_a)} b_parts={len(fp_b)}"
+                    )
+                    return
+                marked = 0
+                for sheet in self.compare_sheets:
+                    if self._is_closing:
+                        return
+                    a_sig = fp_a.get(sheet)
+                    b_sig = fp_b.get(sheet)
+                    if getattr(self, "has_base", False):
+                        base_sig = fp_base.get(sheet)
+                        if base_sig is not None:
+                            has_probable_diff = a_sig != base_sig or b_sig != base_sig
+                        else:
+                            has_probable_diff = a_sig != b_sig
+                    else:
+                        has_probable_diff = a_sig != b_sig
+                    if has_probable_diff:
+                        marked += 1
+                        _queue_ui_task(lambda s=sheet: _apply_fast_mark_result(s, True))
+                _dlog(
+                    f"sheet fingerprint premark done: marked={marked}/{len(self.compare_sheets)} "
+                    f"elapsed={time.monotonic() - started:.3f}s"
+                )
+            except Exception as e:
+                _dlog(f"sheet fingerprint premark worker failed: {e}")
 
         def _sheet_has_diff_fast_tail(ws_a, ws_b, max_row: int, max_col: int, min_row: int = 1):
             none_sig = tuple("" for _ in range(max_col))
@@ -14716,13 +15089,16 @@ class SowMergeApp:
             finally:
                 _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro)
 
-        try:
-            self._fast_tabmark_thread = self._start_background_thread(
-                _scan_sheet_has_diff_fast,
-                name="sow-fast-tabmark",
-            )
-        except Exception:
-            pass
+        if _FAST_TABMARK_ENABLED:
+            try:
+                self._fast_tabmark_thread = self._start_background_thread(
+                    _scan_sheet_fingerprint_marks,
+                    name="sow-sheet-fingerprint",
+                )
+            except Exception:
+                pass
+        else:
+            self._fast_tabmark_thread = None
 
         # Enqueue all sheets for background confirmation (slow compute)
         try:
@@ -15749,12 +16125,14 @@ class SowMergeApp:
             pass
         try:
             self._refresh_sheet_catalog()
+            self._sheet_diff_confirmed.clear()
             for s in self.compare_sheets:
-                self.set_sheet_has_diff(s, False, confirmed=False)
+                self.sheet_diff_state[s] = 0
             with self._compute_lock:
                 self._compute_queue = [s for s in self.compare_sheets if s not in self._compute_inflight]
                 self._compute_total = max(1, len(self.compare_sheets))
                 self._compute_done = 0
+                self._sheet_cache_store.clear()
             self._kick_worker()
         except Exception:
             pass
