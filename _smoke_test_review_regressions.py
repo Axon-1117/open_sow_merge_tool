@@ -2,9 +2,12 @@ import os
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from types import SimpleNamespace
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+from openpyxl.worksheet.datavalidation import DataValidation
 
 import sow_merge_tool as mod
 from _test_temp_utils import make_temp_dir
@@ -112,9 +115,105 @@ def _test_shared_formula_is_not_destroyed():
     try:
         mod._sheet_xml_set_cell(root, 1, 1, "=SUM(B1:D1)", 4)
     except RuntimeError as exc:
-        assert "shared formula" in str(exc)
+        assert "special formula" in str(exc)
     else:
         raise AssertionError("unsafe shared-formula replacement was not rejected")
+
+    array_root = ET.fromstring(
+        f'<worksheet xmlns="{ns}"><sheetData><row r="1">'
+        '<c r="A1"><f t="array" ref="A1:A2">ROW(A1:A2)</f><v>1</v></c>'
+        '</row></sheetData></worksheet>'
+    )
+    try:
+        mod._sheet_xml_set_cell(array_root, 1, 1, "=SUM(B1:C1)", 4)
+    except RuntimeError as exc:
+        assert "special formula" in str(exc)
+    else:
+        raise AssertionError("unsafe array-formula replacement was not rejected")
+
+
+def _test_formula_and_value_comparison_is_conservative():
+    assert mod._same_formula("=sum(a1)", "=SUM(A1)")
+    assert not mod._same_formula('="a b"', '="A B"')
+    assert not mod._same_formula('="a b"', '="ab"')
+    assert not mod._same_formula("=A:A B:B", "=A:AB:B")
+    assert mod._merge_cmp_value("001") != mod._merge_cmp_value(1)
+    assert mod._merge_cmp_value("value ") != mod._merge_cmp_value("value")
+    assert mod._merge_cmp_value(1) == mod._merge_cmp_value(1.0)
+    literal = mod._choose_edit_value("=not-a-formula", "=not-a-formula")
+    assert isinstance(literal, mod._LiteralText)
+    assert mod._formula_text(literal) is None
+
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = ET.fromstring(f'<worksheet xmlns="{ns}"><sheetData/></worksheet>')
+    mod._sheet_xml_set_cell(root, 1, 1, literal)
+    cell = root.find(f".//{{{ns}}}c[@r='A1']")
+    assert cell.attrib.get("t") == "inlineStr"
+    assert cell.find(f"{{{ns}}}f") is None
+    assert cell.find(f"{{{ns}}}is/{{{ns}}}t").text == "=not-a-formula"
+
+    array_a = ArrayFormula("A1:A2", "=ROW(A1:A2)")
+    array_same = ArrayFormula("A1:A2", "=ROW(A1:A2)")
+    array_other = ArrayFormula("A1:A3", "=ROW(A1:A3)")
+    assert mod._same_formula(array_a, array_same)
+    assert not mod._same_formula(array_a, array_other)
+    data_a = DataTableFormula("B1:C3", r1="A1")
+    data_same = DataTableFormula("B1:C3", r1="A1")
+    assert mod._same_formula(data_a, data_same)
+    try:
+        mod._choose_edit_value(1, data_a)
+    except RuntimeError as exc:
+        assert "数据表公式" in str(exc)
+    else:
+        raise AssertionError("data-table formula was silently converted to a scalar")
+
+    shown_a, shown_b, equal = mod._cell_display_and_equal_from_values(
+        None, None, "=A1+1", "=A1+2"
+    )
+    assert not equal
+    assert shown_a == "=A1+1" and shown_b == "=A1+2"
+    shown_a, shown_b, equal = mod._cell_display_and_equal_from_values(
+        None, None, "=A1+1", "=a1+1"
+    )
+    assert equal
+
+
+def _test_ooxml_datetime_is_numeric():
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = ET.fromstring(f'<worksheet xmlns="{ns}"><sheetData/></worksheet>')
+    value = datetime(2026, 7, 21, 12, 30, 0)
+    mod._sheet_xml_set_cell(root, 1, 1, value)
+    cell = root.find(f".//{{{ns}}}c[@r='A1']")
+    cached = cell.find(f"{{{ns}}}v")
+    assert cell.attrib.get("t") is None
+    assert float(cached.text) > 40000
+    assert mod._excel_cached_value_payload("#comment") == ("str", "#comment")
+    assert mod._excel_cached_value_payload("#N/A") == ("e", "#N/A")
+    try:
+        mod._excel_cached_value_payload(float("nan"))
+    except RuntimeError as exc:
+        assert "non-finite" in str(exc)
+    else:
+        raise AssertionError("NaN was written as an invalid OOXML numeric value")
+
+    root_dir = make_temp_dir("sow_date1904_")
+    source = os.path.join(root_dir, "source.xlsx")
+    output = os.path.join(root_dir, "output.xlsx")
+    wb = Workbook()
+    wb.epoch = mod.CALENDAR_MAC_1904
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = datetime(2020, 1, 1)
+    ws["A1"].number_format = "yyyy-mm-dd"
+    wb.save(source)
+    wb.close()
+    expected = datetime(2026, 7, 21)
+    mod._build_manual_merge_xlsx_via_zip(source, output, {("S1", 1, 1): expected})
+    wb = load_workbook(output, data_only=False)
+    try:
+        assert wb["S1"]["A1"].value == expected
+    finally:
+        wb.close()
 
 
 def _test_formula_noop_filter():
@@ -136,6 +235,19 @@ def _test_formula_noop_filter():
     filtered = mod._filter_noop_manual_ops(path, ops)
     assert ("S1", 1, 1) not in filtered, filtered
     assert filtered[("S1", 1, 2)] == 10
+    row_aware = mod._prepare_manual_ops_for_save(
+        path,
+        {("S1", 1, 1): "=SUM(B1:C1)"},
+        row_ops=[{"sheet": "S1", "kind": "insert_rows", "row": 1, "count": 1}],
+    )
+    assert row_aware == {("S1", 1, 1): "=SUM(B1:C1)"}
+
+    replay_sources = mod._replay_formula_source_paths(
+        "mine.xlsx",
+        row_ops=[{"kind": "insert_rows", "source_side": "B"}],
+        source_paths={"B": "theirs.xlsx", "BASE": "base.xlsx"},
+    )
+    assert replay_sources == ["mine.xlsx", "theirs.xlsx"]
 
     text_out = os.path.join(root, "text-output.xlsx")
     mod._build_manual_merge_xlsx_via_zip(
@@ -151,6 +263,27 @@ def _test_formula_noop_filter():
         wb.close()
 
 
+def _test_formula_only_tail_is_not_trimmed():
+    root = make_temp_dir("sow_formula_tail_bounds_")
+    path = os.path.join(root, "formula-tail.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "S1"
+    ws["A1"] = "header"
+    ws["C10"] = "=IF(1=1,\"\",\"x\")"
+    wb.save(path)
+    wb.close()
+
+    wb_val = load_workbook(path, data_only=True)
+    wb_edit = load_workbook(path, data_only=False)
+    try:
+        assert mod._effective_bounds(wb_val["S1"])[0] == 1
+        assert mod._effective_bounds_with_edit(wb_val["S1"], wb_edit["S1"]) == (10, 3)
+    finally:
+        wb_val.close()
+        wb_edit.close()
+
+
 def _test_large_alignment_fast_and_exact():
     sig_base = [f"id-{idx}" for idx in range(20000)]
     sig_theirs = list(sig_base)
@@ -161,6 +294,30 @@ def _test_large_alignment_fast_and_exact():
     assert len(pairs) == 20000, len(pairs)
     assert pairs[0] == (1, 1) and pairs[-1] == (20000, 20000)
     assert elapsed < 2.0, elapsed
+
+    # Equal total row counts can still contain one insertion and one deletion.
+    # Large-sheet auto alignment must not degrade this into thousands of value diffs.
+    structural_a = [f"row-{idx}" for idx in range(20000)]
+    structural_b = structural_a[:500] + ["inserted"] + structural_a[500:15000] + structural_a[15001:]
+    assert len(structural_a) == len(structural_b)
+    assert mod._should_auto_row_align(len(structural_a), len(structural_b))
+    started = time.perf_counter()
+    structural_pairs = mod._compute_row_pairs_from_signatures(structural_a, structural_b)
+    structural_elapsed = time.perf_counter() - started
+    assert sum(1 for left, right in structural_pairs if left is None and right is not None) == 1
+    assert sum(1 for left, right in structural_pairs if left is not None and right is None) == 1
+    assert structural_elapsed < 2.0, structural_elapsed
+
+    # A formula/result-heavy sheet can produce a huge equal-length replace
+    # block. Pairing is unambiguously 1:1 and must not run per-row fuzzy scans.
+    changed_a = [f"left-{idx}-" + ("x" * 120) for idx in range(20000)]
+    changed_b = [f"right-{idx}-" + ("y" * 120) for idx in range(20000)]
+    started = time.perf_counter()
+    changed_pairs = mod._compute_row_pairs_from_signatures(changed_a, changed_b)
+    changed_elapsed = time.perf_counter() - started
+    assert changed_pairs[0] == (1, 1) and changed_pairs[-1] == (20000, 20000)
+    assert len(changed_pairs) == 20000
+    assert changed_elapsed < 2.0, changed_elapsed
 
 
 def _test_stable_copy_waits_for_complete_zip():
@@ -228,16 +385,182 @@ def _test_large_only_diff_disk_worker_is_blocked_after_user_edits():
     assert not mod.SheetView._has_user_edits_for_current_sheet(view)
 
 
+def _test_three_way_formula_structure_is_compared_without_cache():
+    root = make_temp_dir("sow_formula_structure_3way_")
+
+    def _book(name, formula):
+        path = os.path.join(root, name)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "S1"
+        ws["A1"] = formula
+        wb.save(path)
+        wb.close()
+        return path
+
+    base = _book("base.xlsx", "=SUM(1,1)")
+    mine = _book("mine.xlsx", "=SUM(1,2)")
+    theirs = _book("theirs.xlsx", "=SUM(1,3)")
+    conflicts, conflict_map = mod._scan_three_way_conflicts(base, mine, theirs)
+    assert any(sheet == "S1" and row == 1 and col == 1 for sheet, row, col, _vm, _vt in conflicts), conflicts
+    assert conflict_map["S1"][1] == {1}
+
+    mine_unchanged = _book("mine-unchanged.xlsx", "=SUM(1,1)")
+    theirs_changed = _book("theirs-changed.xlsx", "=SUM(1,4)")
+    out = os.path.join(root, "merged.xlsx")
+    conflicts, _preview, conflict_map = mod._merge_three_way(
+        base,
+        mine_unchanged,
+        theirs_changed,
+        out,
+        save_merged=True,
+    )
+    assert conflicts == [] and conflict_map == {}
+    wb = load_workbook(out, data_only=False)
+    try:
+        assert wb["S1"]["A1"].value == "=SUM(1,4)"
+    finally:
+        wb.close()
+
+    assert mod._merge_cell_compare_key("=literal", "=literal")[0] == "VALUE"
+    assert mod._merge_cell_compare_key(None, "=literal")[0] == "FORMULA"
+
+
+def _test_formula_copy_translates_relative_references():
+    translated = mod._copy_edit_value_for_destination(
+        None,
+        "=A11+$C$1+D$2+$E11",
+        None,
+        src_row=11,
+        src_col=2,
+        dst_row=10,
+        dst_col=2,
+    )
+    assert translated == "=A10+$C$1+D$2+$E10", translated
+
+    literal = mod._copy_edit_value_for_destination(
+        "=A11",
+        "=A11",
+        None,
+        src_row=11,
+        src_col=2,
+        dst_row=10,
+        dst_col=2,
+    )
+    assert isinstance(literal, mod._LiteralText)
+    assert str(literal) == "=A11"
+
+    # Formula structure remains significant even when current cached results match.
+    _da, _db, equal = mod._cell_display_and_equal_from_values(
+        2,
+        2,
+        "=1+1",
+        "=SUM(1,1)",
+    )
+    assert not equal
+
+    shifted = mod._translate_normal_formula_for_compare(
+        None,
+        "=A11",
+        11,
+        2,
+        10,
+        2,
+    )
+    _da, _db, equal = mod._cell_display_and_equal_from_values(
+        None,
+        None,
+        "=A10",
+        shifted,
+    )
+    assert equal
+
+
+def _test_same_formula_copy_only_records_changed_cache():
+    view = SimpleNamespace(_formula_copy_skips_pending=0)
+    mode = mod.SheetView._same_formula_copy_mode(view, "=A1", "=A1", 10, 10)
+    assert mode == "noop"
+    assert view._formula_copy_skips_pending == 0
+    mode = mod.SheetView._same_formula_copy_mode(view, "=A1", "=A1", 11, 10)
+    assert mode == "cache"
+    assert view._formula_copy_skips_pending == 1
+    mode = mod.SheetView._same_formula_copy_mode(view, "=A2", "=A1", 11, 10)
+    assert mode is None
+
+
+def _test_excel_row_replay_uses_full_paste():
+    captured = {}
+    original_run = mod.subprocess.run
+    original_validate = mod._validate_xlsx_package
+    try:
+        def _fake_run(command, **_kwargs):
+            captured["command"] = command
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        mod.subprocess.run = _fake_run
+        mod._validate_xlsx_package = lambda _path: (True, "")
+        ok = mod._build_manual_merge_output_with_excel(
+            "source.xlsx",
+            "output.xlsx",
+            {},
+            row_ops=[{
+                "kind": "insert_rows",
+                "sheet": "S1",
+                "row": 2,
+                "count": 1,
+                "source_side": "B",
+                "source_rows": [2],
+            }],
+            source_paths={"B": "theirs.xlsx"},
+        )
+        assert ok
+        script = captured["command"][-1]
+        assert "PasteSpecial(-4104)" in script
+        assert "PasteSpecial(-4122)" not in script
+    finally:
+        mod.subprocess.run = original_run
+        mod._validate_xlsx_package = original_validate
+
+
+def _test_structural_replay_risk_detection():
+    root = make_temp_dir("sow_structural_risk_")
+    plain = os.path.join(root, "plain.xlsx")
+    risky = os.path.join(root, "risky.xlsx")
+
+    wb = Workbook()
+    wb.active["A1"] = "plain"
+    wb.save(plain)
+    wb.close()
+    assert not mod._xlsx_requires_native_structural_replay(plain)
+
+    wb = Workbook()
+    ws = wb.active
+    validation = DataValidation(type="list", formula1='"A,B"')
+    ws.add_data_validation(validation)
+    validation.add("A1:A3")
+    wb.save(risky)
+    wb.close()
+    assert mod._xlsx_requires_native_structural_replay(risky)
+
+
 def main():
     _test_only_diff_region_boundaries()
     _test_logical_region_extends_beyond_render_limit()
     _test_tail_identical_append_stays_paired()
     _test_shared_formula_is_not_destroyed()
+    _test_formula_and_value_comparison_is_conservative()
+    _test_ooxml_datetime_is_numeric()
     _test_formula_noop_filter()
+    _test_formula_only_tail_is_not_trimmed()
     _test_large_alignment_fast_and_exact()
     _test_stable_copy_waits_for_complete_zip()
     _test_background_recalc_policy_is_explicit()
     _test_large_only_diff_disk_worker_is_blocked_after_user_edits()
+    _test_three_way_formula_structure_is_compared_without_cache()
+    _test_formula_copy_translates_relative_references()
+    _test_same_formula_copy_only_records_changed_cache()
+    _test_excel_row_replay_uses_full_paste()
+    _test_structural_replay_risk_detection()
     print("SMOKE_REVIEW_REGRESSIONS_OK")
 
 

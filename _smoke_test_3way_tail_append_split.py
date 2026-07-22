@@ -32,9 +32,9 @@ def main():
     theirs = os.path.join(root_dir, "theirs.xlsx")
     merged = os.path.join(root_dir, "merged.xlsx")
 
-    base_rows = [["id", "name"], [1, "x"], [2, "y"]]
-    mine_rows = [["id", "name"], [1, "x"], [2, "y"], [3, "a"]]
-    theirs_rows = [["id", "name"], [1, "x"], [2, "y"], [4, "b"]]
+    base_rows = [["id", "name", "formula"], [1, "x", "=1"], [2, "y", "=1"]]
+    mine_rows = [["id", "name", "formula"], [1, "x", "=1"], [2, "y", "=1"], [3, "a", "=1"]]
+    theirs_rows = [["id", "name", "formula"], [1, "x", "=1"], [2, "y", "=1"], [4, "b", "=1"]]
 
     _make_book(base, base_rows)
     _make_book(mine, mine_rows)
@@ -67,13 +67,15 @@ def main():
         assert view.app.ws_a_val("S1").cell(row=5, column=2).value == "a"
 
         out = app.build_manual_merge_output_file()
-        wb_out = load_workbook(out, data_only=True)
+        wb_out = load_workbook(out, data_only=False)
         try:
             ws_out = wb_out["S1"]
             assert ws_out.cell(row=4, column=1).value == 4
             assert ws_out.cell(row=4, column=2).value == "b"
             assert ws_out.cell(row=5, column=1).value == 3
             assert ws_out.cell(row=5, column=2).value == "a"
+            assert ws_out.cell(row=4, column=3).value == "=1"
+            assert ws_out.cell(row=5, column=3).value == "=1"
         finally:
             wb_out.close()
     finally:

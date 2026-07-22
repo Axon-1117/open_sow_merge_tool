@@ -9,7 +9,9 @@ import subprocess
 import traceback
 import atexit
 import copy
-from datetime import datetime
+import gc
+import math
+from datetime import date, datetime, time as datetime_time, timedelta
 import time
 import stat
 import shutil
@@ -23,14 +25,16 @@ import json
 import threading
 
 from openpyxl import load_workbook as _openpyxl_load_workbook, Workbook
-from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+from openpyxl.formula.translate import Translator
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-21.update49"
-APP_BUILD_TAG = "new126-only-diff-async-stale-ui-fix"
+APP_VERSION = "2026-07-22.update50"
+APP_BUILD_TAG = "new127-row-formula-structural-merge-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -65,7 +69,7 @@ _LARGE_SHEET_ROW_THRESHOLD = 2000
 _LARGE_SHEET_INITIAL_ROWS = 200
 _LARGE_SHEET_BLOCK_ROWS = 1000
 _ROW_ALIGN_MAX_ROWS = 2000
-_ROW_ALIGN_SOFT_MAX_ROWS = 5000
+_ROW_ALIGN_SOFT_MAX_ROWS = 50000
 _TABMARK_QUICK_TAIL_ROWS = 2000
 # Fast tab-mark pre-scan can duplicate workbook open cost on huge files.
 # Skip it above this size and rely on the normal background compute path.
@@ -251,21 +255,26 @@ def _blank_worksheet(title: str = "Sheet"):
 
 def _row_sig_list_for_ws(ws, max_row_local: int, max_col: int):
     try:
-        all_rows = list(ws.iter_rows(
+        all_rows = ws.iter_rows(
             min_row=1,
             max_row=max_row_local,
             min_col=1,
             max_col=max_col,
             values_only=True,
-        ))
+        )
     except Exception:
-        all_rows = []
+        return []
     sigs = []
     for row in all_rows:
-        if row is None:
-            row = ()
-        sigs.append("\x1f".join(_merge_cmp_value(v) for v in row))
+        sigs.append(_row_signature(row or ()))
     return sigs
+
+
+def _row_signature(row_values) -> str:
+    return "\x1f".join(
+        _merge_cmp_value(value).replace("\x1f", "\x1e")
+        for value in (row_values or ())
+    )
 
 
 def _compute_row_pairs_from_signatures(sig_a: list[str], sig_b: list[str]):
@@ -321,9 +330,28 @@ def _compute_row_pairs_from_signatures(sig_a: list[str], sig_b: list[str]):
             block_len_a = ai2 - ai1
             block_len_b = bj2 - bj1
             common = min(block_len_a, block_len_b)
+            # Equal-length replacement blocks have exactly the same row pairing
+            # whether aligned from the head or tail. Avoid expensive per-row
+            # character SequenceMatcher calls (a major cost on formula-heavy
+            # workbooks such as WorldMonster.xlsx).
+            if block_len_a == block_len_b:
+                for k in range(common):
+                    pairs.append((ai1 + k + 1, bj1 + k + 1))
+                continue
             head_score = 0.0
             tail_score = 0.0
-            for k in range(common):
+            # For very large unequal replace blocks the choice is still only
+            # head-vs-tail. A bounded, evenly distributed sample preserves that
+            # decision without quadratic character matching across every row.
+            if common <= 128:
+                sample_offsets = range(common)
+            else:
+                sample_count = 64
+                sample_offsets = sorted({
+                    int(round(idx * (common - 1) / (sample_count - 1)))
+                    for idx in range(sample_count)
+                })
+            for k in sample_offsets:
                 head_score += _sim_score(sig_a[ai1 + k], sig_b[bj1 + k])
                 tail_score += _sim_score(sig_a[ai2 - common + k], sig_b[bj2 - common + k])
             use_tail = tail_score >= head_score
@@ -415,7 +443,7 @@ def _split_tail_independent_append_pairs(
     except Exception:
         return pairs
 
-    split_indices: set[int] = set()
+    candidate_rows: list[tuple[int, int, int]] = []
     for idx, (ra, rb) in enumerate(pairs):
         if ra is None or rb is None:
             continue
@@ -423,32 +451,38 @@ def _split_tail_independent_append_pairs(
             continue
         if int(ra) <= last_mine_mapped or int(rb) <= last_theirs_mapped:
             continue
-        # Identical independent appends are one logical row, not two competing
-        # blocks. Compare the real row content before splitting the aligned pair.
+        candidate_rows.append((idx, int(ra), int(rb)))
+
+    split_indices: set[int] = set()
+    if candidate_rows:
+        mine_rows = {}
+        theirs_rows = {}
         if ws_mine is not None and ws_theirs is not None and max_col:
-            try:
-                mine_row = next(
-                    ws_mine.iter_rows(
-                        min_row=int(ra), max_row=int(ra), min_col=1,
-                        max_col=int(max_col), values_only=True,
-                    ),
-                    (),
-                )
-                theirs_row = next(
-                    ws_theirs.iter_rows(
-                        min_row=int(rb), max_row=int(rb), min_col=1,
-                        max_col=int(max_col), values_only=True,
-                    ),
-                    (),
-                )
-                mine_sig = "\x1f".join(_merge_cmp_value(v) for v in (mine_row or ()))
-                theirs_sig = "\x1f".join(_merge_cmp_value(v) for v in (theirs_row or ()))
+            # A read_only worksheet may parse from the start of its XML stream for
+            # every high-row iter_rows() call. Read all candidate rows once per
+            # side so multiple tail appends stay linear rather than O(rows * XML).
+            mine_rows = _read_rows_into_cache(
+                ws_mine,
+                [ra for _idx, ra, _rb in candidate_rows],
+                int(max_col),
+                require_complete=True,
+            )
+            theirs_rows = _read_rows_into_cache(
+                ws_theirs,
+                [rb for _idx, _ra, rb in candidate_rows],
+                int(max_col),
+                require_complete=True,
+            )
+        for idx, ra, rb in candidate_rows:
+            # Identical independent appends are one logical row, not two
+            # competing blocks. If equality cannot be proven, retain the
+            # conservative split.
+            if mine_rows and theirs_rows:
+                mine_sig = _row_signature(_row_from_cache(mine_rows, ra, int(max_col)))
+                theirs_sig = _row_signature(_row_from_cache(theirs_rows, rb, int(max_col)))
                 if mine_sig == theirs_sig:
                     continue
-            except Exception:
-                # If equality cannot be proven, retain the conservative split.
-                pass
-        split_indices.add(idx)
+            split_indices.add(idx)
 
     if not split_indices:
         return pairs
@@ -506,8 +540,8 @@ def _split_low_similarity_tail_pairs(
         for ra, rb in zip(rows_a, rows_b):
             row_a = _row_from_cache(rows_a_cache, ra, max_col)
             row_b = _row_from_cache(rows_b_cache, rb, max_col)
-            sig_a = "\x1f".join(_merge_cmp_value(v) for v in row_a)
-            sig_b = "\x1f".join(_merge_cmp_value(v) for v in row_b)
+            sig_a = _row_signature(row_a)
+            sig_b = _row_signature(row_b)
             if sig_a == sig_b:
                 sim_cache[(ra, rb)] = 2.0
                 continue
@@ -694,11 +728,14 @@ def _build_pair_base_row_overrides(
 
 def _copy_sheet_basic(src_ws, dst_ws):
     """Copy enough worksheet structure for merge/save fallback paths."""
-    try:
-        for row in src_ws.iter_rows():
-            for src_cell in row:
+    for row in src_ws.iter_rows():
+        for src_cell in row:
+            try:
                 dst_cell = dst_ws.cell(row=src_cell.row, column=src_cell.column)
-                dst_cell.value = src_cell.value
+                src_value = src_cell.value
+                if src_cell.data_type == "s" and isinstance(src_value, str) and src_value.startswith("="):
+                    src_value = _LiteralText(src_value)
+                _assign_edit_cell_value(dst_cell, src_value)
                 if src_cell.has_style:
                     dst_cell._style = copy.copy(src_cell._style)
                 if src_cell.number_format:
@@ -713,8 +750,14 @@ def _copy_sheet_basic(src_ws, dst_ws):
                     dst_cell.alignment = copy.copy(src_cell.alignment)
                 if src_cell.protection:
                     dst_cell.protection = copy.copy(src_cell.protection)
-    except Exception:
-        pass
+                if src_cell.comment is not None:
+                    dst_cell.comment = copy.copy(src_cell.comment)
+                if src_cell.hyperlink is not None:
+                    dst_cell._hyperlink = copy.copy(src_cell.hyperlink)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"复制 Sheet 单元格失败：{src_ws.title}!{src_cell.coordinate}: {exc}"
+                ) from exc
     try:
         for key, dim in src_ws.row_dimensions.items():
             dst_ws.row_dimensions[key] = copy.copy(dim)
@@ -776,6 +819,31 @@ def _create_sheet_from_source(dst_wb, src_ws, title: str, index: int | None = No
     return dst_ws
 
 
+def _copy_row_metadata(src_ws, dst_ws, src_row: int, dst_row: int, max_col: int):
+    """Copy row/cell presentation metadata without changing cell values."""
+    if src_ws is None or dst_ws is None:
+        return
+    src_row = int(src_row)
+    dst_row = int(dst_row)
+    for col in range(1, max(1, int(max_col)) + 1):
+        src_cell = src_ws.cell(row=src_row, column=col)
+        dst_cell = dst_ws.cell(row=dst_row, column=col)
+        if src_cell.has_style:
+            dst_cell._style = copy.copy(src_cell._style)
+        if src_cell.comment is not None:
+            dst_cell.comment = copy.copy(src_cell.comment)
+        if src_cell.hyperlink is not None:
+            dst_cell._hyperlink = copy.copy(src_cell.hyperlink)
+    src_dim = src_ws.row_dimensions.get(src_row)
+    if src_dim is not None:
+        dst_dim = copy.copy(src_dim)
+        try:
+            dst_dim.index = dst_row
+        except Exception:
+            pass
+        dst_ws.row_dimensions[dst_row] = dst_dim
+
+
 def _val_to_str(v):
     """Render a cell value as single-line text for the Text widget.
 
@@ -802,21 +870,17 @@ def _format_cell(val_str: str, width: int) -> str:
 def _should_auto_row_align(max_row_a: int, max_row_b: int, force: bool = False) -> bool:
     """Auto-enable row alignment when it prevents cascading false diffs.
 
-    For very large sheets we still avoid full SequenceMatcher by default, but if the
-    two sides have different total row counts we allow a higher soft limit. That
-    covers inserted/deleted row blocks without forcing row alignment on every large
-    sheet open.
+    Row counts can remain equal when one side inserts a row and deletes another, so
+    count equality is not evidence that raw row-number comparison is safe. Align all
+    sheets under the soft limit and leave larger sheets to their dedicated block/tail
+    paths.
     """
     max_row = max(max_row_a, max_row_b)
     if max_row <= 0:
         return False
     if force:
         return True
-    if max_row < _ROW_ALIGN_MAX_ROWS:
-        return True
-    if max_row > _ROW_ALIGN_SOFT_MAX_ROWS:
-        return False
-    return max_row_a != max_row_b
+    return max_row <= _ROW_ALIGN_SOFT_MAX_ROWS
 
 
 def _effective_bounds(ws):
@@ -865,7 +929,19 @@ def _effective_bounds(ws):
             return max(1, last_r), max(1, max_c)
         if last_c <= 1 and max_c > last_c:
             return max(1, last_r), max(1, max_c)
-        return max(1, last_r), max(1, last_c)
+    return max(1, last_r), max(1, last_c)
+
+
+def _effective_bounds_with_edit(ws_val, ws_edit=None):
+    """Include formula/literal cells whose data-only cache is empty."""
+    val_row, val_col = _effective_bounds(ws_val)
+    if ws_edit is None or ws_edit is ws_val:
+        return val_row, val_col
+    try:
+        edit_row, edit_col = _effective_bounds(ws_edit)
+        return max(val_row, edit_row), max(val_col, edit_col)
+    except Exception:
+        return val_row, val_col
     return max(1, last_r), max(1, max_c)
 
 
@@ -1049,17 +1125,51 @@ def _cell_display_and_equal(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int, c:
 def _cell_display_and_equal_from_values(va_val, vb_val, va_edit=None, vb_edit=None):
     """Compare already-fetched cell values while preserving the existing fallback rules."""
     if _USE_CACHED_VALUES_ONLY:
+        def _formula_identity(v_val, v_edit):
+            if isinstance(v_edit, str) and v_edit.startswith("=") and v_val == v_edit:
+                return None
+            special = _special_formula_signature(v_edit)
+            if special is not None:
+                return ("SPECIAL", special)
+            formula = _norm_formula_text(v_edit)
+            return ("TEXT", formula) if formula else None
+
         # If cache missing but edit has a literal value, use it for display/compare.
-        if va_val is None and va_edit is not None and not _formula_text(va_edit):
+        identity_a = _formula_identity(va_val, va_edit)
+        identity_b = _formula_identity(vb_val, vb_edit)
+        if va_val is None and va_edit is not None and identity_a is None:
             va_val = va_edit
-        if vb_val is None and vb_edit is not None and not _formula_text(vb_edit):
+        if vb_val is None and vb_edit is not None and identity_b is None:
             vb_val = vb_edit
+
+        formula_a = _formula_text(va_edit) if identity_a is not None else None
+        formula_b = _formula_text(vb_edit) if identity_b is not None else None
+
+        # Formula structure is part of the cell value. Equal cached results do
+        # not make different formulas (or formula-vs-literal) equivalent.
+        if identity_a != identity_b and (identity_a is not None or identity_b is not None):
+            display_a = va_val if va_val is not None else formula_a
+            display_b = vb_val if vb_val is not None else formula_b
+            return display_a, display_b, False
+
+        # If both caches are missing, formula structure is the only available
+        # evidence. Never collapse different formulas (or formula-vs-blank) into
+        # an apparently equal pair of None values.
+        if va_val is None and vb_val is None and (formula_a or formula_b):
+            if identity_a is not None and identity_a == identity_b:
+                return formula_a, formula_b, True
+            return formula_a, formula_b, False
 
         # If cache missing on one side but both formulas are the same, treat as equal
         # and display the available value.
-        if (va_val is None) != (vb_val is None) and _same_formula(va_edit, vb_edit):
+        if (va_val is None) != (vb_val is None) and identity_a is not None and identity_a == identity_b:
             v = va_val if va_val is not None else vb_val
             return v, v, True
+
+        if va_val is None and formula_a:
+            va_val = formula_a
+        if vb_val is None and formula_b:
+            vb_val = formula_b
 
         eq = (_merge_cmp_value(va_val) == _merge_cmp_value(vb_val))
         return va_val, vb_val, eq
@@ -1075,7 +1185,14 @@ def _pad_row_values(row_vals, max_col: int):
     return row + (None,) * (max_col - len(row))
 
 
-def _read_rows_into_cache(ws, row_indices, max_col: int):
+def _read_rows_into_cache(
+    ws,
+    row_indices,
+    max_col: int,
+    *,
+    require_complete: bool = False,
+    cancel_check=None,
+):
     """Read a set of rows via one contiguous iter_rows pass."""
     rows = {}
     try:
@@ -1099,11 +1216,18 @@ def _read_rows_into_cache(ws, row_indices, max_col: int):
             ),
             start=min_r,
         ):
+            if cancel_check is not None and (idx & 127) == 0:
+                cancel_check()
             if idx in needed_set:
                 rows[idx] = _pad_row_values(row, max_col)
+    except InterruptedError:
+        raise
     except Exception:
-        pass
+        if require_complete:
+            return {}
 
+    if require_complete and any(r not in rows for r in needed):
+        return {}
     for r in needed:
         rows.setdefault(r, (None,) * max_col)
     return rows
@@ -1120,10 +1244,18 @@ def _cell_display_and_equal_by_row(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra:
     vb_val = ws_b_val.cell(row=rb, column=c).value if rb is not None else None
     va_edit = ws_a_edit.cell(row=ra, column=c).value if (ra is not None and ws_a_edit is not None) else None
     vb_edit = ws_b_edit.cell(row=rb, column=c).value if (rb is not None and ws_b_edit is not None) else None
+    if ra is not None and rb is not None and ra != rb:
+        vb_edit = _translate_normal_formula_for_compare(vb_val, vb_edit, rb, c, ra, c)
     return _cell_display_and_equal_from_values(va_val, vb_val, va_edit, vb_edit)
 
 
+class _LiteralText(str):
+    """String beginning with '=' that must remain text, not become a formula."""
+
+
 def _formula_text(v):
+    if isinstance(v, _LiteralText):
+        return None
     if isinstance(v, str) and v.startswith("="):
         return v
     if isinstance(v, ArrayFormula):
@@ -1134,6 +1266,36 @@ def _formula_text(v):
     return None
 
 
+def _special_formula_signature(value):
+    """Return structural identity for formulas that cannot be copied as a cell string."""
+    if isinstance(value, ArrayFormula):
+        return (
+            "array",
+            str(getattr(value, "ref", "") or ""),
+            _norm_formula_text(getattr(value, "text", None)),
+        )
+    if isinstance(value, DataTableFormula):
+        try:
+            attrs = tuple(sorted((str(key), str(val)) for key, val in value))
+        except Exception:
+            attrs = tuple(sorted((str(key), repr(val)) for key, val in vars(value).items()))
+        return ("dataTable", attrs)
+    return None
+
+
+def _ensure_formula_copy_supported(src_edit, dst_edit=None):
+    """Reject copying a special multi-cell formula unless the target already owns it."""
+    src_sig = _special_formula_signature(src_edit)
+    if src_sig is None:
+        return
+    if src_sig == _special_formula_signature(dst_edit):
+        return
+    raise RuntimeError(
+        "检测到数组公式或数据表公式。该公式跨越多个单元格，不能按单元格/行直接覆盖；"
+        "请改为合并其依赖数据，或在 Excel 中整体处理该公式区域。"
+    )
+
+
 def _norm_formula_text(v):
     f = _formula_text(v)
     if not f:
@@ -1141,12 +1303,32 @@ def _norm_formula_text(v):
     s = str(f).strip()
     if s.startswith("="):
         s = s[1:]
-    # normalize cosmetic differences
-    s = re.sub(r"\s+", "", s).upper()
-    return s
+    # Excel identifiers/functions are case-insensitive, but string literals and
+    # spaces are semantically significant (a space can be the intersection
+    # operator). Normalize case only outside double-quoted string literals.
+    out = []
+    in_string = False
+    idx = 0
+    while idx < len(s):
+        ch = s[idx]
+        if ch == '"':
+            out.append(ch)
+            if in_string and idx + 1 < len(s) and s[idx + 1] == '"':
+                out.append('"')
+                idx += 2
+                continue
+            in_string = not in_string
+        else:
+            out.append(ch if in_string else ch.upper())
+        idx += 1
+    return "".join(out)
 
 
 def _same_formula(a, b):
+    special_a = _special_formula_signature(a)
+    special_b = _special_formula_signature(b)
+    if special_a is not None or special_b is not None:
+        return special_a is not None and special_a == special_b
     na = _norm_formula_text(a)
     nb = _norm_formula_text(b)
     return bool(na and nb and na == nb)
@@ -1154,10 +1336,162 @@ def _same_formula(a, b):
 
 def _choose_edit_value(v_val, v_edit):
     """Preserve formula semantics on overwrite, even in cached-value mode."""
+    _ensure_formula_copy_supported(v_edit, None)
+    if (
+        isinstance(v_edit, str)
+        and v_edit.startswith("=")
+        and v_val == v_edit
+    ):
+        # A true formula's data-only value is its cached result (or None), never
+        # the formula text itself. Matching edit/data-only values therefore mean
+        # the source cell is literal text whose first character happens to be '='.
+        return _LiteralText(v_edit)
     f = _formula_text(v_edit)
     if f:
         return f
     return v_val if _USE_CACHED_VALUES_ONLY else v_edit
+
+
+def _assign_edit_cell_value(cell, value):
+    """Assign an edit-workbook value without turning literal '=...' text into a formula."""
+    if isinstance(value, _LiteralText):
+        cell.value = str(value)
+        cell.data_type = "s"
+        return
+    cell.value = value
+
+
+def _translate_normal_formula_for_compare(
+    v_val,
+    v_edit,
+    src_row: int,
+    src_col: int,
+    dst_row: int,
+    dst_col: int,
+):
+    """Translate a normal formula to a common coordinate for aligned comparison."""
+    if (
+        isinstance(v_edit, str)
+        and v_edit.startswith("=")
+        and v_val == v_edit
+    ):
+        return v_edit
+    if _special_formula_signature(v_edit) is not None:
+        return v_edit
+    formula = _formula_text(v_edit)
+    if not formula or (int(src_row), int(src_col)) == (int(dst_row), int(dst_col)):
+        return v_edit
+    try:
+        origin = f"{get_column_letter(int(src_col))}{int(src_row)}"
+        target = f"{get_column_letter(int(dst_col))}{int(dst_row)}"
+        return Translator(formula, origin=origin).translate_formula(target)
+    except Exception:
+        # If translation cannot be proven, retain the original formula so the
+        # comparator reports a conservative difference instead of hiding one.
+        return v_edit
+
+
+def _formula_edit_value_map(ws_edit) -> dict[tuple[int, int], object]:
+    """Index only formula cells from a normal worksheet for hot 3-way scans."""
+    result = {}
+    if ws_edit is None:
+        return result
+    try:
+        cells = getattr(ws_edit, "_cells", None)
+        if cells is not None:
+            for (row_idx, col_idx), cell in cells.items():
+                value = cell.value
+                if getattr(cell, "data_type", None) == "f" or _special_formula_signature(value) is not None:
+                    result[(int(row_idx), int(col_idx))] = value
+            return result
+    except Exception:
+        result = {}
+    try:
+        for row in ws_edit.iter_rows(values_only=False):
+            for cell in row:
+                value = cell.value
+                if getattr(cell, "data_type", None) == "f" or _special_formula_signature(value) is not None:
+                    result[(int(cell.row), int(cell.column))] = value
+    except Exception:
+        pass
+    return result
+
+
+class _FormulaIdentityKey:
+    __slots__ = ("kind", "value")
+
+    def __init__(self, kind: str, value):
+        self.kind = kind
+        self.value = value
+
+    def __eq__(self, other):
+        if not isinstance(other, _FormulaIdentityKey) or self.kind != other.kind:
+            return False
+        if self.value == other.value:
+            return True
+        if self.kind == "TEXT":
+            return _same_formula(self.value, other.value)
+        return False
+
+
+def _merge_cell_compare_key(v_val, v_edit):
+    """Type- and formula-aware key for 3-way change/conflict classification."""
+    literal_equals = (
+        isinstance(v_edit, str)
+        and v_edit.startswith("=")
+        and v_val == v_edit
+    )
+    special = _special_formula_signature(v_edit)
+    formula = None if literal_equals else _formula_text(v_edit)
+    if special is not None:
+        return ("FORMULA", _FormulaIdentityKey("SPECIAL", special), _merge_cmp_value(v_val))
+    if formula:
+        return ("FORMULA", _FormulaIdentityKey("TEXT", formula), _merge_cmp_value(v_val))
+    effective = v_val
+    if effective is None and v_edit is not None:
+        effective = v_edit
+    return ("VALUE", _merge_cmp_value(effective))
+
+
+def _copy_edit_value_for_destination(
+    v_val,
+    v_edit,
+    dst_edit,
+    *,
+    src_row: int,
+    src_col: int,
+    dst_row: int,
+    dst_col: int,
+):
+    """Choose an edit value and translate normal formulas like Excel copy/paste."""
+    src_row = int(src_row)
+    src_col = int(src_col)
+    dst_row = int(dst_row)
+    dst_col = int(dst_col)
+    special = _special_formula_signature(v_edit)
+    if special is not None:
+        if (src_row, src_col) != (dst_row, dst_col):
+            raise RuntimeError(
+                "数组公式或数据表公式不能安全移动到不同坐标；"
+                "请在 Excel 中处理该公式区域。"
+            )
+        _ensure_formula_copy_supported(v_edit, dst_edit)
+        return v_edit
+
+    chosen = _choose_edit_value(v_val, v_edit)
+    formula = _formula_text(chosen)
+    if not formula or (src_row, src_col) == (dst_row, dst_col):
+        return chosen
+    try:
+        origin = f"{get_column_letter(src_col)}{src_row}"
+        target = f"{get_column_letter(dst_col)}{dst_row}"
+        return Translator(formula, origin=origin).translate_formula(target)
+    except Exception as exc:
+        raise RuntimeError(
+            f"无法安全平移公式 {formula!r}："
+            f"{get_column_letter(src_col)}{src_row} -> "
+            f"{get_column_letter(dst_col)}{dst_row}"
+        ) from exc
 
 
 def _is_same_formula_copy_noop(src_edit, dst_edit) -> bool:
@@ -1196,6 +1530,41 @@ def _extract_ns_map(xml_bytes: bytes) -> dict:
 
 
 _MISSING_VALUE = object()
+_EXCEL_ERROR_VALUES = {
+    "#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A",
+    "#GETTING_DATA", "#SPILL!", "#CALC!", "#CONNECT!", "#BLOCKED!",
+    "#UNKNOWN!", "#FIELD!",
+}
+
+
+def _excel_cached_value_payload(value, excel_epoch=CALENDAR_WINDOWS_1900):
+    """Return (cell_type, text) for an OOXML cached/scalar value."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return "b", "1" if value else "0"
+    if isinstance(value, (datetime, date, datetime_time, timedelta)):
+        return None, str(to_excel(value, epoch=excel_epoch))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RuntimeError(f"Excel cell cannot store non-finite numeric value: {value!r}")
+        return None, str(value)
+    text = str(value)
+    return ("e" if text.upper() in _EXCEL_ERROR_VALUES else "str"), text
+
+
+def _set_formula_cached_value(target_cell, q, cached_value, excel_epoch):
+    for child in list(target_cell):
+        if child.tag == q("v"):
+            target_cell.remove(child)
+    target_cell.attrib.pop("t", None)
+    cell_type, cache_text = _excel_cached_value_payload(cached_value, excel_epoch)
+    if cache_text is None:
+        return
+    if cell_type:
+        target_cell.attrib["t"] = cell_type
+    v = ET.SubElement(target_cell, q("v"))
+    v.text = cache_text
 
 
 def _sheet_xml_set_cell(
@@ -1205,6 +1574,7 @@ def _sheet_xml_set_cell(
     value,
     cached_value=_MISSING_VALUE,
     preserve_existing_formula: bool = False,
+    excel_epoch=CALENDAR_WINDOWS_1900,
 ):
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     q = lambda t: f"{{{ns}}}{t}"
@@ -1259,21 +1629,7 @@ def _sheet_xml_set_cell(
             raise RuntimeError(f"Cache-only update target is not a formula cell: {cell_ref}")
         if cached_value is _MISSING_VALUE:
             raise RuntimeError(f"Cache-only update has no cached value: {cell_ref}")
-        for child in list(target_cell):
-            if child.tag == q("v"):
-                target_cell.remove(child)
-        target_cell.attrib.pop("t", None)
-        if cached_value is not None:
-            if isinstance(cached_value, bool):
-                target_cell.attrib["t"] = "b"
-                cache_text = "1" if cached_value else "0"
-            elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
-                cache_text = str(cached_value)
-            else:
-                cache_text = str(cached_value)
-                target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
-            v = ET.SubElement(target_cell, q("v"))
-            v.text = cache_text
+        _set_formula_cached_value(target_cell, q, cached_value, excel_epoch)
         return
 
     formula = _formula_text(value)
@@ -1284,25 +1640,11 @@ def _sheet_xml_set_cell(
             # Preserve shared/array formula metadata while allowing an explicit
             # cached-result adoption for workbooks that use manual calculation.
             if cached_value is not _MISSING_VALUE:
-                for child in list(target_cell):
-                    if child.tag == q("v"):
-                        target_cell.remove(child)
-                target_cell.attrib.pop("t", None)
-                if cached_value is not None:
-                    if isinstance(cached_value, bool):
-                        target_cell.attrib["t"] = "b"
-                        cache_text = "1" if cached_value else "0"
-                    elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
-                        cache_text = str(cached_value)
-                    else:
-                        cache_text = str(cached_value)
-                        target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
-                    v = ET.SubElement(target_cell, q("v"))
-                    v.text = cache_text
+                _set_formula_cached_value(target_cell, q, cached_value, excel_epoch)
             return
-        if existing_formula.attrib.get("t") == "shared":
+        if existing_formula.attrib.get("t") in ("shared", "array", "dataTable"):
             raise RuntimeError(
-                f"ZIP fallback cannot safely replace shared formula cell {cell_ref}; "
+                f"ZIP fallback cannot safely replace special formula cell {cell_ref}; "
                 "Excel native save is required"
             )
 
@@ -1314,17 +1656,8 @@ def _sheet_xml_set_cell(
         target_cell.attrib.pop("t", None)
         f = ET.SubElement(target_cell, q("f"))
         f.text = formula[1:] if str(formula).startswith("=") else str(formula)
-        if cached_value is not _MISSING_VALUE and cached_value is not None:
-            if isinstance(cached_value, bool):
-                target_cell.attrib["t"] = "b"
-                cache_text = "1" if cached_value else "0"
-            elif isinstance(cached_value, (int, float)) and not isinstance(cached_value, bool):
-                cache_text = str(cached_value)
-            else:
-                cache_text = str(cached_value)
-                target_cell.attrib["t"] = "e" if cache_text.startswith("#") else "str"
-            v = ET.SubElement(target_cell, q("v"))
-            v.text = cache_text
+        if cached_value is not _MISSING_VALUE:
+            _set_formula_cached_value(target_cell, q, cached_value, excel_epoch)
         return
 
     if value is None:
@@ -1338,9 +1671,17 @@ def _sheet_xml_set_cell(
         return
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RuntimeError(f"Excel cell cannot store non-finite numeric value: {value!r}")
         target_cell.attrib.pop("t", None)
         v = ET.SubElement(target_cell, q("v"))
         v.text = str(value)
+        return
+
+    if isinstance(value, (datetime, date, datetime_time, timedelta)):
+        target_cell.attrib.pop("t", None)
+        v = ET.SubElement(target_cell, q("v"))
+        v.text = str(to_excel(value, epoch=excel_epoch))
         return
 
     # Keep text independent from sharedStrings to avoid global reindex churn.
@@ -1378,6 +1719,13 @@ def _filter_noop_manual_ops(src_xlsx: str, manual_ops: dict) -> dict:
         _wbs_close(wb)
 
 
+def _prepare_manual_ops_for_save(src_xlsx: str, manual_ops: dict, row_ops=None, sheet_ops=None) -> dict:
+    """Filter cell no-ops only when coordinates still match the source snapshot."""
+    if row_ops or sheet_ops:
+        return dict(manual_ops or {})
+    return _filter_noop_manual_ops(src_xlsx, manual_ops or {})
+
+
 def _xlsx_contains_formulas(path: str) -> bool:
     try:
         with zipfile.ZipFile(path, "r") as zf:
@@ -1388,6 +1736,71 @@ def _xlsx_contains_formulas(path: str) -> bool:
     except Exception:
         return True
     return False
+
+
+def _xlsx_requires_native_structural_replay(path: str) -> bool:
+    """Return True when openpyxl row/sheet replay cannot prove package fidelity."""
+    if _xlsx_contains_formulas(path):
+        return True
+    risky_prefixes = (
+        "xl/drawings/", "xl/charts/", "xl/tables/", "xl/pivot",
+        "xl/comments", "xl/threadedComments/", "xl/externalLinks/",
+        "xl/ctrlProps/", "xl/embeddings/", "xl/activeX/", "xl/slicers/",
+        "xl/timelines/", "xl/vbaProject.bin", "xl/macrosheets/",
+        "xl/dialogsheets/",
+    )
+    risky_sheet_tags = re.compile(
+        rb"<(?:[A-Za-z_][\w.-]*:)?(?:dataValidations?|conditionalFormatting|mergeCells|hyperlinks)(?:\s|>)"
+    )
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = zf.namelist()
+            if any(name.startswith(risky_prefixes) for name in names):
+                return True
+            for name in names:
+                if name.startswith("xl/worksheets/") and name.endswith(".xml"):
+                    if risky_sheet_tags.search(zf.read(name)):
+                        return True
+        return False
+    except Exception:
+        # Structural replay is destructive; unreadable package metadata must fail closed.
+        return True
+
+
+def _replay_formula_source_paths(
+    src_xlsx: str,
+    row_ops=None,
+    sheet_ops=None,
+    source_paths: dict[str, str] | None = None,
+) -> list[str]:
+    """Return workbook paths whose formulas can enter a row/sheet replay."""
+    source_paths = source_paths or {}
+    sides = {"A"}
+    for op in list(row_ops or []) + list(sheet_ops or []):
+        side = str(op.get("source_side") or "").upper()
+        if side:
+            sides.add(side)
+    paths = [src_xlsx]
+    if "A" in sides and source_paths.get("A"):
+        paths.append(source_paths["A"])
+    if sides & {"B", "THEIRS"}:
+        path_b = source_paths.get("B") or source_paths.get("THEIRS")
+        if path_b:
+            paths.append(path_b)
+    if "BASE" in sides and source_paths.get("BASE"):
+        paths.append(source_paths["BASE"])
+    unique = []
+    seen = set()
+    for path in paths:
+        try:
+            key = os.path.normcase(os.path.abspath(path))
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def _validate_xlsx_package(path: str) -> tuple[bool, str]:
@@ -1449,6 +1862,11 @@ def _build_manual_merge_xlsx_via_zip(
     doc_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
     wb_root = ET.fromstring(files[wb_name])
+    wb_pr = wb_root.find(f"{{{wb_ns}}}workbookPr")
+    date1904 = False
+    if wb_pr is not None:
+        date1904 = str(wb_pr.attrib.get("date1904", "0")).strip().lower() in ("1", "true")
+    excel_epoch = CALENDAR_MAC_1904 if date1904 else CALENDAR_WINDOWS_1900
     rel_root = ET.fromstring(files[rels_name])
     rid_to_target = {}
     for rel in rel_root.findall(f"{{{rel_ns}}}Relationship"):
@@ -1504,6 +1922,7 @@ def _build_manual_merge_xlsx_via_zip(
                 v,
                 cached,
                 preserve_existing_formula=cache_only,
+                excel_epoch=excel_epoch,
             )
         xml_bytes = ET.tostring(ws_root, encoding="utf-8", xml_declaration=True)
         xml_bytes = re.sub(
@@ -1580,6 +1999,46 @@ def _build_manual_merge_xlsx_via_zip(
         raise RuntimeError(f"unsafe XLSX output rejected: {reason}")
 
 
+def _excel_com_cell_op(sheet: str, row: int, col: int, value) -> dict:
+    """Return a JSON-safe, type-preserving Excel COM cell operation."""
+    formula = _formula_text(value)
+    if formula:
+        return {"sheet": sheet, "r": int(row), "c": int(col), "formula": formula}
+    if isinstance(value, datetime):
+        return {
+            "sheet": sheet,
+            "r": int(row),
+            "c": int(col),
+            "value": float(to_excel(value, epoch=CALENDAR_WINDOWS_1900)),
+            "value_kind": "datetime_serial",
+        }
+    if isinstance(value, date):
+        return {
+            "sheet": sheet,
+            "r": int(row),
+            "c": int(col),
+            "value": float(to_excel(value, epoch=CALENDAR_WINDOWS_1900)),
+            "value_kind": "datetime_serial",
+        }
+    if isinstance(value, datetime_time):
+        seconds = (
+            value.hour * 3600
+            + value.minute * 60
+            + value.second
+            + value.microsecond / 1_000_000.0
+        )
+        value = seconds / 86400.0
+    elif isinstance(value, timedelta):
+        value = value.total_seconds() / 86400.0
+    return {
+        "sheet": sheet,
+        "r": int(row),
+        "c": int(col),
+        "value": str(value) if isinstance(value, _LiteralText) else value,
+        "value_kind": "text" if isinstance(value, str) else "typed",
+    }
+
+
 def _build_manual_merge_output_with_excel(
     src_xlsx: str,
     out_xlsx: str,
@@ -1599,26 +2058,22 @@ def _build_manual_merge_output_with_excel(
     sheet_ops = list(sheet_ops or [])
     ops = []
     for (sheet, r, c), v in manual_ops.items():
-        fv = _formula_text(v)
-        if fv:
-            ops.append({"sheet": sheet, "r": int(r), "c": int(c), "formula": fv})
-        else:
-            ops.append({
-                "sheet": sheet,
-                "r": int(r),
-                "c": int(c),
-                "value": v,
-                "value_kind": "text" if isinstance(v, str) else "typed",
-            })
+        ops.append(_excel_com_cell_op(sheet, r, c, v))
     try:
         ops_json = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merge_ops_{os.getpid()}_{int(time.time())}.json")
         with open(ops_json, "w", encoding="utf-8") as f:
-            json.dump({"row_ops": row_ops, "cell_ops": ops, "sheet_ops": sheet_ops}, f, ensure_ascii=False)
+            json.dump(
+                {"row_ops": row_ops, "cell_ops": ops, "sheet_ops": sheet_ops},
+                f,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
     except Exception as e:
         _dlog(f"excel native save: write ops json failed: {e}")
         return False
     try:
         source_paths = source_paths or {}
+        mine_src = str(source_paths.get("A") or "").replace("'", "''")
         base_src = str(source_paths.get("BASE") or "").replace("'", "''")
         theirs_src = str(source_paths.get("B") or source_paths.get("THEIRS") or "").replace("'", "''")
         ps = (
@@ -1630,17 +2085,22 @@ def _build_manual_merge_output_with_excel(
             "$src='" + src_xlsx.replace("'", "''") + "';"
             "$out='" + out_xlsx.replace("'", "''") + "';"
             "$opsPath='" + ops_json.replace("'", "''") + "';"
+            "$mineSrc='" + mine_src + "';"
             "$baseSrc='" + base_src + "';"
             "$theirsSrc='" + theirs_src + "';"
             "$payload=Get-Content -Raw -LiteralPath $opsPath | ConvertFrom-Json;"
+            "$xl=$null;$wb=$null;$wbMine=$null;$wbBase=$null;$wbTheirs=$null;"
+            "try{"
             "$xl=New-Object -ComObject Excel.Application;"
             "$xl.Visible=$false;"
             "$xl.DisplayAlerts=$false;"
             "$xl.AskToUpdateLinks=$false;"
             "$xl.EnableEvents=$false;"
+            "try{$xl.Calculation=-4135}catch{};"
+            "try{$xl.CalculateBeforeSave=$false}catch{};"
             "$wb=$xl.Workbooks.Open($src,0,$false);"
-            "$wbBase=$null;"
-            "$wbTheirs=$null;"
+            "try{$xl.Calculation=-4135}catch{};"
+            "if($mineSrc){$wbMine=$xl.Workbooks.Open($mineSrc,0,$true)};"
             "if($baseSrc){$wbBase=$xl.Workbooks.Open($baseSrc,0,$true)};"
             "if($theirsSrc){$wbTheirs=$xl.Workbooks.Open($theirsSrc,0,$true)};"
             "foreach($op in @($payload.sheet_ops)){"
@@ -1655,6 +2115,7 @@ def _build_manual_merge_output_with_excel(
             "    $srcWs=$null;"
             "    if($op.source_side -eq 'BASE' -and $wbBase -ne $null){$srcWs=$wbBase.Worksheets.Item($op.sheet)}"
             "    elseif(($op.source_side -eq 'B' -or $op.source_side -eq 'THEIRS') -and $wbTheirs -ne $null){$srcWs=$wbTheirs.Worksheets.Item($op.sheet)}"
+            "    elseif($op.source_side -eq 'A' -and $wbMine -ne $null){$srcWs=$wbMine.Worksheets.Item($op.sheet)}"
             "    elseif($op.source_side -eq 'A'){$srcWs=$wb.Worksheets.Item($op.sheet)};"
             "    if($srcWs -eq $null){continue};"
             "    try{$wb.Worksheets.Item($op.sheet).Delete()}catch{};"
@@ -1669,6 +2130,24 @@ def _build_manual_merge_output_with_excel(
             "  $ws=$wb.Worksheets.Item($op.sheet);"
             "  if($op.kind -eq 'insert_rows'){"
             "    for($i=0;$i -lt [int]$op.count;$i++){[void]$ws.Rows.Item([int]$op.row).Insert()}"
+            "    $srcWs=$null;"
+            "    if(($op.source_side -eq 'B' -or $op.source_side -eq 'THEIRS') -and $wbTheirs -ne $null){$srcWs=$wbTheirs.Worksheets.Item($op.sheet)}"
+            "    elseif($op.source_side -eq 'BASE' -and $wbBase -ne $null){$srcWs=$wbBase.Worksheets.Item($op.sheet)};"
+            "    if($op.source_side -eq 'A' -and $wbMine -ne $null){$srcWs=$wbMine.Worksheets.Item($op.sheet)};"
+            "    $srcRows=@($op.source_rows);"
+            "    if($srcWs -ne $null -and $srcRows.Count -gt 0){"
+            "      $lastCol=[Math]::Max(1,[int]($srcWs.UsedRange.Column+$srcWs.UsedRange.Columns.Count-1));"
+            "      for($i=0;$i -lt $srcRows.Count;$i++){"
+            "        $srcRow=[int]$srcRows[$i];$dstRow=[int]$op.row+$i;"
+            "        $srcRange=$srcWs.Range($srcWs.Cells.Item($srcRow,1),$srcWs.Cells.Item($srcRow,$lastCol));"
+            "        $dstRange=$ws.Range($ws.Cells.Item($dstRow,1),$ws.Cells.Item($dstRow,$lastCol));"
+            # xlPasteAll preserves comments, hyperlinks, validation and cell
+            # metadata. Explicit cell_ops run afterwards and remain the source
+            # of truth for translated formulas and cached-value decisions.
+            "        [void]$srcRange.Copy();[void]$dstRange.PasteSpecial(-4104);"
+            "        try{$ws.Rows.Item($dstRow).RowHeight=$srcWs.Rows.Item($srcRow).RowHeight}catch{}"
+            "      }"
+            "    }"
             "  }"
             "};"
             "foreach($op in @($payload.cell_ops)){"
@@ -1676,18 +2155,26 @@ def _build_manual_merge_output_with_excel(
             "  $ws=$wb.Worksheets.Item($op.sheet);"
             "  $cell=$ws.Cells.Item([int]$op.r,[int]$op.c);"
             "  if($null -ne $op.formula){$cell.Formula=$op.formula}"
-            "  elseif($op.value_kind -eq 'text'){$cell.NumberFormat='@';$cell.Value2=[string]$op.value}"
+            "  elseif($op.value_kind -eq 'datetime_serial'){"
+            "    $serial=[double]$op.value;if($wb.Date1904){$serial-=1462};$cell.Value2=$serial"
+            "  }"
+            "  elseif($op.value_kind -eq 'text'){"
+            "    if($cell.NumberFormat -eq 'General'){$cell.NumberFormat='@'};"
+            "    $textValue=[string]$op.value;"
+            "    $cell.Value=$textValue"
+            "  }"
             "  else{$cell.Value2=$op.value}"
             "};"
             "$wb.SaveCopyAs($out);"
-            "$wb.Close($false);"
-            "if($wbBase -ne $null){$wbBase.Close($false)};"
-            "if($wbTheirs -ne $null){$wbTheirs.Close($false)};"
-            "$xl.Quit();"
-            "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null;"
-            "if($wbBase -ne $null){[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wbBase) | Out-Null};"
-            "if($wbTheirs -ne $null){[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wbTheirs) | Out-Null};"
-            "[System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null;"
+            "}finally{"
+            "  $cell=$null;$ws=$null;$srcRange=$null;$dstRange=$null;$srcWs=$null;$newWs=$null;$after=$null;"
+            "  if($wbTheirs -ne $null){try{$wbTheirs.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbTheirs)}catch{}};"
+            "  if($wbBase -ne $null){try{$wbBase.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbBase)}catch{}};"
+            "  if($wbMine -ne $null){try{$wbMine.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbMine)}catch{}};"
+            "  if($wb -ne $null){try{$wb.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb)}catch{}};"
+            "  if($xl -ne $null){try{$xl.Quit()}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($xl)}catch{}};"
+            "  [GC]::Collect();[GC]::WaitForPendingFinalizers();[GC]::Collect();[GC]::WaitForPendingFinalizers();"
+            "};"
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", ps],
@@ -1727,12 +2214,15 @@ def _build_manual_merge_output_with_openpyxl(
 ) -> bool:
     """Replay manual merge operations with openpyxl when Excel COM is unavailable."""
     wb = None
+    wb_a = None
     wb_base = None
     wb_b = None
     ext_parts = _capture_external_link_parts(src_xlsx)
     try:
         wb = load_workbook(src_xlsx, data_only=False)
         source_paths = source_paths or {}
+        if source_paths.get("A"):
+            wb_a = load_workbook(source_paths["A"], data_only=False)
         if source_paths.get("BASE"):
             wb_base = load_workbook(source_paths["BASE"], data_only=False)
         if source_paths.get("B"):
@@ -1748,7 +2238,8 @@ def _build_manual_merge_output_with_openpyxl(
             side = str(op.get("source_side") or "").upper()
             src_ws = None
             if side == "A":
-                src_ws = wb[sheet] if sheet in wb.sheetnames else None
+                source_wb = wb_a if wb_a is not None else wb
+                src_ws = source_wb[sheet] if sheet in source_wb.sheetnames else None
             elif side == "BASE":
                 src_ws = wb_base[sheet] if wb_base is not None and sheet in wb_base.sheetnames else None
             elif side in ("B", "THEIRS"):
@@ -1764,11 +2255,25 @@ def _build_manual_merge_output_with_openpyxl(
                 continue
             row = max(1, int(op.get("row", 1)))
             count = max(1, int(op.get("count", 1)))
-            wb[sheet].insert_rows(idx=row, amount=count)
+            dst_ws = wb[sheet]
+            dst_ws.insert_rows(idx=row, amount=count)
+            source_side = str(op.get("source_side") or "").upper()
+            source_rows = [int(value) for value in (op.get("source_rows") or [])]
+            src_ws = None
+            if source_side in ("B", "THEIRS") and wb_b is not None and sheet in wb_b.sheetnames:
+                src_ws = wb_b[sheet]
+            elif source_side == "A" and wb_a is not None and sheet in wb_a.sheetnames:
+                src_ws = wb_a[sheet]
+            elif source_side == "BASE" and wb_base is not None and sheet in wb_base.sheetnames:
+                src_ws = wb_base[sheet]
+            if src_ws is not None:
+                max_col = max(1, int(src_ws.max_column or 1))
+                for offset, source_row in enumerate(source_rows[:count]):
+                    _copy_row_metadata(src_ws, dst_ws, source_row, row + offset, max_col)
         for (sheet, r, c), v in manual_ops.items():
             if sheet not in wb.sheetnames:
                 continue
-            wb[sheet].cell(row=int(r), column=int(c)).value = v
+            _assign_edit_cell_value(wb[sheet].cell(row=int(r), column=int(c)), v)
         wb.save(out_xlsx)
         if ext_parts:
             _apply_external_link_parts_on_file(out_xlsx, ext_parts)
@@ -1778,29 +2283,31 @@ def _build_manual_merge_output_with_openpyxl(
         _dlog(f"openpyxl merge save failed: {e}")
         return False
     finally:
-        _wbs_close(wb, wb_base, wb_b)
+        _wbs_close(wb, wb_a, wb_base, wb_b)
 
 
 def _merge_cmp_value(v):
-    """Normalize values for merge conflict comparison to match UI display."""
+    """Build a type-aware comparison key without collapsing meaningful data."""
     try:
         if v is None:
-            return ""
-        s = _val_to_str(v)
-        if isinstance(s, str):
-            # Normalize line endings and trim trailing whitespace to avoid false conflicts
-            s = s.replace("\r\n", "\n").rstrip()
-            # Normalize numeric strings
-            try:
-                num = float(s)
-                if num.is_integer():
-                    return str(int(num))
-                return str(num)
-            except Exception:
-                return s
-        return s
+            return "BLANK:"
+        if isinstance(v, bool):
+            return "BOOL:1" if v else "BOOL:0"
+        if isinstance(v, int) and not isinstance(v, bool):
+            return f"NUM:{v}"
+        if isinstance(v, float):
+            if v == 0:
+                v = 0.0
+            if v.is_integer():
+                return f"NUM:{int(v)}"
+            return f"NUM:{repr(v)}"
+        if isinstance(v, (datetime, date, datetime_time, timedelta)):
+            return f"DATE:{repr(v)}"
+        if isinstance(v, str):
+            return "TEXT:" + v.replace("\r\n", "\n").replace("\r", "\n")
+        return f"{type(v).__name__}:{_val_to_str(v)}"
     except Exception:
-        return v
+        return f"FALLBACK:{repr(v)}"
 
 
 def _scan_formula_cache(path: str):
@@ -1824,8 +2331,18 @@ def _scan_formula_cache(path: str):
             if sheet not in wb_val.sheetnames:
                 continue
             ws_v = wb_val[sheet]
-            for row in ws_e.iter_rows(values_only=False):
-                for cell in row:
+            max_row = max(int(ws_e.max_row or 1), int(ws_v.max_row or 1))
+            max_col = max(int(ws_e.max_column or 1), int(ws_v.max_column or 1))
+            edit_rows = ws_e.iter_rows(
+                min_row=1, max_row=max_row, min_col=1, max_col=max_col,
+                values_only=False,
+            )
+            value_rows = ws_v.iter_rows(
+                min_row=1, max_row=max_row, min_col=1, max_col=max_col,
+                values_only=False,
+            )
+            for edit_row, value_row in zip(edit_rows, value_rows):
+                for cell, value_cell in zip(edit_row, value_row):
                     if checked >= _CACHE_CHECK_MAX_CELLS:
                         return has_formula, missing_cache
                     f = _formula_text(cell.value)
@@ -1833,19 +2350,12 @@ def _scan_formula_cache(path: str):
                         continue
                     has_formula = True
                     checked += 1
-                    try:
-                        v = ws_v.cell(row=cell.row, column=cell.column).value
-                    except Exception:
-                        v = None
+                    v = value_cell.value
                     if v is None:
                         missing_cache = True
                         return has_formula, missing_cache
     finally:
-        try:
-            wb_val.close()
-            wb_edit.close()
-        except Exception:
-            pass
+        _wbs_close(wb_val, wb_edit)
     return has_formula, missing_cache
 
 
@@ -1867,6 +2377,8 @@ def _recalc_with_excel(path: str) -> str | None:
         ps = (
             "$ErrorActionPreference='Stop';"
             "$p='" + tmp.replace("'", "''") + "';"
+            "$xl=$null;$wb=$null;"
+            "try{"
             "$xl=New-Object -ComObject Excel.Application;"
             "$xl.Visible=$false;"
             "$xl.DisplayAlerts=$false;"
@@ -1877,8 +2389,11 @@ def _recalc_with_excel(path: str) -> str | None:
             "try{$xl.CalculateFullRebuild()}catch{};"
             "try{$wb.RefreshAll();$xl.CalculateFullRebuild()}catch{};"
             "$wb.Save();"
-            "$wb.Close($true);"
-            "$xl.Quit();"
+            "}finally{"
+            "  if($wb -ne $null){try{$wb.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb)}catch{}};"
+            "  if($xl -ne $null){try{$xl.Quit()}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($xl)}catch{}};"
+            "  [GC]::Collect();[GC]::WaitForPendingFinalizers();[GC]::Collect();[GC]::WaitForPendingFinalizers();"
+            "};"
         )
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         r = subprocess.run(
@@ -2408,7 +2923,7 @@ def excel_to_text(path: str, out_path: str, thick_sep_char: str = "="):
                         vals.append(_val_to_str(ws.cell(row=r, column=c).value))
                     f.write(str(r) + "\t" + "\t".join(vals) + "\n")
     finally:
-        wb.close()
+        _wbs_close(wb)
         if val_path != path:
             try:
                 os.remove(val_path)
@@ -2849,34 +3364,47 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     for name in only_theirs:
         ws_t = wb_theirs_edit[name]  # data_only=False preserves formulas
         ws_m = wb_merged.create_sheet(title=name)
-        max_row = ws_t.max_row or 1
-        max_col = ws_t.max_column or 1
-        for r in range(1, max_row + 1):
-            row = next(ws_t.iter_rows(min_row=r, max_row=r, min_col=1, max_col=max_col, values_only=True), ())
-            if len(row) < max_col:
-                row = tuple(row) + (None,) * (max_col - len(row))
-            for c, v in enumerate(row, start=1):
-                ws_m.cell(row=r, column=c).value = v
+        _copy_sheet_basic(ws_t, ws_m)
 
     conflicts = []
     conflict_cells_by_sheet = {}
 
-    def _cmp_cell(ws_val, ws_edit, row_idx: int | None, col_idx: int):
+    def _cmp_cell(
+        ws_val,
+        ws_edit,
+        formula_map,
+        row_idx: int | None,
+        col_idx: int,
+        compare_row: int | None = None,
+    ):
         if ws_val is None or row_idx is None or row_idx <= 0:
-            return None
+            return None, _merge_cell_compare_key(None, None)
         try:
             vv = ws_val.cell(row=row_idx, column=col_idx).value
         except Exception:
             vv = None
+        missing_formula = object()
+        ve = formula_map.get((int(row_idx), int(col_idx)), missing_formula)
+        if ve is missing_formula:
+            ve = None
+            if vv is None:
+                try:
+                    if ws_edit is not None:
+                        ve = ws_edit.cell(row=row_idx, column=col_idx).value
+                except Exception:
+                    ve = None
+        if compare_row is not None and row_idx != compare_row:
+            ve = _translate_normal_formula_for_compare(
+                vv, ve, row_idx, col_idx, compare_row, col_idx
+            )
         cmp_v = vv
         try:
-            if cmp_v is None and ws_edit is not None:
-                ve = ws_edit.cell(row=row_idx, column=col_idx).value
+            if cmp_v is None:
                 if ve is not None and not _formula_text(ve):
                     cmp_v = ve
         except Exception:
             pass
-        return cmp_v
+        return cmp_v, _merge_cell_compare_key(vv, ve)
 
     common = sorted(set_mine & set_theirs)
     for name in common:
@@ -2886,6 +3414,9 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
         ws_m_edit = wb_mine[name]
         ws_b_edit = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
         ws_t_edit = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
+        formula_map_m = _formula_edit_value_map(ws_m_edit)
+        formula_map_b = _formula_edit_value_map(ws_b_edit)
+        formula_map_t = _formula_edit_value_map(ws_t_edit)
 
         max_col = max(ws_m_val.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
 
@@ -2919,22 +3450,21 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
             base_row_m = mine_to_base.get(ra) if ra is not None else None
             base_row_t = theirs_to_base.get(rb) if rb is not None else None
             for c in range(1, max_col + 1):
-                vm_cmp = _cmp_cell(ws_m_val, ws_m_edit, ra, c)
-                vt_cmp = _cmp_cell(ws_t, ws_t_edit, rb, c)
+                compare_row = ra if ra is not None else rb
+                vm_cmp, vm_key = _cmp_cell(ws_m_val, ws_m_edit, formula_map_m, ra, c, compare_row)
+                vt_cmp, vt_key = _cmp_cell(ws_t, ws_t_edit, formula_map_t, rb, c, compare_row)
                 conflict_row = ra if ra is not None else (rb if rb is not None else 0)
 
                 # Aligned 1:1 row sharing a base row -> full 3-way cell logic.
                 if ra is not None and rb is not None and base_row_m is not None and base_row_m == base_row_t:
-                    vb_cmp = _cmp_cell(ws_b, ws_b_edit, base_row_m, c)
+                    vb_cmp, vb_key = _cmp_cell(ws_b, ws_b_edit, formula_map_b, base_row_m, c, compare_row)
                     if vb_cmp is None and vt_cmp is not None and ws_b_edit is not None and ws_t_edit is not None:
                         try:
                             if _same_formula(ws_b_edit.cell(row=base_row_m, column=c).value, ws_t_edit.cell(row=rb, column=c).value):
                                 vb_cmp = vt_cmp
+                                vb_key = vt_key
                         except Exception:
                             pass
-                    vm_key = _merge_cmp_value(vm_cmp)
-                    vt_key = _merge_cmp_value(vt_cmp)
-                    vb_key = _merge_cmp_value(vb_cmp)
                     mine_changed = (vm_key != vb_key)
                     theirs_changed = (vt_key != vb_key)
                     if mine_changed and theirs_changed:
@@ -2945,13 +3475,32 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
                     elif (not mine_changed) and theirs_changed:
                         # Safe to apply theirs onto mine's aligned row (preserve formulas).
                         _t_edit_v = ws_t_edit.cell(row=rb, column=c).value if ws_t_edit is not None else None
-                        ws_m_edit.cell(row=ra, column=c).value = _t_edit_v if _t_edit_v is not None else vt_cmp
+                        _m_edit_v = ws_m_edit.cell(row=ra, column=c).value
+                        try:
+                            _new_edit_v = _copy_edit_value_for_destination(
+                                vt_cmp,
+                                _t_edit_v,
+                                _m_edit_v,
+                                src_row=rb,
+                                src_col=c,
+                                dst_row=ra,
+                                dst_col=c,
+                            )
+                        except RuntimeError:
+                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
+                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
+                            continue
+                        if not _is_same_formula_copy_noop(_new_edit_v, _m_edit_v):
+                            _assign_edit_cell_value(
+                                ws_m_edit.cell(row=ra, column=c),
+                                _new_edit_v,
+                            )
                     continue
 
                 # Both sides added the same logical row independently (no shared base):
                 # differing values are a conflict for manual resolution.
                 if ra is not None and rb is not None and base_row_m is None and base_row_t is None:
-                    if _merge_cmp_value(vm_cmp) != _merge_cmp_value(vt_cmp):
+                    if vm_key != vt_key:
                         conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
                         conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
                 # ra is None (theirs-only row) or rb is None (mine-only row): structural
@@ -3015,22 +3564,42 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
         set_theirs = set(wb_theirs_val.sheetnames)
         common = sorted(set_mine & set_theirs)
 
-        def _cmp_cell(ws_val, ws_edit, row_idx: int | None, col_idx: int):
+        def _cmp_cell(
+            ws_val,
+            ws_edit,
+            formula_map,
+            row_idx: int | None,
+            col_idx: int,
+            compare_row: int | None = None,
+        ):
             if ws_val is None or row_idx is None or row_idx <= 0:
-                return None
+                return None, _merge_cell_compare_key(None, None)
             try:
                 vv = ws_val.cell(row=row_idx, column=col_idx).value
             except Exception:
                 vv = None
+            missing_formula = object()
+            ve = formula_map.get((int(row_idx), int(col_idx)), missing_formula)
+            if ve is missing_formula:
+                ve = None
+                if vv is None:
+                    try:
+                        if ws_edit is not None:
+                            ve = ws_edit.cell(row=row_idx, column=col_idx).value
+                    except Exception:
+                        ve = None
+            if compare_row is not None and row_idx != compare_row:
+                ve = _translate_normal_formula_for_compare(
+                    vv, ve, row_idx, col_idx, compare_row, col_idx
+                )
             cmp_v = vv
             try:
-                if cmp_v is None and ws_edit is not None:
-                    ve = ws_edit.cell(row=row_idx, column=col_idx).value
+                if cmp_v is None:
                     if ve is not None and not _formula_text(ve):
                         cmp_v = ve
             except Exception:
                 pass
-            return cmp_v
+            return cmp_v, _merge_cell_compare_key(vv, ve)
 
         for name in common:
             ws_b = wb_base_val[name] if name in set_base else None
@@ -3039,6 +3608,9 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
             ws_m_e = wb_mine_edit[name]
             ws_b_e = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
             ws_t_e = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
+            formula_map_m = _formula_edit_value_map(ws_m_e)
+            formula_map_b = _formula_edit_value_map(ws_b_e)
+            formula_map_t = _formula_edit_value_map(ws_t_e)
 
             max_col = max(ws_m.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
             mine_sigs = _row_sig_list_for_ws(ws_m, ws_m.max_row or 1, max_col)
@@ -3069,21 +3641,20 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
                 base_row_m = mine_to_base.get(ra) if ra is not None else None
                 base_row_t = theirs_to_base.get(rb) if rb is not None else None
                 for c in range(1, max_col + 1):
-                    vm_cmp = _cmp_cell(ws_m, ws_m_e, ra, c)
-                    vt_cmp = _cmp_cell(ws_t, ws_t_e, rb, c)
+                    compare_row = ra if ra is not None else rb
+                    vm_cmp, vm_key = _cmp_cell(ws_m, ws_m_e, formula_map_m, ra, c, compare_row)
+                    vt_cmp, vt_key = _cmp_cell(ws_t, ws_t_e, formula_map_t, rb, c, compare_row)
                     conflict_row = ra if ra is not None else (rb if rb is not None else 0)
 
                     if ra is not None and rb is not None and base_row_m is not None and base_row_m == base_row_t:
-                        vb_cmp = _cmp_cell(ws_b, ws_b_e, base_row_m, c)
+                        vb_cmp, vb_key = _cmp_cell(ws_b, ws_b_e, formula_map_b, base_row_m, c, compare_row)
                         if vb_cmp is None and vt_cmp is not None and ws_b_e is not None and ws_t_e is not None:
                             try:
                                 if _same_formula(ws_b_e.cell(row=base_row_m, column=c).value, ws_t_e.cell(row=rb, column=c).value):
                                     vb_cmp = vt_cmp
+                                    vb_key = vt_key
                             except Exception:
                                 pass
-                        vm_key = _merge_cmp_value(vm_cmp)
-                        vt_key = _merge_cmp_value(vt_cmp)
-                        vb_key = _merge_cmp_value(vb_cmp)
                         mine_changed = (vm_key != vb_key)
                         theirs_changed = (vt_key != vb_key)
                         if mine_changed and theirs_changed and vm_key != vt_key:
@@ -3092,8 +3663,6 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
                         continue
 
                     if ra is not None and rb is not None and base_row_m is None and base_row_t is None:
-                        vm_key = _merge_cmp_value(vm_cmp)
-                        vt_key = _merge_cmp_value(vt_cmp)
                         if vm_key != vt_key:
                             conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
                             conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
@@ -3216,6 +3785,7 @@ class SheetView:
         self._only_diff_async_build_key: tuple | None = None
         self._only_diff_async_build_seq = 0
         self._only_diff_async_building = False
+        self._only_diff_async_thread: threading.Thread | None = None
 
         # Toolbar
         bar = ttk.Frame(self.frame)
@@ -6604,7 +7174,7 @@ class SheetView:
             elif direction == "BASE2A":
                 if ra is None:
                     return
-                src_r = ra
+                src_r = self._base_row_for_pair(pair_idx, pair)
                 dst_r = ra
             else:
                 if rb is None:
@@ -6613,12 +7183,29 @@ class SheetView:
                 dst_r = ra if ra is not None else rb
 
             anchor = self._capture_view_anchor()
+            adopted_formula_cache = False
             if direction == "A2B":
                 old_edit = self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value
                 old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=c).value
-                self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
+                new_edit = _copy_edit_value_for_destination(
+                    v_val, v_edit, old_edit,
+                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
+                    self.app.record_manual_b_formula_cache(self.sheet, dst_r, c, v_val)
+                    adopted_formula_cache = True
+                else:
+                    self.app.clear_manual_b_formula_cache(self.sheet, dst_r, c)
+                    _assign_edit_cell_value(
+                        self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c),
+                        new_edit,
+                    )
+                    self.app.record_manual_b_cell(self.sheet, dst_r, c, new_edit)
                 self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                 self.app.modified_b = True
                 self.app.modified_sheets_b.add(self.sheet)
@@ -6626,12 +7213,30 @@ class SheetView:
             elif direction == "BASE2A":
                 old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
-                v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
-                v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
-                new_edit = _choose_edit_value(v_val, v_edit)
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                if src_r is None:
+                    v_edit = None
+                    v_val = None
+                else:
+                    v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
+                    v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
+                new_edit = (
+                    _copy_edit_value_for_destination(
+                        v_val, v_edit, old_edit,
+                        src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                    )
+                    if src_r is not None else None
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
+                    new_edit = old_edit
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    adopted_formula_cache = True
+                else:
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
-                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -6640,10 +7245,21 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
-                new_edit = _choose_edit_value(v_val, v_edit)
-                self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                new_edit = _copy_edit_value_for_destination(
+                    v_val, v_edit, old_edit,
+                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
+                    new_edit = old_edit
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    adopted_formula_cache = True
+                else:
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
+                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
-                self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
                 self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
@@ -6658,6 +7274,8 @@ class SheetView:
             self.refresh(row_only=dst_r, rescan=False)
             self._restore_view_anchor(anchor)
             self._update_cursor_lines()
+            if adopted_formula_cache:
+                self._show_formula_copy_skip_notice(1)
         except Exception as e:
             messagebox.showerror("Error", f"C区覆盖失败：\n{e}")
 
@@ -6835,6 +7453,17 @@ class SheetView:
 
     def _copy_missing_sheet(self, direction: str):
         meta = self._sheet_meta()
+        action_text = {
+            "A2B": "正在复制左侧整张 Sheet...",
+            "B2A": "正在复制 theirs 整张 Sheet 到 mine...",
+            "BASE2A": "正在按 Base 恢复或删除整张 Sheet...",
+        }.get(direction, "正在处理整张 Sheet...")
+        try:
+            self.info.configure(text=action_text)
+            self.root.configure(cursor="watch")
+            self.root.update_idletasks()
+        except Exception:
+            pass
         try:
             if direction == "A2B":
                 if meta.get("has_a") and (not meta.get("has_b")):
@@ -6861,6 +7490,11 @@ class SheetView:
             self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("Error", f"整Sheet操作失败：\n{e}")
+        finally:
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
 
     def _update_merge_buttons_for_row(self, excel_row: int):
         # Buttons are always visible; no UI updates needed.
@@ -6926,6 +7560,12 @@ class SheetView:
         started = time.perf_counter()
         processed_rows = 0
         changed_any = False
+        previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive()
+        self._suppress_bg_apply = True
         direction_text = {
             "B2A": "右侧区域到 mine",
             "A2B": "左侧区域到 theirs",
@@ -6949,6 +7589,9 @@ class SheetView:
                 self.root.update_idletasks()
             except Exception:
                 pass
+            # Validate the whole region before writing the first cell so a later
+            # unsupported multi-cell formula cannot leave a half-applied region.
+            self._preflight_region_formula_copy(direction, region_pair_indices)
             anchor = self._capture_view_anchor()
             # Collect all undo cells into one list so the entire region is a
             # single undo entry regardless of how many rows it spans.
@@ -7050,12 +7693,20 @@ class SheetView:
                         old_val = ws_a_val_fast.cell(row=ra, column=c).value
                         source_edit = ws_b_edit_fast.cell(row=rb, column=c).value
                         source_val = ws_b_val_fast.cell(row=rb, column=c).value
-                        if self._skip_same_formula_copy(source_edit, old_edit):
+                        new_edit = _copy_edit_value_for_destination(
+                            source_val, source_edit, old_edit,
+                            src_row=rb, src_col=c, dst_row=ra, dst_col=c,
+                        )
+                        formula_mode = self._same_formula_copy_mode(
+                            new_edit, old_edit, source_val, old_val
+                        )
+                        if formula_mode == "noop":
+                            continue
+                        if formula_mode == "cache":
                             ws_a_val_fast.cell(row=ra, column=c).value = source_val
                             self.app.record_manual_a_formula_cache(self.sheet, ra, c, source_val)
                         else:
-                            new_edit = _choose_edit_value(source_val, source_edit)
-                            ws_a_edit_fast.cell(row=ra, column=c).value = new_edit
+                            _assign_edit_cell_value(ws_a_edit_fast.cell(row=ra, column=c), new_edit)
                             ws_a_val_fast.cell(row=ra, column=c).value = source_val
                             self.app.record_manual_a_cell(self.sheet, ra, c, new_edit)
                         row_undo.append((ra, c, old_edit, old_val))
@@ -7127,6 +7778,9 @@ class SheetView:
         except Exception as e:
             messagebox.showerror("Error", f"覆盖区域失败：\n{e}")
         finally:
+            self._suppress_bg_apply = previous_bg_suppression
+            if callable(end_interactive):
+                end_interactive()
             try:
                 self.root.configure(cursor="")
             except Exception:
@@ -7376,11 +8030,17 @@ class SheetView:
         raw_b: list[str] = []
         cols: set[int] = set()
         for offset in range(self.max_col):
+            col_idx = offset + 1
+            edit_b = row_b_edit_vals[offset]
+            if ra is not None and rb is not None and ra != rb:
+                edit_b = _translate_normal_formula_for_compare(
+                    row_b_vals[offset], edit_b, rb, col_idx, ra, col_idx
+                )
             da, db, eq = _cell_display_and_equal_from_values(
                 row_a_vals[offset],
                 row_b_vals[offset],
                 row_a_edit_vals[offset],
-                row_b_edit_vals[offset],
+                edit_b,
             )
             raw_a.append(_val_to_str(da))
             raw_b.append(_val_to_str(db))
@@ -7420,11 +8080,17 @@ class SheetView:
             row_base_edit_vals = _pad_row_values(row_base_edit_vals, self.max_col)
         cols: set[int] = set()
         for offset in range(self.max_col):
+            col_idx = offset + 1
+            edit_base = row_base_edit_vals[offset]
+            if ra != base_row:
+                edit_base = _translate_normal_formula_for_compare(
+                    row_base_vals[offset], edit_base, base_row, col_idx, ra, col_idx
+                )
             _va, _vb, eq = _cell_display_and_equal_from_values(
                 row_a_vals[offset],
                 row_base_vals[offset],
                 row_a_edit_vals[offset],
-                row_base_edit_vals[offset],
+                edit_base,
             )
             if not eq:
                 cols.add(offset + 1)
@@ -8085,6 +8751,7 @@ class SheetView:
         row_b_to_pair_idx = dict(self.row_b_to_pair_idx)
         mine_to_base_row = dict(self.mine_to_base_row)
         theirs_to_base_row = dict(self.theirs_to_base_row)
+        pair_base_row_override = dict(getattr(self, "pair_base_row_override", {}) or {})
         missing_base_row_map = dict(getattr(self, "_missing_base_row_map", {}) or {})
         has_base = bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False))
         align_enabled = bool(self._align_rows_enabled)
@@ -8092,6 +8759,8 @@ class SheetView:
         def _base_row_for_snapshot(pair_idx: int, pair: tuple[int | None, int | None]) -> int | None:
             if not has_base:
                 return None
+            if pair_idx in pair_base_row_override:
+                return pair_base_row_override.get(pair_idx)
             ra, rb = pair
             mapped = missing_base_row_map.get(pair_idx)
             if mapped is not None:
@@ -8109,6 +8778,15 @@ class SheetView:
             wb_a_edit = None
             wb_b_edit = None
             wb_base_edit = None
+
+            def _cancelled():
+                return bool(
+                    getattr(self.app, "_is_closing", False)
+                    or build_seq != self._only_diff_async_build_seq
+                )
+
+            if _cancelled():
+                return
             try:
                 wb_a_val = load_workbook(self.app._file_a_val_path, data_only=True, read_only=True)
                 wb_b_val = load_workbook(self.app._file_b_val_path, data_only=True, read_only=True)
@@ -8118,6 +8796,9 @@ class SheetView:
                 wb_b_edit = load_workbook(self.app.file_b, data_only=False, read_only=True)
                 if has_base and getattr(self.app, "base_path", None):
                     wb_base_edit = load_workbook(self.app.base_path, data_only=False, read_only=True)
+                if _cancelled():
+                    _wbs_close(wb_a_val, wb_b_val, wb_base_val, wb_a_edit, wb_b_edit, wb_base_edit)
+                    return
             except Exception as e:
                 _dlog(f"only-diff async open failed sheet={sheet_name}: {e}")
                 _wbs_close(wb_a_val, wb_b_val, wb_base_val, wb_a_edit, wb_b_edit, wb_base_edit)
@@ -8155,10 +8836,53 @@ class SheetView:
                 edit_cache_b: dict[int, tuple] = {}
                 edit_cache_base: dict[int, tuple] = {}
 
+                def _formula_rows(ws_edit):
+                    rows = {}
+                    if ws_edit is None:
+                        return rows
+                    for row_idx, cells in enumerate(
+                        ws_edit.iter_rows(min_col=1, max_col=max_col, values_only=False),
+                        start=1,
+                    ):
+                        if (row_idx & 255) == 0 and _cancelled():
+                            break
+                        values = tuple(cell.value for cell in cells)
+                        if any(
+                            getattr(cell, "data_type", None) == "f"
+                            or _special_formula_signature(cell.value) is not None
+                            for cell in cells
+                        ):
+                            rows[row_idx] = _pad_row_values(values, max_col)
+                    return rows
+
+                formula_rows_a = _formula_rows(ws_a_edit)
+                formula_rows_b = _formula_rows(ws_b_edit)
+                formula_rows_base = _formula_rows(ws_base_edit) if has_base else {}
+
+                def _needs_formula_exact(row_left, row_right, edit_left, edit_right):
+                    for offset in range(max_col):
+                        if row_left[offset] is not None or row_right[offset] is not None:
+                            continue
+                        left_formula = _formula_text(edit_left[offset]) or _special_formula_signature(edit_left[offset])
+                        right_formula = _formula_text(edit_right[offset]) or _special_formula_signature(edit_right[offset])
+                        if left_formula or right_formula:
+                            return True
+                    return False
+
+                def _edit_rows_for(needed_rows, preloaded, ws_edit):
+                    needed = sorted({int(row) for row in needed_rows if row is not None})
+                    result_rows = {row: preloaded[row] for row in needed if row in preloaded}
+                    missing = [row for row in needed if row not in result_rows]
+                    if missing and ws_edit is not None:
+                        result_rows.update(_read_rows_into_cache(ws_edit, missing, max_col))
+                    return result_rows
+
                 if align_enabled and row_pairs:
                     pair_count = len(row_pairs)
                     block = _LARGE_SHEET_BLOCK_ROWS
                     for block_end in range(pair_count, 0, -block):
+                        if _cancelled():
+                            return
                         block_start = max(0, block_end - block)
                         block_pairs = row_pairs[block_start:block_end]
                         rows_a = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in block_pairs if ra is not None], max_col)
@@ -8182,6 +8906,13 @@ class SheetView:
                                 need_exact_ab = False
                             else:
                                 cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                                if not need_exact_ab and (ra in formula_rows_a or rb in formula_rows_b):
+                                    need_exact_ab = _needs_formula_exact(
+                                        row_a,
+                                        row_b,
+                                        _row_from_cache(formula_rows_a, ra, max_col),
+                                        _row_from_cache(formula_rows_b, rb, max_col),
+                                    )
                             base_cols = set()
                             need_exact_base = False
                             base_row = None
@@ -8192,7 +8923,14 @@ class SheetView:
                                 else:
                                     row_base = _row_from_cache(rows_base, base_row, max_col)
                                     base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
-                            if (not cols) and (not base_cols):
+                                    if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
+                                        need_exact_base = _needs_formula_exact(
+                                            row_a,
+                                            row_base,
+                                            _row_from_cache(formula_rows_a, ra, max_col),
+                                            _row_from_cache(formula_rows_base, base_row, max_col),
+                                        )
+                            if (not cols) and (not base_cols) and (not need_exact_ab) and (not need_exact_base):
                                 continue
                             if need_exact_ab or need_exact_base:
                                 exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
@@ -8208,9 +8946,9 @@ class SheetView:
                             exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
                             exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
                             exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
-                            rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, max_col) if ws_a_edit is not None else {}
-                            rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, max_col) if ws_b_edit is not None else {}
-                            rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, max_col) if (has_base and ws_base_edit is not None) else {}
+                            rows_a_edit = _edit_rows_for(exact_rows_a, formula_rows_a, ws_a_edit)
+                            rows_b_edit = _edit_rows_for(exact_rows_b, formula_rows_b, ws_b_edit)
+                            rows_base_edit = _edit_rows_for(exact_rows_base, formula_rows_base, ws_base_edit) if has_base else {}
                             for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
                                 row_a = _row_from_cache(rows_a, ra, max_col)
                                 row_b = _row_from_cache(rows_b, rb, max_col)
@@ -8261,6 +8999,8 @@ class SheetView:
                     max_row = max(max_row_a, max_row_b)
                     block = _LARGE_SHEET_BLOCK_ROWS
                     for block_end in range(max_row, 0, -block):
+                        if _cancelled():
+                            return
                         block_start = max(1, block_end - block + 1)
                         rows_a = _read_rows_into_cache(
                             ws_a_val,
@@ -8300,6 +9040,13 @@ class SheetView:
                                 need_exact_ab = False
                             else:
                                 cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                                if not need_exact_ab and (ra in formula_rows_a or rb in formula_rows_b):
+                                    need_exact_ab = _needs_formula_exact(
+                                        row_a,
+                                        row_b,
+                                        _row_from_cache(formula_rows_a, ra, max_col),
+                                        _row_from_cache(formula_rows_b, rb, max_col),
+                                    )
                             base_cols = set()
                             need_exact_base = False
                             base_row = None
@@ -8310,7 +9057,14 @@ class SheetView:
                                 else:
                                     row_base = _row_from_cache(rows_base, base_row, max_col)
                                     base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
-                            if (not cols) and (not base_cols):
+                                    if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
+                                        need_exact_base = _needs_formula_exact(
+                                            row_a,
+                                            row_base,
+                                            _row_from_cache(formula_rows_a, ra, max_col),
+                                            _row_from_cache(formula_rows_base, base_row, max_col),
+                                        )
+                            if (not cols) and (not base_cols) and (not need_exact_ab) and (not need_exact_base):
                                 continue
                             if need_exact_ab or need_exact_base:
                                 exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
@@ -8326,9 +9080,9 @@ class SheetView:
                             exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
                             exact_rows_b = [rb for _pair_idx, _ra, rb, _base_row, _cols, need_ab, _bcols, _need_base in exact_rows if rb is not None and need_ab]
                             exact_rows_base = [base_row for _pair_idx, _ra, _rb, base_row, _cols, _need_ab, _bcols, need_base in exact_rows if base_row is not None and need_base]
-                            rows_a_edit = _read_rows_into_cache(ws_a_edit, exact_rows_a, max_col) if ws_a_edit is not None else {}
-                            rows_b_edit = _read_rows_into_cache(ws_b_edit, exact_rows_b, max_col) if ws_b_edit is not None else {}
-                            rows_base_edit = _read_rows_into_cache(ws_base_edit, exact_rows_base, max_col) if (has_base and ws_base_edit is not None) else {}
+                            rows_a_edit = _edit_rows_for(exact_rows_a, formula_rows_a, ws_a_edit)
+                            rows_b_edit = _edit_rows_for(exact_rows_b, formula_rows_b, ws_b_edit)
+                            rows_base_edit = _edit_rows_for(exact_rows_base, formula_rows_base, ws_base_edit) if has_base else {}
                             for pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base in exact_rows:
                                 row_a = _row_from_cache(rows_a, ra, max_col)
                                 row_b = _row_from_cache(rows_b, rb, max_col)
@@ -8413,11 +9167,19 @@ class SheetView:
                     self._update_diff_nav_state()
 
             try:
-                self.app._queue_ui_task(_apply_result)
+                if not _cancelled():
+                    self.app._queue_ui_task(_apply_result)
             except Exception as e:
                 _dlog(f"only-diff async queue failed sheet={sheet_name}: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._only_diff_async_thread = self.app._start_background_thread(
+            _worker,
+            name=f"sow-only-diff-{sheet_name[:30]}",
+        )
+        if self._only_diff_async_thread is None:
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            return False
         return True
 
     def _toggle_only_diff(self):
@@ -8469,6 +9231,15 @@ class SheetView:
         except Exception:
             pass
 
+        if bool(cur) and bool(getattr(self, "_is_large_sheet", False)) and not self._full_render:
+            # A formula-result sheet can legitimately have thousands of diff rows.
+            # Rendering 800 tagged Text lines blocks the toggle for several seconds;
+            # render the same 200-row first window used by large full-mode sheets.
+            self._render_limit = min(
+                max(1, int(self._render_limit or _LARGE_SHEET_INITIAL_ROWS)),
+                _LARGE_SHEET_INITIAL_ROWS,
+            )
+
         self._refresh_mode_switch_preserving_selection(rescan=need_rescan)
 
         # Persist setting (debounced: write 1 s after last toggle to avoid per-keypress I/O)
@@ -8519,11 +9290,65 @@ class SheetView:
         self._update_diff_nav_state()
 
     # ---------- Merge operations ----------
-    def _skip_same_formula_copy(self, src_edit, dst_edit) -> bool:
+    def _same_formula_copy_mode(self, src_edit, dst_edit, src_val, dst_val) -> str | None:
+        """Return ``noop`` or ``cache`` for same-formula copies."""
         if not _is_same_formula_copy_noop(src_edit, dst_edit):
-            return False
+            return None
+        if _merge_cmp_value(src_val) == _merge_cmp_value(dst_val):
+            return "noop"
         self._formula_copy_skips_pending += 1
-        return True
+        return "cache"
+
+    def _preflight_region_formula_copy(self, direction: str, pair_indices: list[int]):
+        if direction not in ("A2B", "B2A", "BASE2A"):
+            return
+        if direction == "A2B" and getattr(self.app, "merge_conflict_mode", False):
+            return
+        ws_a_edit = self.app.ws_a_edit(self.sheet)
+        ws_b_edit = self.app.ws_b_edit(self.sheet)
+        ws_base_edit = self.app.ws_base_edit(self.sheet) if getattr(self.app, "has_base", False) else None
+        ws_a_val = self.app.ws_a_val(self.sheet)
+        ws_b_val = self.app.ws_b_val(self.sheet)
+        ws_base_val = self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None
+        for pair_idx in pair_indices:
+            if not (0 <= int(pair_idx) < len(self.row_pairs)):
+                continue
+            pair = self.row_pairs[int(pair_idx)]
+            ra, rb = pair
+            if direction == "A2B":
+                src_ws, src_val_ws, dst_ws, src_row, dst_row = ws_a_edit, ws_a_val, ws_b_edit, ra, rb
+            elif direction == "B2A":
+                src_ws, src_val_ws, dst_ws, src_row, dst_row = ws_b_edit, ws_b_val, ws_a_edit, rb, ra
+            else:
+                src_ws, src_val_ws, dst_ws = ws_base_edit, ws_base_val, ws_a_edit
+                src_row = self._base_row_for_pair(int(pair_idx), pair)
+                dst_row = ra
+            if src_ws is None or src_row is None:
+                continue
+            cols = set(self.pair_diff_cols.get(int(pair_idx), set()))
+            if dst_row is None or cols == {-1}:
+                cols = set(range(1, max(1, int(src_ws.max_column or 1)) + 1))
+            for col_idx in cols:
+                if int(col_idx) <= 0:
+                    continue
+                src_edit = src_ws.cell(row=int(src_row), column=int(col_idx)).value
+                dst_edit = (
+                    dst_ws.cell(row=int(dst_row), column=int(col_idx)).value
+                    if dst_ws is not None and dst_row is not None else None
+                )
+                src_val = (
+                    src_val_ws.cell(row=int(src_row), column=int(col_idx)).value
+                    if src_val_ws is not None else None
+                )
+                _copy_edit_value_for_destination(
+                    src_val,
+                    src_edit,
+                    dst_edit,
+                    src_row=int(src_row),
+                    src_col=int(col_idx),
+                    dst_row=int(dst_row) if dst_row is not None else int(src_row),
+                    dst_col=int(col_idx),
+                )
 
     def _show_formula_copy_skip_notice(self, count: int):
         if count <= 0:
@@ -8544,6 +9369,12 @@ class SheetView:
             pass
 
     def _copy_cell(self, direction: str, event):
+        previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive()
+        self._suppress_bg_apply = True
         try:
             if self._is_missing_sheet_view():
                 self._copy_missing_sheet(direction)
@@ -8626,15 +9457,28 @@ class SheetView:
                 old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=c).value
-                if self._skip_same_formula_copy(v_edit, old_edit):
+                new_edit = _copy_edit_value_for_destination(
+                    v_val, v_edit, old_edit,
+                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
                     self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_b_formula_cache(self.sheet, dst_r, c, v_val)
                     self.app.modified_b = True
                     self.app.modified_sheets_b.add(self.sheet)
                     self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
                     self._show_formula_copy_skip_notice(1)
                 else:
                     # Cached-value mode: always write the cached value
-                    self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
+                    self.app.clear_manual_b_formula_cache(self.sheet, dst_r, c)
+                    _assign_edit_cell_value(
+                        self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c),
+                        new_edit,
+                    )
+                    self.app.record_manual_b_cell(self.sheet, dst_r, c, new_edit)
                     self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                     self.app.modified_b = True
                     self.app.modified_sheets_b.add(self.sheet)
@@ -8650,7 +9494,14 @@ class SheetView:
                 old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
                 v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
                 v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
-                if self._skip_same_formula_copy(v_edit, old_edit):
+                new_edit = _copy_edit_value_for_destination(
+                    v_val, v_edit, old_edit,
+                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
                     self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
                     self.app.modified_a = True
@@ -8658,8 +9509,7 @@ class SheetView:
                     self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
                     self._show_formula_copy_skip_notice(1)
                 else:
-                    new_edit = _choose_edit_value(v_val, v_edit)
-                    self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
                     self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     self.app.modified_a = True
@@ -8679,7 +9529,17 @@ class SheetView:
                 else:
                     v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
                     v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
-                if self._skip_same_formula_copy(v_edit, old_edit):
+                new_edit = (
+                    _copy_edit_value_for_destination(
+                        v_val, v_edit, old_edit,
+                        src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                    )
+                    if src_r is not None else None
+                )
+                formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
+                if formula_mode == "noop":
+                    return
+                if formula_mode == "cache":
                     self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
                     self.app.modified_a = True
@@ -8687,8 +9547,7 @@ class SheetView:
                     self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
                     self._show_formula_copy_skip_notice(1)
                 else:
-                    new_edit = _choose_edit_value(v_val, v_edit)
-                    self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value = new_edit
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
                     self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     self.app.modified_a = True
@@ -8712,6 +9571,10 @@ class SheetView:
             self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("Error", f"覆盖单元格失败：\n{e}")
+        finally:
+            self._suppress_bg_apply = previous_bg_suppression
+            if callable(end_interactive):
+                end_interactive()
 
     # ---------- Row-insert helpers ----------
 
@@ -8970,6 +9833,49 @@ class SheetView:
     ) -> bool:
         if not run:
             return False
+        committed = False
+        dst_val_inserted = False
+        dst_edit_inserted = False
+        base_val_inserted = False
+        base_edit_inserted = False
+        ws_dst_val = None
+        ws_dst_edit = None
+        ws_bv = None
+        ws_be = None
+        insert_pos = None
+        base_insert_pos = None
+        count = len(run)
+        manual_a_cells_before = dict(getattr(self.app, "manual_a_cell_ops", {}) or {})
+        manual_a_cache_before = dict(getattr(self.app, "manual_a_formula_cache_ops", {}) or {})
+        manual_b_cells_before = dict(getattr(self.app, "manual_b_cell_ops", {}) or {})
+        manual_b_cache_before = dict(getattr(self.app, "manual_b_formula_cache_ops", {}) or {})
+        manual_row_ops_len = len(getattr(self.app, "manual_a_row_ops", []) or [])
+        manual_b_row_ops_len = len(getattr(self.app, "manual_b_row_ops", []) or [])
+        undo_len = len(getattr(self.app, "undo_stack", []) or [])
+        modified_a_before = bool(getattr(self.app, "modified_a", False))
+        modified_b_before = bool(getattr(self.app, "modified_b", False))
+        modified_sheets_a_before = set(getattr(self.app, "modified_sheets_a", set()) or set())
+        modified_sheets_b_before = set(getattr(self.app, "modified_sheets_b", set()) or set())
+        row_pairs_before = list(getattr(self, "row_pairs", []) or [])
+        mine_to_base_before = dict(getattr(self, "mine_to_base_row", {}) or {})
+        theirs_to_base_before = dict(getattr(self, "theirs_to_base_row", {}) or {})
+        overrides_before = dict(getattr(self, "pair_base_row_override", {}) or {})
+        touched_before = set(getattr(self, "touched_rows", set()) or set())
+        max_row_before = getattr(self, "max_row", 1)
+        cache_maps = (
+            self.pair_text_a,
+            self.pair_text_b,
+            self.pair_diff_cols,
+            self.pair_base_diff_cols,
+        )
+        affected_pair_indices = [int(pair_idx) for pair_idx, _src_row in run]
+        pair_cache_before = [
+            {
+                idx: (idx in cache_map, cache_map.get(idx))
+                for idx in affected_pair_indices
+            }
+            for cache_map in cache_maps
+        ]
         try:
             run = [(int(pair_idx), int(src_row)) for pair_idx, src_row in run]
             ws_a_val = self.app.ws_a_val(self.sheet)
@@ -9002,29 +9908,51 @@ class SheetView:
                 ws_src_edit = ws_a_edit
                 insert_pos = self._find_row_insert_position(first_pair_idx, "B")
 
-            count = len(run)
             ws_dst_val.insert_rows(idx=insert_pos, amount=count)
+            dst_val_inserted = True
             ws_dst_edit.insert_rows(idx=insert_pos, amount=count)
+            dst_edit_inserted = True
 
             if direction == "B2A":
-                try:
-                    for op_map in (
-                        self.app.manual_a_cell_ops,
-                        self.app.manual_a_formula_cache_ops,
-                    ):
-                        to_shift = {
-                            k: v for k, v in op_map.items()
-                            if k[0] == self.sheet and k[1] >= insert_pos
-                        }
-                        for k in to_shift:
-                            del op_map[k]
-                        for (s, r, c), v in to_shift.items():
-                            op_map[(s, r + count, c)] = v
-                except Exception as _e_shift:
-                    # Failing to shift recorded edits would write them to the wrong
-                    # rows in the merge output; make it visible rather than silent.
-                    _dlog(f"manual_a_cell_ops shift failed (batch insert): sheet={self.sheet} pos={insert_pos} err={_e_shift}")
-                self.app.record_manual_a_row_insert(self.sheet, insert_pos, count)
+                for op_map in (
+                    self.app.manual_a_cell_ops,
+                    self.app.manual_a_formula_cache_ops,
+                ):
+                    to_shift = {
+                        k: v for k, v in op_map.items()
+                        if k[0] == self.sheet and k[1] >= insert_pos
+                    }
+                    for k in to_shift:
+                        del op_map[k]
+                    for (s, r, c), v in to_shift.items():
+                        op_map[(s, r + count, c)] = v
+                self.app.record_manual_a_row_insert(
+                    self.sheet,
+                    insert_pos,
+                    count,
+                    source_side="B",
+                    source_rows=[src_row for _pair_idx, src_row in run],
+                )
+            else:
+                for op_map in (
+                    self.app.manual_b_cell_ops,
+                    self.app.manual_b_formula_cache_ops,
+                ):
+                    to_shift = {
+                        key: value for key, value in op_map.items()
+                        if key[0] == self.sheet and key[1] >= insert_pos
+                    }
+                    for key in to_shift:
+                        del op_map[key]
+                    for (sheet_name, row_idx, col_idx), value in to_shift.items():
+                        op_map[(sheet_name, row_idx + count, col_idx)] = value
+                self.app.record_manual_b_row_insert(
+                    self.sheet,
+                    insert_pos,
+                    count,
+                    source_side="A",
+                    source_rows=[src_row for _pair_idx, src_row in run],
+                )
 
             base_inserted = False
             # BASE insert position is computed in BASE coordinates (not mine's
@@ -9037,23 +9965,16 @@ class SheetView:
                     base_insert_pos = self._find_base_row_insert_position(first_pair_idx)
                     ws_bv = self.app.ws_base_val(self.sheet)
                     ws_be = self.app.ws_base_edit(self.sheet)
-                    if ws_bv is not None and ws_be is not None:
-                        ws_bv.insert_rows(idx=base_insert_pos, amount=count)
-                        ws_be.insert_rows(idx=base_insert_pos, amount=count)
-                        base_inserted = True
+                    if ws_bv is None or ws_be is None:
+                        raise RuntimeError("BASE worksheet is unavailable")
+                    ws_bv.insert_rows(idx=base_insert_pos, amount=count)
+                    base_val_inserted = True
+                    ws_be.insert_rows(idx=base_insert_pos, amount=count)
+                    base_edit_inserted = True
+                    base_inserted = True
                 except Exception as _e_base_ins:
-                    # A base insert failure leaves A and BASE misaligned for the
-                    # rest of the session (BASE2A would target wrong rows): surface
-                    # it instead of silently corrupting the 3-way view.
                     _dlog(f"batch base insert failed: sheet={self.sheet} pos={base_insert_pos} err={_e_base_ins}")
-                    try:
-                        messagebox.showwarning(
-                            "基准行插入失败",
-                            "向 BASE 插入对齐行失败，三方对齐可能不准确，请重新加载后再操作。\n"
-                            f"详情：{_e_base_ins}",
-                        )
-                    except Exception:
-                        pass
+                    raise RuntimeError(f"向 BASE 批量插入对齐行失败：{_e_base_ins}") from _e_base_ins
 
             src_rows = [src_row for _pair_idx, src_row in run]
             max_col = max(1, ws_src_val.max_column or 1, ws_src_edit.max_column or 1)
@@ -9066,11 +9987,28 @@ class SheetView:
                 for c in range(1, max_col + 1):
                     v_val = row_val[c - 1]
                     v_edit = row_edit[c - 1]
-                    new_edit = _choose_edit_value(v_val, v_edit)
+                    dst_cell_edit = ws_dst_edit.cell(row=dst_row, column=c)
+                    new_edit = _copy_edit_value_for_destination(
+                        v_val,
+                        v_edit,
+                        dst_cell_edit.value,
+                        src_row=src_row,
+                        src_col=c,
+                        dst_row=dst_row,
+                        dst_col=c,
+                    )
                     ws_dst_val.cell(row=dst_row, column=c).value = v_val
-                    ws_dst_edit.cell(row=dst_row, column=c).value = new_edit
+                    _assign_edit_cell_value(dst_cell_edit, new_edit)
                     if direction == "B2A":
                         self.app.record_manual_a_cell(self.sheet, dst_row, c, new_edit)
+                        if _formula_text(new_edit):
+                            self.app.record_manual_a_formula_cache(self.sheet, dst_row, c, v_val)
+                    else:
+                        self.app.record_manual_b_cell(self.sheet, dst_row, c, new_edit)
+                        if _formula_text(new_edit):
+                            self.app.record_manual_b_formula_cache(self.sheet, dst_row, c, v_val)
+                _copy_row_metadata(ws_src_edit, ws_dst_edit, src_row, dst_row, max_col)
+                _copy_row_metadata(ws_src_val, ws_dst_val, src_row, dst_row, max_col)
 
             if direction == "B2A":
                 self.app.modified_a = True
@@ -9179,8 +10117,9 @@ class SheetView:
             except Exception:
                 pass
 
-            for pair_idx, src_row in run:
-                self.touched_rows.add(int(src_row))
+            for offset, (pair_idx, src_row) in enumerate(run):
+                touched_row = insert_pos + offset if direction == "B2A" else src_row
+                self.touched_rows.add(int(touched_row))
                 self._prime_pair_cache_after_insert(
                     pair_idx=pair_idx,
                     ws_a_val=ws_a_val,
@@ -9189,15 +10128,80 @@ class SheetView:
                     ws_b_edit=ws_b_edit,
                 )
 
+            committed = True
+
             if not suppress_refresh:
-                self._invalidate_only_diff_snapshot_cache()
-                self._invalidate_render_cache()
-                self.refresh(row_only=None, rescan=False)
-                if anchor is not None:
-                    self._restore_view_anchor(anchor)
-                self._update_cursor_lines()
+                try:
+                    self._invalidate_only_diff_snapshot_cache()
+                    self._invalidate_render_cache()
+                    self.refresh(row_only=None, rescan=False)
+                    if anchor is not None:
+                        self._restore_view_anchor(anchor)
+                    self._update_cursor_lines()
+                except Exception as refresh_error:
+                    _dlog(
+                        f"batch row insert committed but refresh failed: sheet={self.sheet} "
+                        f"row={insert_pos} count={count} err={refresh_error}"
+                    )
+                    try:
+                        messagebox.showwarning(
+                            "行已插入",
+                            "数据已成功批量插入，但界面刷新失败。请点击“刷新本Sheet”查看最新结果。\n"
+                            f"详情：{refresh_error}",
+                        )
+                    except Exception:
+                        pass
             return True
         except Exception as e:
+            if not committed:
+                try:
+                    if base_edit_inserted and ws_be is not None and base_insert_pos is not None:
+                        ws_be.delete_rows(int(base_insert_pos), int(count))
+                    if base_val_inserted and ws_bv is not None and base_insert_pos is not None:
+                        ws_bv.delete_rows(int(base_insert_pos), int(count))
+                    if dst_edit_inserted and ws_dst_edit is not None and insert_pos is not None:
+                        ws_dst_edit.delete_rows(int(insert_pos), int(count))
+                    if dst_val_inserted and ws_dst_val is not None and insert_pos is not None:
+                        ws_dst_val.delete_rows(int(insert_pos), int(count))
+                    self.app.manual_a_cell_ops.clear()
+                    self.app.manual_a_cell_ops.update(manual_a_cells_before)
+                    self.app.manual_a_formula_cache_ops.clear()
+                    self.app.manual_a_formula_cache_ops.update(manual_a_cache_before)
+                    self.app.manual_b_cell_ops.clear()
+                    self.app.manual_b_cell_ops.update(manual_b_cells_before)
+                    self.app.manual_b_formula_cache_ops.clear()
+                    self.app.manual_b_formula_cache_ops.update(manual_b_cache_before)
+                    del self.app.manual_a_row_ops[manual_row_ops_len:]
+                    del self.app.manual_b_row_ops[manual_b_row_ops_len:]
+                    del self.app.undo_stack[undo_len:]
+                    self.app.modified_a = modified_a_before
+                    self.app.modified_b = modified_b_before
+                    self.app.modified_sheets_a.clear()
+                    self.app.modified_sheets_a.update(modified_sheets_a_before)
+                    self.app.modified_sheets_b.clear()
+                    self.app.modified_sheets_b.update(modified_sheets_b_before)
+                    self.row_pairs = row_pairs_before
+                    self.mine_to_base_row = mine_to_base_before
+                    self.theirs_to_base_row = theirs_to_base_before
+                    self.pair_base_row_override = overrides_before
+                    self.touched_rows = touched_before
+                    self.max_row = max_row_before
+                    self._rebuild_row_pair_lookup_maps()
+                    for cache_map, saved_entries in zip(cache_maps, pair_cache_before):
+                        for idx, (existed, value) in saved_entries.items():
+                            if existed:
+                                cache_map[idx] = value
+                            else:
+                                cache_map.pop(idx, None)
+                    _dlog(
+                        f"batch row insert rolled back: sheet={self.sheet} "
+                        f"row={insert_pos} count={count}"
+                    )
+                except Exception as rollback_error:
+                    _dlog(
+                        f"CRITICAL batch row insert rollback failed: sheet={self.sheet} "
+                        f"row={insert_pos} count={count} err={rollback_error}"
+                    )
             messagebox.showerror("Error", f"批量插入行失败：\n{e}")
             return False
 
@@ -9219,6 +10223,28 @@ class SheetView:
         In 3-way mode, B2A also inserts an empty row in Base at the same position
         to keep A-Base row-number alignment intact.
         """
+        committed = False
+        dst_val_inserted = False
+        dst_edit_inserted = False
+        base_val_inserted = False
+        base_edit_inserted = False
+        ws_dst_val = None
+        ws_dst_edit = None
+        ws_bv = None
+        ws_be = None
+        insert_pos = None
+        base_insert_pos = None
+        manual_a_cells_before = dict(getattr(self.app, "manual_a_cell_ops", {}) or {})
+        manual_a_cache_before = dict(getattr(self.app, "manual_a_formula_cache_ops", {}) or {})
+        manual_b_cells_before = dict(getattr(self.app, "manual_b_cell_ops", {}) or {})
+        manual_b_cache_before = dict(getattr(self.app, "manual_b_formula_cache_ops", {}) or {})
+        manual_row_ops_len = len(getattr(self.app, "manual_a_row_ops", []) or [])
+        manual_b_row_ops_len = len(getattr(self.app, "manual_b_row_ops", []) or [])
+        undo_len = len(getattr(self.app, "undo_stack", []) or [])
+        modified_a_before = bool(getattr(self.app, "modified_a", False))
+        modified_b_before = bool(getattr(self.app, "modified_b", False))
+        modified_sheets_a_before = set(getattr(self.app, "modified_sheets_a", set()) or set())
+        modified_sheets_b_before = set(getattr(self.app, "modified_sheets_b", set()) or set())
         try:
             ws_a_val = self.app.ws_a_val(self.sheet)
             ws_b_val = self.app.ws_b_val(self.sheet)
@@ -9241,25 +10267,50 @@ class SheetView:
 
             # Insert blank row in destination worksheet.
             ws_dst_val.insert_rows(idx=insert_pos)
+            dst_val_inserted = True
             ws_dst_edit.insert_rows(idx=insert_pos)
+            dst_edit_inserted = True
 
             # When inserting into A, shift any existing manual-edit records whose
             # row numbers are >= insert_pos (they moved up by one in the worksheet).
             if direction == "B2A":
-                try:
-                    for op_map in (
-                        self.app.manual_a_cell_ops,
-                        self.app.manual_a_formula_cache_ops,
-                    ):
-                        to_shift = {k: v for k, v in op_map.items()
-                                    if k[0] == self.sheet and k[1] >= insert_pos}
-                        for k in to_shift:
-                            del op_map[k]
-                        for (s, r, c), v in to_shift.items():
-                            op_map[(s, r + 1, c)] = v
-                except Exception as _e_shift:
-                    _dlog(f"manual_a_cell_ops shift failed (row insert): sheet={self.sheet} pos={insert_pos} err={_e_shift}")
-                self.app.record_manual_a_row_insert(self.sheet, insert_pos, 1)
+                for op_map in (
+                    self.app.manual_a_cell_ops,
+                    self.app.manual_a_formula_cache_ops,
+                ):
+                    to_shift = {k: v for k, v in op_map.items()
+                                if k[0] == self.sheet and k[1] >= insert_pos}
+                    for k in to_shift:
+                        del op_map[k]
+                    for (s, r, c), v in to_shift.items():
+                        op_map[(s, r + 1, c)] = v
+                self.app.record_manual_a_row_insert(
+                    self.sheet,
+                    insert_pos,
+                    1,
+                    source_side="B",
+                    source_rows=[src_row],
+                )
+            else:
+                for op_map in (
+                    self.app.manual_b_cell_ops,
+                    self.app.manual_b_formula_cache_ops,
+                ):
+                    to_shift = {
+                        key: value for key, value in op_map.items()
+                        if key[0] == self.sheet and key[1] >= insert_pos
+                    }
+                    for key in to_shift:
+                        del op_map[key]
+                    for (sheet_name, row_idx, col_idx), value in to_shift.items():
+                        op_map[(sheet_name, row_idx + 1, col_idx)] = value
+                self.app.record_manual_b_row_insert(
+                    self.sheet,
+                    insert_pos,
+                    1,
+                    source_side="A",
+                    source_rows=[src_row],
+                )
 
             # In 3-way mode, inserting into A also inserts an empty row in Base.
             # The base position is mapped via base coordinates (not mine's
@@ -9272,31 +10323,45 @@ class SheetView:
                     base_insert_pos = self._find_base_row_insert_position(pair_idx)
                     ws_bv = self.app.ws_base_val(self.sheet)
                     ws_be = self.app.ws_base_edit(self.sheet)
-                    if ws_bv is not None and ws_be is not None:
-                        ws_bv.insert_rows(idx=base_insert_pos)
-                        ws_be.insert_rows(idx=base_insert_pos)
-                        base_inserted = True
+                    if ws_bv is None or ws_be is None:
+                        raise RuntimeError("BASE worksheet is unavailable")
+                    ws_bv.insert_rows(idx=base_insert_pos)
+                    base_val_inserted = True
+                    ws_be.insert_rows(idx=base_insert_pos)
+                    base_edit_inserted = True
+                    base_inserted = True
                 except Exception as _e_base_ins:
                     _dlog(f"base insert failed: sheet={self.sheet} pos={base_insert_pos} err={_e_base_ins}")
-                    try:
-                        messagebox.showwarning(
-                            "基准行插入失败",
-                            "向 BASE 插入对齐行失败，三方对齐可能不准确，请重新加载后再操作。\n"
-                            f"详情：{_e_base_ins}",
-                        )
-                    except Exception:
-                        pass
+                    raise RuntimeError(f"向 BASE 插入对齐行失败：{_e_base_ins}") from _e_base_ins
 
             # Copy cell values from src_row into the newly inserted row.
             max_col = max(1, ws_src_val.max_column or 1, ws_src_edit.max_column or 1)
             for c in range(1, max_col + 1):
                 v_val = ws_src_val.cell(row=src_row, column=c).value
                 v_edit = ws_src_edit.cell(row=src_row, column=c).value
-                new_edit = _choose_edit_value(v_val, v_edit)
+                dst_cell_edit = ws_dst_edit.cell(row=insert_pos, column=c)
+                new_edit = _copy_edit_value_for_destination(
+                    v_val,
+                    v_edit,
+                    dst_cell_edit.value,
+                    src_row=src_row,
+                    src_col=c,
+                    dst_row=insert_pos,
+                    dst_col=c,
+                )
                 ws_dst_val.cell(row=insert_pos, column=c).value = v_val
-                ws_dst_edit.cell(row=insert_pos, column=c).value = new_edit
+                _assign_edit_cell_value(dst_cell_edit, new_edit)
                 if direction == "B2A":
                     self.app.record_manual_a_cell(self.sheet, insert_pos, c, new_edit)
+                    if _formula_text(new_edit):
+                        self.app.record_manual_a_formula_cache(self.sheet, insert_pos, c, v_val)
+                else:
+                    self.app.record_manual_b_cell(self.sheet, insert_pos, c, new_edit)
+                    if _formula_text(new_edit):
+                        self.app.record_manual_b_formula_cache(self.sheet, insert_pos, c, v_val)
+
+            _copy_row_metadata(ws_src_edit, ws_dst_edit, src_row, insert_pos, max_col)
+            _copy_row_metadata(ws_src_val, ws_dst_val, src_row, insert_pos, max_col)
 
             if direction == "B2A":
                 self.app.modified_a = True
@@ -9314,31 +10379,79 @@ class SheetView:
                 "count": 1,
                 "base_inserted": base_inserted,
             })
+            committed = True
 
             if not suppress_refresh:
-                fast_done = self._try_fast_refresh_after_row_insert(
-                    pair_idx=pair_idx,
-                    direction=direction,
-                    insert_pos=insert_pos,
-                    base_insert_pos=base_insert_pos,
-                    old_pair=old_pair,
-                    base_inserted=base_inserted,
-                    suppress_refresh=suppress_refresh,
-                    anchor=anchor,
-                    ws_a_val=ws_a_val,
-                    ws_b_val=ws_b_val,
-                    ws_a_edit=ws_a_edit,
-                    ws_b_edit=ws_b_edit,
-                )
-                if not fast_done:
-                    self._invalidate_only_diff_snapshot_cache()
-                    self._invalidate_render_cache()
-                    self.refresh(row_only=None, rescan=True)
-                    if anchor is not None:
-                        self._restore_view_anchor(anchor)
-                    self._update_cursor_lines()
+                try:
+                    fast_done = self._try_fast_refresh_after_row_insert(
+                        pair_idx=pair_idx,
+                        direction=direction,
+                        insert_pos=insert_pos,
+                        base_insert_pos=base_insert_pos,
+                        old_pair=old_pair,
+                        base_inserted=base_inserted,
+                        suppress_refresh=suppress_refresh,
+                        anchor=anchor,
+                        ws_a_val=ws_a_val,
+                        ws_b_val=ws_b_val,
+                        ws_a_edit=ws_a_edit,
+                        ws_b_edit=ws_b_edit,
+                    )
+                    if not fast_done:
+                        self._invalidate_only_diff_snapshot_cache()
+                        self._invalidate_render_cache()
+                        self.refresh(row_only=None, rescan=True)
+                        if anchor is not None:
+                            self._restore_view_anchor(anchor)
+                        self._update_cursor_lines()
+                except Exception as refresh_error:
+                    _dlog(
+                        f"row insert committed but refresh failed: sheet={self.sheet} "
+                        f"row={insert_pos} err={refresh_error}"
+                    )
+                    try:
+                        messagebox.showwarning(
+                            "行已插入",
+                            "数据已成功插入，但界面刷新失败。请点击“刷新本Sheet”查看最新结果。\n"
+                            f"详情：{refresh_error}",
+                        )
+                    except Exception:
+                        pass
             return True
         except Exception as e:
+            if not committed:
+                try:
+                    if base_edit_inserted and ws_be is not None and base_insert_pos is not None:
+                        ws_be.delete_rows(int(base_insert_pos), 1)
+                    if base_val_inserted and ws_bv is not None and base_insert_pos is not None:
+                        ws_bv.delete_rows(int(base_insert_pos), 1)
+                    if dst_edit_inserted and ws_dst_edit is not None and insert_pos is not None:
+                        ws_dst_edit.delete_rows(int(insert_pos), 1)
+                    if dst_val_inserted and ws_dst_val is not None and insert_pos is not None:
+                        ws_dst_val.delete_rows(int(insert_pos), 1)
+                    self.app.manual_a_cell_ops.clear()
+                    self.app.manual_a_cell_ops.update(manual_a_cells_before)
+                    self.app.manual_a_formula_cache_ops.clear()
+                    self.app.manual_a_formula_cache_ops.update(manual_a_cache_before)
+                    self.app.manual_b_cell_ops.clear()
+                    self.app.manual_b_cell_ops.update(manual_b_cells_before)
+                    self.app.manual_b_formula_cache_ops.clear()
+                    self.app.manual_b_formula_cache_ops.update(manual_b_cache_before)
+                    del self.app.manual_a_row_ops[manual_row_ops_len:]
+                    del self.app.manual_b_row_ops[manual_b_row_ops_len:]
+                    del self.app.undo_stack[undo_len:]
+                    self.app.modified_a = modified_a_before
+                    self.app.modified_b = modified_b_before
+                    self.app.modified_sheets_a.clear()
+                    self.app.modified_sheets_a.update(modified_sheets_a_before)
+                    self.app.modified_sheets_b.clear()
+                    self.app.modified_sheets_b.update(modified_sheets_b_before)
+                    _dlog(f"row insert rolled back: sheet={self.sheet} row={insert_pos}")
+                except Exception as rollback_error:
+                    _dlog(
+                        f"CRITICAL row insert rollback failed: sheet={self.sheet} "
+                        f"row={insert_pos} err={rollback_error}"
+                    )
             messagebox.showerror("Error", f"插入行失败：\n{e}")
             return False
 
@@ -9353,6 +10466,25 @@ class SheetView:
     ) -> bool:
         t0 = datetime.now()
         formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
+        interactive_busy = not suppress_refresh
+        previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive()
+        self._suppress_bg_apply = True
+        if interactive_busy:
+            action_text = {
+                "B2A": "正在采用 theirs 行到 mine...",
+                "A2B": "正在采用 mine 行到 theirs...",
+                "BASE2A": "正在采用 Base 行到 mine...",
+            }.get(direction, "正在处理行操作...")
+            try:
+                self.info.configure(text=action_text)
+                self.root.configure(cursor="watch")
+                self.root.update_idletasks()
+            except Exception:
+                pass
         try:
             if self._is_missing_sheet_view():
                 self._copy_missing_sheet(direction)
@@ -9477,6 +10609,24 @@ class SheetView:
             if not cols:
                 return False
 
+            if not resolved_only and action_direction in ("A2B", "B2A", "BASE2A"):
+                if action_direction == "A2B":
+                    src_edit_ws, src_val_ws, dst_edit_ws = ws_a_edit, ws_a_val, ws_b_edit
+                elif action_direction == "B2A":
+                    src_edit_ws, src_val_ws, dst_edit_ws = ws_b_edit, ws_b_val, ws_a_edit
+                else:
+                    src_edit_ws, src_val_ws, dst_edit_ws = ws_base_edit, ws_base_val, ws_a_edit
+                if src_r is not None and src_edit_ws is not None:
+                    for c in cols:
+                        if int(c) <= 0:
+                            continue
+                        _copy_edit_value_for_destination(
+                            src_val_ws.cell(row=src_r, column=c).value if src_val_ws is not None else None,
+                            src_edit_ws.cell(row=src_r, column=c).value,
+                            dst_edit_ws.cell(row=dst_r, column=c).value,
+                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                        )
+
             if action_direction == "A2B":
                 if not resolved_only:
                     undo_cells = []
@@ -9485,11 +10635,26 @@ class SheetView:
                         old_val = ws_b_val.cell(row=dst_r, column=c).value
                         v_edit = ws_a_edit.cell(row=src_r, column=c).value
                         v_val = ws_a_val.cell(row=src_r, column=c).value
-                        if self._skip_same_formula_copy(v_edit, old_edit):
+                        new_edit = _copy_edit_value_for_destination(
+                            v_val, v_edit, old_edit,
+                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                        )
+                        formula_mode = self._same_formula_copy_mode(
+                            new_edit, old_edit, v_val, old_val
+                        )
+                        if formula_mode == "noop":
+                            continue
+                        if formula_mode == "cache":
                             ws_b_val.cell(row=dst_r, column=c).value = v_val
+                            self.app.record_manual_b_formula_cache(self.sheet, dst_r, c, v_val)
                             undo_cells.append((dst_r, c, old_edit, old_val))
                             continue
-                        ws_b_edit.cell(row=dst_r, column=c).value = _choose_edit_value(v_val, v_edit)
+                        self.app.clear_manual_b_formula_cache(self.sheet, dst_r, c)
+                        _assign_edit_cell_value(
+                            ws_b_edit.cell(row=dst_r, column=c),
+                            new_edit,
+                        )
+                        self.app.record_manual_b_cell(self.sheet, dst_r, c, new_edit)
                         ws_b_val.cell(row=dst_r, column=c).value = v_val
                         undo_cells.append((dst_r, c, old_edit, old_val))
                     self.app.modified_b = True
@@ -9512,14 +10677,22 @@ class SheetView:
                     old_val = ws_a_val.cell(row=dst_r, column=c).value
                     v_edit = ws_b_edit.cell(row=src_r, column=c).value
                     v_val = ws_b_val.cell(row=src_r, column=c).value
-                    if self._skip_same_formula_copy(v_edit, old_edit):
+                    new_edit = _copy_edit_value_for_destination(
+                        v_val, v_edit, old_edit,
+                        src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                    )
+                    formula_mode = self._same_formula_copy_mode(
+                        new_edit, old_edit, v_val, old_val
+                    )
+                    if formula_mode == "noop":
+                        continue
+                    if formula_mode == "cache":
                         ws_a_val.cell(row=dst_r, column=c).value = v_val
                         self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
                         undo_cells.append((dst_r, c, old_edit, old_val))
                         applied_cols.add(c)
                         continue
-                    new_edit = _choose_edit_value(v_val, v_edit)
-                    ws_a_edit.cell(row=dst_r, column=c).value = new_edit
+                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=c), new_edit)
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
@@ -9552,14 +10725,25 @@ class SheetView:
                     else:
                         v_edit = ws_base_edit.cell(row=src_r, column=c).value
                         v_val = ws_base_val.cell(row=src_r, column=c).value
-                    if self._skip_same_formula_copy(v_edit, old_edit):
+                    new_edit = (
+                        _copy_edit_value_for_destination(
+                            v_val, v_edit, old_edit,
+                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                        )
+                        if src_r is not None else None
+                    )
+                    formula_mode = self._same_formula_copy_mode(
+                        new_edit, old_edit, v_val, old_val
+                    )
+                    if formula_mode == "noop":
+                        continue
+                    if formula_mode == "cache":
                         ws_a_val.cell(row=dst_r, column=c).value = v_val
                         self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
                         undo_cells.append((dst_r, c, old_edit, old_val))
                         applied_cols.add(c)
                         continue
-                    new_edit = _choose_edit_value(v_val, v_edit)
-                    ws_a_edit.cell(row=dst_r, column=c).value = new_edit
+                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=c), new_edit)
                     ws_a_val.cell(row=dst_r, column=c).value = v_val
                     self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
                     undo_cells.append((dst_r, c, old_edit, old_val))
@@ -9605,11 +10789,19 @@ class SheetView:
             messagebox.showerror("Error", f"覆盖整行失败：\n{e}")
             return False
         finally:
+            self._suppress_bg_apply = previous_bg_suppression
+            if callable(end_interactive):
+                end_interactive()
             try:
                 dt = (datetime.now() - t0).total_seconds() * 1000.0
                 _dlog(f"OVERWRITE_ROW {self.sheet} dir={direction} ms={dt:.1f}")
             except Exception:
                 pass
+            if interactive_busy:
+                try:
+                    self.root.configure(cursor="")
+                except Exception:
+                    pass
 
     def _undo_last_action(self):
         try:
@@ -9683,6 +10875,32 @@ class SheetView:
                     ws_val = self.app.ws_b_val(sheet)
                     ws_edit.delete_rows(row, count)
                     ws_val.delete_rows(row, count)
+                    try:
+                        row_int = int(row)
+                        for op_map in (
+                            self.app.manual_b_cell_ops,
+                            self.app.manual_b_formula_cache_ops,
+                        ):
+                            to_drop = [
+                                key for key in op_map
+                                if key[0] == sheet and row_int <= key[1] < row_int + count
+                            ]
+                            for key in to_drop:
+                                del op_map[key]
+                            to_shift = {
+                                key: value for key, value in op_map.items()
+                                if key[0] == sheet and key[1] >= row_int + count
+                            }
+                            for key in to_shift:
+                                del op_map[key]
+                            for (sheet_name, row_idx, col_idx), value in to_shift.items():
+                                op_map[(sheet_name, row_idx - count, col_idx)] = value
+                    except Exception as cache_shift_error:
+                        _dlog(
+                            f"manual_b_formula_cache_ops undo shift failed: "
+                            f"sheet={sheet} row={row} err={cache_shift_error}"
+                        )
+                    self.app.remove_last_manual_b_row_insert(sheet, row, count)
                     self.app.modified_b = True
                     self.app.modified_sheets_b.add(sheet)
                 if base_inserted:
@@ -9715,10 +10933,18 @@ class SheetView:
                 self.app.modified_sheets_b.add(sheet)
             rows = set()
             for r, c, old_edit, old_val in cells:
-                ws_edit.cell(row=r, column=c).value = old_edit
+                restored_edit = _choose_edit_value(old_val, old_edit)
+                _assign_edit_cell_value(ws_edit.cell(row=r, column=c), restored_edit)
                 ws_val.cell(row=r, column=c).value = old_val
                 if target == "A":
-                    self.app.record_manual_a_cell(sheet, r, c, old_edit)
+                    self.app.record_manual_a_cell(sheet, r, c, restored_edit)
+                    if _formula_text(restored_edit):
+                        self.app.record_manual_a_formula_cache(sheet, r, c, old_val)
+                else:
+                    self.app.record_manual_b_cell(sheet, r, c, restored_edit)
+                    self.app.clear_manual_b_formula_cache(sheet, r, c)
+                    if _formula_text(restored_edit):
+                        self.app.record_manual_b_formula_cache(sheet, r, c, old_val)
                 rows.add(r)
             # refresh current sheet if applicable
             if sheet == self.sheet:
@@ -10243,9 +11469,12 @@ class SheetView:
         ws_b_edit = self._display_ws("B", edit=True)
         ws_base = self._display_ws("BASE", edit=False) if getattr(self.app, "has_base", False) else None
 
-        a_r, a_c = _effective_bounds(ws_a) if meta.get("has_a") else (0, 0)
-        b_r, b_c = _effective_bounds(ws_b) if meta.get("has_b") else (0, 0)
-        base_r, base_c = _effective_bounds(ws_base) if (ws_base is not None and meta.get("has_base")) else (0, 0)
+        a_r, a_c = _effective_bounds_with_edit(ws_a, ws_a_edit) if meta.get("has_a") else (0, 0)
+        b_r, b_c = _effective_bounds_with_edit(ws_b, ws_b_edit) if meta.get("has_b") else (0, 0)
+        base_r, base_c = (
+            _effective_bounds_with_edit(ws_base, self._display_ws("BASE", edit=True))
+            if (ws_base is not None and meta.get("has_base")) else (0, 0)
+        )
         self.max_row = max(1, a_r, b_r, base_r)
         self.max_col = max(1, a_c, b_c, base_c)
         self.col_max_a = max(1, a_c)
@@ -10377,8 +11606,8 @@ class SheetView:
             ws_base_edit_ready = None
 
         if rescan or (not self._bounds_checked):
-            a_r, a_c = _effective_bounds(ws_a)
-            b_r, b_c = _effective_bounds(ws_b)
+            a_r, a_c = _effective_bounds_with_edit(ws_a, ws_a_edit)
+            b_r, b_c = _effective_bounds_with_edit(ws_b, ws_b_edit)
             self.max_row = max(a_r, b_r)
             self.max_col = max(a_c, b_c)
             self.col_max_a = a_c
@@ -10642,7 +11871,11 @@ class SheetView:
                 )
                 if self._render_limit < target_limit:
                     self._render_limit = target_limit
-            if len(self._full_display_rows) > _FAST_RENDER_ROW_LIMIT and self._render_limit < _FAST_RENDER_ROW_LIMIT:
+            if (
+                (not self._is_large_sheet)
+                and len(self._full_display_rows) > _FAST_RENDER_ROW_LIMIT
+                and self._render_limit < _FAST_RENDER_ROW_LIMIT
+            ):
                 self._render_limit = _FAST_RENDER_ROW_LIMIT
             if self._is_large_sheet and rescan:
                 self._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, len(self._full_display_rows)) if self._full_display_rows else _LARGE_SHEET_INITIAL_ROWS
@@ -11085,6 +12318,16 @@ class SowMergeApp:
                  base_path: str | None = None,
                  merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False,
                  raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None):
+        # Sequential GUI instances are common in smoke tests and can also occur
+        # in host integrations. Collect destroyed Tk object cycles on the UI
+        # thread before any new background XML parser can trigger that GC.
+        gc.collect()
+        self._is_closing = False
+        self._background_threads_lock = threading.Lock()
+        self._background_threads: set[threading.Thread] = set()
+        self._interactive_action_lock = threading.Lock()
+        self._interactive_action_depth = 0
+        self._interactive_action_event = threading.Event()
         self.file_a = file_a
         self.file_b = file_b
         self.base_path = base_path
@@ -11106,10 +12349,13 @@ class SowMergeApp:
         # In 3-way manual merge mode, persist only explicitly operated A-side cells on save.
         # key: (sheet, row, col) -> edit value to write
         self.manual_a_cell_ops: dict[tuple[str, int, int], object] = {}
+        self.manual_b_cell_ops: dict[tuple[str, int, int], object] = {}
         # Same-formula cells can have intentionally adopted cached results in
         # manual-calculation workbooks. Keep them separate from formula edits.
         self.manual_a_formula_cache_ops: dict[tuple[str, int, int], object] = {}
+        self.manual_b_formula_cache_ops: dict[tuple[str, int, int], object] = {}
         self.manual_a_row_ops: list[dict[str, object]] = []
+        self.manual_b_row_ops: list[dict[str, object]] = []
         self.manual_sheet_ops: list[dict[str, object]] = []
         self.auto_sheet_ops: list[dict[str, object]] = []
         self.sheet_level_conflicts: list[dict[str, object]] = []
@@ -11184,6 +12430,9 @@ class SowMergeApp:
         # Always run regardless of _FAST_OPEN_ENABLED: fast-open defers value loading
         # but edit workbooks must still be ready before the user's first row override.
         def _preload_edit():
+            a_edit = None
+            b_edit = None
+            base_edit = None
             try:
                 _dlog("preload edit workbooks (background) start")
                 t1 = datetime.now()
@@ -11197,17 +12446,25 @@ class SowMergeApp:
                     t3 = datetime.now()
                     base_edit = load_workbook(self.base_path, data_only=False)
                     _dlog(f"preload wb_base_edit: {(datetime.now()-t3).total_seconds():.3f}s")
-                self._wb_a_edit = a_edit
-                self._wb_b_edit = b_edit
-                self._wb_base_edit = base_edit
+                with self._edit_fallback_lock:
+                    if self._is_closing:
+                        _wbs_close(a_edit, b_edit, base_edit)
+                    else:
+                        self._wb_a_edit = a_edit
+                        self._wb_b_edit = b_edit
+                        self._wb_base_edit = base_edit
             except Exception as e:
+                _wbs_close(a_edit, b_edit, base_edit)
                 _dlog(f"preload edit failed: {e}")
             finally:
                 self._edit_loaded_event.set()
                 _dlog("preload edit workbooks (background) done")
 
         self._edit_loading_started = True
-        threading.Thread(target=_preload_edit, daemon=True).start()
+        self._edit_preload_thread = self._start_background_thread(
+            _preload_edit,
+            name="sow-edit-preload",
+        )
 
         self.modified_a = False
         self.modified_b = False
@@ -11226,7 +12483,6 @@ class SowMergeApp:
             self.root.title(f"{self._window_title_suffix} (TortoiseMerge-like)")
         self.root.geometry("1450x860")
 
-        self._is_closing = False
         self._root_after_ids: set[str] = set()
         try:
             self.root.protocol("WM_DELETE_WINDOW", self._shutdown_root)
@@ -11338,13 +12594,101 @@ class SowMergeApp:
         ws_b = self.ws_for_side(side_b, sheet, edit=False, allow_missing=True)
         if ws_a is None or ws_b is None:
             return False
+        ws_a_edit = self.ws_for_side(side_a, sheet, edit=True, allow_missing=True)
+        ws_b_edit = self.ws_for_side(side_b, sheet, edit=True, allow_missing=True)
+        if ws_a_edit is None or ws_b_edit is None:
+            return False
         max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
-        max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
-        for r in range(1, max_row + 1):
-            for c in range(1, max_col + 1):
-                va = ws_a.cell(row=r, column=c).value
-                vb = ws_b.cell(row=r, column=c).value
-                if _merge_cmp_value(va) != _merge_cmp_value(vb):
+        max_col = max(
+            ws_a.max_column or 1,
+            ws_b.max_column or 1,
+            ws_a_edit.max_column or 1,
+            ws_b_edit.max_column or 1,
+        )
+        try:
+            if {str(rng) for rng in ws_a_edit.merged_cells.ranges} != {
+                str(rng) for rng in ws_b_edit.merged_cells.ranges
+            }:
+                return False
+            if str(ws_a_edit.freeze_panes or "") != str(ws_b_edit.freeze_panes or ""):
+                return False
+            if str(getattr(ws_a_edit.auto_filter, "ref", "") or "") != str(
+                getattr(ws_b_edit.auto_filter, "ref", "") or ""
+            ):
+                return False
+
+            def _row_dim_key(dim):
+                return (
+                    getattr(dim, "height", None), getattr(dim, "hidden", None),
+                    getattr(dim, "outlineLevel", None), getattr(dim, "collapsed", None),
+                    getattr(dim, "style_id", None), getattr(dim, "thickTop", None),
+                    getattr(dim, "thickBot", None),
+                )
+
+            row_keys = set(ws_a_edit.row_dimensions) | set(ws_b_edit.row_dimensions)
+            for key in row_keys:
+                if _row_dim_key(ws_a_edit.row_dimensions[key]) != _row_dim_key(ws_b_edit.row_dimensions[key]):
+                    return False
+
+            def _col_dim_key(dim):
+                return (
+                    getattr(dim, "width", None), getattr(dim, "hidden", None),
+                    getattr(dim, "bestFit", None), getattr(dim, "outlineLevel", None),
+                    getattr(dim, "collapsed", None), getattr(dim, "style_id", None),
+                    getattr(dim, "min", None), getattr(dim, "max", None),
+                )
+
+            col_keys = set(ws_a_edit.column_dimensions) | set(ws_b_edit.column_dimensions)
+            for key in col_keys:
+                if _col_dim_key(ws_a_edit.column_dimensions[key]) != _col_dim_key(ws_b_edit.column_dimensions[key]):
+                    return False
+        except Exception:
+            # This predicate controls destructive auto-delete. If structure
+            # cannot be compared, fail closed and surface a sheet conflict.
+            return False
+
+        rows_a = ws_a.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
+        rows_b = ws_b.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)
+        rows_a_edit = ws_a_edit.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=False)
+        rows_b_edit = ws_b_edit.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=False)
+        for row_a, row_b, row_a_edit, row_b_edit in zip(rows_a, rows_b, rows_a_edit, rows_b_edit):
+            for va, vb, cell_a_edit, cell_b_edit in zip(row_a, row_b, row_a_edit, row_b_edit):
+                va_edit = cell_a_edit.value
+                vb_edit = cell_b_edit.value
+                try:
+                    if cell_a_edit.data_type != cell_b_edit.data_type:
+                        return False
+                    if cell_a_edit._style != cell_b_edit._style:
+                        return False
+                    comment_a = cell_a_edit.comment
+                    comment_b = cell_b_edit.comment
+                    if (
+                        getattr(comment_a, "text", None), getattr(comment_a, "author", None)
+                    ) != (
+                        getattr(comment_b, "text", None), getattr(comment_b, "author", None)
+                    ):
+                        return False
+                    link_a = cell_a_edit.hyperlink
+                    link_b = cell_b_edit.hyperlink
+                    if (
+                        getattr(link_a, "target", None), getattr(link_a, "location", None),
+                        getattr(link_a, "tooltip", None), getattr(link_a, "display", None),
+                    ) != (
+                        getattr(link_b, "target", None), getattr(link_b, "location", None),
+                        getattr(link_b, "tooltip", None), getattr(link_b, "display", None),
+                    ):
+                        return False
+                except Exception:
+                    return False
+                formula_a = _formula_text(va_edit)
+                formula_b = _formula_text(vb_edit)
+                if formula_a or formula_b:
+                    if not (formula_a and formula_b and _same_formula(va_edit, vb_edit)):
+                        return False
+                _display_a, _display_b, equal = _cell_display_and_equal_from_values(
+                    va, vb, va_edit, vb_edit
+                )
+                if not equal:
                     return False
         return True
 
@@ -11366,6 +12710,59 @@ class SowMergeApp:
             if allow_missing:
                 return None
             raise
+
+    def _start_background_thread(self, target, *, name: str):
+        """Start and track a worker so shutdown cannot orphan workbook/Tk state."""
+        if getattr(self, "_is_closing", False):
+            return None
+
+        def _run_tracked():
+            try:
+                target()
+            finally:
+                try:
+                    with self._background_threads_lock:
+                        self._background_threads.discard(threading.current_thread())
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=_run_tracked, daemon=True, name=name)
+        with self._background_threads_lock:
+            if self._is_closing:
+                return None
+            self._background_threads.add(thread)
+        try:
+            thread.start()
+        except Exception:
+            with self._background_threads_lock:
+                self._background_threads.discard(thread)
+            raise
+        return thread
+
+    def _begin_interactive_action(self):
+        """Pause optional background scans while the user is changing data."""
+        with self._interactive_action_lock:
+            self._interactive_action_depth += 1
+            self._interactive_action_event.set()
+
+    def _end_interactive_action(self):
+        with self._interactive_action_lock:
+            self._interactive_action_depth = max(0, self._interactive_action_depth - 1)
+            if self._interactive_action_depth == 0:
+                self._interactive_action_event.clear()
+
+    def _join_background_threads(self, timeout: float = 5.0):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._background_threads_lock:
+            threads = list(self._background_threads)
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current or not thread.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
 
     def _safe_root_after(self, delay_ms: int, callback):
         if getattr(self, "_is_closing", False):
@@ -11412,18 +12809,17 @@ class SowMergeApp:
         self._is_closing = True
         self._cancel_root_afters()
         try:
-            _wbs_close(
-                getattr(self, "_wb_a_val", None),
-                getattr(self, "_wb_b_val", None),
-                getattr(self, "_wb_base_val", None),
-                getattr(self, "_wb_a_edit", None),
-                getattr(self, "_wb_b_edit", None),
-                getattr(self, "_wb_base_edit", None),
-            )
+            with self._compute_lock:
+                self._compute_queue.clear()
         except Exception:
             pass
         try:
             for view in list(getattr(self, "sheet_views", {}).values()):
+                if view is None:
+                    continue
+                view._only_diff_async_build_seq += 1
+                view._only_diff_async_building = False
+                view._only_diff_async_build_key = None
                 for attr in ("_settings_save_id", "_hover_debounce_id", "_diff_map_debounce_id"):
                     aid = getattr(view, attr, None)
                     if not aid:
@@ -11436,6 +12832,30 @@ class SowMergeApp:
                         setattr(view, attr, None)
                     except Exception:
                         pass
+        except Exception:
+            pass
+        try:
+            with self._ui_task_lock:
+                self._ui_tasks.clear()
+        except Exception:
+            pass
+        self._join_background_threads(timeout=5.0)
+        try:
+            with self._edit_fallback_lock:
+                _wbs_close(
+                    getattr(self, "_wb_a_val", None),
+                    getattr(self, "_wb_b_val", None),
+                    getattr(self, "_wb_base_val", None),
+                    getattr(self, "_wb_a_edit", None),
+                    getattr(self, "_wb_b_edit", None),
+                    getattr(self, "_wb_base_edit", None),
+                )
+                self._wb_a_val = None
+                self._wb_b_val = None
+                self._wb_base_val = None
+                self._wb_a_edit = None
+                self._wb_b_edit = None
+                self._wb_base_edit = None
         except Exception:
             pass
         try:
@@ -11551,16 +12971,68 @@ class SowMergeApp:
         except Exception:
             pass
 
-    def record_manual_a_row_insert(self, sheet: str, row: int, count: int = 1):
+    def record_manual_b_cell(self, sheet: str, r: int, c: int, edit_value):
         try:
-            self.manual_a_row_ops.append({
+            key = (sheet, int(r), int(c))
+            self.manual_b_cell_ops[key] = edit_value
+            self.manual_b_formula_cache_ops.pop(key, None)
+        except Exception:
+            pass
+
+    def record_manual_b_formula_cache(self, sheet: str, r: int, c: int, cached_value):
+        try:
+            self.manual_b_formula_cache_ops[(sheet, int(r), int(c))] = cached_value
+        except Exception:
+            pass
+
+    def clear_manual_b_formula_cache(self, sheet: str, r: int, c: int):
+        try:
+            self.manual_b_formula_cache_ops.pop((sheet, int(r), int(c)), None)
+        except Exception:
+            pass
+
+    def record_manual_a_row_insert(
+        self,
+        sheet: str,
+        row: int,
+        count: int = 1,
+        source_side: str | None = None,
+        source_rows: list[int] | None = None,
+    ):
+        try:
+            op = {
                 "sheet": sheet,
                 "kind": "insert_rows",
                 "row": int(row),
                 "count": max(1, int(count)),
-            })
+            }
+            if source_side:
+                op["source_side"] = str(source_side).upper()
+            if source_rows:
+                op["source_rows"] = [int(value) for value in source_rows]
+            self.manual_a_row_ops.append(op)
         except Exception:
             pass
+
+    def record_manual_b_row_insert(
+        self,
+        sheet: str,
+        row: int,
+        count: int = 1,
+        source_side: str | None = None,
+        source_rows: list[int] | None = None,
+    ):
+        op = {
+            "sheet": sheet,
+            "kind": "insert_rows",
+            "row": int(row),
+            "count": max(1, int(count)),
+        }
+        if source_side:
+            op["source_side"] = str(source_side).upper()
+        if source_rows:
+            op["source_rows"] = [int(value) for value in source_rows]
+        self.manual_b_row_ops.append(op)
 
     def remove_last_manual_a_row_insert(self, sheet: str, row: int, count: int = 1) -> bool:
         row = int(row)
@@ -11578,6 +13050,21 @@ class SowMergeApp:
                     return True
             except Exception:
                 continue
+        return False
+
+    def remove_last_manual_b_row_insert(self, sheet: str, row: int, count: int = 1) -> bool:
+        row = int(row)
+        count = max(1, int(count))
+        for idx in range(len(self.manual_b_row_ops) - 1, -1, -1):
+            op = self.manual_b_row_ops[idx]
+            if (
+                op.get("sheet") == sheet
+                and op.get("kind") == "insert_rows"
+                and int(op.get("row", 0)) == row
+                and int(op.get("count", 1)) == count
+            ):
+                del self.manual_b_row_ops[idx]
+                return True
         return False
 
     def record_manual_sheet_copy(self, sheet: str, source_side: str, target_side: str):
@@ -11626,11 +13113,11 @@ class SowMergeApp:
         if target_side == "A":
             self.modified_a = True
             self.modified_sheets_a.add(sheet)
-            if self.merge_mode and self.has_base:
-                self.record_manual_sheet_copy(sheet, source_side, target_side)
+            self.record_manual_sheet_copy(sheet, source_side, target_side)
         elif target_side == "B":
             self.modified_b = True
             self.modified_sheets_b.add(sheet)
+            self.record_manual_sheet_copy(sheet, source_side, target_side)
         self._refresh_sheet_catalog()
 
     def _delete_sheet_on_side(self, sheet: str, target_side: str):
@@ -11644,11 +13131,11 @@ class SowMergeApp:
         if target_side == "A":
             self.modified_a = True
             self.modified_sheets_a.add(sheet)
-            if self.merge_mode and self.has_base:
-                self.record_manual_sheet_delete(sheet, target_side)
+            self.record_manual_sheet_delete(sheet, target_side)
         elif target_side == "B":
             self.modified_b = True
             self.modified_sheets_b.add(sheet)
+            self.record_manual_sheet_delete(sheet, target_side)
         self._refresh_sheet_catalog()
         if sheet not in self.sheet_meta:
             self.display_sheets.append(sheet)
@@ -11656,14 +13143,42 @@ class SowMergeApp:
             self.sheet_diff_state[sheet] = 0
         return True
 
+    def _sheet_ops_for_target(self, target_side: str, *, include_auto: bool = False):
+        target_side = str(target_side or "").upper()
+        ops = []
+        if include_auto:
+            ops.extend(getattr(self, "auto_sheet_ops", []) or [])
+        ops.extend(getattr(self, "manual_sheet_ops", []) or [])
+        return [
+            dict(op)
+            for op in ops
+            if str(op.get("target_side") or "A").upper() == target_side
+        ]
+
+    def _clear_sheet_ops_for_target(self, target_side: str):
+        target_side = str(target_side or "").upper()
+        self.manual_sheet_ops[:] = [
+            op for op in self.manual_sheet_ops
+            if str(op.get("target_side") or "A").upper() != target_side
+        ]
+
     def build_manual_merge_output_file(self):
         """Build merge output by XML-level patching from pristine mine snapshot."""
         src = self._merge_mine_snapshot if (self._merge_mine_snapshot and os.path.exists(self._merge_mine_snapshot)) else self.file_a
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merged_output_{os.getpid()}_{ts}{_workbook_ext(src)}")
-        sheet_ops = list(getattr(self, "auto_sheet_ops", []) or []) + list(getattr(self, "manual_sheet_ops", []) or [])
-        manual_ops = _filter_noop_manual_ops(src, self.manual_a_cell_ops)
+        sheet_ops = self._sheet_ops_for_target("A", include_auto=True)
+        manual_ops = _prepare_manual_ops_for_save(
+            src,
+            self.manual_a_cell_ops,
+            row_ops=self.manual_a_row_ops,
+            sheet_ops=sheet_ops,
+        )
         formula_cache_values = dict(getattr(self, "manual_a_formula_cache_ops", {}) or {})
+        literal_text_values = {
+            key: value for key, value in manual_ops.items()
+            if isinstance(value, _LiteralText)
+        }
         cached_values = dict(formula_cache_values)
         for sheet, row_idx, col_idx in manual_ops.keys():
             try:
@@ -11715,12 +13230,17 @@ class SowMergeApp:
                 source_paths=source_paths,
             )
             if ok:
-                if formula_cache_values:
+                if formula_cache_values or literal_text_values:
                     cache_out = out + ".formula-cache.xlsx"
+                    post_save_ops = {
+                        key: zip_ops[key] for key in formula_cache_values
+                        if key in zip_ops
+                    }
+                    post_save_ops.update(literal_text_values)
                     _build_manual_merge_xlsx_via_zip(
                         out,
                         cache_out,
-                        {key: zip_ops[key] for key in formula_cache_values if key in zip_ops},
+                        post_save_ops,
                         cached_values=formula_cache_values,
                         cache_only_keys=set(formula_cache_values),
                     )
@@ -11728,10 +13248,20 @@ class SowMergeApp:
                 return out
             _dlog("WARNING: excel native save failed, trying openpyxl replay fallback")
         if self.manual_a_row_ops or sheet_ops:
-            if _xlsx_contains_formulas(src):
+            unsafe_sources = [
+                path for path in _replay_formula_source_paths(
+                    src,
+                    row_ops=self.manual_a_row_ops,
+                    sheet_ops=sheet_ops,
+                    source_paths=source_paths,
+                )
+                if _xlsx_requires_native_structural_replay(path)
+            ]
+            if unsafe_sources:
                 raise RuntimeError(
-                    "Excel 原生保存失败。为避免 openpyxl 回退丢失公式缓存，"
+                    "Excel 原生保存失败。为避免 openpyxl 回退破坏公式缓存或高级 Sheet 对象，"
                     "已停止保存且未替换目标文件；请关闭占用文件的 Excel 后重试。"
+                    f"\n需要原生回放的来源文件：{', '.join(os.path.basename(path) for path in unsafe_sources)}"
                 )
             ok = _build_manual_merge_output_with_openpyxl(
                 src,
@@ -11748,6 +13278,111 @@ class SowMergeApp:
             "无法安全保存所选公式单元格：ZIP 校验未通过且 Excel 原生保存不可用。"
             "目标文件未被替换。"
         )
+
+    def build_manual_b_output_file(self):
+        """Build a 2-way B-side result by replaying structural operations safely."""
+        src = self.file_b
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(
+            tempfile.gettempdir(),
+            f"{APP_NAME}_b_output_{os.getpid()}_{ts}{_workbook_ext(src)}",
+        )
+        row_ops = list(getattr(self, "manual_b_row_ops", []) or [])
+        sheet_ops = self._sheet_ops_for_target("B")
+        manual_ops = _prepare_manual_ops_for_save(
+            src,
+            self.manual_b_cell_ops,
+            row_ops=row_ops,
+            sheet_ops=sheet_ops,
+        )
+        formula_cache_values = dict(getattr(self, "manual_b_formula_cache_ops", {}) or {})
+        literal_text_values = {
+            key: value for key, value in manual_ops.items()
+            if isinstance(value, _LiteralText)
+        }
+        cached_values = dict(formula_cache_values)
+        for sheet, row_idx, col_idx in manual_ops.keys():
+            try:
+                cached_values[(sheet, row_idx, col_idx)] = self.ws_b_val(sheet).cell(
+                    row=int(row_idx), column=int(col_idx)
+                ).value
+            except Exception:
+                pass
+        zip_ops = dict(manual_ops)
+        for key in formula_cache_values.keys():
+            sheet, row_idx, col_idx = key
+            try:
+                formula = _formula_text(
+                    self.ws_b_edit(sheet).cell(row=int(row_idx), column=int(col_idx)).value
+                )
+                if formula:
+                    zip_ops[key] = formula
+            except Exception:
+                pass
+        if not zip_ops and not row_ops and not sheet_ops:
+            shutil.copy2(src, out)
+            return out
+        if not row_ops and not sheet_ops:
+            _build_manual_merge_xlsx_via_zip(
+                src,
+                out,
+                zip_ops,
+                cached_values=cached_values,
+                cache_only_keys=set(formula_cache_values),
+            )
+            return out
+
+        source_paths = {"A": self.file_a}
+        if _EXCEL_NATIVE_SAVE_ON_MERGE and _build_manual_merge_output_with_excel(
+            src,
+            out,
+            manual_ops,
+            row_ops,
+            sheet_ops=sheet_ops,
+            source_paths=source_paths,
+        ):
+            if formula_cache_values or literal_text_values:
+                cache_out = out + ".formula-cache.xlsx"
+                post_save_ops = {
+                    key: zip_ops[key] for key in formula_cache_values
+                    if key in zip_ops
+                }
+                post_save_ops.update(literal_text_values)
+                _build_manual_merge_xlsx_via_zip(
+                    out,
+                    cache_out,
+                    post_save_ops,
+                    cached_values=formula_cache_values,
+                    cache_only_keys=set(formula_cache_values),
+                )
+                os.replace(cache_out, out)
+            return out
+
+        unsafe_sources = [
+            path for path in _replay_formula_source_paths(
+                src,
+                row_ops=row_ops,
+                sheet_ops=sheet_ops,
+                source_paths=source_paths,
+            )
+            if _xlsx_requires_native_structural_replay(path)
+        ]
+        if unsafe_sources:
+            raise RuntimeError(
+                "Excel 原生保存失败。为避免 openpyxl 插行破坏公式引用或高级 Sheet 对象，"
+                "已停止保存且未替换目标文件；请关闭占用文件的 Excel 后重试。"
+                f"\n需要原生回放的来源文件：{', '.join(os.path.basename(path) for path in unsafe_sources)}"
+            )
+        if _build_manual_merge_output_with_openpyxl(
+            src,
+            out,
+            manual_ops,
+            row_ops,
+            sheet_ops=sheet_ops,
+            source_paths=source_paths,
+        ):
+            return out
+        raise RuntimeError("B-side structural replay failed")
 
     def set_sheet_has_diff(self, sheet: str, has: bool, confirmed: bool = True):
         # Keep API: mark sheet diff state
@@ -11866,6 +13501,8 @@ class SowMergeApp:
         self._ui_tasks = []
 
         def _enqueue_sheet(sheet: str, front: bool = False):
+            if self._is_closing:
+                return
             with self._compute_lock:
                 if sheet in self._compute_inflight:
                     return
@@ -11881,10 +13518,17 @@ class SowMergeApp:
                     self._compute_queue.append(sheet)
 
         def _queue_ui_task(fn):
+            if self._is_closing:
+                return False
             with self._ui_task_lock:
+                if self._is_closing:
+                    return False
                 self._ui_tasks.append(fn)
+            return True
 
         def _drain_ui_tasks():
+            if self._is_closing:
+                return
             tasks = []
             try:
                 with self._ui_task_lock:
@@ -11906,6 +13550,16 @@ class SowMergeApp:
             except Exception:
                 pass
 
+        def _check_bg_cancel():
+            if self._is_closing:
+                raise InterruptedError("background compute cancelled during shutdown")
+            # Openpyxl XML parsing is CPU/GIL heavy. Yield while a user-triggered
+            # overwrite/insert is active so button feedback and redraw stay prompt.
+            while self._interactive_action_event.is_set():
+                if self._is_closing:
+                    raise InterruptedError("background compute cancelled during shutdown")
+                time.sleep(0.01)
+
         def _compute_trim_bounds(ws):
             # Find the true last non-empty row for this sheet. Empty strings are
             # treated as empty so formulas returning "" do not expand the bounds.
@@ -11917,10 +13571,34 @@ class SowMergeApp:
             found = False
             found_via_cells = False
 
+            # ReadOnlyWorksheet.cell()/high-min_row iteration reparses the XML
+            # stream from the beginning. A single forward pass is both exact and
+            # avoids the old worst case of doing that up to 5000 times.
+            if ws.__class__.__name__ == "ReadOnlyWorksheet":
+                for row_idx, row in enumerate(
+                    ws.iter_rows(min_row=1, max_row=max_r, min_col=1, max_col=max_c, values_only=True),
+                    start=1,
+                ):
+                    if (row_idx & 127) == 0:
+                        _check_bg_cancel()
+                    row_last_col = 0
+                    for col_idx, value in enumerate(row, start=1):
+                        if value not in (None, ""):
+                            row_last_col = col_idx
+                    if row_last_col:
+                        found = True
+                        last_r = row_idx
+                        last_c = max(last_c, row_last_col)
+                if not found:
+                    return 1, max(1, max_c)
+                return max(1, last_r), max(1, last_c)
+
             try:
                 cells = getattr(ws, "_cells", None)
                 if cells:
-                    for cell in cells.values():
+                    for cell_idx, cell in enumerate(cells.values(), start=1):
+                        if (cell_idx & 1023) == 0:
+                            _check_bg_cancel()
                         v = cell.value
                         if v not in (None, ""):
                             found = True
@@ -11934,6 +13612,8 @@ class SowMergeApp:
 
             if not found:
                 for r in range(max_r, max(0, max_r - 5000), -1):
+                    if (r & 127) == 0:
+                        _check_bg_cancel()
                     row = next(ws.iter_rows(min_row=r, max_row=r, min_col=1, max_col=max_c, values_only=True), ())
                     if any(v not in (None, "") for v in row):
                         found = True
@@ -11966,74 +13646,30 @@ class SowMergeApp:
             def _bulk_sig_list(ws, max_row_local: int):
                 sigs = []
                 try:
-                    for row in ws.iter_rows(
+                    for row_idx, row in enumerate(ws.iter_rows(
                         min_row=1,
                         max_row=max_row_local,
                         min_col=1,
                         max_col=max_col,
                         values_only=True,
-                    ):
-                        sigs.append("\x1f".join(_merge_cmp_value(v).replace("\x1f", "\x1e") for v in (row or ())))
+                    ), start=1):
+                        if (row_idx & 127) == 0:
+                            _check_bg_cancel()
+                        sigs.append(_row_signature(row or ()))
+                except InterruptedError:
+                    raise
                 except Exception:
                     return []
                 return sigs
             sig_a = _bulk_sig_list(ws_a, max_row_a)
             sig_b = _bulk_sig_list(ws_b, max_row_b)
-            def _sim_score(sa: str, sb: str) -> float:
-                if sa == sb:
-                    return 2.0
-                if (not sa) or (not sb):
-                    return 0.0
-                try:
-                    return difflib.SequenceMatcher(a=sa, b=sb, autojunk=False).ratio()
-                except Exception:
-                    return 0.0
-            sm = difflib.SequenceMatcher(a=sig_a, b=sig_b, autojunk=False)
-            pairs: list[tuple[int | None, int | None]] = []
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag == "equal":
-                    for i, j in zip(range(i1, i2), range(j1, j2)):
-                        pairs.append((i + 1, j + 1))
-                elif tag == "replace":
-                    len_a = i2 - i1
-                    len_b = j2 - j1
-                    common = min(len_a, len_b)
-                    head_score = 0.0
-                    tail_score = 0.0
-                    for k in range(common):
-                        head_score += _sim_score(sig_a[i1 + k], sig_b[j1 + k])
-                        tail_score += _sim_score(sig_a[i2 - common + k], sig_b[j2 - common + k])
-                    use_tail = tail_score >= head_score
-                    if use_tail:
-                        extra_a = len_a - common
-                        extra_b = len_b - common
-                        for k in range(extra_a):
-                            pairs.append((i1 + k + 1, None))
-                        for k in range(extra_b):
-                            pairs.append((None, j1 + k + 1))
-                        a_start = i2 - common
-                        b_start = j2 - common
-                        for k in range(common):
-                            pairs.append((a_start + k + 1, b_start + k + 1))
-                    else:
-                        for k in range(common):
-                            pairs.append((i1 + k + 1, j1 + k + 1))
-                        for k in range(common, len_a):
-                            pairs.append((i1 + k + 1, None))
-                        for k in range(common, len_b):
-                            pairs.append((None, j1 + k + 1))
-                elif tag == "delete":
-                    for i in range(i1, i2):
-                        pairs.append((i + 1, None))
-                elif tag == "insert":
-                    for j in range(j1, j2):
-                        pairs.append((None, j + 1))
-            return pairs
+            return _compute_row_pairs_from_signatures(sig_a, sig_b)
 
         def _has_diff_by_blocks_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
             max_row = max(max_row_a, max_row_b)
             block = _LARGE_SHEET_BLOCK_ROWS
             for block_end in range(max_row, 0, -block):
+                _check_bg_cancel()
                 block_start = max(1, block_end - block + 1)
                 rows_a = {}
                 rows_b = {}
@@ -12048,6 +13684,8 @@ class SowMergeApp:
                         ),
                         start=block_start,
                     ):
+                        if (idx & 127) == 0:
+                            _check_bg_cancel()
                         rows_a[idx] = row or ()
                 if block_start <= max_row_b:
                     for idx, row in enumerate(
@@ -12060,6 +13698,8 @@ class SowMergeApp:
                         ),
                         start=block_start,
                     ):
+                        if (idx & 127) == 0:
+                            _check_bg_cancel()
                         rows_b[idx] = row or ()
                 for r in range(block_end, block_start - 1, -1):
                     row_a = rows_a.get(r, ())
@@ -12077,6 +13717,7 @@ class SowMergeApp:
             block = _LARGE_SHEET_BLOCK_ROWS
             pair_count = len(row_pairs)
             for block_end in range(pair_count, 0, -block):
+                _check_bg_cancel()
                 block_start = max(0, block_end - block)
                 block_pairs = row_pairs[block_start:block_end]
                 left_rows_needed = sorted({left for left, _right in block_pairs if left is not None})
@@ -12097,6 +13738,8 @@ class SowMergeApp:
                         ),
                         start=min_left,
                     ):
+                        if (idx & 127) == 0:
+                            _check_bg_cancel()
                         rows_left[idx] = row or ()
                 if right_rows_needed:
                     min_right = right_rows_needed[0]
@@ -12111,6 +13754,8 @@ class SowMergeApp:
                         ),
                         start=min_right,
                     ):
+                        if (idx & 127) == 0:
+                            _check_bg_cancel()
                         rows_right[idx] = row or ()
 
                 for left_row, right_row in reversed(block_pairs):
@@ -12134,22 +13779,46 @@ class SowMergeApp:
                 return True
             return False
 
-        def _compute_sheet_cache(wb_a_val, wb_b_val, wb_a_edit, wb_b_edit, sheet: str, wb_base_val=None):
+        def _compute_sheet_cache(
+            wb_a_val,
+            wb_b_val,
+            wb_a_edit,
+            wb_b_edit,
+            sheet: str,
+            wb_base_val=None,
+            wb_base_edit=None,
+        ):
+            _check_bg_cancel()
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
             max_r_a, max_c_a = _compute_trim_bounds(ws_a)
             max_r_b, max_c_b = _compute_trim_bounds(ws_b)
+            _check_bg_cancel()
+            ws_a_edit = wb_a_edit[sheet]
+            ws_b_edit = wb_b_edit[sheet]
+            edit_r_a, edit_c_a = _compute_trim_bounds(ws_a_edit)
+            edit_r_b, edit_c_b = _compute_trim_bounds(ws_b_edit)
+            max_r_a, max_c_a = max(max_r_a, edit_r_a), max(max_c_a, edit_c_a)
+            max_r_b, max_c_b = max(max_r_b, edit_r_b), max(max_c_b, edit_c_b)
             ws_base = None
+            ws_base_edit = None
             max_r_base = 0
             max_c_base = 0
             if wb_base_val is not None and sheet in wb_base_val.sheetnames:
                 ws_base = wb_base_val[sheet]
                 max_r_base, max_c_base = _compute_trim_bounds(ws_base)
+                if wb_base_edit is not None and sheet in wb_base_edit.sheetnames:
+                    ws_base_edit = wb_base_edit[sheet]
+                    edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit)
+                    max_r_base = max(max_r_base, edit_r_base)
+                    max_c_base = max(max_c_base, edit_c_base)
+            _check_bg_cancel()
             max_row = max(max_r_a, max_r_b, max_r_base)
             max_col = max(max_c_a, max_c_b, max_c_base)
 
             # Compute row-aligned pairs (same algorithm as SheetView._build_row_pairs)
             row_pairs = _compute_row_pairs_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
+            _check_bg_cancel()
 
             pair_diff_cols: dict[int, set] = {}
             # Keep raw per-cell display parts in cache; render with current grid mode on UI thread.
@@ -12192,6 +13861,7 @@ class SowMergeApp:
                     ws_b,
                     max_col,
                 )
+                _check_bg_cancel()
 
             for idx, (ra, rb) in enumerate(row_pairs):
                 if ra is not None:
@@ -12213,28 +13883,25 @@ class SowMergeApp:
                 if tail_start < len(row_pairs):
                     sample_indices.extend(range(tail_start, len(row_pairs)))
 
-                def _row_values_bg(ws, row_idx: int | None):
-                    if row_idx is None:
-                        return ()
-                    try:
-                        row = next(
-                            ws.iter_rows(
-                                min_row=row_idx,
-                                max_row=row_idx,
-                                min_col=1,
-                                max_col=max_col,
-                                values_only=True,
-                            ),
-                            (),
-                        )
-                    except Exception:
-                        row = ()
-                    return row or ()
+                sample_rows_a = _read_rows_into_cache(
+                    ws_a,
+                    [row_pairs[idx][0] for idx in sample_indices],
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+                sample_rows_b = _read_rows_into_cache(
+                    ws_b,
+                    [row_pairs[idx][1] for idx in sample_indices],
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
 
                 for idx in sample_indices:
+                    if (idx & 31) == 0:
+                        _check_bg_cancel()
                     ra, rb = row_pairs[idx]
-                    row_a_vals = _row_values_bg(ws_a, ra)
-                    row_b_vals = _row_values_bg(ws_b, rb)
+                    row_a_vals = _row_from_cache(sample_rows_a, ra, max_col)
+                    row_b_vals = _row_from_cache(sample_rows_b, rb, max_col)
                     for ci in range(max_col):
                         va = row_a_vals[ci] if ci < len(row_a_vals) else None
                         vb = row_b_vals[ci] if ci < len(row_b_vals) else None
@@ -12245,9 +13912,11 @@ class SowMergeApp:
                         if w > col_char_widths.get(col_idx, 0):
                             col_char_widths[col_idx] = w
             else:
-                ws_a_e = wb_a_edit[sheet]
-                ws_b_e = wb_b_edit[sheet]
+                ws_a_e = ws_a_edit
+                ws_b_e = ws_b_edit
                 for idx, (ra, rb) in enumerate(row_pairs):
+                    if (idx & 127) == 0:
+                        _check_bg_cancel()
                     cols = set()
                     parts_a = []
                     parts_b = []
@@ -12449,6 +14118,7 @@ class SowMergeApp:
             wb_base_ro = None
             wb_a_e = None
             wb_b_e = None
+            wb_base_e = None
             try:
                 try:
                     # Use separate read-only workbooks to avoid threading issues
@@ -12458,6 +14128,8 @@ class SowMergeApp:
                         wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
                     wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
                     wb_b_e = load_workbook(self.file_b, data_only=False, read_only=True)
+                    if getattr(self, "has_base", False) and getattr(self, "base_path", None):
+                        wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
                 except Exception as e:
                     _dlog(f"bg compute open read-only failed: {e}")
                     return
@@ -12466,6 +14138,8 @@ class SowMergeApp:
                     return
 
                 while True:
+                    if self._is_closing:
+                        break
                     with self._compute_lock:
                         if not self._compute_queue:
                             break
@@ -12473,16 +14147,28 @@ class SowMergeApp:
                         self._compute_inflight.add(sheet)
                     try:
                         _dlog(f"bg compute sheet: {sheet}")
-                        cache = _compute_sheet_cache(wb_a_ro, wb_b_ro, wb_a_e, wb_b_e, sheet, wb_base_ro)
+                        cache = _compute_sheet_cache(
+                            wb_a_ro,
+                            wb_b_ro,
+                            wb_a_e,
+                            wb_b_e,
+                            sheet,
+                            wb_base_ro,
+                            wb_base_e,
+                        )
+                        if self._is_closing:
+                            break
                         # Never call tkinter APIs from background threads.
                         _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
+                    except InterruptedError:
+                        break
                     except Exception as e:
                         _dlog(f"bg compute failed {sheet}: {e}")
                     finally:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
             finally:
-                _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e)
+                _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
                 with self._compute_lock:
                     if self._compute_thread is threading.current_thread():
                         self._compute_thread = None
@@ -12495,9 +14181,13 @@ class SowMergeApp:
                     return
                 if not self._compute_queue:
                     return
-                th = threading.Thread(target=_compute_worker, daemon=True)
+                th = self._start_background_thread(
+                    _compute_worker,
+                    name="sow-sheet-diff",
+                )
+                if th is None:
+                    return
                 self._compute_thread = th
-                th.start()
         self._queue_ui_task = _queue_ui_task
         self._kick_worker = _kick_worker
 
@@ -12680,10 +14370,18 @@ class SowMergeApp:
 
                 # Phase-1: quick tail scan to surface diff tabs early.
                 for s in ordered:
+                    if self._is_closing:
+                        break
                     ws_a = wb_a_ro[s]
                     ws_b = wb_b_ro[s]
                     max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
                     max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+                    # Read-only tail iteration still reparses XML from row 1. On a
+                    # large sheet this optional pre-mark duplicates the exact
+                    # background compute and can outlive the window during close.
+                    if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
+                        _dlog(f"skip fast tab mark for large sheet: {s} rows={max_row}")
+                        continue
                     has_quick = _sheet_has_diff_quick_tail(ws_a, ws_b, max_row, max_col)
                     if (not has_quick) and getattr(self, "has_base", False):
                         if wb_base_ro is not None and s not in wb_base_ro.sheetnames:
@@ -12697,6 +14395,8 @@ class SowMergeApp:
                 if _FAST_TABMARK_PHASE2_ENABLED:
                     # Re-fetch worksheet objects: read_only iterators from Phase-1 are consumed.
                     for s, _stale_a, _stale_b, max_row, max_col in unknown_sheets:
+                        if self._is_closing:
+                            break
                         ws_a = wb_a_ro[s]
                         ws_b = wb_b_ro[s]
                         has = _sheet_has_diff_fast_tail(ws_a, ws_b, max_row, max_col)
@@ -12704,18 +14404,13 @@ class SowMergeApp:
             except Exception as e:
                 _dlog(f"fast diff mark scan failed: {e}")
             finally:
-                try:
-                    if wb_a_ro:
-                        wb_a_ro.close()
-                    if wb_b_ro:
-                        wb_b_ro.close()
-                    if wb_base_ro:
-                        wb_base_ro.close()
-                except Exception:
-                    pass
+                _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro)
 
         try:
-            threading.Thread(target=_scan_sheet_has_diff_fast, daemon=True).start()
+            self._fast_tabmark_thread = self._start_background_thread(
+                _scan_sheet_has_diff_fast,
+                name="sow-fast-tabmark",
+            )
         except Exception:
             pass
 
@@ -13395,7 +15090,10 @@ class SowMergeApp:
             except Exception:
                 pass
 
-        threading.Thread(target=_worker, daemon=True).start()
+        self._auto_recalc_thread = self._start_background_thread(
+            _worker,
+            name="sow-auto-recalc",
+        )
 
 
     def _with_progress(self, title: str, message: str, fn):
@@ -13705,6 +15403,17 @@ class SowMergeApp:
             warning = f"{which} 文件已保存，但公式缓存刷新失败：\n{e}"
             _dlog(f"post save recalc failed: which={which} path={path} err={e}")
 
+        # A deliberate same-formula adoption is a cached-result decision. Excel
+        # recalculation above is still needed for every other formula, but it can
+        # overwrite that decision from local precedents. Reapply only the explicit
+        # adopted cache cells after recalculation, then reload the value workbook.
+        try:
+            self._reapply_formula_cache_overrides(path, which)
+        except Exception as e:
+            cache_warning = f"{which} 文件已保存，但采用的公式计算结果未能写回：\n{e}"
+            warning = f"{warning}\n\n{cache_warning}" if warning else cache_warning
+            _dlog(f"post save formula cache patch failed: which={which} path={path} err={e}")
+
         try:
             if which == "A":
                 self._apply_recalc_results(new_a=path)
@@ -13718,6 +15427,65 @@ class SowMergeApp:
             warning = f"{warning}\n\n{reload_warning}" if warning else reload_warning
         return warning
 
+    def _reapply_formula_cache_overrides(self, path: str, which: str) -> bool:
+        which = str(which or "").upper()
+        if which == "A":
+            cache_ops = self.manual_a_formula_cache_ops
+            edit_wb = self._wb_a_edit
+        elif which == "B":
+            cache_ops = self.manual_b_formula_cache_ops
+            edit_wb = self._wb_b_edit
+        else:
+            return False
+        if not cache_ops:
+            return False
+
+        formula_ops = {}
+        cached_values = {}
+        applied_keys = []
+        for key, cached_value in list(cache_ops.items()):
+            sheet, row_idx, col_idx = key
+            try:
+                if edit_wb is None or sheet not in edit_wb.sheetnames:
+                    continue
+                formula = _formula_text(
+                    edit_wb[sheet].cell(row=int(row_idx), column=int(col_idx)).value
+                )
+                if not formula:
+                    continue
+                formula_ops[key] = formula
+                cached_values[key] = cached_value
+                applied_keys.append(key)
+            except Exception:
+                continue
+        if not formula_ops:
+            return False
+
+        suffix = _workbook_ext(path)
+        patched = os.path.join(
+            tempfile.gettempdir(),
+            f"{APP_NAME}_{which.lower()}_formula_cache_{os.getpid()}_{time.time_ns()}{suffix}",
+        )
+        try:
+            _build_manual_merge_xlsx_via_zip(
+                path,
+                patched,
+                formula_ops,
+                cached_values=cached_values,
+                cache_only_keys=set(formula_ops),
+            )
+            self._atomic_replace_file_with_retry(patched, path)
+            for key in applied_keys:
+                cache_ops.pop(key, None)
+            _dlog(f"post save formula cache patch ok: which={which} cells={len(applied_keys)}")
+            return True
+        finally:
+            try:
+                if os.path.exists(patched):
+                    os.remove(patched)
+            except Exception:
+                pass
+
     def save_b_inplace(self):
         self._ensure_edit_loaded()
         path = self.file_b
@@ -13728,11 +15496,27 @@ class SowMergeApp:
 
             def _do_save():
                 nonlocal warning
-                self._atomic_save(self._wb_b_edit, path)
+                replay_out = None
+                try:
+                    if self.manual_b_row_ops or self._sheet_ops_for_target("B"):
+                        replay_out = self.build_manual_b_output_file()
+                        self._atomic_replace_file_with_retry(replay_out, path)
+                    else:
+                        self._atomic_save(self._wb_b_edit, path)
+                finally:
+                    if replay_out and os.path.exists(replay_out):
+                        try:
+                            os.remove(replay_out)
+                        except Exception:
+                            pass
                 warning = self._post_save_refresh("B", path)
 
             self._with_progress("保存中", f"正在保存：\n{path}", _do_save)
             self.modified_b = False
+            self.manual_b_cell_ops.clear()
+            self.manual_b_row_ops.clear()
+            self.manual_b_formula_cache_ops.clear()
+            self._clear_sheet_ops_for_target("B")
             if warning:
                 messagebox.showwarning("Saved", f"已保存并覆盖：\n{path}\n\n{warning}")
             else:
@@ -13757,11 +15541,27 @@ class SowMergeApp:
 
             def _do_save():
                 nonlocal warning
-                self._atomic_save(self._wb_a_edit, path)
+                replay_out = None
+                try:
+                    if self.manual_a_row_ops or self._sheet_ops_for_target("A"):
+                        replay_out = self.build_manual_merge_output_file()
+                        self._atomic_replace_file_with_retry(replay_out, path)
+                    else:
+                        self._atomic_save(self._wb_a_edit, path)
+                finally:
+                    if replay_out and os.path.exists(replay_out):
+                        try:
+                            os.remove(replay_out)
+                        except Exception:
+                            pass
                 warning = self._post_save_refresh("A", path)
 
             self._with_progress("保存中", f"正在保存：\n{path}", _do_save)
             self.modified_a = False
+            self.manual_a_cell_ops.clear()
+            self.manual_a_row_ops.clear()
+            self.manual_a_formula_cache_ops.clear()
+            self._clear_sheet_ops_for_target("A")
             if warning:
                 messagebox.showwarning("Saved", f"已保存并覆盖：\n{path}\n\n{warning}")
             else:

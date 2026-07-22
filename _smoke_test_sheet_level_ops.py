@@ -48,8 +48,15 @@ def main():
         assert view._is_missing_sheet_view()
         assert app.get_sheet_meta("OnlyA").get("view_mode") == "missing_sheet"
         view._copy_missing_sheet("A2B")
-        app._ensure_edit_loaded()
-        app._atomic_save(app._wb_b_edit, out_b)
+        assert any(
+            op.get("kind") == "copy_sheet"
+            and op.get("sheet") == "OnlyA"
+            and op.get("source_side") == "A"
+            and op.get("target_side") == "B"
+            for op in app.manual_sheet_ops
+        ), app.manual_sheet_ops
+        replay_b = app.build_manual_b_output_file()
+        app._atomic_replace_file_with_retry(replay_b, out_b)
         wb = load_workbook(out_b, data_only=False)
         try:
             assert "OnlyA" in wb.sheetnames, wb.sheetnames
@@ -66,17 +73,39 @@ def main():
     mine = os.path.join(root, "mine.xlsx")
     theirs = os.path.join(root, "theirs.xlsx")
     merged = os.path.join(root, "merged.xlsx")
-    _make_book(base, [("Common", ["base"]), ("DeleteMe", ["same-as-base"]), ("BaseOnly", ["from-base"])])
-    _make_book(mine, [("Common", ["mine"]), ("DeleteMe", ["same-as-base"])])
+    _make_book(base, [
+        ("Common", ["base"]),
+        ("DeleteMe", ["same-as-base"]),
+        ("FormatChanged", [123]),
+        ("BaseOnly", ["from-base"]),
+    ])
+    _make_book(mine, [
+        ("Common", ["mine"]),
+        ("DeleteMe", ["same-as-base"]),
+        ("FormatChanged", [123]),
+    ])
+    wb = load_workbook(mine)
+    wb["FormatChanged"]["A1"].number_format = "0.00"
+    wb.save(mine)
+    wb.close()
     _make_book(theirs, [("Common", ["theirs"]), ("Added", ["from-theirs"])])
 
     app = mod.SowMergeApp(mine, theirs, merge_mode=True, merged_path=merged, base_path=base)
     try:
+        assert any(
+            item.get("sheet") == "FormatChanged"
+            for item in app.sheet_level_conflicts
+        ), app.sheet_level_conflicts
+        assert not any(
+            op.get("kind") == "delete_sheet" and op.get("sheet") == "FormatChanged"
+            for op in app.auto_sheet_ops
+        ), app.auto_sheet_ops
         out = app.build_manual_merge_output_file()
         wb = load_workbook(out, data_only=False)
         try:
             assert "Added" in wb.sheetnames, wb.sheetnames
             assert "DeleteMe" not in wb.sheetnames, wb.sheetnames
+            assert "FormatChanged" in wb.sheetnames, wb.sheetnames
             assert wb["Added"]["A1"].value == "from-theirs"
         finally:
             wb.close()
