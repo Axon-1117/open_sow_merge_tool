@@ -11,6 +11,7 @@ This is a best-effort benchmark; results vary by machine and file size.
 """
 
 import os
+import sys
 import time
 from openpyxl import Workbook
 from _test_temp_utils import make_temp_dir
@@ -49,9 +50,17 @@ def main():
     _make_xlsx(fa, a_rows)
     _make_xlsx(fb, b_rows)
 
-    import sys
-    sys.path.insert(0, r"D:\Tools\sow_merge_tool")
+    # Always benchmark the source beside this script. A hard-coded tool install
+    # path previously made this benchmark silently measure an older build.
+    source_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, source_dir)
     import sow_merge_tool as mod
+    expected_module = os.path.normcase(os.path.join(source_dir, "sow_merge_tool.py"))
+    actual_module = os.path.normcase(os.path.abspath(mod.__file__))
+    if actual_module != expected_module:
+        raise RuntimeError(
+            f"Benchmark imported unexpected module: {actual_module}; expected: {expected_module}"
+        )
 
     app = mod.SowMergeApp(fa, fb)
 

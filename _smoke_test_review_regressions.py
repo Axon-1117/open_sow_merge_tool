@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -88,6 +89,97 @@ def _test_region_anchor_uses_selected_pair_before_trailing_insert_line():
     assert anchor == 152, anchor
     block = view._logical_diff_pair_block_for_pair(anchor)
     assert block == list(range(151, 1352)), (block[:2], block[-2:], len(block))
+
+
+def _test_full_only_diff_block_model_is_stable_and_uncapped():
+    rows = [10, 11, 50, 51, 800, 801, 1200]
+    pending_pairs = {50, 51, 1200}
+    blocks = mod.SheetView._group_diff_pair_rows(
+        rows,
+        pending_predicate=lambda pair_idx: pair_idx in pending_pairs,
+    )
+    assert [(b.start_pair_idx, b.end_pair_idx) for b in blocks] == [
+        (10, 11),
+        (50, 51),
+        (800, 801),
+        (1200, 1200),
+    ]
+    assert [b.ordinal for b in blocks] == [1, 2, 3, 4]
+    assert [b.pending for b in blocks] == [False, True, False, True]
+    assert blocks[0].pair_indices == (10, 11)
+    assert blocks[-1].start_pair_idx > 800
+
+    # Duplicate/invalid entries must not create phantom blocks; a retained
+    # resolved row keeps the original consecutive snapshot block intact.
+    normalized = mod.SheetView._group_diff_pair_rows(
+        [5, 6, 6, -1, 7],
+        pending_predicate=lambda pair_idx: pair_idx == 7,
+    )
+    assert len(normalized) == 1
+    assert normalized[0].pair_indices == (5, 6, 7)
+    assert normalized[0].pending is True
+
+
+def _test_diff_block_updates_never_read_workbook_state():
+    class BombApp:
+        def __getattribute__(self, name):
+            raise AssertionError(f"Unexpected app/workbook access: {name}")
+
+    class DummyVar:
+        @staticmethod
+        def get():
+            return 1
+
+    class DummyText:
+        @staticmethod
+        def index(_position):
+            return "1.0"
+
+    class DummyView:
+        app = BombApp()
+        only_diff_var = DummyVar()
+        left = DummyText()
+        row_pairs = [(idx + 1, idx + 1) for idx in range(1300)]
+        display_rows = [10, 11, 1200]
+        _full_display_rows = [10, 11, 1200]
+        _only_diff_source_version = 3
+        _data_version = 7
+        _data_ready = True
+        _only_diff_async_building = False
+        _full_diff_blocks_cache_key = None
+        _full_diff_blocks = []
+        _pair_to_full_diff_block = {}
+        selected_pair_idx = 1200
+        _last_selected_line = 3
+        _main_sel_line = None
+        _main_sel_col = None
+        _cursor_cmp_sel_line = None
+        _cursor_cmp_sel_col = None
+
+        @staticmethod
+        def _pair_has_visual_diff(pair_idx):
+            return int(pair_idx) in {10, 1200}
+
+        _normalize_pair_idx = mod.SheetView._normalize_pair_idx
+        has_explicit_cell_selection = mod.SheetView.has_explicit_cell_selection
+        _invalidate_diff_block_model = mod.SheetView._invalidate_diff_block_model
+        _diff_block_model_ready = mod.SheetView._diff_block_model_ready
+        _group_diff_pair_rows = staticmethod(mod.SheetView._group_diff_pair_rows)
+        _ensure_full_diff_blocks = mod.SheetView._ensure_full_diff_blocks
+        _full_diff_block_index_for_pair = mod.SheetView._full_diff_block_index_for_pair
+        _full_diff_block_for_pair = mod.SheetView._full_diff_block_for_pair
+        _active_full_diff_block_index = mod.SheetView._active_full_diff_block_index
+        _logical_diff_pair_block_for_pair = mod.SheetView._logical_diff_pair_block_for_pair
+        _pair_idx_for_line = mod.SheetView._pair_idx_for_line
+
+    view = DummyView()
+    blocks = view._ensure_full_diff_blocks()
+    assert [(block.start_pair_idx, block.end_pair_idx) for block in blocks] == [
+        (10, 11),
+        (1200, 1200),
+    ]
+    assert view._active_full_diff_block_index() == 1
+    assert view._logical_diff_pair_block_for_pair(10) == [10, 11]
 
 
 def _test_tail_identical_append_stays_paired():
@@ -543,6 +635,13 @@ def _test_excel_row_replay_uses_full_paste():
     try:
         def _fake_run(command, **_kwargs):
             captured["command"] = command
+            script = command[-1]
+            marker = "$opsPath='"
+            start = script.index(marker) + len(marker)
+            end = script.index("';", start)
+            ops_path = script[start:end].replace("''", "'")
+            with open(ops_path, "r", encoding="utf-8") as f:
+                captured["payload"] = json.load(f)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         mod.subprocess.run = _fake_run
@@ -550,7 +649,12 @@ def _test_excel_row_replay_uses_full_paste():
         ok = mod._build_manual_merge_output_with_excel(
             "source.xlsx",
             "output.xlsx",
-            {},
+            {
+                ("S1", 2, 2): None,
+                ("S1", 2, 3): "",
+                ("S1", 2, 4): 0,
+                ("S1", 2, 5): False,
+            },
             row_ops=[{
                 "kind": "insert_rows",
                 "sheet": "S1",
@@ -565,6 +669,21 @@ def _test_excel_row_replay_uses_full_paste():
         script = captured["command"][-1]
         assert "PasteSpecial(-4104)" in script
         assert "PasteSpecial(-4122)" not in script
+        assert "value_kind -eq 'blank'" in script
+        assert "$cell.ClearContents()" in script
+        payload_ops = {
+            (op["r"], op["c"]): op
+            for op in captured["payload"]["cell_ops"]
+        }
+        assert payload_ops[(2, 2)] == {
+            "sheet": "S1", "r": 2, "c": 2, "value_kind": "blank"
+        }, payload_ops[(2, 2)]
+        assert payload_ops[(2, 3)]["value_kind"] == "text"
+        assert payload_ops[(2, 3)]["value"] == ""
+        assert payload_ops[(2, 4)]["value_kind"] == "typed"
+        assert payload_ops[(2, 4)]["value"] == 0
+        assert payload_ops[(2, 5)]["value_kind"] == "typed"
+        assert payload_ops[(2, 5)]["value"] is False
     finally:
         mod.subprocess.run = original_run
         mod._validate_xlsx_package = original_validate
@@ -595,6 +714,8 @@ def main():
     _test_only_diff_region_boundaries()
     _test_logical_region_extends_beyond_render_limit()
     _test_region_anchor_uses_selected_pair_before_trailing_insert_line()
+    _test_full_only_diff_block_model_is_stable_and_uncapped()
+    _test_diff_block_updates_never_read_workbook_state()
     _test_tail_identical_append_stays_paired()
     _test_shared_formula_is_not_destroyed()
     _test_formula_and_value_comparison_is_conservative()

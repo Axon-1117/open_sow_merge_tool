@@ -19,6 +19,7 @@ import zipfile
 import posixpath
 import platform
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -34,8 +35,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-22.update53"
-APP_BUILD_TAG = "new130-nonblocking-notice-region-anchor-fix"
+APP_VERSION = "2026-07-22.update54"
+APP_BUILD_TAG = "new131-onlydiff-block-navigation-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -933,7 +934,11 @@ def _effective_bounds(ws):
             return max(1, last_r), max(1, max_c)
         if last_c <= 1 and max_c > last_c:
             return max(1, last_r), max(1, max_c)
-    return max(1, last_r), max(1, last_c)
+        return max(1, last_r), max(1, last_c)
+    # ReadOnlyWorksheet has no populated _cells mapping. The tail scan above
+    # locates the last non-empty row, but it does not establish the widest
+    # populated column across earlier rows, so keep the worksheet max_column.
+    return max(1, last_r), max(1, max_c)
 
 
 def _effective_bounds_with_edit(ws_val, ws_edit=None):
@@ -2060,6 +2065,16 @@ def _excel_com_cell_op(sheet: str, row: int, col: int, value) -> dict:
     formula = _formula_text(value)
     if formula:
         return {"sheet": sheet, "r": int(row), "c": int(col), "formula": formula}
+    if value is None:
+        # ConvertFrom-Json maps JSON null to PowerShell $null. Assigning that
+        # directly to Excel Range.Value2 can raise NullReferenceException;
+        # clearing is also the correct Excel operation for a blank source cell.
+        return {
+            "sheet": sheet,
+            "r": int(row),
+            "c": int(col),
+            "value_kind": "blank",
+        }
     if isinstance(value, datetime):
         return {
             "sheet": sheet,
@@ -2211,6 +2226,7 @@ def _build_manual_merge_output_with_excel(
             "  $ws=$wb.Worksheets.Item($op.sheet);"
             "  $cell=$ws.Cells.Item([int]$op.r,[int]$op.c);"
             "  if($null -ne $op.formula){$cell.Formula=$op.formula}"
+            "  elseif($op.value_kind -eq 'blank'){$cell.ClearContents()}"
             "  elseif($op.value_kind -eq 'datetime_serial'){"
             "    $serial=[double]$op.value;if($wb.Date1904){$serial-=1462};$cell.Value2=$serial"
             "  }"
@@ -3878,6 +3894,15 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
                     pass
 
 
+@dataclass(frozen=True)
+class _DiffBlock:
+    ordinal: int
+    pair_indices: tuple[int, ...]
+    start_pair_idx: int
+    end_pair_idx: int
+    pending: bool
+
+
 class SheetView:
     """TortoiseMerge-like side-by-side full-sheet viewer.
 
@@ -4004,6 +4029,17 @@ class SheetView:
         self.next_diff_btn.pack(side="right", padx=(6, 0))
         self.prev_diff_btn.pack(side="right", padx=(6, 0))
         self._diff_blocks_cache = None  # None = not yet computed; [] = computed, no diffs
+        self._full_diff_blocks_cache_key = None
+        self._full_diff_blocks: list[_DiffBlock] = []
+        self._pair_to_full_diff_block: dict[int, int] = {}
+        self.diff_block_status_var = tk.StringVar(value="差异块 计算中...")
+        self.diff_block_status = tk.Label(
+            bar,
+            textvariable=self.diff_block_status_var,
+            width=28,
+            anchor="e",
+            fg="#174A7E",
+        )
 
         # Some environments fail to toggle BooleanVar reliably; use IntVar with explicit on/off values.
         self.only_diff_var = tk.IntVar(value=int(getattr(self.app, "only_diff_default", 0)))
@@ -4658,6 +4694,15 @@ class SheetView:
         self.left_ln.tag_configure("diffrow", background="#ffd9d9")
         self.base_ln.tag_configure("diffrow", background="#ffd9d9")
         self.right_ln.tag_configure("diffrow", background="#ffd9d9")
+        for w in (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln):
+            w.tag_configure("blockstart", spacing1=8)
+        self.left_ln.tag_configure(
+            "blockmarker",
+            background="#D8E8F8",
+            foreground="#174A7E",
+            font=("Consolas", 10, "bold"),
+        )
+        self.left_ln.tag_raise("blockmarker")
 
         # Bindings
         self._syncing = False
@@ -5704,6 +5749,10 @@ class SheetView:
         debounces the (cached) marker redraw to coalesce rapid scroll frames.
         """
         self._redraw_diff_viewport()
+        try:
+            self._update_diff_block_indicator()
+        except Exception:
+            pass
         aid = getattr(self, "_diff_map_debounce_id", None)
         if aid is not None:
             try:
@@ -6152,10 +6201,18 @@ class SheetView:
             w.delete(f"{line}.0", f"{line}.end")
             w.insert(f"{line}.0", txt)
             for tag in keep_tags:
+                if tag == "blockmarker":
+                    continue
                 try:
                     w.tag_add(tag, f"{line}.0", f"{line}.end")
                 except Exception:
                     pass
+            if w is self.left_ln:
+                pair_idx = self._pair_idx_for_line(line)
+                block = self._full_diff_block_for_pair(pair_idx)
+                marker_width = self._diff_block_marker_width()
+                if block is not None and block.start_pair_idx == pair_idx and marker_width > 0:
+                    w.tag_add("blockmarker", f"{line}.0", f"{line}.{marker_width}")
             w.configure(state="disabled")
         except Exception:
             pass
@@ -6171,7 +6228,7 @@ class SheetView:
             return
         rn_w = self._sync_row_header_width_widgets()
         side = self._row_header_side(w)
-        txt = self._row_label_for_pair_idx(pair_idx, side).rjust(rn_w)
+        txt = self._format_main_row_header(pair_idx, side, rn_w)
         self._set_row_header_text(w, line, txt)
         try:
             w.configure(cursor="arrow")
@@ -6221,7 +6278,7 @@ class SheetView:
         self._clear_row_header_hover(w)
         rn_w = self._sync_row_header_width_widgets()
         arrow = _ROW_ARROW_RIGHT if direction in ("A2B", "MINE2A", "BASE2A") else _ROW_ARROW_LEFT
-        self._set_row_header_text(w, line, arrow.rjust(rn_w))
+        self._set_row_header_text(w, line, self._format_main_row_header(pair_idx, side, rn_w, arrow=arrow))
         try:
             w.configure(cursor="hand2")
         except Exception:
@@ -7703,6 +7760,238 @@ class SheetView:
         return
 
     # ---------- Diff block navigation ----------
+    @staticmethod
+    def _group_diff_pair_rows(rows, pending_predicate=None) -> list[_DiffBlock]:
+        """Group cached only-diff pair indices without reading worksheet cells."""
+        normalized = []
+        seen = set()
+        for raw_idx in rows or []:
+            try:
+                pair_idx = int(raw_idx)
+            except Exception:
+                continue
+            if pair_idx < 0 or pair_idx in seen:
+                continue
+            normalized.append(pair_idx)
+            seen.add(pair_idx)
+        normalized.sort()
+
+        blocks: list[_DiffBlock] = []
+        current: list[int] = []
+
+        def _flush():
+            if not current:
+                return
+            pending = True
+            if callable(pending_predicate):
+                pending = any(bool(pending_predicate(pair_idx)) for pair_idx in current)
+            blocks.append(
+                _DiffBlock(
+                    ordinal=len(blocks) + 1,
+                    pair_indices=tuple(current),
+                    start_pair_idx=current[0],
+                    end_pair_idx=current[-1],
+                    pending=bool(pending),
+                )
+            )
+
+        previous = None
+        for pair_idx in normalized:
+            if previous is not None and pair_idx != previous + 1:
+                _flush()
+                current = []
+            current.append(pair_idx)
+            previous = pair_idx
+        _flush()
+        return blocks
+
+    def _invalidate_diff_block_model(self):
+        self._full_diff_blocks_cache_key = None
+        self._full_diff_blocks = []
+        self._pair_to_full_diff_block = {}
+
+    def _diff_block_model_ready(self) -> bool:
+        try:
+            return bool(self.only_diff_var.get()) and bool(self._data_ready) and not bool(self._only_diff_async_building)
+        except Exception:
+            return False
+
+    def _ensure_full_diff_blocks(self) -> list[_DiffBlock]:
+        if not self._diff_block_model_ready():
+            self._invalidate_diff_block_model()
+            return []
+        rows = self._full_display_rows
+        key = (
+            id(rows),
+            len(rows),
+            id(self.row_pairs),
+            len(self.row_pairs),
+            int(self._only_diff_source_version),
+            int(self._data_version),
+        )
+        if self._full_diff_blocks_cache_key == key:
+            return self._full_diff_blocks
+        blocks = self._group_diff_pair_rows(
+            (pair_idx for pair_idx in rows if 0 <= int(pair_idx) < len(self.row_pairs)),
+            pending_predicate=self._pair_has_visual_diff,
+        )
+        pair_to_block = {}
+        for block_idx, block in enumerate(blocks):
+            for pair_idx in block.pair_indices:
+                pair_to_block[pair_idx] = block_idx
+        self._full_diff_blocks_cache_key = key
+        self._full_diff_blocks = blocks
+        self._pair_to_full_diff_block = pair_to_block
+        return blocks
+
+    def _full_diff_block_index_for_pair(self, pair_idx) -> int | None:
+        pair_idx = self._normalize_pair_idx(pair_idx)
+        if pair_idx is None:
+            return None
+        self._ensure_full_diff_blocks()
+        return self._pair_to_full_diff_block.get(pair_idx)
+
+    def _active_full_diff_block_index(self) -> int | None:
+        blocks = self._ensure_full_diff_blocks()
+        if not blocks:
+            return None
+
+        selected_pair = self._normalize_pair_idx(self.selected_pair_idx)
+        if selected_pair is not None and (
+            self.has_explicit_cell_selection() or getattr(self, "_last_selected_line", None) is not None
+        ):
+            block_idx = self._pair_to_full_diff_block.get(selected_pair)
+            if block_idx is not None:
+                return block_idx
+
+        try:
+            top_line = int(str(self.left.index("@0,0")).split(".")[0])
+        except Exception:
+            top_line = 1
+        top_pair = self._pair_idx_for_line(max(1, top_line))
+        block_idx = self._pair_to_full_diff_block.get(top_pair)
+        if block_idx is not None:
+            return block_idx
+
+        if selected_pair is not None:
+            block_idx = self._pair_to_full_diff_block.get(selected_pair)
+            if block_idx is not None:
+                return block_idx
+        return 0
+
+    def _full_diff_block_for_pair(self, pair_idx) -> _DiffBlock | None:
+        block_idx = self._full_diff_block_index_for_pair(pair_idx)
+        blocks = self._full_diff_blocks
+        if block_idx is None or not (0 <= block_idx < len(blocks)):
+            return None
+        return blocks[block_idx]
+
+    def _set_diff_block_indicator_visible(self, visible: bool):
+        try:
+            if visible:
+                if not self.diff_block_status.winfo_manager():
+                    self.diff_block_status.pack(
+                        side="right",
+                        padx=(8, 2),
+                        before=self.prev_diff_btn,
+                    )
+            else:
+                self.diff_block_status.pack_forget()
+        except Exception:
+            pass
+
+    def _update_diff_block_indicator(self):
+        try:
+            only_diff = bool(self.only_diff_var.get())
+        except Exception:
+            only_diff = False
+        self._set_diff_block_indicator_visible(only_diff)
+        if not only_diff:
+            return
+        if not self._diff_block_model_ready():
+            self.diff_block_status_var.set("差异块 计算中...")
+            return
+        blocks = self._ensure_full_diff_blocks()
+        if not blocks:
+            self.diff_block_status_var.set("差异块 -/0 · 待处理 0")
+            return
+        active_idx = self._active_full_diff_block_index()
+        if active_idx is None or not (0 <= active_idx < len(blocks)):
+            active_idx = 0
+        pending_count = sum(1 for block in blocks if block.pending)
+        active = blocks[active_idx]
+        suffix = " · 已处理" if not active.pending else ""
+        self.diff_block_status_var.set(
+            f"差异块 {active.ordinal}/{len(blocks)} · 待处理 {pending_count}{suffix}"
+        )
+
+    def _diff_block_marker_width(self) -> int:
+        try:
+            if not bool(self.only_diff_var.get()):
+                return 0
+        except Exception:
+            return 0
+        blocks = self._ensure_full_diff_blocks()
+        if not blocks:
+            return 0
+        return max(4, len(str(len(blocks))) + 3)
+
+    def _diff_block_marker_prefix(self, pair_idx: int, side: str) -> str:
+        marker_width = self._diff_block_marker_width()
+        if marker_width <= 0:
+            return ""
+        marker = ""
+        if side == "A":
+            block = self._full_diff_block_for_pair(pair_idx)
+            if block is not None and block.start_pair_idx == pair_idx:
+                marker = f"[{block.ordinal}]"
+        return marker.ljust(marker_width)
+
+    def _apply_diff_block_presentation(self):
+        widgets = (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln)
+        for w in widgets:
+            try:
+                w.tag_remove("blockstart", "1.0", "end")
+            except Exception:
+                pass
+        try:
+            self.left_ln.tag_remove("blockmarker", "1.0", "end")
+        except Exception:
+            pass
+        try:
+            if not bool(self.only_diff_var.get()):
+                return
+        except Exception:
+            return
+
+        blocks = self._ensure_full_diff_blocks()
+        marker_width = self._diff_block_marker_width()
+        for block in blocks:
+            line = self.row_to_line.get(block.start_pair_idx)
+            if line is None:
+                continue
+            if block.ordinal > 1:
+                start = f"{line}.0"
+                end = f"{line + 1}.0"
+                for w in widgets:
+                    try:
+                        w.tag_add("blockstart", start, end)
+                    except Exception:
+                        pass
+            if marker_width > 0:
+                try:
+                    self.left_ln.tag_add("blockmarker", f"{line}.0", f"{line}.{marker_width}")
+                except Exception:
+                    pass
+        try:
+            self.left_ln.tag_raise("blockmarker")
+        except Exception:
+            pass
+
+    def _refresh_diff_block_ui(self):
+        self._apply_diff_block_presentation()
+        self._update_diff_block_indicator()
+
     def _compute_diff_blocks(self):
         """Return list of (start_line, end_line) diff blocks in current view."""
         blocks = []
@@ -7753,6 +8042,13 @@ class SheetView:
         anchor_pair_idx = self._normalize_pair_idx(anchor_pair_idx)
         if anchor_pair_idx is None:
             return []
+        try:
+            if bool(self.only_diff_var.get()):
+                block = self._full_diff_block_for_pair(anchor_pair_idx)
+                if block is not None:
+                    return list(block.pair_indices)
+        except Exception:
+            pass
         if not self._pair_has_visual_diff(anchor_pair_idx):
             return []
         start_pair_idx = anchor_pair_idx
@@ -7787,7 +8083,17 @@ class SheetView:
             # after the last rendered row (for example line 801 when a large
             # sheet initially renders 800 rows). Single-row actions already use
             # the selected/hovered pair first; region actions must do the same.
-            anchor_pair_idx = self.resolved_pair_idx_for_c_area()
+            selected_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+            has_selected_row = getattr(self, "_last_selected_line", None) is not None
+            if selected_pair_idx is not None and (
+                self.has_explicit_cell_selection() or has_selected_row
+            ):
+                # Region actions are commands, not hover previews. A deliberate
+                # cell/row selection must win over stale hover state left behind
+                # when the pointer moves from the grid to the toolbar button.
+                anchor_pair_idx = selected_pair_idx
+            else:
+                anchor_pair_idx = self.resolved_pair_idx_for_c_area()
             region_pair_indices = self._logical_diff_pair_block_for_pair(anchor_pair_idx)
             if not region_pair_indices:
                 _dlog(
@@ -7831,7 +8137,10 @@ class SheetView:
             region_pos = 0
             while region_pos < total_region_rows:
                 pair_idx = region_pair_indices[region_pos]
-                cols = set(self.pair_diff_cols.get(pair_idx, set()))
+                if direction == "BASE2A":
+                    cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
+                else:
+                    cols = set(self.pair_diff_cols.get(pair_idx, set()))
                 if not cols:
                     region_pos += 1
                     continue
@@ -8010,10 +8319,31 @@ class SheetView:
             )
 
     def _update_diff_nav_state(self):
+        try:
+            only_diff = bool(self.only_diff_var.get())
+        except Exception:
+            only_diff = False
+        if only_diff:
+            self._update_diff_block_indicator()
+            if not self._diff_block_model_ready():
+                self.prev_diff_btn.configure(state="disabled")
+                self.next_diff_btn.configure(state="disabled")
+                return
+            blocks = self._ensure_full_diff_blocks()
+            active_idx = self._active_full_diff_block_index()
+            if not blocks or active_idx is None:
+                self.prev_diff_btn.configure(state="disabled")
+                self.next_diff_btn.configure(state="disabled")
+                return
+            self.prev_diff_btn.configure(state=("normal" if active_idx > 0 else "disabled"))
+            self.next_diff_btn.configure(state=("normal" if active_idx + 1 < len(blocks) else "disabled"))
+            return
+
         blocks = self._compute_diff_blocks()
         if not blocks:
             self.prev_diff_btn.configure(state="disabled")
             self.next_diff_btn.configure(state="disabled")
+            self._update_diff_block_indicator()
             return
 
         cur = self._current_line()
@@ -8021,6 +8351,70 @@ class SheetView:
         has_next = any(b[0] > cur for b in blocks)
         self.prev_diff_btn.configure(state=("normal" if has_prev else "disabled"))
         self.next_diff_btn.configure(state=("normal" if has_next else "disabled"))
+        self._update_diff_block_indicator()
+
+    def _materialize_pair_for_navigation(self, pair_idx: int) -> bool:
+        pair_idx = self._normalize_pair_idx(pair_idx)
+        if pair_idx is None:
+            return False
+        if pair_idx in self.row_to_line:
+            return True
+        try:
+            target_pos = bisect.bisect_left(self._full_display_rows, pair_idx)
+            if target_pos >= len(self._full_display_rows) or self._full_display_rows[target_pos] != pair_idx:
+                return False
+        except Exception:
+            return False
+        # Navigation targets a logical block, not an isolated row.  Materialize
+        # the complete target block so the user never lands on a half-rendered
+        # region when its first row is beyond the large-sheet render limit.
+        target_end_pos = target_pos
+        target_block = self._full_diff_block_for_pair(pair_idx)
+        if target_block is not None:
+            try:
+                candidate = bisect.bisect_left(
+                    self._full_display_rows,
+                    target_block.end_pair_idx,
+                    lo=target_pos,
+                )
+                if (
+                    candidate < len(self._full_display_rows)
+                    and self._full_display_rows[candidate] == target_block.end_pair_idx
+                ):
+                    target_end_pos = candidate
+            except Exception:
+                target_end_pos = target_pos
+        old_limit = len(self.display_rows)
+        new_limit = min(len(self._full_display_rows), target_end_pos + 1)
+        if new_limit <= old_limit:
+            return pair_idx in self.row_to_line
+        try:
+            self.info.configure(text=f"正在定位差异块：加载到第 {new_limit} 条差异行...")
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        self._render_limit = max(int(self._render_limit or 0), new_limit)
+        self._append_rows(self._full_display_rows[old_limit:new_limit])
+        _dlog(
+            f"DIFF_BLOCK_MATERIALIZE sheet={self.sheet} pair={pair_idx} "
+            f"rows={old_limit}->{new_limit} rescan=0"
+        )
+        return pair_idx in self.row_to_line
+
+    def _goto_full_diff_block(self, block_idx: int):
+        blocks = self._ensure_full_diff_blocks()
+        if not (0 <= int(block_idx) < len(blocks)):
+            self._update_diff_nav_state()
+            return
+        pair_idx = blocks[int(block_idx)].start_pair_idx
+        if not self._materialize_pair_for_navigation(pair_idx):
+            self._update_diff_nav_state()
+            return
+        line = self.row_to_line.get(pair_idx)
+        if line is None:
+            self._update_diff_nav_state()
+            return
+        self._goto_block_start(line)
 
     def _goto_block_start(self, start_line: int):
         # Scroll so the line is visible
@@ -8031,7 +8425,10 @@ class SheetView:
                 saved_x = float((self.left.xview() or (0.0, 1.0))[0])
             except Exception:
                 pass
-            for w in (self.left, self.right):
+            nav_widgets = [self.left, self.right]
+            if self._is_three_way_enabled():
+                nav_widgets.insert(1, self.base)
+            for w in nav_widgets:
                 w.mark_set("insert", f"{start_line}.0")
                 w.see(f"{start_line}.0")
             # Restore horizontal position after see() reset it.
@@ -8053,6 +8450,19 @@ class SheetView:
         self._update_diff_nav_state()
 
     def _goto_next_diff_block(self):
+        try:
+            if bool(self.only_diff_var.get()):
+                blocks = self._ensure_full_diff_blocks()
+                active_idx = self._active_full_diff_block_index()
+                if blocks:
+                    target_idx = 0 if active_idx is None else active_idx + 1
+                    if target_idx < len(blocks):
+                        self._goto_full_diff_block(target_idx)
+                        return
+                self._update_diff_nav_state()
+                return
+        except Exception:
+            pass
         blocks = self._compute_diff_blocks()
         cur = self._current_line()
         for start, _end in blocks:
@@ -8062,6 +8472,16 @@ class SheetView:
         self._update_diff_nav_state()
 
     def _goto_prev_diff_block(self):
+        try:
+            if bool(self.only_diff_var.get()):
+                active_idx = self._active_full_diff_block_index()
+                if active_idx is not None and active_idx > 0:
+                    self._goto_full_diff_block(active_idx - 1)
+                    return
+                self._update_diff_nav_state()
+                return
+        except Exception:
+            pass
         blocks = self._compute_diff_blocks()
         cur = self._current_line()
         prev = None
@@ -8875,6 +9295,7 @@ class SheetView:
         self._only_diff_async_build_key = None
         self._only_diff_async_building = False
         self._only_diff_async_build_seq += 1
+        self._invalidate_diff_block_model()
 
     def _has_user_edits_for_current_sheet(self) -> bool:
         if bool(self.touched_rows):
@@ -8922,6 +9343,8 @@ class SheetView:
             self.info.configure(
                 text=f"只看差异 | 正在后台生成精确差异行...   Rows: {total_rows}   Cols: {self.max_col}"
             )
+            self._set_diff_block_indicator_visible(True)
+            self.diff_block_status_var.set("差异块 计算中...")
         except Exception:
             pass
 
@@ -11340,6 +11763,7 @@ class SheetView:
         self._data_version += 1
         self._render_cache.clear()
         self._diff_blocks_cache = None
+        self._invalidate_diff_block_model()
 
     def _build_base_line(self, pair_idx: int) -> str:
         if not self._is_three_way_enabled():
@@ -11429,6 +11853,18 @@ class SheetView:
         except Exception:
             return ""
 
+    def _format_main_row_header(
+        self,
+        pair_idx: int,
+        side: str,
+        rownum_width: int,
+        *,
+        arrow: str | None = None,
+    ) -> str:
+        prefix = self._diff_block_marker_prefix(pair_idx, side)
+        body = arrow if arrow is not None else self._row_label_for_pair_idx(pair_idx, side)
+        return prefix + str(body or "").rjust(rownum_width)
+
     def _rownum_render_width(self) -> int:
         max_label = int(self.max_row or 0)
         try:
@@ -11447,7 +11883,7 @@ class SheetView:
 
     def _sync_row_header_width_widgets(self):
         rn_w = self._rownum_render_width()
-        header_w = max(4, rn_w + 1)
+        header_w = max(4, rn_w + 1 + self._diff_block_marker_width())
         self._rownum_display_width = rn_w
         if getattr(self, "_row_header_width", None) == header_w:
             return rn_w
@@ -11477,9 +11913,9 @@ class SheetView:
         base_lines = []
         right_lines = []
         for pidx in self.display_rows:
-            left_lines.append(self._row_label_for_pair_idx(pidx, "A").rjust(rn_w))
-            base_lines.append(self._row_label_for_pair_idx(pidx, "BASE").rjust(rn_w))
-            right_lines.append(self._row_label_for_pair_idx(pidx, "B").rjust(rn_w))
+            left_lines.append(self._format_main_row_header(pidx, "A", rn_w))
+            base_lines.append(self._format_main_row_header(pidx, "BASE", rn_w))
+            right_lines.append(self._format_main_row_header(pidx, "B", rn_w))
         for w, lines in ((self.left_ln, left_lines), (self.base_ln, base_lines), (self.right_ln, right_lines)):
             try:
                 w.configure(state="normal")
@@ -11493,9 +11929,9 @@ class SheetView:
     def _render_row_header_line(self, line: int, pair_idx: int):
         rn_w = self._sync_row_header_width_widgets()
         vals = (
-            self._row_label_for_pair_idx(pair_idx, "A").rjust(rn_w),
-            self._row_label_for_pair_idx(pair_idx, "BASE").rjust(rn_w),
-            self._row_label_for_pair_idx(pair_idx, "B").rjust(rn_w),
+            self._format_main_row_header(pair_idx, "A", rn_w),
+            self._format_main_row_header(pair_idx, "BASE", rn_w),
+            self._format_main_row_header(pair_idx, "B", rn_w),
         )
         for w, txt in ((self.left_ln, vals[0]), (self.base_ln, vals[1]), (self.right_ln, vals[2])):
             try:
@@ -11521,7 +11957,7 @@ class SheetView:
     def _render_col_headers(self):
         hdr = self._build_col_header_line()
         rn_w = self._sync_row_header_width_widgets()
-        corner = "".rjust(rn_w)
+        corner = "".rjust(rn_w + self._diff_block_marker_width())
         for w in (self.left_corner_hdr, self.base_corner_hdr, self.right_corner_hdr, self.cursor_cmp_corner):
             try:
                 w.configure(state="normal")
@@ -11554,7 +11990,8 @@ class SheetView:
         else:
             rows.append(str(ra) if ra is not None else "")
         rows.append(str(rb) if rb is not None else "")
-        rows_txt = [r.rjust(rn_w) for r in rows]
+        prefix = " " * self._diff_block_marker_width()
+        rows_txt = [prefix + r.rjust(rn_w) for r in rows]
         try:
             self.cursor_cmp_ln.configure(state="normal")
             self.cursor_cmp_ln.delete("1.0", "end")
@@ -11680,6 +12117,7 @@ class SheetView:
                 pass
 
         self._invalidate_render_cache()
+        self._refresh_diff_block_ui()
 
     def _maybe_load_more_rows(self, last_fraction: float):
         if not _FAST_OPEN_ENABLED:
@@ -11809,6 +12247,7 @@ class SheetView:
         if pad_right:
             self.right.tag_add("paddingrow", *pad_right)
 
+        self._refresh_diff_block_ui()
         diff_count = len(self.display_rows)
         self.info.configure(text=f"缺失Sheet对照 | RowsShown: {len(self.display_rows)} / {len(self.row_pairs)}   Cols: {self.max_col}   DiffRows: {diff_count}")
         self._display_diff_row_count = diff_count
@@ -12271,6 +12710,7 @@ class SheetView:
                 if right_args:
                     self.right.tag_add("diffcell", *right_args)
                 self._clear_diffrow_under_diffcells(left_args, base_args, right_args)
+            self._refresh_diff_block_ui()
             # keep fast; do not rebuild sheet nav here
             try:
                 self._display_diff_row_count = sum(1 for idx in self.display_rows if self._pair_has_visual_diff(idx))
@@ -12377,6 +12817,7 @@ class SheetView:
                     if _pcol_right:
                         self.right.tag_add("paddingcol", *_pcol_right)
                 # rownum gutter tags are unused when row headers are separate
+                self._refresh_diff_block_ui()
 
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
@@ -12542,6 +12983,7 @@ class SheetView:
             if _pcol_right:
                 self.right.tag_add("paddingcol", *_pcol_right)
         # row-number styling handled by dedicated row-header widgets
+        self._refresh_diff_block_ui()
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
         total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
@@ -14150,9 +14592,53 @@ class SowMergeApp:
             sig_b = _bulk_sig_list(ws_b, max_row_b)
             return _compute_row_pairs_from_signatures(sig_a, sig_b)
 
-        def _has_diff_by_blocks_bg(ws_a, ws_b, max_row_a: int, max_row_b: int, max_col: int):
+        def _complete_trimmed_rows(ws, rows_cache):
+            """Return a complete forward-scan cache for ``ws`` when available."""
+            if not isinstance(rows_cache, dict):
+                return None
+            cached = rows_cache.get(id(ws))
+            if not isinstance(cached, (list, tuple)):
+                return None
+            try:
+                worksheet_rows = max(1, int(ws.max_row or 1))
+            except Exception:
+                return None
+            if len(cached) < worksheet_rows:
+                return None
+            return cached
+
+        def _has_diff_by_blocks_bg(
+            ws_a,
+            ws_b,
+            max_row_a: int,
+            max_row_b: int,
+            max_col: int,
+            rows_cache=None,
+        ):
             max_row = max(max_row_a, max_row_b)
             block = _LARGE_SHEET_BLOCK_ROWS
+            cached_a = _complete_trimmed_rows(ws_a, rows_cache)
+            cached_b = _complete_trimmed_rows(ws_b, rows_cache)
+            if cached_a is not None and cached_b is not None:
+                # _compute_trim_bounds already parsed each ReadOnlyWorksheet in
+                # one forward pass. Reuse those rows while retaining the exact
+                # tail-first comparison order of the legacy block scan.
+                for block_end in range(max_row, 0, -block):
+                    _check_bg_cancel()
+                    block_start = max(1, block_end - block + 1)
+                    for r in range(block_end, block_start - 1, -1):
+                        if (r & 127) == 0:
+                            _check_bg_cancel()
+                        row_a = cached_a[r - 1] if r <= max_row_a and r <= len(cached_a) else ()
+                        row_b = cached_b[r - 1] if r <= max_row_b and r <= len(cached_b) else ()
+                        for ci in range(max_col):
+                            va = row_a[ci] if ci < len(row_a) else None
+                            vb = row_b[ci] if ci < len(row_b) else None
+                            if _merge_cmp_value(va) != _merge_cmp_value(vb):
+                                return True
+                return False
+
+            # Safe fallback for callers without a complete trim cache.
             for block_end in range(max_row, 0, -block):
                 _check_bg_cancel()
                 block_start = max(1, block_end - block + 1)
@@ -14196,11 +14682,39 @@ class SowMergeApp:
                             return True
             return False
 
-        def _pairs_have_diff_bg(ws_left, ws_right, row_pairs, max_col: int):
+        def _pairs_have_diff_bg(ws_left, ws_right, row_pairs, max_col: int, rows_cache=None):
             if not row_pairs:
                 return False
             block = _LARGE_SHEET_BLOCK_ROWS
             pair_count = len(row_pairs)
+            cached_left = _complete_trimmed_rows(ws_left, rows_cache)
+            cached_right = _complete_trimmed_rows(ws_right, rows_cache)
+            if cached_left is not None and cached_right is not None:
+                for block_end in range(pair_count, 0, -block):
+                    _check_bg_cancel()
+                    block_start = max(0, block_end - block)
+                    for pair_idx in range(block_end - 1, block_start - 1, -1):
+                        if (pair_idx & 127) == 0:
+                            _check_bg_cancel()
+                        left_row, right_row = row_pairs[pair_idx]
+                        row_left = (
+                            cached_left[left_row - 1]
+                            if left_row is not None and 0 < left_row <= len(cached_left)
+                            else ()
+                        )
+                        row_right = (
+                            cached_right[right_row - 1]
+                            if right_row is not None and 0 < right_row <= len(cached_right)
+                            else ()
+                        )
+                        for ci in range(max_col):
+                            vl = row_left[ci] if ci < len(row_left) else None
+                            vr = row_right[ci] if ci < len(row_right) else None
+                            if _merge_cmp_value(vl) != _merge_cmp_value(vr):
+                                return True
+                return False
+
+            # Safe fallback for incomplete or unavailable caches.
             for block_end in range(pair_count, 0, -block):
                 _check_bg_cancel()
                 block_start = max(0, block_end - block)
@@ -14269,12 +14783,12 @@ class SowMergeApp:
             row_pairs_a_base = _compute_row_pairs_bg(
                 ws_a, ws_base, max_r_a, max_r_base, max_col, signature_cache, rows_cache
             )
-            if _pairs_have_diff_bg(ws_a, ws_base, row_pairs_a_base, max_col):
+            if _pairs_have_diff_bg(ws_a, ws_base, row_pairs_a_base, max_col, rows_cache):
                 return True
             row_pairs_b_base = _compute_row_pairs_bg(
                 ws_b, ws_base, max_r_b, max_r_base, max_col, signature_cache, rows_cache
             )
-            if _pairs_have_diff_bg(ws_b, ws_base, row_pairs_b_base, max_col):
+            if _pairs_have_diff_bg(ws_b, ws_base, row_pairs_b_base, max_col, rows_cache):
                 return True
             return False
 
@@ -14380,7 +14894,14 @@ class SowMergeApp:
             # Large-sheet fast open: avoid full cell-by-cell precompute.
             # Still estimate display widths from head + tail samples to prevent 4-char collapse.
             if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
-                has_diff = _has_diff_by_blocks_bg(ws_a, ws_b, max_r_a, max_r_b, max_col)
+                has_diff = _has_diff_by_blocks_bg(
+                    ws_a,
+                    ws_b,
+                    max_r_a,
+                    max_r_b,
+                    max_col,
+                    trimmed_rows_cache,
+                )
                 if (not has_diff) and getattr(self, "has_base", False):
                     has_diff = _sheet_has_base_diff_bg(
                         ws_a,
