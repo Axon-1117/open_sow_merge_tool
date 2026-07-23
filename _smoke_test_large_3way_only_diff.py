@@ -33,11 +33,25 @@ def _open_view(base: str, mine: str, theirs: str, merged: str):
     for _ in range(220):
         _pump(app.root, 0.05)
         view = app.sheet_views.get("S1")
-        if view is not None and getattr(view, "_data_ready", False):
+        if view is not None and view._derive_lifecycle_state() == "READY":
             break
     assert view is not None, "sheet view not created"
+    assert view._derive_lifecycle_state() == "READY", view._derive_lifecycle_state()
+    if bool(view.only_diff_var.get()):
+        view.only_diff_var.set(0)
+        view._toggle_only_diff()
+        for _ in range(200):
+            _pump(app.root, 0.02)
+            if not getattr(view, "_mode_switch_pending", False):
+                break
+        assert not getattr(view, "_mode_switch_pending", False)
     view.force_align_var.set(1)
     view._toggle_force_align()
+    for _ in range(300):
+        _pump(app.root, 0.05)
+        if view._derive_lifecycle_state() == "READY":
+            break
+    assert view._derive_lifecycle_state() == "READY", view._derive_lifecycle_state()
     return app, view
 
 
@@ -69,9 +83,14 @@ def _case_theirs_insert_large():
         assert list(view.display_rows) == before_toggle_rows, "Expected full view to stay visible while async only-diff builds"
         for _ in range(300):
             _pump(app.root, 0.05)
-            if (not getattr(view, "_only_diff_async_building", False)) and len(view.display_rows) <= 10:
+            if (
+                not getattr(view, "_only_diff_async_building", False)
+                and not getattr(view, "_mode_switch_pending", False)
+                and len(view.display_rows) <= 10
+            ):
                 break
         assert not getattr(view, "_only_diff_async_building", False), "Expected async only-diff build to finish"
+        assert not getattr(view, "_mode_switch_pending", False), "Expected deferred only-diff publish to finish"
 
         targets = []
         for idx in view.display_rows:
@@ -115,9 +134,14 @@ def _case_base_only_insert_large():
         assert list(view.display_rows) == before_toggle_rows, "Expected full view to stay visible while async only-diff builds"
         for _ in range(300):
             _pump(app.root, 0.05)
-            if (not getattr(view, "_only_diff_async_building", False)) and len(view.display_rows) <= 10:
+            if (
+                not getattr(view, "_only_diff_async_building", False)
+                and not getattr(view, "_mode_switch_pending", False)
+                and len(view.display_rows) <= 10
+            ):
                 break
         assert not getattr(view, "_only_diff_async_building", False), "Expected async only-diff build to finish"
+        assert not getattr(view, "_mode_switch_pending", False), "Expected deferred only-diff publish to finish"
 
         targets = []
         for idx in view.display_rows:

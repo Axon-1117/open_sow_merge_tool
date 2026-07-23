@@ -36,6 +36,8 @@ def main():
     assert startup_updates == ["stage1", "stage2"]
 
     with tempfile.TemporaryDirectory(prefix="sow_progress_test_") as tmp:
+        original_settings_path = sm._SETTINGS_PATH
+        sm._SETTINGS_PATH = os.path.join(tmp, "settings.json")
         left = os.path.join(tmp, "Book.xlsx")
         right = os.path.join(tmp, "Book-right.xlsx")
         merged = os.path.join(tmp, "Book-merged.xlsx")
@@ -76,6 +78,23 @@ def main():
         assert not view.loading_progress.winfo_manager()
         view._suppress_bg_apply = False
 
+        # Editable preload completion may update readiness, but it must never
+        # trigger a foreground rescan on the Tk thread.
+        original_refresh = view.refresh
+        edit_ready_refreshes = []
+        view.refresh = lambda *args, **kwargs: edit_ready_refreshes.append(
+            (args, dict(kwargs))
+        )
+        try:
+            view._cache_formula_aware = True
+            app._refresh_loaded_views_after_edit_ready()
+        finally:
+            view.refresh = original_refresh
+        assert not any(
+            bool(kwargs.get("rescan"))
+            for _args, kwargs in edit_ready_refreshes
+        ), edit_ready_refreshes
+
         # A checkbox click while the Sheet cache is still pending must never
         # run refresh(rescan=True) on the Tk callback.
         old_ready = view._data_ready
@@ -106,6 +125,8 @@ def main():
                 app.root.after(20, _tick)
 
         app.root.after(0, _tick)
+        progress_window_state = str(app.root.state())
+        progress_window_geometry = str(app.root.geometry())
 
         def _background_task(report):
             report("后台任务", "执行中", 35)
@@ -122,6 +143,37 @@ def main():
         )
         assert value == 42
         assert len(ticks) >= 5, f"progress dialog blocked Tk event loop: ticks={len(ticks)}"
+        tick_gaps = [
+            later - earlier
+            for earlier, later in zip(ticks, ticks[1:])
+        ]
+        assert not tick_gaps or max(tick_gaps) < 0.2, max(tick_gaps)
+        assert str(app.root.state()) == progress_window_state
+        assert str(app.root.geometry()) == progress_window_geometry
+
+        # A user-selected normal window must not be maximized, normalized, or
+        # repositioned by a cached only-diff transition.
+        if sys.platform.startswith("win"):
+            app.root.state("normal")
+            app.root.geometry("940x760+120+90")
+            app.root.update()
+            normal_state = str(app.root.state())
+            normal_geometry = str(app.root.geometry())
+            view._row_model_exact = True
+            view._cache_formula_aware = True
+            view._pair_diff_full_exact = True
+            view._only_diff_rows_exact = True
+            view._cache_only_diff_rows_snapshot(
+                pair_idx
+                for pair_idx in range(len(view.row_pairs))
+                if view._pair_has_visual_diff(pair_idx)
+            )
+            view._refresh_interaction_gate()
+            view.only_diff_var.set(1)
+            view._toggle_only_diff()
+            app.root.update()
+            assert str(app.root.state()) == normal_state
+            assert str(app.root.geometry()) == normal_geometry
 
         old_showinfo = sm.messagebox.showinfo
         old_showwarning = sm.messagebox.showwarning
@@ -145,6 +197,7 @@ def main():
             assert wb["Data"]["B2"].value == "mine"
         finally:
             wb.close()
+        sm._SETTINGS_PATH = original_settings_path
 
     print("GUI_SELF_TEST_PROGRESS_FEEDBACK_OK")
 

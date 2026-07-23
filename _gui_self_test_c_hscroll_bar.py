@@ -1,4 +1,4 @@
-"""GUI self-test: C-area horizontal scrollbars must reflect and drive main xview.
+"""GUI self-test: C-area uses full width and keeps its own horizontal scroll.
 
 Run:
   .venv\\Scripts\\python.exe _gui_self_test_c_hscroll_bar.py
@@ -38,7 +38,9 @@ def main():
     import sow_merge_tool as mod
 
     app = mod.SowMergeApp(fa, fb)
-    app.root.geometry("700x450")
+    app._intended_window_state = "normal"
+    app.root.state("normal")
+    app.root.geometry("1200x700")
     sheet = app.common_sheets[0]
     view = app.sheet_views.get(sheet)
     if view is None:
@@ -53,6 +55,20 @@ def main():
         app.root.update_idletasks()
         app.root.update()
 
+    c_width = int(view.cursor_cmp.winfo_width())
+    header_width = int(view.cursor_cmp_colhdr.winfo_width())
+    main_width = int(view.left.winfo_width())
+    available_width = int(view.c_area.winfo_width()) - int(view.cursor_cmp_ln.winfo_width())
+    assert c_width >= available_width - 12, (
+        f"C body did not consume lower-pane width: c={c_width} available={available_width}"
+    )
+    assert c_width > main_width * 1.5, (
+        f"C body should be substantially wider than one main pane: c={c_width} main={main_width}"
+    )
+    assert abs(header_width - c_width) <= 4, (
+        f"C header/body widths diverged: header={header_width} body={c_width}"
+    )
+
     view._sync_main_x_to_frac(0.6)
     view._sync_c_x_to_frac(0.6)
     for _ in range(4):
@@ -61,22 +77,30 @@ def main():
 
     left_first = float((view.left.xview() or (0.0, 1.0))[0])
     cursor_first = float((view.cursor_hsb.get() or (0.0, 1.0))[0])
+    cursor_view_first = float((view.cursor_cmp.xview() or (0.0, 1.0))[0])
     cell_first = float((view.cell_cmp_hsb.get() or (0.0, 1.0))[0])
     assert abs(left_first - 0.6) < 0.03, f"Expected main pane near 0.6, got {left_first:.6f}"
-    assert abs(cursor_first - left_first) < 0.03, (
-        f"Expected cursor_hsb to mirror main xview; left={left_first:.6f} cursor={cursor_first:.6f}"
+    assert abs(cursor_first - cursor_view_first) < 0.03, (
+        "Expected cursor_hsb to report C's wider viewport; "
+        f"c_view={cursor_view_first:.6f} cursor={cursor_first:.6f}"
     )
     assert abs(cell_first - left_first) < 0.03, (
         f"Expected cell_cmp_hsb to mirror main xview; left={left_first:.6f} cell={cell_first:.6f}"
     )
 
+    main_before_c_drive = float((view.left.xview() or (0.0, 1.0))[0])
     view._xview_cursor_cmp("moveto", "0.2")
     for _ in range(4):
         app.root.update_idletasks()
         app.root.update()
     after_cursor_drive = float((view.left.xview() or (0.0, 1.0))[0])
-    assert abs(after_cursor_drive - 0.2) < 0.03, (
-        f"Expected C top scrollbar to drive main xview; got {after_cursor_drive:.6f}"
+    c_after_drive = float((view.cursor_cmp.xview() or (0.0, 1.0))[0])
+    assert abs(after_cursor_drive - main_before_c_drive) < 0.01, (
+        "C scrollbar unexpectedly moved the main pane; "
+        f"before={main_before_c_drive:.6f} after={after_cursor_drive:.6f}"
+    )
+    assert abs(c_after_drive - 0.2) < 0.03, (
+        f"Expected C scrollbar to move C itself; got {c_after_drive:.6f}"
     )
 
     view._xview_cell_cmp("moveto", "0.4")

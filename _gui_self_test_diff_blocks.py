@@ -29,11 +29,22 @@ def _pump(root, seconds=0.2):
 def _prepare_view(app, *, only_diff=True):
     app.root.deiconify()
     app.nb.select(app._sheet_containers["Data"])
-    _pump(app.root)
-    view = app.sheet_views["Data"]
-    view._suppress_bg_apply = True
-    view.only_diff_var.set(1 if only_diff else 0)
-    view.refresh(row_only=None, rescan=True)
+    deadline = time.time() + 20.0
+    view = None
+    while time.time() < deadline:
+        _pump(app.root, 0.02)
+        view = app.sheet_views.get("Data")
+        if view is not None and view._derive_lifecycle_state() == "READY":
+            break
+    assert view is not None and view._derive_lifecycle_state() == "READY"
+    requested = 1 if only_diff else 0
+    if int(view.only_diff_var.get()) != requested:
+        view.only_diff_var.set(requested)
+        view._toggle_only_diff()
+    deadline = time.time() + 20.0
+    while time.time() < deadline and view._derive_lifecycle_state() != "READY":
+        _pump(app.root, 0.02)
+    assert view._derive_lifecycle_state() == "READY"
     _pump(app.root, 0.05)
     return view
 
@@ -219,7 +230,8 @@ def _test_two_way_block_presentation(root_dir):
         view.only_diff_var.set(0)
         view._refresh_mode_switch_preserving_selection(rescan=False)
         _pump(app.root, 0.05)
-        assert not view.diff_block_status.winfo_manager()
+        assert view.diff_block_status.winfo_manager()
+        assert view.diff_block_status_var.get() == "差异块 -/- · 待处理 -"
         assert not view.left.tag_ranges("blockstart")
         assert not view.left_ln.tag_ranges("blockmarker")
     finally:

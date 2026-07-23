@@ -1,5 +1,6 @@
 from openpyxl import Workbook
 import os
+import time
 from _test_temp_utils import make_temp_dir
 
 # create two small workbooks in separate dirs but same basename
@@ -37,6 +38,17 @@ if view is None:
 # Force synchronous rescan (rescan=True bypasses the background-wait guard)
 view.refresh(row_only=None, rescan=True)
 assert view._data_ready, 'refresh(rescan=True) should set _data_ready'
+
+# Mutations are intentionally gated until the formula-aware editable
+# workbooks and the exact comparison generation are ready.
+deadline = time.time() + 15.0
+while time.time() < deadline and view._derive_lifecycle_state() != "READY":
+    try:
+        app.root.update_idletasks(); app.root.update()
+    except Exception:
+        pass
+    time.sleep(0.01)
+assert view._derive_lifecycle_state() == "READY", view._derive_lifecycle_state()
 
 # Row 1 of A differs from row 1 of B (B1: 'y' vs 'Y'); look up via pair index
 pair_idx_r1 = view.row_a_to_pair_idx.get(1)

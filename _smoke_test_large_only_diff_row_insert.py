@@ -46,24 +46,43 @@ def main():
         for _ in range(200):
             _pump(app.root, 0.05)
             view = app.sheet_views.get("S1")
-            if view is not None and getattr(view, "_data_ready", False):
+            if view is not None and view._derive_lifecycle_state() == "READY":
                 break
 
         assert view is not None, "sheet view not created"
+        assert view._derive_lifecycle_state() == "READY", view._derive_lifecycle_state()
         view.force_align_var.set(1)
         view._toggle_force_align()
+        for _ in range(300):
+            _pump(app.root, 0.05)
+            if view._derive_lifecycle_state() == "READY":
+                break
+        assert view._derive_lifecycle_state() == "READY", view._derive_lifecycle_state()
         before_toggle_rows = list(view.display_rows)
         view.only_diff_var.set(1)
         t0 = time.time()
         view._toggle_only_diff()
         toggle_cost = time.time() - t0
         assert toggle_cost < 1.5, f"Expected only-diff toggle to stay responsive, got {toggle_cost:.3f}s"
-        assert list(view.display_rows) == before_toggle_rows, "Expected full view to stay visible while async only-diff builds"
+        if (
+            getattr(view, "_only_diff_async_building", False)
+            or getattr(view, "_mode_switch_pending", False)
+        ):
+            assert list(view.display_rows) == before_toggle_rows, (
+                "Expected full view to stay visible while async only-diff builds"
+            )
+        else:
+            assert len(view.display_rows) <= 10, view.display_rows[:20]
         for _ in range(300):
             _pump(app.root, 0.05)
-            if (not getattr(view, "_only_diff_async_building", False)) and len(view.display_rows) <= 10:
+            if (
+                not getattr(view, "_only_diff_async_building", False)
+                and not getattr(view, "_mode_switch_pending", False)
+                and len(view.display_rows) <= 10
+            ):
                 break
         assert not getattr(view, "_only_diff_async_building", False), "Expected async only-diff build to finish"
+        assert not getattr(view, "_mode_switch_pending", False), "Expected deferred only-diff publish to finish"
 
         mod_pair = None
         insert_pair = None
@@ -81,13 +100,19 @@ def main():
 
         view.only_diff_var.set(0)
         view._toggle_only_diff()
-        _pump(app.root, 0.1)
+        for _ in range(100):
+            _pump(app.root, 0.02)
+            if not getattr(view, "_mode_switch_pending", False):
+                break
         view.only_diff_var.set(1)
         t1 = time.time()
         view._toggle_only_diff()
         cached_toggle_cost = time.time() - t1
         assert cached_toggle_cost < 0.5, f"Expected cached only-diff toggle to be near-instant, got {cached_toggle_cost:.3f}s"
-        _pump(app.root, 0.1)
+        for _ in range(100):
+            _pump(app.root, 0.02)
+            if not getattr(view, "_mode_switch_pending", False):
+                break
         assert mod_pair in view.display_rows and insert_pair in view.display_rows, view.display_rows[:20]
     finally:
         try:

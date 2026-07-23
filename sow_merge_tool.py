@@ -40,8 +40,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-23.update56"
-APP_BUILD_TAG = "new133-region-mode-guided-apply"
+APP_VERSION = "2026-07-23.update57"
+APP_BUILD_TAG = "new134-only-diff-loading-progress-ux"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -7268,7 +7268,9 @@ def _take_startup_progress_root():
     except Exception:
         root_exists = False
     if not root_exists:
-        return tk.Tk()
+        root = tk.Tk()
+        root.withdraw()
+        return root
     try:
         for aid in list(root.tk.call("after", "info") or ()):
             try:
@@ -7283,7 +7285,10 @@ def _take_startup_progress_root():
         except Exception:
             pass
     try:
-        root.deiconify()
+        # The progress window used a compact geometry. Keep it withdrawn until
+        # the full application layout has settled so Windows never paints that
+        # intermediate geometry as the main window.
+        root.withdraw()
     except Exception:
         pass
     return root
@@ -8555,6 +8560,20 @@ class SheetView:
         # reuse that model only after proving the old/new slot mapping; every
         # other path falls back to the normal full scan.
         self._pair_diff_full_exact = False
+        self._base_diff_full_exact = False
+        self._cache_formula_aware = False
+        self._row_model_exact = False
+        self._only_diff_rows_exact = False
+        self._lifecycle_generation = 0
+        self._lifecycle_state = "LOADING"
+        self._lifecycle_error: str | None = None
+        self._lifecycle_canceled = False
+        self._only_diff_preview_full = False
+        self._mode_switch_pending = False
+        self._mode_switch_seq = 0
+        self._mode_switch_after_id = None
+        self._pending_exact_render = False
+        self._pending_pair_parts_cache = None
         self._pending_column_only_diff_seed = None
         self._column_diff_seed_last = {"used": False, "reason": "not-attempted"}
         self._align_rows_enabled = True
@@ -8581,37 +8600,62 @@ class SheetView:
         self._only_diff_async_build_seq = 0
         self._only_diff_async_building = False
         self._only_diff_async_thread: threading.Thread | None = None
+        self._only_diff_async_requested_value = int(
+            getattr(self.app, "only_diff_default", 0)
+        )
+        self._only_diff_request_origin_value = int(
+            getattr(self.app, "only_diff_default", 0)
+        )
+        self._mutation_widgets: list[object] = []
 
         # Toolbar
         bar = ttk.Frame(self.frame)
         bar.pack(fill="x", padx=8, pady=(8, 6))
+        self.diff_nav_bar = ttk.Frame(self.frame)
+        self.diff_nav_bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.diff_nav_group = ttk.Frame(self.diff_nav_bar)
+        self.diff_nav_group.pack(side="right")
 
         ttk.Label(bar, text=f"Sheet: {sheet_name}", font=("Segoe UI", 11, "bold")).pack(side="left")
         self.info = ttk.Label(bar, text="", foreground="#444")
         self.info.pack(side="left", padx=(10, 0))
         self.loading_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
-        # Diff block navigation (fixed position on the right; does not shift with label lengths)
-        self.next_diff_btn = tk.Button(bar, text="下一处差异", padx=10, pady=2, command=self._goto_next_diff_block)
-        self.prev_diff_btn = tk.Button(bar, text="上一处差异", padx=10, pady=2, command=self._goto_prev_diff_block)
-        # Pack on right so it stays at a stable location across sheets
-        self.next_diff_btn.pack(side="right", padx=(6, 0))
-        self.prev_diff_btn.pack(side="right", padx=(6, 0))
+        # Difference navigation owns a separate, always-reserved row. Dynamic
+        # counts must never reflow the view-mode controls in the toolbar above.
+        self.next_diff_btn = tk.Button(
+            self.diff_nav_group,
+            text="下一处差异",
+            padx=10,
+            pady=2,
+            command=self._goto_next_diff_block,
+        )
+        self.prev_diff_btn = tk.Button(
+            self.diff_nav_group,
+            text="上一处差异",
+            padx=10,
+            pady=2,
+            command=self._goto_prev_diff_block,
+        )
         self._diff_blocks_cache = None  # None = not yet computed; [] = computed, no diffs
         self._full_diff_blocks_cache_key = None
         self._full_diff_blocks: list[_DiffBlock] = []
         self._pair_to_full_diff_block: dict[int, int] = {}
-        self.diff_block_status_var = tk.StringVar(value="差异块 计算中...")
+        self.diff_block_status_var = tk.StringVar(value="差异块 -/- · 待处理 -")
         self.diff_block_status = tk.Label(
-            bar,
+            self.diff_nav_group,
             textvariable=self.diff_block_status_var,
             width=28,
-            anchor="e",
+            anchor="center",
             fg="#174A7E",
         )
+        self.prev_diff_btn.pack(side="left")
+        self.diff_block_status.pack(side="left", padx=8)
+        self.next_diff_btn.pack(side="left")
 
         # Some environments fail to toggle BooleanVar reliably; use IntVar with explicit on/off values.
         self.only_diff_var = tk.IntVar(value=int(getattr(self.app, "only_diff_default", 0)))
+        self._last_only_diff_value = int(self.only_diff_var.get())
 
         self.only_diff_cb = tk.Checkbutton(
             bar,
@@ -8656,8 +8700,10 @@ class SheetView:
             except Exception:
                 pass
         self.three_way_var = tk.IntVar(value=1 if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False) else 0)
+        self._last_three_way_value = int(self.three_way_var.get())
+        self.three_way_cb = None
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
-            tk.Checkbutton(
+            self.three_way_cb = tk.Checkbutton(
                 bar,
                 text="3视图",
                 variable=self.three_way_var,
@@ -8665,7 +8711,8 @@ class SheetView:
                 offvalue=0,
                 command=self._toggle_three_way_view,
                 padx=6,
-            ).pack(side="right", padx=(6, 0))
+            )
+            self.three_way_cb.pack(side="right", padx=(6, 0))
 
         # Apply initial visual state from persisted setting
         try:
@@ -8810,7 +8857,8 @@ class SheetView:
         self.use_left_group.pack(side="right")
         self.undo_btn.pack(side="right", padx=(6, 0))
 
-        ttk.Button(bar, text="刷新本Sheet", command=self._manual_rescan).pack(side="right", padx=(6, 0))
+        self.manual_rescan_btn = ttk.Button(bar, text="刷新本Sheet", command=self._manual_rescan)
+        self.manual_rescan_btn.pack(side="right", padx=(6, 0))
         self._full_render = False
         self._load_all_btn = ttk.Button(bar, text="加载全部", command=self._load_all_rows)
         if _FAST_OPEN_ENABLED:
@@ -9236,13 +9284,19 @@ class SheetView:
         save_a_row.pack(fill="x", pady=(2, 0))
         save_a_row.pack_propagate(False)
         if getattr(self.app, "merge_mode", False):
-            tk.Button(save_a_row, text="保存Merged并退出", bg="#eaf2ff", padx=14, pady=4,
-                      command=self.app.save_merged_and_exit).pack(side="right")
+            self.save_a_btn = tk.Button(
+                save_a_row, text="保存Merged并退出", bg="#eaf2ff", padx=14, pady=4,
+                command=self.app.save_merged_and_exit
+            )
+            self.save_a_btn.pack(side="right")
         else:
             if not getattr(self.app, "diff_base_mine_mode", False):
                 if not _is_temp_base_path(getattr(self.app, "file_a", "")):
-                    tk.Button(save_a_row, text="保存A", bg="#eaf2ff", padx=14, pady=4,
-                              command=self.app.save_a_inplace).pack(side="right")
+                    self.save_a_btn = tk.Button(
+                        save_a_row, text="保存A", bg="#eaf2ff", padx=14, pady=4,
+                        command=self.app.save_a_inplace
+                    )
+                    self.save_a_btn.pack(side="right")
 
         # Base pane spacer: maintain same bottom reserved height as A/B panes.
         save_mid_row = ttk.Frame(mid_footer, height=save_row_height)
@@ -9261,8 +9315,11 @@ class SheetView:
         save_b_row.pack_propagate(False)
         if not getattr(self.app, "merge_mode", False):
             save_b_text = "Save Mine" if getattr(self.app, "diff_base_mine_mode", False) else "Save B"
-            tk.Button(save_b_row, text=save_b_text, bg="#ffecec", padx=14, pady=4,
-                      command=self.app.save_b_inplace).pack(side="right")
+            self.save_b_btn = tk.Button(
+                save_b_row, text=save_b_text, bg="#ffecec", padx=14, pady=4,
+                command=self.app.save_b_inplace
+            )
+            self.save_b_btn.pack(side="right")
 
         # Tags (order matters: diffcell should be applied after diffrow)
         # Closer to TortoiseMerge vibe: left diff block = orange, right diff block = yellow
@@ -9384,7 +9441,7 @@ class SheetView:
                                          font=self.editor_font, bg="#efefef", fg="#555555", relief="flat", takefocus=0, cursor="arrow")
         self.cursor_cmp_corner.pack(side="left", fill="y")
         ttk.Separator(c_head, orient="vertical").pack(side="left", fill="y")
-        self.cursor_cmp_colhdr.pack(side="left", fill="y", expand=False)
+        self.cursor_cmp_colhdr.pack(side="left", fill="x", expand=True)
 
         c_body = ttk.Frame(c_text_frame)
         c_body.pack(side="top", fill="x")
@@ -9410,7 +9467,7 @@ class SheetView:
         self.cursor_cmp.tag_configure("diffcell", background=_DIFF_CELL_BG)
         # Explicit C-area click target highlight
         self.cursor_cmp.tag_configure("cselcell", background="#8EB9FF")
-        self.cursor_cmp.pack(side="left", fill="y", expand=False)
+        self.cursor_cmp.pack(side="left", fill="x", expand=True)
 
         for w in (self.cursor_cmp_corner, self.cursor_cmp_colhdr, self.cursor_cmp_ln):
             try:
@@ -9536,6 +9593,7 @@ class SheetView:
         # self._update_cursor_lines()
         # Initial panel state (must run after C区 widgets are created)
         self._toggle_three_way_view(init_only=True)
+        self._refresh_interaction_gate()
 
     # ---------- Scrolling sync ----------
     def _is_three_way_enabled(self) -> bool:
@@ -9625,6 +9683,12 @@ class SheetView:
 
     def _display_ws(self, side: str, edit: bool = False):
         side = str(side or "").upper()
+        if edit:
+            edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
+            if callable(edit_ready) and not edit_ready():
+                # View-only rendering must not synchronously load editable
+                # workbooks. Use the value sheet as a provisional display.
+                return self._display_ws(side, edit=False)
         ws = self.app.ws_for_side(side, self.sheet, edit=edit, allow_missing=True)
         if ws is not None:
             return ws
@@ -9661,6 +9725,142 @@ class SheetView:
             return theirs_map.get(rb)
         return None
 
+    def _derive_lifecycle_state(self) -> str:
+        """Return the current per-Sheet readiness state.
+
+        Rendering and navigation remain available in every non-closing state.
+        Workbook mutations are permitted only after the row model, the requested
+        comparison mode, column projection, and editable workbooks are ready.
+        """
+        if bool(getattr(self.app, "_is_closing", False)):
+            return "CLOSING"
+        if getattr(self, "_lifecycle_error", None):
+            return "FAILED"
+        if bool(getattr(self, "_lifecycle_canceled", False)):
+            return "CANCELED"
+        interactive_event = getattr(self.app, "_interactive_action_event", None)
+        try:
+            if interactive_event is not None and interactive_event.is_set():
+                return "BUSY"
+        except Exception:
+            pass
+        if bool(getattr(self, "_mode_switch_pending", False)):
+            return "DIFFING"
+        if not bool(getattr(self, "_data_ready", False)):
+            return "LOADING"
+        if not bool(getattr(self, "_row_model_exact", False)):
+            return "DIFFING"
+        if not bool(getattr(self, "_cache_formula_aware", False)):
+            return "DIFFING"
+        if not bool(getattr(self, "_pair_diff_full_exact", False)):
+            return "DIFFING"
+        if (
+            self._is_three_way_enabled()
+            and getattr(self.app, "has_base", False)
+            and not bool(getattr(self, "_base_diff_full_exact", False))
+        ):
+            return "DIFFING"
+        requested_only_diff = bool(getattr(self, "only_diff_var", None) and self.only_diff_var.get())
+        if requested_only_diff and (
+            not bool(getattr(self, "_only_diff_rows_exact", False))
+            or not self._has_valid_only_diff_snapshot_cache()
+        ):
+            return "DIFFING"
+        try:
+            if not self._column_mapping_is_current():
+                return "DIFFING"
+        except Exception:
+            return "DIFFING"
+        edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
+        if callable(edit_ready) and not edit_ready():
+            return "EDIT_LOADING"
+        return "READY"
+
+    def _mutation_block_message(self, action: str = "此操作") -> str:
+        state = self._derive_lifecycle_state()
+        detail = {
+            "LOADING": "当前 Sheet 正在加载行结构。",
+            "DIFFING": "当前 Sheet 正在生成精确差异。",
+            "EDIT_LOADING": "可编辑工作簿正在后台加载。",
+            "BUSY": "当前有一项修改正在执行。",
+            "FAILED": f"当前 Sheet 计算失败：{getattr(self, '_lifecycle_error', '')}",
+            "CANCELED": "当前 Sheet 的后台计算已取消。",
+            "CLOSING": "工具正在关闭。",
+        }.get(state, "当前 Sheet 尚未准备完成。")
+        return f"{action}暂不可用。{detail}加载完成后请再次操作；当前仍可查看和切换 Sheet。"
+
+    def _guard_mutation_ready(self, action: str = "此操作", *, notify: bool = True) -> bool:
+        self._refresh_interaction_gate()
+        if getattr(self, "_lifecycle_state", "") == "READY":
+            return True
+        if notify:
+            show_notice = getattr(self.app, "show_nonblocking_notice", None)
+            if callable(show_notice):
+                show_notice(self._mutation_block_message(action), warning=False, duration_ms=6000)
+        _dlog(
+            f"mutation blocked sheet={self.sheet} action={action} "
+            f"state={getattr(self, '_lifecycle_state', 'unknown')}"
+        )
+        return False
+
+    def _refresh_interaction_gate(self):
+        """Atomically project lifecycle readiness onto every mutation control."""
+        previous = getattr(self, "_lifecycle_state", None)
+        current = self._derive_lifecycle_state()
+        self._lifecycle_state = current
+        if previous != current:
+            self._lifecycle_generation += 1
+            _dlog(
+                f"SHEET_STATE sheet={self.sheet} generation={self._lifecycle_generation} "
+                f"{previous}->{current}"
+            )
+        ready = current == "READY"
+        mutation_state = "normal" if ready else "disabled"
+        try:
+            checkbox_state = mutation_state
+            if getattr(self.app, "merge_conflict_mode", False):
+                checkbox_state = "disabled"
+            self.only_diff_cb.configure(text="只看差异内容", state=checkbox_state)
+        except Exception:
+            pass
+        try:
+            force_state = mutation_state
+            if getattr(self.app, "merge_conflict_mode", False):
+                force_state = "disabled"
+            self.force_align_cb.configure(state=force_state)
+        except Exception:
+            pass
+        for name in (
+            "use_left_btn",
+            "use_right_btn",
+            "use_left_menu_btn",
+            "use_right_menu_btn",
+            "use_base_btn",
+            "undo_btn",
+            "save_a_btn",
+            "save_b_btn",
+            "three_way_cb",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                try:
+                    widget.configure(state=mutation_state)
+                except Exception:
+                    pass
+        try:
+            self.manual_rescan_btn.configure(
+                state=("normal" if current in ("READY", "FAILED", "CANCELED") else "disabled")
+            )
+        except Exception:
+            pass
+        try:
+            if getattr(self.app, "selected_sheet", None) == self.sheet:
+                self.app.recalc_btn.configure(state=mutation_state)
+        except Exception:
+            pass
+        self._update_sheet_role_labels()
+        self._refresh_column_action_buttons()
+
     def _update_sheet_role_labels(self):
         enabled = self._is_three_way_enabled()
         meta = self._sheet_meta()
@@ -9685,17 +9885,18 @@ class SheetView:
         except Exception:
             pass
         try:
+            gate_ready = getattr(self, "_lifecycle_state", "") == "READY"
             if self._is_missing_sheet_view():
                 if enabled:
-                    left_state = "normal" if (meta.get("has_base") or meta.get("has_a")) else "disabled"
+                    left_state = "normal" if gate_ready and (meta.get("has_base") or meta.get("has_a")) else "disabled"
                 else:
-                    left_state = "normal" if meta.get("has_a") else "disabled"
-                right_state = "normal" if meta.get("has_b") else "disabled"
-                mine_state = "normal" if meta.get("has_a") else "disabled"
+                    left_state = "normal" if gate_ready and meta.get("has_a") else "disabled"
+                right_state = "normal" if gate_ready and meta.get("has_b") else "disabled"
+                mine_state = "normal" if gate_ready and meta.get("has_a") else "disabled"
             else:
-                left_state = "normal"
-                right_state = "normal"
-                mine_state = "normal"
+                left_state = "normal" if gate_ready else "disabled"
+                right_state = "normal" if gate_ready else "disabled"
+                mine_state = "normal" if gate_ready else "disabled"
             self.use_left_btn.configure(state=left_state)
             self.use_right_btn.configure(state=right_state)
             if self.use_base_btn is not None:
@@ -9708,6 +9909,13 @@ class SheetView:
             pass
 
     def _toggle_three_way_view(self, init_only: bool = False):
+        if not init_only and self._derive_lifecycle_state() != "READY":
+            try:
+                self.three_way_var.set(int(self._last_three_way_value))
+            except Exception:
+                pass
+            self._guard_mutation_ready("切换三方视图")
+            return
         enabled = self._is_three_way_enabled()
         def _one_line_text(s: str, max_len: int = 120) -> str:
             s = (s or "").replace("\r", " ").replace("\n", " ")
@@ -9765,9 +9973,11 @@ class SheetView:
             pass
         if not init_only:
             try:
+                self._last_three_way_value = int(self.three_way_var.get())
                 self._invalidate_only_diff_snapshot_cache()
                 self.refresh(row_only=None, rescan=False)
                 self._update_cursor_lines()
+                self._refresh_interaction_gate()
             except Exception:
                 pass
         try:
@@ -9795,26 +10005,8 @@ class SheetView:
             self._xsyncing = prev_xsync
 
     def _sync_c_projection_viewport_width(self):
-        """Give C the same viewport width as one main logical-slot pane.
-
-        C spans the lower notebook, but a full-window Text viewport clamps its
-        native xview long before the three main panes.  Keeping the actual Text
-        viewport one-pane wide preserves one canonical xview fraction without
-        padding or duplicating logical content; the remaining lower-area width
-        is simply unused inspection space.
-        """
-        try:
-            from tkinter import font as tkfont
-
-            main_px = max(1, int(self.left.winfo_width()))
-            font = tkfont.Font(font=self.editor_font)
-            char_px = max(1, int(font.measure("0")))
-            width_chars = max(12, int(round(main_px / char_px)))
-            for widget in (self.cursor_cmp, self.cursor_cmp_colhdr):
-                if int(widget.cget("width")) != width_chars:
-                    widget.configure(width=width_chars)
-        except Exception:
-            pass
+        """C uses the full lower-pane width assigned by the geometry manager."""
+        return
 
     def _sync_c_x_to_frac(self, first):
         try:
@@ -9828,7 +10020,7 @@ class SheetView:
         try:
             self._sync_c_projection_viewport_width()
             try:
-                c_first = frac
+                c_first = self._map_xfirst_between_widgets(self.left, self.cursor_cmp, frac)
                 self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
                     self.cursor_cmp_colhdr.xview_moveto(c_first)
@@ -9853,7 +10045,8 @@ class SheetView:
                 first, last = (0.0, 1.0)
         try:
             if getattr(self, "cursor_hsb", None) is not None:
-                self.cursor_hsb.set(first, last)
+                c_first, c_last = self.cursor_cmp.xview()
+                self.cursor_hsb.set(c_first, c_last)
         except Exception:
             pass
         try:
@@ -9956,7 +10149,11 @@ class SheetView:
         try:
             self._sync_c_projection_viewport_width()
             try:
-                c_first = float(src_first)
+                c_first = self._map_xfirst_between_widgets(
+                    src_widget,
+                    self.cursor_cmp,
+                    src_first,
+                )
                 self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
                     self.cursor_cmp_colhdr.xview_moveto(c_first)
@@ -10025,13 +10222,12 @@ class SheetView:
             return
         self._xsyncing = True
         try:
-            # Drive the main pane directly so the full A/B scroll range is accessible.
-            # C区's viewport is wider, so using cursor_cmp as driver would clamp
-            # the scroll position and prevent reaching the rightmost content in A/B.
-            self.left.xview(*args)
-            first, last = self.left.xview()
-            self._sync_main_x_to_frac(first)
-            self._sync_c_x_from_widget(self.left, first)
+            # C has a wider viewport than each main pane. Its scrollbar therefore
+            # controls C itself; main-pane scrolling still updates C's left edge.
+            self.cursor_cmp.xview(*args)
+            first, last = self.cursor_cmp.xview()
+            if getattr(self, "cursor_cmp_colhdr", None) is not None:
+                self.cursor_cmp_colhdr.xview_moveto(first)
             self._set_c_hscrollbars_from_main()
         finally:
             self._xsyncing = False
@@ -10043,11 +10239,11 @@ class SheetView:
     def _xscroll_cursor_cmp(self, first, last):
         if self._is_click_trace_active():
             _dlog(f"xscroll_cursor_cmp first={first} last={last} xsyncing={self._xsyncing} suppress={getattr(self, '_suppress_c_xsync', False)}")
-        # Passive C-pane xscroll callback should never drive main panes.
-        # Only explicit C scrollbar command handlers (_xview_cursor_cmp/_xview_cell_cmp)
-        # are allowed to sync main xview.
-        self._set_c_hscrollbars_from_main()
-        return
+        try:
+            if getattr(self, "cursor_hsb", None) is not None:
+                self.cursor_hsb.set(float(first), float(last))
+        except Exception:
+            pass
 
     def _xview_cell_cmp(self, *args):
         if self._xsyncing:
@@ -10283,6 +10479,24 @@ class SheetView:
         self._diff_map_cache = data
         self._diff_map_cache_version = ver
         return data
+
+    def _install_exact_diff_map_cache(self, diff_rows):
+        """Install worker-prepared exact marker data without an O(N) Tk scan."""
+        diff_cols = set()
+        for cols in (self.pair_diff_cols or {}).values():
+            diff_cols.update(int(col) for col in cols if int(col) > 0)
+        try:
+            cache = self._active_column_comparison_cache()
+            diff_cols.update(int(col) for col in cache.structural_diff_cols)
+            diff_cols.update(int(col) for col in cache.unresolved_cols)
+        except Exception:
+            pass
+        self._diff_map_cache = (
+            len(self.row_pairs),
+            sorted({int(idx) for idx in (diff_rows or [])}),
+            sorted(diff_cols),
+        )
+        self._diff_map_cache_version = self._data_version
 
     def _redraw_diff_markers(self):
         """Redraw the data-dependent diff markers (tagged ``dmark``)."""
@@ -12164,7 +12378,8 @@ class SheetView:
 
     def _refresh_column_action_buttons(self):
         selected = self._selected_column_block() is not None
-        state = "normal" if selected else "disabled"
+        ready = getattr(self, "_lifecycle_state", "") == "READY"
+        state = "normal" if selected and ready else "disabled"
         for name in ("use_mine_col_btn", "use_theirs_col_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -13887,6 +14102,8 @@ class SheetView:
         confirm_unresolved: bool = False,
         _failure_injector=None,
     ) -> ColumnBlockActionPlan:
+        if not self._guard_mutation_ready("列结构操作"):
+            raise RuntimeError(self._mutation_block_message("列结构操作"))
         plan = self._plan_selected_column_block_action(
             source_side,
             target_side,
@@ -13918,7 +14135,7 @@ class SheetView:
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
-            begin_interactive()
+            begin_interactive(self)
         snapshot = None
         try:
             self.root.configure(cursor="watch")
@@ -14150,6 +14367,8 @@ class SheetView:
             self._update_cursor_lines()
 
     def _undo_column_action(self, action: dict) -> bool:
+        if not self._guard_mutation_ready("撤销列结构操作"):
+            return False
         snapshot = action.get("snapshot")
         if snapshot is None:
             self._retained_column_decisions = set(action.get("retained_decisions") or set())
@@ -14159,7 +14378,7 @@ class SheetView:
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
-            begin_interactive()
+            begin_interactive(self)
         try:
             self._restore_column_action_workbook_snapshot(snapshot)
             plan = action.get("plan")
@@ -14193,6 +14412,8 @@ class SheetView:
 
     def _on_column_action_button(self, source_side: str):
         try:
+            if not self._guard_mutation_ready("列结构操作"):
+                return
             block = self._selected_column_block()
             if block is None:
                 return
@@ -14212,53 +14433,6 @@ class SheetView:
                 ))
                 if not confirmed:
                     return
-            edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
-            if callable(edit_ready) and not edit_ready():
-                if bool(getattr(self, "_pending_column_action_after_edit_load", False)):
-                    return
-                self._pending_column_action_after_edit_load = True
-                request_preload = getattr(self.app, "_request_edit_preload", None)
-                if callable(request_preload):
-                    request_preload()
-                self.column_action_status_var.set(
-                    "正在后台加载公式、样式和批注；完成后将自动执行所选列操作..."
-                )
-                for name in ("use_mine_col_btn", "use_base_col_btn", "use_theirs_col_btn"):
-                    button = getattr(self, name, None)
-                    if button is not None:
-                        try:
-                            button.configure(state="disabled")
-                        except Exception:
-                            pass
-
-                def _continue_when_edit_ready():
-                    if getattr(self.app, "_is_closing", False):
-                        self._pending_column_action_after_edit_load = False
-                        return
-                    if not edit_ready():
-                        schedule = getattr(self.app, "_safe_root_after", None)
-                        if callable(schedule):
-                            schedule(100, _continue_when_edit_ready)
-                        else:
-                            self.root.after(100, _continue_when_edit_ready)
-                        return
-                    self._pending_column_action_after_edit_load = False
-                    try:
-                        self._apply_selected_column_block(
-                            source_side,
-                            confirm_unresolved=confirmed,
-                        )
-                    except Exception as exc:
-                        messagebox.showerror("列结构操作失败", str(exc))
-                    finally:
-                        self._refresh_column_action_buttons()
-
-                schedule = getattr(self.app, "_safe_root_after", None)
-                if callable(schedule):
-                    schedule(100, _continue_when_edit_ready)
-                else:
-                    self.root.after(100, _continue_when_edit_ready)
-                return
             self._apply_selected_column_block(
                 source_side,
                 confirm_unresolved=confirmed,
@@ -14292,7 +14466,40 @@ class SheetView:
             )
         return int(source_col), int(destination_col)
 
-    def _copy_single_cell_by_pair(self, pair_idx: int, direction: str, c: int):
+    def _copy_single_cell_by_pair(
+        self,
+        pair_idx: int,
+        direction: str,
+        c: int,
+        *,
+        _guarded: bool = False,
+    ):
+        if not _guarded and not self._guard_mutation_ready("单元格覆盖"):
+            return False
+        if _guarded:
+            if not self.app._has_active_mutation_owner(self):
+                _dlog(
+                    f"mutation lease rejected sheet={self.sheet} "
+                    "action=单元格覆盖"
+                )
+                return False
+            return self._copy_single_cell_by_pair_impl(pair_idx, direction, c)
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive(self)
+        try:
+            return self._copy_single_cell_by_pair_impl(pair_idx, direction, c)
+        finally:
+            if callable(end_interactive):
+                end_interactive()
+
+    def _copy_single_cell_by_pair_impl(
+        self,
+        pair_idx: int,
+        direction: str,
+        c: int,
+    ):
         try:
             if pair_idx is None or pair_idx >= len(self.row_pairs):
                 return
@@ -14587,8 +14794,10 @@ class SheetView:
             pass
 
     def _run_copy_action_by_mode(self, direction: str):
+        if not self._guard_mutation_ready("采用所选内容"):
+            return
         if self._is_missing_sheet_view():
-            self._copy_missing_sheet(direction)
+            self._copy_missing_sheet(direction, _guarded=True)
             return
         mode = getattr(self, "_copy_scope_mode", "row")
         if mode == "region":
@@ -14596,7 +14805,15 @@ class SheetView:
         else:
             self._copy_selected_row(direction)
 
-    def _copy_missing_sheet(self, direction: str):
+    def _copy_missing_sheet(self, direction: str, *, _guarded: bool = False):
+        if not _guarded and not self._guard_mutation_ready("整 Sheet 操作"):
+            return False
+        if _guarded and not self.app._has_active_mutation_owner(self):
+            _dlog(
+                f"mutation lease rejected sheet={self.sheet} "
+                "action=整 Sheet 操作"
+            )
+            return False
         meta = self._sheet_meta()
         action_text = {
             "A2B": "正在复制左侧整张 Sheet...",
@@ -14779,18 +14996,13 @@ class SheetView:
         return blocks[block_idx]
 
     def _set_diff_block_indicator_visible(self, visible: bool):
-        try:
-            if visible:
-                if not self.diff_block_status.winfo_manager():
-                    self.diff_block_status.pack(
-                        side="right",
-                        padx=(8, 2),
-                        before=self.prev_diff_btn,
-                    )
-            else:
-                self.diff_block_status.pack_forget()
-        except Exception:
-            pass
+        # The indicator owns reserved geometry in the dedicated navigation row.
+        # Visibility changes only its content, never the toolbar layout.
+        if not visible:
+            try:
+                self.diff_block_status_var.set("差异块 -/- · 待处理 -")
+            except Exception:
+                pass
 
     def _update_diff_block_indicator(self):
         try:
@@ -15144,6 +15356,8 @@ class SheetView:
 
     def _copy_selected_region(self, direction: str):
         """Copy contiguous diff block around current line using diff-cell columns only."""
+        if not self._guard_mutation_ready("区域覆盖"):
+            return False
         started = time.perf_counter()
         processed_rows = 0
         changed_any = False
@@ -15151,7 +15365,7 @@ class SheetView:
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
-            begin_interactive()
+            begin_interactive(self)
         self._suppress_bg_apply = True
         direction_text = {
             "B2A": "右侧区域",
@@ -15750,6 +15964,8 @@ class SheetView:
 
     def _show_loading(self, message: str = "正在后台计算差异，请稍候..."):
         """Show a loading placeholder while background diff computation is in progress."""
+        if bool(getattr(self, "only_diff_var", None) and self.only_diff_var.get()):
+            message = "只看差异 | 正在后台生成精确差异；当前只读，可查看或切换 Sheet..."
         try:
             if not self.loading_progress.winfo_manager():
                 self.loading_progress.pack(side="left", padx=(10, 0))
@@ -15766,6 +15982,7 @@ class SheetView:
             self.info.configure(text=message)
         except Exception:
             pass
+        self._refresh_interaction_gate()
 
     def _hide_loading(self):
         try:
@@ -15773,6 +15990,7 @@ class SheetView:
             self.loading_progress.pack_forget()
         except Exception:
             pass
+        self._refresh_interaction_gate()
 
     @staticmethod
     def _row_label(r: int | None) -> str:
@@ -16063,6 +16281,72 @@ class SheetView:
         self._base_spans_cache = None
         self._base_spans_cache_key = None
         return widths
+
+    def _stage_cached_pair_parts(
+        self,
+        pair_parts_a,
+        pair_parts_b,
+        pair_parts_base,
+        physical_widths,
+        *,
+        replace: bool = True,
+    ):
+        incoming_a = dict(pair_parts_a or {})
+        incoming_b = dict(pair_parts_b or {})
+        incoming_base = dict(pair_parts_base or {})
+        if not replace and self._pending_pair_parts_cache is not None:
+            old_a, old_b, old_base, old_widths, old_replace = self._pending_pair_parts_cache
+            incoming_a = {**old_a, **incoming_a}
+            incoming_b = {**old_b, **incoming_b}
+            incoming_base = {**old_base, **incoming_base}
+            physical_widths = {**(old_widths or {}), **(physical_widths or {})}
+            replace = bool(old_replace)
+        self._pending_pair_parts_cache = (
+            incoming_a,
+            incoming_b,
+            incoming_base,
+            dict(physical_widths or {}),
+            bool(replace),
+        )
+
+    def _materialize_staged_pair_parts(self):
+        staged = self._pending_pair_parts_cache
+        if staged is None:
+            return
+        pair_parts_a, pair_parts_b, pair_parts_base, physical_widths, replace = staged
+        self._pending_pair_parts_cache = None
+        self._projected_widths_from_cached_parts(
+            pair_parts_a,
+            pair_parts_b,
+            pair_parts_base,
+            physical_widths,
+        )
+        if pair_parts_a or pair_parts_b:
+            rendered_a = {
+                int(idx): self._render_line_from_raw_parts(list(parts), "A")
+                for idx, parts in pair_parts_a.items()
+            }
+            rendered_b = {
+                int(idx): self._render_line_from_raw_parts(list(parts), "B")
+                for idx, parts in pair_parts_b.items()
+            }
+            if replace:
+                self.pair_text_a = rendered_a
+                self.pair_text_b = rendered_b
+            else:
+                self.pair_text_a.update(rendered_a)
+                self.pair_text_b.update(rendered_b)
+        rendered_base = {
+            int(idx): (
+                self._render_line_from_raw_parts(list(parts), "BASE")
+                if parts else ""
+            )
+            for idx, parts in pair_parts_base.items()
+        }
+        if replace:
+            self.pair_text_base = rendered_base
+        else:
+            self.pair_text_base.update(rendered_base)
 
     def _identity_column_comparison_cache(self) -> LogicalColumnComparisonCache:
         """Return an immutable physical-order model until a signature cache is ready."""
@@ -17293,6 +17577,7 @@ class SheetView:
         self._only_diff_source_version += 1
         self._only_diff_rows_cache = None
         self._only_diff_rows_cache_key = None
+        self._only_diff_rows_exact = False
         self._only_diff_async_build_key = None
         self._only_diff_async_building = False
         self._only_diff_async_build_seq += 1
@@ -17323,10 +17608,12 @@ class SheetView:
             return False
         return self._only_diff_rows_cache_key == self._current_only_diff_cache_key()
 
-    def _cache_only_diff_rows_snapshot(self, rows):
+    def _cache_only_diff_rows_snapshot(self, rows, *, exact: bool = False):
         normalized = sorted({int(idx) for idx in (rows or []) if 0 <= int(idx) < len(self.row_pairs)})
         self._only_diff_rows_cache = normalized
         self._only_diff_rows_cache_key = self._current_only_diff_cache_key()
+        if exact:
+            self._only_diff_rows_exact = True
         return list(normalized)
 
     def _cache_only_diff_rows_from_exact_pair_maps(self) -> bool:
@@ -17340,6 +17627,8 @@ class SheetView:
         """
         if not bool(getattr(self, "_data_ready", False)):
             return False
+        if not bool(getattr(self, "_cache_formula_aware", False)):
+            return False
         pair_diff_map = getattr(self, "pair_diff_cols", {}) or {}
         pair_map_complete = len(pair_diff_map) >= len(self.row_pairs) and all(
             pair_idx in pair_diff_map for pair_idx in range(len(self.row_pairs))
@@ -17347,12 +17636,15 @@ class SheetView:
         if not bool(getattr(self, "_pair_diff_full_exact", False)) and not pair_map_complete:
             return False
         if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
-            if len(getattr(self, "pair_base_diff_cols", {}) or {}) < len(self.row_pairs):
+            if not bool(getattr(self, "_base_diff_full_exact", False)):
                 return False
         self._cache_only_diff_rows_snapshot(
-            pair_idx
-            for pair_idx in range(len(self.row_pairs))
-            if self._pair_has_visual_diff(pair_idx)
+            (
+                pair_idx
+                for pair_idx in range(len(self.row_pairs))
+                if self._pair_has_visual_diff(pair_idx)
+            ),
+            exact=True,
         )
         return True
 
@@ -17369,8 +17661,13 @@ class SheetView:
     def _set_only_diff_pending_info(self):
         try:
             total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
+            prefix = (
+                "只看差异 | 正在后台生成精确差异行..."
+                if bool(self.only_diff_var.get())
+                else "正在后台完成精确差异计算（当前只读）..."
+            )
             self.info.configure(
-                text=f"只看差异 | 正在后台生成精确差异行...   Rows: {total_rows}   {self._info_column_text()}"
+                text=f"{prefix}   Rows: {total_rows}   {self._info_column_text()}"
             )
             self._set_diff_block_indicator_visible(True)
             self.diff_block_status_var.set("差异块 计算中...")
@@ -17398,7 +17695,7 @@ class SheetView:
         self._update_cursor_lines()
         self._update_diff_nav_state()
 
-    def _start_async_large_only_diff_build(self) -> bool:
+    def _start_async_large_only_diff_build(self, *, user_initiated: bool = False) -> bool:
         # This worker opens disk snapshots. Once the user has adopted any data,
         # those files are stale and must never be allowed to rebuild UI text.
         if self._has_user_edits_for_current_sheet():
@@ -17418,9 +17715,16 @@ class SheetView:
 
         self._only_diff_async_build_seq += 1
         build_seq = int(self._only_diff_async_build_seq)
+        self._lifecycle_canceled = False
+        self.app._claim_priority_exact(self, build_seq)
         self._only_diff_async_build_key = cache_key
         self._only_diff_async_building = True
+        self._only_diff_async_requested_value = int(self.only_diff_var.get())
+        self._only_diff_preview_full = True
         self._set_only_diff_pending_info()
+        self._refresh_interaction_gate()
+        if user_initiated and getattr(self.app, "selected_sheet", None) == self.sheet:
+            self.app._begin_only_diff_progress(self, build_seq)
 
         sheet_name = self.sheet
         max_col = int(self.max_col or 1)
@@ -17462,6 +17766,7 @@ class SheetView:
             wb_a_edit = None
             wb_b_edit = None
             wb_base_edit = None
+            last_progress_emit = [0.0]
 
             def _cancelled():
                 return bool(
@@ -17469,8 +17774,29 @@ class SheetView:
                     or build_seq != self._only_diff_async_build_seq
                 )
 
+            def _report_progress(stage: str, current: int, total: int, *, force: bool = False):
+                now = time.monotonic()
+                if not force and now - last_progress_emit[0] < 0.12:
+                    return
+                last_progress_emit[0] = now
+                try:
+                    self.app._queue_ui_task(
+                        lambda s=str(stage), c=int(current), t=max(1, int(total)): (
+                            self.app._update_only_diff_progress(
+                                self,
+                                build_seq,
+                                s,
+                                c,
+                                t,
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
+
             if _cancelled():
                 return
+            _report_progress("正在打开工作簿", 0, 1, force=True)
             try:
                 wb_a_val = load_workbook(self.app._file_a_val_path, data_only=True, read_only=True)
                 wb_b_val = load_workbook(self.app._file_b_val_path, data_only=True, read_only=True)
@@ -17492,7 +17818,21 @@ class SheetView:
                         return
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    self._lifecycle_error = "精确差异生成失败"
+                    self.app._finish_only_diff_progress(
+                        self,
+                        build_seq,
+                        outcome="open-failed",
+                    )
                     self._refresh_diff_block_ui()
+                    self._refresh_interaction_gate()
+                    show_notice = getattr(self.app, "show_nonblocking_notice", None)
+                    if callable(show_notice):
+                        show_notice(
+                            f"{self.sheet} 精确差异生成失败，可稍后重试“只看差异”。",
+                            warning=True,
+                            duration_ms=8000,
+                        )
 
                 try:
                     self.app._queue_ui_task(_apply_open_fail)
@@ -17533,14 +17873,17 @@ class SheetView:
                         _row_from_cache(rows_base, base_row, max_col)
                     )
 
-                def _formula_rows(ws_edit):
+                def _formula_rows(ws_edit, stage: str):
                     rows = {}
                     if ws_edit is None:
                         return rows
+                    total = max(1, int(ws_edit.max_row or 1))
                     for row_idx, cells in enumerate(
                         ws_edit.iter_rows(min_col=1, max_col=max_col, values_only=False),
                         start=1,
                     ):
+                        if (row_idx & 255) == 0:
+                            _report_progress(stage, row_idx, total)
                         if (row_idx & 255) == 0 and _cancelled():
                             break
                         values = tuple(cell.value for cell in cells)
@@ -17550,11 +17893,16 @@ class SheetView:
                             for cell in cells
                         ):
                             rows[row_idx] = _pad_row_values(values, max_col)
+                    _report_progress(stage, total, total, force=True)
                     return rows
 
-                formula_rows_a = _formula_rows(ws_a_edit)
-                formula_rows_b = _formula_rows(ws_b_edit)
-                formula_rows_base = _formula_rows(ws_base_edit) if has_base else {}
+                formula_rows_a = _formula_rows(ws_a_edit, "正在扫描 Mine 公式")
+                formula_rows_b = _formula_rows(ws_b_edit, "正在扫描 Theirs 公式")
+                formula_rows_base = (
+                    _formula_rows(ws_base_edit, "正在扫描 Base 公式")
+                    if has_base
+                    else {}
+                )
 
                 def _needs_formula_exact(row_left, row_right, edit_left, edit_right):
                     for offset in range(max_col):
@@ -17576,6 +17924,7 @@ class SheetView:
 
                 if align_enabled and row_pairs:
                     pair_count = len(row_pairs)
+                    processed_pairs = 0
                     block = _LARGE_SHEET_BLOCK_ROWS
                     for block_end in range(pair_count, 0, -block):
                         if _cancelled():
@@ -17698,10 +18047,18 @@ class SheetView:
                                 result["pair_parts_a"][pair_idx] = raw_a
                                 result["pair_parts_b"][pair_idx] = raw_b
                                 _store_base_parts(pair_idx, (ra, rb), rows_base)
+                        processed_pairs += len(block_pairs)
+                        _report_progress(
+                            "正在生成精确差异",
+                            processed_pairs,
+                            pair_count,
+                            force=processed_pairs >= pair_count,
+                        )
                 else:
                     max_row_a = ws_a_val.max_row or 1
                     max_row_b = ws_b_val.max_row or 1
                     max_row = max(max_row_a, max_row_b)
+                    processed_rows = 0
                     block = _LARGE_SHEET_BLOCK_ROWS
                     for block_end in range(max_row, 0, -block):
                         if _cancelled():
@@ -17840,57 +18197,141 @@ class SheetView:
                                 result["pair_parts_a"][pair_idx] = raw_a
                                 result["pair_parts_b"][pair_idx] = raw_b
                                 _store_base_parts(pair_idx, (ra, rb), rows_base)
+                        processed_rows += block_end - block_start + 1
+                        _report_progress(
+                            "正在生成精确差异",
+                            processed_rows,
+                            max_row,
+                            force=processed_rows >= max_row,
+                        )
 
                 result["diff_pair_indices"] = sorted(set(result["diff_pair_indices"]))
+                _report_progress("正在准备显示结果", 1, 1, force=True)
             except Exception as e:
                 _dlog(f"only-diff async build failed sheet={sheet_name}: {e}")
                 result["error"] = str(e)
             finally:
                 _wbs_close(wb_a_val, wb_b_val, wb_base_val, wb_a_edit, wb_b_edit, wb_base_edit)
 
-            def _apply_result(res=result):
+            def _apply_result(res=result, _prepared=False):
                 if res.get("build_seq") != self._only_diff_async_build_seq:
                     return
+                visible_for_publish = (
+                    getattr(self.app, "selected_sheet", None) == self.sheet
+                    and not bool(getattr(self.app, "_is_closing", False))
+                )
+                if (
+                    not _prepared
+                    and not res.get("error")
+                    and res.get("build_key") == self._current_only_diff_cache_key()
+                    and not self._has_user_edits_for_current_sheet()
+                    and visible_for_publish
+                ):
+                    # The broker may just have released lower-priority XML
+                    # parsing. Reserve a quiet UI window before rebuilding
+                    # Text widgets, then acknowledge the lease afterward.
+                    release_transition = self.app._reserve_ui_transition_window(
+                        1200
+                    )
+
+                    def _publish_after_quiet_window():
+                        try:
+                            _apply_result(res, True)
+                        finally:
+                            if callable(release_transition):
+                                release_transition()
+
+                    try:
+                        self.frame.after(75, _publish_after_quiet_window)
+                        return
+                    except Exception:
+                        if callable(release_transition):
+                            release_transition()
                 if res.get("build_key") != self._current_only_diff_cache_key():
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    if not self._has_valid_only_diff_snapshot_cache():
+                        self._lifecycle_canceled = True
                     # A foreground rescan may already have produced the exact
                     # row set while this older worker was running.  Dropping
                     # the stale payload must still publish that now-ready
                     # block model to the widgets.
                     self._refresh_diff_block_ui()
+                    self._refresh_interaction_gate()
+                    self.app._finish_only_diff_progress(
+                        self,
+                        build_seq,
+                        outcome="superseded",
+                    )
                     return
                 if self._has_user_edits_for_current_sheet():
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    self._lifecycle_canceled = True
                     _dlog(f"only-diff async result dropped after user edits: sheet={self.sheet}")
                     self._refresh_diff_block_ui()
+                    self._refresh_interaction_gate()
+                    self.app._finish_only_diff_progress(
+                        self,
+                        build_seq,
+                        outcome="edited",
+                    )
                     return
                 self._only_diff_async_building = False
                 self._only_diff_async_build_key = None
                 if res.get("error"):
+                    self._lifecycle_error = str(res.get("error") or "精确差异生成失败")
+                    self.app._finish_only_diff_progress(
+                        self,
+                        build_seq,
+                        outcome="failed",
+                    )
                     self._refresh_diff_block_ui()
+                    self._refresh_interaction_gate()
+                    show_notice = getattr(self.app, "show_nonblocking_notice", None)
+                    if callable(show_notice):
+                        show_notice(
+                            f"{self.sheet} 精确差异生成失败，可稍后重试“只看差异”。",
+                            warning=True,
+                            duration_ms=8000,
+                        )
                     return
+                self._lifecycle_error = None
+                self._lifecycle_canceled = False
                 self.pair_diff_cols = {
                     int(pair_idx): set(cols)
                     for pair_idx, cols in (res.get("pair_diff_cols") or {}).items()
                     if cols
                 }
                 self._pair_diff_full_exact = True
+                self._base_diff_full_exact = bool(has_base)
+                self._cache_formula_aware = True
+                self._only_diff_rows_exact = True
                 for pair_idx, cols in (res.get("pair_base_diff_cols") or {}).items():
                     self.pair_base_diff_cols[int(pair_idx)] = set(cols)
-                for pair_idx, parts in (res.get("pair_parts_a") or {}).items():
-                    self.pair_text_a[int(pair_idx)] = self._render_line_from_raw_parts(list(parts), "A")
-                for pair_idx, parts in (res.get("pair_parts_b") or {}).items():
-                    self.pair_text_b[int(pair_idx)] = self._render_line_from_raw_parts(list(parts), "B")
-                for pair_idx, parts in (res.get("pair_parts_base") or {}).items():
-                    base_parts = list(parts)
-                    self.pair_text_base[int(pair_idx)] = (
-                        self._render_line_from_raw_parts(base_parts, "BASE") if base_parts else ""
-                    )
-                self._cache_only_diff_rows_snapshot(res.get("diff_pair_indices") or [])
+                visible = (
+                    getattr(self.app, "selected_sheet", None) == self.sheet
+                    and not bool(getattr(self.app, "_is_closing", False))
+                )
+                self._stage_cached_pair_parts(
+                    res.get("pair_parts_a") or {},
+                    res.get("pair_parts_b") or {},
+                    res.get("pair_parts_base") or {},
+                    {},
+                    replace=False,
+                )
+                if visible:
+                    self._materialize_staged_pair_parts()
+                self._cache_only_diff_rows_snapshot(
+                    res.get("diff_pair_indices") or [],
+                    exact=True,
+                )
+                self._only_diff_preview_full = False
                 self._invalidate_render_cache()
-                if bool(self.only_diff_var.get()):
+                self._install_exact_diff_map_cache(
+                    res.get("diff_pair_indices") or []
+                )
+                if bool(self.only_diff_var.get()) and visible:
                     self._refresh_mode_switch_preserving_selection(rescan=False)
                     # The first presentation pass can run while the async model
                     # is still marked as building, in which case it correctly
@@ -17898,8 +18339,20 @@ class SheetView:
                     # been materialized and the ready flag is false so every
                     # pane receives the final block boundaries.
                     self._refresh_diff_block_ui()
+                    self._pending_exact_render = False
+                elif bool(self.only_diff_var.get()):
+                    self._pending_exact_render = True
+                    _dlog(f"EXACT_RESULT cached without render sheet={self.sheet}")
                 else:
                     self._update_diff_nav_state()
+                self._last_only_diff_value = int(self.only_diff_var.get())
+                self._refresh_interaction_gate()
+                self._persist_only_diff_setting_debounced()
+                self.app._finish_only_diff_progress(
+                    self,
+                    build_seq,
+                    outcome="success",
+                )
 
             try:
                 if not _cancelled():
@@ -17907,24 +18360,99 @@ class SheetView:
             except Exception as e:
                 _dlog(f"only-diff async queue failed sheet={sheet_name}: {e}")
 
-        def _priority_worker():
-            try:
-                _worker_impl()
-            finally:
-                self.app._end_priority_diff_compute()
-
-        self.app._begin_priority_diff_compute()
-        self._only_diff_async_thread = self.app._start_background_thread(
-            _priority_worker,
-            name=f"sow-only-diff-{sheet_name[:30]}",
-        )
-        if self._only_diff_async_thread is None:
-            self.app._end_priority_diff_compute()
+        def _handle_submit_failure():
+            self.app._release_priority_exact(self, build_seq)
             self._only_diff_async_building = False
             self._only_diff_async_build_key = None
+            self._only_diff_preview_full = False
+            self._lifecycle_error = "无法启动精确差异后台任务"
+            self.app._finish_only_diff_progress(
+                self,
+                build_seq,
+                outcome="submit-failed",
+            )
             self._refresh_diff_block_ui()
-            return False
-        return True
+            self._refresh_interaction_gate()
+
+        def _launch_exact_worker():
+            if (
+                build_seq != int(self._only_diff_async_build_seq)
+                or bool(getattr(self.app, "_is_closing", False))
+            ):
+                return False
+            self._only_diff_async_thread = self.app._submit_priority_exact(
+                self,
+                build_seq,
+                _worker_impl,
+            )
+            if self._only_diff_async_thread is None:
+                _handle_submit_failure()
+                return False
+            return True
+
+        if user_initiated:
+            # Let the modal dialog acquire its grab and paint before openpyxl
+            # starts parsing XML. This keeps visible feedback inside the 100 ms
+            # contract even on a cold WorldMonster run.
+            self._only_diff_async_thread = True
+            try:
+                self.frame.after(60, _launch_exact_worker)
+                return True
+            except Exception:
+                pass
+        return _launch_exact_worker()
+
+    def _cancel_only_diff_calculation(self, build_seq: int | None = None):
+        """Cancel only the pending display-mode request, not the stable Sheet."""
+        if build_seq is None:
+            build_seq = int(self._only_diff_async_build_seq)
+        token = (self, int(build_seq))
+        if getattr(self.app, "_only_diff_progress_owner", None) != token:
+            return
+        try:
+            button = getattr(self.app, "_only_diff_progress_cancel_btn", None)
+            if button is not None:
+                button.configure(text="正在取消…", state="disabled")
+        except Exception:
+            pass
+
+        self._only_diff_async_build_seq += 1
+        self._only_diff_async_building = False
+        self._only_diff_async_build_key = None
+        self._only_diff_preview_full = False
+        self._pending_exact_render = False
+        self._lifecycle_error = None
+        self._lifecycle_canceled = False
+        origin = int(getattr(self, "_only_diff_request_origin_value", 0))
+        self.only_diff_var.set(origin)
+        self._last_only_diff_value = origin
+        self._prefer_only_diff_when_ready = bool(origin)
+        self.app._release_priority_exact(self, int(build_seq))
+        try:
+            with self.app._exact_broker_lock:
+                pending = self.app._exact_broker_pending
+                if pending and pending[0] is self and int(pending[1]) == int(build_seq):
+                    self.app._exact_broker_pending = None
+        except Exception:
+            pass
+        self.app._finish_only_diff_progress(
+            self,
+            int(build_seq),
+            outcome="canceled",
+        )
+        self._refresh_diff_block_ui()
+        self._refresh_interaction_gate()
+        self._persist_only_diff_setting_debounced()
+        try:
+            total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
+            self.info.configure(
+                text=(
+                    f"已取消只看差异计算，保留全量视图 | "
+                    f"RowsShown: {len(self.display_rows)} / {total_rows}"
+                )
+            )
+        except Exception:
+            pass
 
     def _persist_only_diff_setting_debounced(self):
         try:
@@ -17938,18 +18466,128 @@ class SheetView:
         except Exception as e:
             _dlog(f"settings debounce failed: {e}")
 
+    def _schedule_cached_only_diff_mode_switch(self, requested_value: int) -> bool:
+        """Publish a large cached mode switch after the Tk callback returns.
+
+        A ready exact cache makes the comparison itself cheap, but rebuilding
+        the visible Text panes can still contend with a background XML parser.
+        The short reservation gives that parser time to reach a cooperative
+        pause before the bounded visible publication runs.
+        """
+        if bool(getattr(self, "_mode_switch_pending", False)):
+            return True
+        self._mode_switch_seq += 1
+        switch_seq = int(self._mode_switch_seq)
+        self._mode_switch_pending = True
+        self._last_only_diff_value = int(requested_value)
+        self._only_diff_preview_full = False
+        self._refresh_interaction_gate()
+        try:
+            self.info.configure(
+                text=(
+                    "正在切换为只看差异；当前暂只读..."
+                    if requested_value
+                    else "正在切换为显示全部；当前暂只读..."
+                )
+            )
+        except Exception:
+            pass
+
+        release_transition = None
+        reserve_transition = getattr(self.app, "_reserve_ui_transition_window", None)
+        if callable(reserve_transition):
+            release_transition = reserve_transition(700)
+
+        def _apply_mode_switch():
+            self._mode_switch_after_id = None
+            if switch_seq != int(getattr(self, "_mode_switch_seq", 0)):
+                if callable(release_transition):
+                    release_transition()
+                return
+            if bool(getattr(self.app, "_is_closing", False)):
+                self._mode_switch_pending = False
+                if callable(release_transition):
+                    release_transition()
+                return
+            if getattr(self.app, "selected_sheet", None) != self.sheet:
+                self._pending_exact_render = True
+                self._mode_switch_pending = False
+                self._refresh_interaction_gate()
+                if callable(release_transition):
+                    release_transition()
+                return
+            started = time.perf_counter()
+            try:
+                self._refresh_mode_switch_preserving_selection(rescan=False)
+                self._pending_exact_render = False
+            except Exception as exc:
+                self._lifecycle_error = f"显示模式切换失败：{exc}"
+                _dlog(
+                    f"only-diff deferred render failed sheet={self.sheet}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                self._mode_switch_pending = False
+                self._only_diff_preview_full = False
+                self._refresh_interaction_gate()
+                if callable(release_transition):
+                    release_transition()
+                _dlog(
+                    f"ONLY_DIFF_PUBLISH sheet={self.sheet} "
+                    f"requested={bool(requested_value)} "
+                    f"render_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+                )
+
+        try:
+            # Let the checkbox callback return and give cooperative workbook
+            # parsers several heartbeat slices to observe the pause event.
+            self._mode_switch_after_id = self.frame.after(75, _apply_mode_switch)
+            return True
+        except Exception:
+            if callable(release_transition):
+                release_transition()
+            self._mode_switch_pending = False
+            return False
+
     def _toggle_only_diff(self):
         # Snapshot mode confirmed by user: diff rows list is generated once when opening (or manual refresh).
         # Toggling "只看差异" only switches display, without recomputing the diff map.
         try:
-            _dlog(f"TOGGLE only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()} sheet={self.sheet}")
+            _dlog(
+                f"TOGGLE only_diff={bool(self.only_diff_var.get())} "
+                f"raw={self.only_diff_var.get()} sheet={self.sheet} "
+                f"window_state={self.root.state()} geometry={self.root.geometry()}"
+            )
         except Exception:
             pass
 
-        # Always trust current UI value; do not auto-flip state.
-        # Auto-flip can invert explicit programmatic toggles and break only-diff filtering.
+        if bool(getattr(self, "_only_diff_async_building", False)):
+            self.only_diff_var.set(
+                int(getattr(self, "_only_diff_async_requested_value", 1))
+            )
+            self._refresh_interaction_gate()
+            return
+
         cur = int(self.only_diff_var.get())
-        self._last_only_diff_value = cur
+        previous = int(getattr(self, "_last_only_diff_value", 0))
+        # Tk has already changed the IntVar before invoking this callback.
+        # Validate the lifecycle that owned the click, not the newly requested
+        # mode (which legitimately lacks an exact only-diff snapshot yet).
+        self.only_diff_var.set(previous)
+        try:
+            entry_state = self._derive_lifecycle_state()
+        finally:
+            self.only_diff_var.set(cur)
+        if entry_state != "READY":
+            self.only_diff_var.set(previous)
+            show_notice = getattr(self.app, "show_nonblocking_notice", None)
+            if callable(show_notice):
+                show_notice(
+                    self._mutation_block_message("切换“只看差异”"),
+                    duration_ms=6000,
+                )
+            self._refresh_interaction_gate()
+            return
 
         # Performance optimization:
         # - For normal sheets with ready diff data, toggling only-diff only changes
@@ -17970,7 +18608,11 @@ class SheetView:
                 except Exception:
                     pass
             try:
-                self.app._enqueue_sheet(self.sheet, front=True)
+                self.app._enqueue_sheet(
+                    self.sheet,
+                    front=True,
+                    exact_only_diff=bool(cur),
+                )
                 self.app._kick_worker()
             except Exception as e:
                 _dlog(f"only-diff prioritize failed sheet={self.sheet}: {e}")
@@ -17978,10 +18620,15 @@ class SheetView:
             self._persist_only_diff_setting_debounced()
             return
         if bool(cur) and not self._has_valid_only_diff_snapshot_cache():
-            cached_synchronously = self._cache_only_diff_rows_from_exact_pair_maps()
-            if (not cached_synchronously) and self._start_async_large_only_diff_build():
-                self._update_diff_nav_state()
-                self._persist_only_diff_setting_debounced()
+            # Do not sweep a large pair map on the Tk callback. The exact worker
+            # owns progress, cancellation, and publication for that path.
+            cached_synchronously = False
+            if not bool(getattr(self, "_is_large_sheet", False)):
+                cached_synchronously = self._cache_only_diff_rows_from_exact_pair_maps()
+            self._only_diff_request_origin_value = previous
+            if (not cached_synchronously) and self._start_async_large_only_diff_build(
+                user_initiated=True,
+            ):
                 return
         try:
             _dlog(
@@ -18002,13 +18649,30 @@ class SheetView:
                 _LARGE_SHEET_INITIAL_ROWS,
             )
 
+        if bool(getattr(self, "_is_large_sheet", False)):
+            if self._schedule_cached_only_diff_mode_switch(cur):
+                self._persist_only_diff_setting_debounced()
+                return
+
+        reserve_transition = getattr(self.app, "_reserve_ui_transition_window", None)
+        if callable(reserve_transition):
+            reserve_transition(300)
         self._refresh_mode_switch_preserving_selection(rescan=False)
+        self._last_only_diff_value = cur
+        self._only_diff_preview_full = False
+        self._refresh_interaction_gate()
 
         # Persist setting (debounced: write 1 s after last toggle to avoid per-keypress I/O)
         self._persist_only_diff_setting_debounced()
 
     def _toggle_force_align(self):
         """Manual override for large-sheet row pairing accuracy."""
+        if not self._guard_mutation_ready("重新行对齐"):
+            try:
+                self.force_align_var.set(int(bool(self._force_sequence_align)))
+            except Exception:
+                pass
+            return
         try:
             self._force_sequence_align = bool(self.force_align_var.get())
             _dlog(f"TOGGLE force_align={self._force_sequence_align} sheet={self.sheet}")
@@ -18022,6 +18686,16 @@ class SheetView:
             self._suppress_bg_apply = False  # Fresh data rendered; allow bg applies again.
         self._update_cursor_lines()
         self._update_diff_nav_state()
+        if (
+            not bool(getattr(self, "_pair_diff_full_exact", False))
+            or (
+                self._is_three_way_enabled()
+                and getattr(self.app, "has_base", False)
+                and not bool(getattr(self, "_base_diff_full_exact", False))
+            )
+        ):
+            self._start_async_large_only_diff_build()
+        self._refresh_interaction_gate()
 
     def _flush_settings(self):
         """Debounced settings write: called 1 s after the last only-diff toggle."""
@@ -18033,6 +18707,30 @@ class SheetView:
             _dlog(f"settings save failed: {e}")
 
     def _manual_rescan(self):
+        state = self._derive_lifecycle_state()
+        if state not in ("READY", "FAILED", "CANCELED"):
+            self._guard_mutation_ready("刷新当前 Sheet")
+            return
+        if state in ("FAILED", "CANCELED") or not self._has_user_edits_for_current_sheet():
+            self._lifecycle_error = None
+            self._lifecycle_canceled = False
+            self._data_ready = False
+            self._row_model_exact = False
+            self._only_diff_rows_exact = False
+            self._invalidate_only_diff_snapshot_cache()
+            self._show_loading("正在后台重新计算当前 Sheet...")
+            with self.app._compute_lock:
+                self.app._sheet_compute_generation[self.sheet] = (
+                    int(self.app._sheet_compute_generation.get(self.sheet, 0)) + 1
+                )
+            self.app._enqueue_sheet(
+                self.sheet,
+                front=True,
+                exact_only_diff=bool(self.only_diff_var.get()),
+                force_recompute=True,
+            )
+            self.app._kick_worker()
+            return
         self._invalidate_only_diff_snapshot_cache()
         self._suppress_bg_apply = True
         try:
@@ -18122,15 +18820,17 @@ class SheetView:
             pass
 
     def _copy_cell(self, direction: str, event):
+        if not self._guard_mutation_ready("单元格覆盖"):
+            return "break"
         previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
-            begin_interactive()
+            begin_interactive(self)
         self._suppress_bg_apply = True
         try:
             if self._is_missing_sheet_view():
-                self._copy_missing_sheet(direction)
+                self._copy_missing_sheet(direction, _guarded=True)
                 return
             anchor = self._capture_view_anchor()
             if direction == "A2B":
@@ -18209,7 +18909,12 @@ class SheetView:
                 self.app.user_touched_conflicts = True
                 self._resolve_conflict_cell(dst_r, c)
                 return
-            self._copy_single_cell_by_pair(pair_idx, direction, c)
+            self._copy_single_cell_by_pair(
+                pair_idx,
+                direction,
+                c,
+                _guarded=True,
+            )
             return
 
             # Merge conflict mode:
@@ -18610,6 +19315,12 @@ class SheetView:
         anchor,
     ) -> bool:
         if not run:
+            return False
+        if not self.app._has_active_mutation_owner(self):
+            _dlog(
+                f"mutation lease rejected sheet={self.sheet} "
+                "action=批量插入行"
+            )
             return False
         committed = False
         dst_val_inserted = False
@@ -19255,6 +19966,17 @@ class SheetView:
         suppress_refresh: bool = False,
         _undo_out: list | None = None,
     ) -> bool:
+        # Region actions acquire readiness at their public entry and then reuse
+        # this primitive while the app advertises BUSY.
+        if suppress_refresh:
+            if not self.app._has_active_mutation_owner(self):
+                _dlog(
+                    f"mutation lease rejected sheet={self.sheet} "
+                    "action=批量行覆盖"
+                )
+                return False
+        elif not self._guard_mutation_ready("行覆盖"):
+            return False
         t0 = datetime.now()
         formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
         interactive_busy = not suppress_refresh
@@ -19262,7 +19984,7 @@ class SheetView:
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
         if callable(begin_interactive):
-            begin_interactive()
+            begin_interactive(self)
         self._suppress_bg_apply = True
         if interactive_busy:
             action_text = {
@@ -19278,7 +20000,7 @@ class SheetView:
                 pass
         try:
             if self._is_missing_sheet_view():
-                self._copy_missing_sheet(direction)
+                self._copy_missing_sheet(direction, _guarded=True)
                 return True
             anchor = None if suppress_refresh else self._capture_view_anchor()
             resolved_only = False
@@ -19624,19 +20346,27 @@ class SheetView:
                     pass
 
     def _undo_last_action(self):
+        pending = self.app.undo_stack[-1] if getattr(self.app, "undo_stack", None) else None
+        if not pending:
+            return
+        action_sheet = pending.get("sheet") or self.sheet
+        undo_view = (
+            self
+            if action_sheet == self.sheet
+            else getattr(self.app, "sheet_views", {}).get(action_sheet)
+        )
+        if undo_view is None:
+            self.app.show_nonblocking_notice(
+                f"撤销暂不可用：{action_sheet} 尚未加载。",
+                duration_ms=6000,
+            )
+            return
+        if not undo_view._guard_mutation_ready("撤销"):
+            return
         try:
-            self._ensure_column_projection_current("撤销操作")
-            pending = self.app.undo_stack[-1] if getattr(self.app, "undo_stack", None) else None
-            column_undo_view = self
+            undo_view._ensure_column_projection_current("撤销操作")
+            column_undo_view = undo_view
             if pending and pending.get("kind") == "column_action":
-                action_sheet = pending.get("sheet")
-                column_undo_view = (
-                    self
-                    if action_sheet == self.sheet
-                    else getattr(self.app, "sheet_views", {}).get(action_sheet)
-                )
-                if column_undo_view is None:
-                    raise RuntimeError(f"撤销所需的 Sheet 视图尚未加载：{action_sheet}")
                 column_undo_view._ensure_column_projection_current("撤销列结构操作")
             action = self.app.pop_undo()
             if not action:
@@ -19646,7 +20376,7 @@ class SheetView:
                 return
             sheet = action.get("sheet")
             target = action.get("target")
-            if sheet == self.sheet:
+            if sheet == undo_view.sheet:
                 row_structure = target in (
                     "A_APPEND",
                     "A_INSERT_ROW",
@@ -19659,13 +20389,13 @@ class SheetView:
                 else:
                     edited_sides = ()
                 if row_structure:
-                    self._mark_column_mapping_stale(
+                    undo_view._mark_column_mapping_stale(
                         "undo",
                         row_structure=True,
                         edited_sides=edited_sides,
                     )
                 elif target in ("A", "B"):
-                    self._mark_nonstructural_cell_edit(
+                    undo_view._mark_nonstructural_cell_edit(
                         "undo-cell-overwrite",
                         edited_sides=edited_sides,
                     )
@@ -19690,11 +20420,11 @@ class SheetView:
                     pass
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(sheet)
-                if sheet == self.sheet:
-                    self._invalidate_only_diff_snapshot_cache()
-                    self._invalidate_render_cache()
-                    self.refresh(row_only=None, rescan=True)
-                    self._update_cursor_lines()
+                if sheet == undo_view.sheet:
+                    undo_view._invalidate_only_diff_snapshot_cache()
+                    undo_view._invalidate_render_cache()
+                    undo_view.refresh(row_only=None, rescan=True)
+                    undo_view._update_cursor_lines()
                 return
             if target in ("A_INSERT_ROW", "B_INSERT_ROW"):
                 row = action.get("row", 1)
@@ -19771,11 +20501,11 @@ class SheetView:
                             ws_be.delete_rows(base_row_del, count)
                     except Exception:
                         pass
-                if sheet == self.sheet:
-                    self._invalidate_only_diff_snapshot_cache()
-                    self._invalidate_render_cache()
-                    self.refresh(row_only=None, rescan=True)
-                    self._update_cursor_lines()
+                if sheet == undo_view.sheet:
+                    undo_view._invalidate_only_diff_snapshot_cache()
+                    undo_view._invalidate_render_cache()
+                    undo_view.refresh(row_only=None, rescan=True)
+                    undo_view._update_cursor_lines()
                 return
             cells = action.get("cells", [])
             if not cells:
@@ -19806,36 +20536,36 @@ class SheetView:
                         self.app.record_manual_b_formula_cache(sheet, r, c, old_val)
                 rows.add(r)
             # refresh current sheet if applicable
-            if sheet == self.sheet:
+            if sheet == undo_view.sheet:
                 for r in rows:
-                    self.touched_rows.add(r)
-                self._invalidate_only_diff_snapshot_cache()
-                self._invalidate_render_cache()
+                    undo_view.touched_rows.add(r)
+                undo_view._invalidate_only_diff_snapshot_cache()
+                undo_view._invalidate_render_cache()
                 side_lookup = (
-                    self.row_a_to_pair_idx if target == "A"
-                    else self.row_b_to_pair_idx
+                    undo_view.row_a_to_pair_idx if target == "A"
+                    else undo_view.row_b_to_pair_idx
                 )
                 affected_pair_indices = list(dict.fromkeys(
                     int(side_lookup[r])
                     for r in sorted(rows)
                     if r in side_lookup
                 ))
-                self._refresh_pair_indices_exact(affected_pair_indices)
-                if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
-                    self._cache_only_diff_rows_from_exact_pair_maps()
+                undo_view._refresh_pair_indices_exact(affected_pair_indices)
+                if bool(undo_view.only_diff_var.get()) and undo_view.snapshot_only_diff:
+                    undo_view._cache_only_diff_rows_from_exact_pair_maps()
                 if len(affected_pair_indices) <= _CELL_UNDO_INCREMENTAL_ROW_LIMIT:
                     # ``refresh(row_only=...)`` accepts a worksheet row rather
                     # than a pair index. Prefer Mine's row because refresh
                     # resolves that lookup first, then fall back to Theirs for
                     # a one-sided aligned pair.
                     for pair_idx in affected_pair_indices:
-                        ra, rb = self.row_pairs[pair_idx]
+                        ra, rb = undo_view.row_pairs[pair_idx]
                         display_row = ra if ra is not None else rb
                         if display_row is not None:
-                            self.refresh(row_only=int(display_row), rescan=False)
+                            undo_view.refresh(row_only=int(display_row), rescan=False)
                 else:
-                    self.refresh(row_only=None, rescan=False)
-                self._update_cursor_lines()
+                    undo_view.refresh(row_only=None, rescan=False)
+                undo_view._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("撤销失败", f"撤销操作失败，数据可能未恢复：\n{e}")
 
@@ -20385,13 +21115,16 @@ class SheetView:
         # Only rows not covered by the exact background cache need formula-text
         # fallback. Cached rows must never block scrolling/rendering on workbook I/O.
         if missing_pair_text and _USE_CACHED_VALUES_ONLY and (ws_a_edit is None or ws_b_edit is None):
-            try:
-                self.app._ensure_edit_loaded()
-                ws_a_edit = self.app.ws_a_edit(self.sheet)
-                ws_b_edit = self.app.ws_b_edit(self.sheet)
-                _dlog(f"formula fallback enabled: loaded edit wbs for sheet={self.sheet}")
-            except Exception as e:
-                _dlog(f"formula fallback load failed: sheet={self.sheet} err={e}")
+            # Scrolling is a view-only action and must never synchronously parse
+            # editable workbooks on Tk. The background preload will publish
+            # readiness; until then cached values remain viewable.
+            request_preload = getattr(self.app, "_request_edit_preload", None)
+            if callable(request_preload):
+                request_preload()
+            _dlog(
+                f"formula fallback deferred off Tk: sheet={self.sheet} "
+                f"rows={len(new_rows)}"
+            )
 
         start_line = len(self.display_rows) + 1
         # Preserve current scroll position to avoid jumps
@@ -20565,7 +21298,27 @@ class SheetView:
             self.pair_diff_cols[idx] = cols
 
         self._data_ready = True
-        self._full_display_rows = list(range(0, len(self.row_pairs)))
+        self._row_model_exact = True
+        self._pair_diff_full_exact = True
+        self._base_diff_full_exact = True
+        self._cache_formula_aware = bool(self.app._edit_workbooks_ready())
+        self._lifecycle_error = None
+        self._lifecycle_canceled = False
+        self._only_diff_async_build_seq += 1
+        self._only_diff_async_building = False
+        self._only_diff_async_build_key = None
+        exact_diff_rows = [
+            pair_idx
+            for pair_idx in range(len(self.row_pairs))
+            if self._pair_has_visual_diff(pair_idx)
+        ]
+        self._cache_only_diff_rows_snapshot(exact_diff_rows, exact=True)
+        if bool(self.only_diff_var.get()):
+            self._full_display_rows = self._only_diff_rows_with_touched(
+                exact_diff_rows
+            )
+        else:
+            self._full_display_rows = list(range(0, len(self.row_pairs)))
         self.display_rows = list(self._full_display_rows)
         self.row_to_line = {r: i + 1 for i, r in enumerate(self.display_rows)}
 
@@ -20624,6 +21377,7 @@ class SheetView:
             self._update_diff_maps()
         except Exception:
             pass
+        self._refresh_interaction_gate()
         return
 
     def refresh(self, row_only: int | None, rescan: bool, *, column_only: bool = False):
@@ -21038,6 +21792,15 @@ class SheetView:
                     self._pair_diff_full_exact = True
 
             self._data_ready = True
+            self._row_model_exact = True
+            self._cache_formula_aware = bool(
+                ws_a_edit is not None
+                and ws_b_edit is not None
+                and (
+                    not self._is_three_way_enabled()
+                    or ws_base_edit_ready is not None
+                )
+            )
 
         if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
             need_full_base_diff = (not self._is_large_sheet) and (bool(self.only_diff_var.get()) or (not self._is_large_sheet))
@@ -21052,6 +21815,9 @@ class SheetView:
                 )
                 if added_base_diff:
                     self._invalidate_render_cache()
+                self._base_diff_full_exact = bool(
+                    len(self.pair_base_diff_cols) >= len(self.row_pairs)
+                )
 
         if (
             isinstance(column_diff_seed_request, dict)
@@ -21070,6 +21836,11 @@ class SheetView:
                 if idx is not None:
                     rows.append(idx)
             self._full_display_rows = rows
+        elif bool(getattr(self, "_only_diff_preview_full", False)):
+            # The checkbox already reflects the requested mode, but the exact
+            # row set is not published yet. Keep one stable full preview rather
+            # than visually reverting or showing a transient partial subset.
+            self._full_display_rows = list(range(len(self.row_pairs)))
         elif bool(self.only_diff_var.get()):
             cached_only_diff_rows = self._only_diff_rows_cache if self._has_valid_only_diff_snapshot_cache() else None
             if self.snapshot_only_diff and cached_only_diff_rows is not None and (not rescan):
@@ -21090,7 +21861,17 @@ class SheetView:
                             idx for idx in range(len(self.row_pairs))
                             if self._pair_has_visual_diff(idx)
                         ]
-                        self._cache_only_diff_rows_snapshot(fallback_rows)
+                        self._cache_only_diff_rows_snapshot(
+                            fallback_rows,
+                            exact=bool(
+                                self._pair_diff_full_exact
+                                and (
+                                    not self._is_three_way_enabled()
+                                    or not getattr(self.app, "has_base", False)
+                                    or self._base_diff_full_exact
+                                )
+                            ),
+                        )
                     self._full_display_rows = self._only_diff_rows_with_touched(fallback_rows)
             elif (not self.snapshot_only_diff) or rescan or (cached_only_diff_rows is None):
                 # Build snapshot: diff rows + touched rows.
@@ -21142,7 +21923,17 @@ class SheetView:
                             except Exception:
                                 pass
 
-                self._cache_only_diff_rows_snapshot(rows)
+                self._cache_only_diff_rows_snapshot(
+                    rows,
+                    exact=bool(
+                        self._pair_diff_full_exact
+                        and (
+                            not self._is_three_way_enabled()
+                            or not getattr(self.app, "has_base", False)
+                            or self._base_diff_full_exact
+                        )
+                    ),
+                )
                 self._full_display_rows = self._only_diff_rows_with_touched(rows)
             else:
                 # snapshot mode: keep existing row list stable
@@ -21657,6 +22448,7 @@ class SheetView:
             text_a = "\n".join(lines_a) + ("\n" if lines_a else "")
             text_b = "\n".join(lines_b) + ("\n" if lines_b else "")
             self._render_cache[cache_key] = (text_a, text_b, tag_rows, tag_cells, diff_row_count)
+        self._refresh_interaction_gate()
 
 
 class SowMergeApp:
@@ -21674,9 +22466,25 @@ class SowMergeApp:
         self._interactive_action_lock = threading.Lock()
         self._interactive_action_depth = 0
         self._interactive_action_event = threading.Event()
+        self._interactive_owner_stack = []
         self._priority_diff_lock = threading.Lock()
         self._priority_diff_depth = 0
         self._priority_diff_event = threading.Event()
+        self._exact_worker_lock = threading.Lock()
+        self._priority_exact_owner = None
+        self._exact_broker_lock = threading.Lock()
+        self._exact_broker_pending = None
+        self._exact_broker_running = False
+        self._exact_broker_thread = None
+        self._only_diff_progress_owner = None
+        self._only_diff_progress_win = None
+        self._only_diff_progress_stage_var = None
+        self._only_diff_progress_detail_var = None
+        self._only_diff_progress_bar = None
+        self._only_diff_progress_cancel_btn = None
+        self._only_diff_progress_started = 0.0
+        self._only_diff_tab_states = {}
+        self._sheet_switch_guard = False
         self.file_a = file_a
         self.file_b = file_b
         self.base_path = base_path
@@ -21849,10 +22657,7 @@ class SowMergeApp:
         else:
             self.root.title(f"{self._window_title_suffix} (TortoiseMerge-like)")
         self.root.geometry("1450x860")
-        try:
-            self.root.state("zoomed")
-        except Exception:
-            pass
+        self._intended_window_state = "zoomed"
 
         self._root_after_ids: set[str] = set()
         try:
@@ -21861,6 +22666,51 @@ class SowMergeApp:
             pass
 
         self._build_ui()
+        self._safe_root_after(0, self._ensure_only_diff_progress_dialog)
+        self._ui_heartbeat_last = time.perf_counter()
+        self._ui_heartbeat_max_gap = 0.0
+        self._ui_heartbeat_samples = 0
+
+        def _ui_heartbeat():
+            if self._is_closing:
+                return
+            now = time.perf_counter()
+            gap = max(0.0, now - self._ui_heartbeat_last)
+            self._ui_heartbeat_last = now
+            self._ui_heartbeat_max_gap = max(self._ui_heartbeat_max_gap, gap)
+            self._ui_heartbeat_samples += 1
+            if gap > 0.2:
+                try:
+                    _dlog(
+                        f"UI_HEARTBEAT_GAP ms={gap * 1000.0:.1f} "
+                        f"state={self.root.state()} geometry={self.root.geometry()} "
+                        f"sheet={getattr(self, 'selected_sheet', '')}"
+                    )
+                except Exception:
+                    pass
+            self._safe_root_after(50, _ui_heartbeat)
+
+        def _show_main_window_after_layout():
+            if self._is_closing:
+                return
+            try:
+                self.root.update_idletasks()
+                _dlog(
+                    f"WINDOW_STATE stage=before-show state={self.root.state()} "
+                    f"geometry={self.root.geometry()}"
+                )
+                self.root.deiconify()
+                self.root.state(self._intended_window_state)
+                self.root.update_idletasks()
+                _dlog(
+                    f"WINDOW_STATE stage=after-show state={self.root.state()} "
+                    f"geometry={self.root.geometry()}"
+                )
+            except Exception as exc:
+                _dlog(f"main window show failed: {exc}")
+
+        self._safe_root_after(0, _show_main_window_after_layout)
+        self._safe_root_after(50, _ui_heartbeat)
         self._schedule_auto_recalc()
 
     def _sheet_names_for_side(self, side: str) -> list[str]:
@@ -22112,17 +22962,50 @@ class SowMergeApp:
             raise
         return thread
 
-    def _begin_interactive_action(self):
+    def _begin_interactive_action(self, owner_view=None):
         """Pause optional background scans while the user is changing data."""
         with self._interactive_action_lock:
             self._interactive_action_depth += 1
+            owner_generation = None
+            if owner_view is not None:
+                owner_generation = int(
+                    getattr(owner_view, "_lifecycle_generation", -1)
+                )
+            self._interactive_owner_stack.append(
+                (owner_view, owner_generation)
+            )
             self._interactive_action_event.set()
+        view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
+        if view is not None:
+            try:
+                view._refresh_interaction_gate()
+            except Exception:
+                pass
+        if owner_view is not None:
+            with self._interactive_action_lock:
+                if (
+                    self._interactive_owner_stack
+                    and self._interactive_owner_stack[-1][0] is owner_view
+                ):
+                    self._interactive_owner_stack[-1] = (
+                        owner_view,
+                        int(getattr(owner_view, "_lifecycle_generation", -1)),
+                    )
 
     def _end_interactive_action(self):
         with self._interactive_action_lock:
             self._interactive_action_depth = max(0, self._interactive_action_depth - 1)
+            if self._interactive_owner_stack:
+                self._interactive_owner_stack.pop()
             if self._interactive_action_depth == 0:
+                self._interactive_owner_stack.clear()
                 self._interactive_action_event.clear()
+        view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
+        if view is not None:
+            try:
+                view._refresh_interaction_gate()
+            except Exception:
+                pass
 
     def _begin_priority_diff_compute(self):
         """Pause lower-priority tab scans while the active Sheet builds exact diffs."""
@@ -22135,6 +23018,292 @@ class SowMergeApp:
             self._priority_diff_depth = max(0, self._priority_diff_depth - 1)
             if self._priority_diff_depth == 0:
                 self._priority_diff_event.clear()
+
+    def _reserve_ui_transition_window(self, duration_ms: int = 250):
+        """Briefly yield background XML parsing to a visible Tk transition."""
+        self._begin_priority_diff_compute()
+        released = False
+
+        def _release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._end_priority_diff_compute()
+
+        try:
+            self._safe_root_after(max(50, int(duration_ms)), _release)
+        except Exception:
+            _release()
+        return _release
+
+    def _claim_priority_exact(self, view, build_seq: int):
+        """Make one Sheet/generation the sole exact-comparison owner."""
+        previous = None
+        with self._priority_diff_lock:
+            previous = self._priority_exact_owner
+            self._priority_exact_owner = (view, int(build_seq))
+        if previous and previous[0] is not view:
+            old_view, _old_seq = previous
+            old_view._only_diff_async_build_seq += 1
+            old_view._only_diff_async_building = False
+            old_view._only_diff_async_build_key = None
+            old_view._only_diff_preview_full = False
+            old_view._pending_exact_render = False
+            old_view._lifecycle_canceled = True
+            self._finish_only_diff_progress(
+                old_view,
+                _old_seq,
+                outcome="superseded",
+            )
+            try:
+                old_view._refresh_interaction_gate()
+            except Exception:
+                pass
+            _dlog(
+                f"EXACT_OWNER cancel hidden={old_view.sheet} "
+                f"active={getattr(view, 'sheet', '')}"
+            )
+
+    def _release_priority_exact(self, view, build_seq: int):
+        with self._priority_diff_lock:
+            if self._priority_exact_owner == (view, int(build_seq)):
+                self._priority_exact_owner = None
+
+    def _cancel_current_only_diff_progress(self, _event=None):
+        owner = self._only_diff_progress_owner
+        if owner is not None:
+            owner[0]._cancel_only_diff_calculation(owner[1])
+        return "break"
+
+    def _ensure_only_diff_progress_dialog(self):
+        """Create the reusable dialog off the latency-sensitive click path."""
+        win = self._only_diff_progress_win
+        try:
+            if win is not None and win.winfo_exists():
+                return win
+        except Exception:
+            pass
+        if self._is_closing:
+            return None
+        try:
+            win = tk.Toplevel(self.root)
+            win.withdraw()
+            win.transient(self.root)
+            win.resizable(False, False)
+            self._only_diff_progress_win = win
+            self._only_diff_progress_stage_var = tk.StringVar(master=win, value="")
+            self._only_diff_progress_detail_var = tk.StringVar(master=win, value="")
+            body = ttk.Frame(win, padding=18)
+            body.pack(fill="both", expand=True)
+            ttk.Label(
+                body,
+                textvariable=self._only_diff_progress_stage_var,
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w")
+            ttk.Label(
+                body,
+                textvariable=self._only_diff_progress_detail_var,
+                foreground="#555555",
+            ).pack(anchor="w", pady=(8, 6))
+            bar = ttk.Progressbar(
+                body,
+                mode="determinate",
+                maximum=100,
+                length=420,
+            )
+            bar.pack(fill="x")
+            self._only_diff_progress_bar = bar
+            button_row = ttk.Frame(body)
+            button_row.pack(fill="x", pady=(14, 0))
+            cancel_btn = ttk.Button(
+                button_row,
+                text="取消",
+                command=self._cancel_current_only_diff_progress,
+            )
+            cancel_btn.pack(side="right")
+            self._only_diff_progress_cancel_btn = cancel_btn
+            win.protocol(
+                "WM_DELETE_WINDOW",
+                self._cancel_current_only_diff_progress,
+            )
+            win.bind("<Escape>", self._cancel_current_only_diff_progress)
+            win.update_idletasks()
+            return win
+        except Exception as exc:
+            _dlog(f"only-diff progress preload failed: {exc}")
+            self._only_diff_progress_win = None
+            return None
+
+    def _begin_only_diff_progress(self, view, build_seq: int):
+        """Claim input immediately, then show the prebuilt dialog."""
+        token = (view, int(build_seq))
+        if self._only_diff_progress_owner == token:
+            return
+        if self._only_diff_progress_owner is not None:
+            old_view, old_seq = self._only_diff_progress_owner
+            self._finish_only_diff_progress(old_view, old_seq, outcome="superseded")
+
+        self._only_diff_progress_owner = token
+        self._only_diff_progress_started = time.monotonic()
+
+        def _show_dialog():
+            if self._only_diff_progress_owner != token or self._is_closing:
+                return
+            try:
+                win = self._ensure_only_diff_progress_dialog()
+                if win is None:
+                    return
+                win.title(f"正在计算差异 — {view.sheet}")
+                self._only_diff_progress_stage_var.set(
+                    f"正在准备“{view.sheet}”的精确差异"
+                )
+                self._only_diff_progress_detail_var.set(
+                    "正在打开工作簿…  已用时 0.0 秒"
+                )
+                self._only_diff_progress_bar.configure(value=0)
+                self._only_diff_progress_cancel_btn.configure(
+                    text="取消",
+                    state="normal",
+                )
+                win.deiconify()
+                win.grab_set()
+                win.focus_set()
+                width = win.winfo_reqwidth()
+                height = win.winfo_reqheight()
+                win.geometry(
+                    f"+{max(0, self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2)}"
+                    f"+{max(0, self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2)}"
+                )
+            except Exception as exc:
+                _dlog(
+                    f"only-diff progress show failed sheet={view.sheet}: {exc}"
+                )
+
+        self._safe_root_after(0, _show_dialog)
+
+    def _update_only_diff_progress(
+        self,
+        view,
+        build_seq: int,
+        stage: str,
+        current: int,
+        total: int,
+    ):
+        token = (view, int(build_seq))
+        if self._only_diff_progress_owner != token:
+            return
+        current = max(0, int(current or 0))
+        total = max(1, int(total or 1))
+        percent = max(0.0, min(100.0, current * 100.0 / total))
+        elapsed = max(0.0, time.monotonic() - self._only_diff_progress_started)
+        try:
+            self._only_diff_progress_stage_var.set(str(stage))
+            self._only_diff_progress_detail_var.set(
+                f"已处理 {min(current, total):,} / {total:,} 行"
+                f"（{percent:.1f}%）  已用时 {elapsed:.1f} 秒"
+            )
+            self._only_diff_progress_bar.configure(value=percent)
+        except Exception:
+            pass
+
+    def _finish_only_diff_progress(self, view, build_seq: int, *, outcome: str):
+        """Close only the matching dialog and release its input ownership."""
+        token = (view, int(build_seq))
+        if self._only_diff_progress_owner != token:
+            return False
+        win = self._only_diff_progress_win
+        try:
+            if win is not None and win.winfo_exists():
+                try:
+                    if win.grab_current() == win:
+                        win.grab_release()
+                except Exception:
+                    pass
+                win.withdraw()
+        except Exception:
+            pass
+        self._only_diff_progress_owner = None
+        self._only_diff_tab_states.clear()
+        _dlog(
+            f"ONLY_DIFF_PROGRESS_END sheet={view.sheet} "
+            f"seq={build_seq} outcome={outcome}"
+        )
+        return True
+
+    def _cancel_priority_exact_for_hidden(self, active_sheet: str):
+        with self._priority_diff_lock:
+            owner = self._priority_exact_owner
+        if owner and getattr(owner[0], "sheet", None) != active_sheet:
+            old_view = owner[0]
+            old_view._only_diff_async_build_seq += 1
+            old_view._only_diff_async_building = False
+            old_view._only_diff_async_build_key = None
+            old_view._only_diff_preview_full = False
+            old_view._lifecycle_canceled = True
+            self._finish_only_diff_progress(
+                old_view,
+                owner[1],
+                outcome="tab-superseded",
+            )
+            try:
+                old_view._refresh_interaction_gate()
+            except Exception:
+                pass
+            _dlog(
+                f"EXACT_OWNER tab-cancel hidden={old_view.sheet} active={active_sheet}"
+            )
+
+    def _submit_priority_exact(self, view, build_seq: int, worker):
+        """Submit to one replaceable exact-compute broker.
+
+        There is at most one broker thread and one pending request. Selecting a
+        newer Sheet replaces the pending request instead of creating blocked
+        daemon threads that keep lower-priority work paused.
+        """
+        with self._exact_broker_lock:
+            self._exact_broker_pending = (view, int(build_seq), worker)
+            if self._exact_broker_running:
+                return self._exact_broker_thread or True
+            self._exact_broker_running = True
+
+        def _broker_loop():
+            while not self._is_closing:
+                with self._exact_broker_lock:
+                    job = self._exact_broker_pending
+                    self._exact_broker_pending = None
+                    if job is None:
+                        self._exact_broker_running = False
+                        self._exact_broker_thread = None
+                        return
+                job_view, job_seq, job_worker = job
+                if int(job_seq) != int(job_view._only_diff_async_build_seq):
+                    self._release_priority_exact(job_view, job_seq)
+                    continue
+                self._begin_priority_diff_compute()
+                try:
+                    job_worker()
+                finally:
+                    self._release_priority_exact(job_view, job_seq)
+                    self._end_priority_diff_compute()
+            with self._exact_broker_lock:
+                self._exact_broker_pending = None
+                self._exact_broker_running = False
+                self._exact_broker_thread = None
+
+        thread = self._start_background_thread(
+            _broker_loop,
+            name="sow-only-diff-broker",
+        )
+        if thread is None:
+            with self._exact_broker_lock:
+                self._exact_broker_pending = None
+                self._exact_broker_running = False
+                self._exact_broker_thread = None
+            return None
+        with self._exact_broker_lock:
+            self._exact_broker_thread = thread
+        return thread
 
     def _join_background_threads(self, timeout: float = 5.0):
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -22194,6 +23363,16 @@ class SowMergeApp:
         self._is_closing = True
         try:
             self._initial_sheet_ready_event.set()
+        except Exception:
+            pass
+        try:
+            owner = getattr(self, "_only_diff_progress_owner", None)
+            if owner is not None:
+                self._finish_only_diff_progress(
+                    owner[0],
+                    owner[1],
+                    outcome="closing",
+                )
         except Exception:
             pass
         self._cancel_root_afters()
@@ -22318,6 +23497,91 @@ class SowMergeApp:
             and (not self.has_base or self._wb_base_edit is not None)
         )
 
+    def _guard_active_sheet_mutation(self, action: str) -> bool:
+        view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
+        if view is None:
+            self.show_nonblocking_notice(
+                f"{action}暂不可用。当前 Sheet 尚未加载完成。",
+                duration_ms=6000,
+            )
+            return False
+        return bool(view._guard_mutation_ready(action))
+
+    def _guard_sheet_mutation(self, sheet: str, action: str) -> bool:
+        view = getattr(self, "sheet_views", {}).get(str(sheet))
+        if view is None:
+            return False
+        # A handler acquires readiness before entering BUSY. Deeper workbook
+        # primitives may revalidate that same owner/generation without being
+        # rejected merely because the handler itself set the BUSY event.
+        if self._has_active_mutation_owner(view):
+            return True
+        return bool(view._guard_mutation_ready(action))
+
+    def _has_active_mutation_owner(self, view) -> bool:
+        with self._interactive_action_lock:
+            owner_entry = (
+                self._interactive_owner_stack[-1]
+                if self._interactive_owner_stack
+                else None
+            )
+        if owner_entry is None:
+            return False
+        owner_view, owner_generation = owner_entry
+        return bool(
+            owner_view is view
+            and int(getattr(owner_view, "_lifecycle_generation", -2))
+            == int(owner_generation)
+        )
+
+    def _pending_mutation_sheets(self, target_side: str) -> set[str]:
+        side = str(target_side or "").upper()
+        sheets: set[str] = set()
+        if side == "A":
+            sheets.update(sheet for sheet, _row, _col in self.manual_a_cell_ops)
+            sheets.update(sheet for sheet, _row, _col in self.manual_a_formula_cache_ops)
+            sheets.update(str(op.get("sheet")) for op in self.manual_a_row_ops if op.get("sheet"))
+            sheets.update(str(op.get("sheet")) for op in self.manual_a_column_ops if op.get("sheet"))
+            sheets.update(getattr(self, "modified_sheets_a", set()))
+        elif side == "B":
+            sheets.update(sheet for sheet, _row, _col in self.manual_b_cell_ops)
+            sheets.update(sheet for sheet, _row, _col in self.manual_b_formula_cache_ops)
+            sheets.update(str(op.get("sheet")) for op in self.manual_b_row_ops if op.get("sheet"))
+            sheets.update(str(op.get("sheet")) for op in self.manual_b_column_ops if op.get("sheet"))
+            sheets.update(getattr(self, "modified_sheets_b", set()))
+        for op in getattr(self, "manual_sheet_ops", ()):
+            if str(op.get("target_side") or "").upper() == side and op.get("sheet"):
+                sheets.add(str(op["sheet"]))
+        for op in getattr(self, "auto_sheet_ops", ()):
+            if str(op.get("target_side") or "A").upper() == side and op.get("sheet"):
+                sheets.add(str(op["sheet"]))
+        selected = getattr(self, "selected_sheet", None)
+        if selected:
+            sheets.add(str(selected))
+        return sheets
+
+    def _guard_save_readiness(self, action: str, target_side: str) -> bool:
+        if not self._edit_workbooks_ready():
+            self.show_nonblocking_notice(
+                f"{action}暂不可用。可编辑工作簿仍在后台加载。",
+                duration_ms=6000,
+            )
+            return False
+        blocked = []
+        for sheet in sorted(self._pending_mutation_sheets(target_side)):
+            view = getattr(self, "sheet_views", {}).get(sheet)
+            if view is None or view._derive_lifecycle_state() != "READY":
+                state = "未加载" if view is None else view._derive_lifecycle_state()
+                blocked.append(f"{sheet}({state})")
+        if blocked:
+            self.show_nonblocking_notice(
+                f"{action}暂不可用。以下相关 Sheet 尚未 READY："
+                + "、".join(blocked[:8]),
+                duration_ms=8000,
+            )
+            return False
+        return True
+
     def _request_edit_preload(self):
         """Release the existing preload worker without starting a second parser."""
         try:
@@ -22326,28 +23590,60 @@ class SowMergeApp:
             pass
 
     def _refresh_loaded_views_after_edit_ready(self):
-        """Replace value-only provisional row diffs with formula-aware results."""
+        """Publish edit readiness without performing a Tk-thread rescan.
+
+        Background Sheet caches are already formula-aware. A legacy/value-only
+        view is requeued for background refinement; no workbook scan or Text
+        rebuild runs from this UI callback.
+        """
         if self._is_closing or not self._edit_workbooks_ready():
             return
+        started = time.perf_counter()
+        requeued = 0
         for sheet, view in list(getattr(self, "sheet_views", {}).items()):
-            if view is None or not bool(getattr(view, "_data_ready", False)):
-                continue
-            if (
-                sheet in getattr(self, "modified_sheets_a", set())
-                or sheet in getattr(self, "modified_sheets_b", set())
-            ):
+            if view is None:
                 continue
             try:
-                # This formula-aware foreground result is authoritative for the
-                # loaded tab. Do not let a late provisional background cache
-                # overwrite it afterward.
-                view._suppress_bg_apply = True
-                view.refresh(row_only=None, rescan=True)
+                if (
+                    view._is_missing_sheet_view()
+                    and bool(getattr(view, "_data_ready", False))
+                    and not bool(getattr(view, "_cache_formula_aware", False))
+                ):
+                    # A missing Sheet is already an exact structural difference:
+                    # formulas cannot change row membership or the mutation
+                    # target. Editable preload only completes the source used by
+                    # a later whole-Sheet copy, so publish readiness without a
+                    # foreground row scan.
+                    view._cache_formula_aware = True
+                    view._refresh_interaction_gate()
+                    continue
+                if (
+                    bool(getattr(view, "_data_ready", False))
+                    and not bool(getattr(view, "_cache_formula_aware", False))
+                    and sheet not in getattr(self, "modified_sheets_a", set())
+                    and sheet not in getattr(self, "modified_sheets_b", set())
+                ):
+                    view._data_ready = False
+                    view._lifecycle_generation += 1
+                    self._enqueue_sheet(
+                        sheet,
+                        front=(sheet == getattr(self, "selected_sheet", "")),
+                        exact_only_diff=bool(view.only_diff_var.get()),
+                    )
+                    requeued += 1
+                view._refresh_interaction_gate()
             except Exception as exc:
                 _dlog(
-                    f"edit-ready formula refresh failed: sheet={sheet} "
+                    f"edit-ready state publish failed: sheet={sheet} "
                     f"err={type(exc).__name__}:{exc}"
                 )
+        if requeued:
+            self._kick_worker()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        _dlog(
+            f"EDIT_READY_GATE views={len(getattr(self, 'sheet_views', {}))} "
+            f"requeued={requeued} callback_ms={elapsed_ms:.1f} rescan=False"
+        )
 
     def _load_edit_workbooks_owned(self) -> bool:
         """Load each editable workbook once under a single ownership lock.
@@ -22719,6 +24015,8 @@ class SowMergeApp:
         return None, None
 
     def _copy_sheet_between_sides(self, sheet: str, source_side: str, target_side: str):
+        if not self._guard_sheet_mutation(sheet, "整 Sheet 复制"):
+            raise RuntimeError("当前 Sheet 尚未 READY，已阻止整 Sheet 复制。")
         self._ensure_edit_loaded()
         source_side = str(source_side or "").upper()
         target_side = str(target_side or "").upper()
@@ -22741,6 +24039,8 @@ class SowMergeApp:
         self._refresh_sheet_catalog()
 
     def _delete_sheet_on_side(self, sheet: str, target_side: str):
+        if not self._guard_sheet_mutation(sheet, "整 Sheet 删除"):
+            raise RuntimeError("当前 Sheet 尚未 READY，已阻止整 Sheet 删除。")
         self._ensure_edit_loaded()
         target_side = str(target_side or "").upper()
         dst_val_wb, dst_edit_wb = self._workbooks_for_side(target_side)
@@ -22781,6 +24081,46 @@ class SowMergeApp:
             op for op in self.manual_sheet_ops
             if str(op.get("target_side") or "A").upper() != target_side
         ]
+
+    def _commit_saved_side_baseline(self, target_side: str):
+        """Retire mutations that are now present in the saved workbook.
+
+        This runs before value-workbook reload queues a fresh background
+        comparison. Otherwise the cache publisher correctly sees historical
+        ``modified_sheets``/``touched_rows`` and rejects every new baseline as
+        stale forever.
+        """
+        side = str(target_side or "").upper()
+        saved_sheets = set(self._pending_mutation_sheets(side))
+        if side == "A":
+            self.modified_a = False
+            self.modified_sheets_a.clear()
+            self.manual_a_cell_ops.clear()
+            self.manual_a_formula_cache_ops.clear()
+            self.manual_a_row_ops.clear()
+            self.manual_a_column_ops.clear()
+        elif side == "B":
+            self.modified_b = False
+            self.modified_sheets_b.clear()
+            self.manual_b_cell_ops.clear()
+            self.manual_b_formula_cache_ops.clear()
+            self.manual_b_row_ops.clear()
+            self.manual_b_column_ops.clear()
+        else:
+            return
+        self._clear_sheet_ops_for_target(side)
+        remaining_a = set(getattr(self, "modified_sheets_a", set()))
+        remaining_b = set(getattr(self, "modified_sheets_b", set()))
+        for sheet in saved_sheets:
+            if sheet in remaining_a or sheet in remaining_b:
+                continue
+            view = getattr(self, "sheet_views", {}).get(sheet)
+            if view is not None:
+                view.touched_rows.clear()
+        _dlog(
+            f"SAVE_BASELINE_COMMITTED side={side} "
+            f"sheets={','.join(sorted(saved_sheets)) or '-'}"
+        )
 
     def _ensure_live_column_mappings_current(self, operation: str):
         """Synchronously validate/rebuild every materialized view before output."""
@@ -23226,7 +24566,12 @@ class SowMergeApp:
             ttk.Label(top, text=read_line, foreground="#555").grid(row=detail_row, column=0, columnspan=3, sticky="w", pady=(2, 0))
         ttk.Label(top, text=f"Build: {APP_BUILD_TAG}", foreground="#666").grid(row=0, column=3, sticky="ne", padx=(16, 0))
 
-        ttk.Button(top, text="重算并刷新", command=self.recalc_and_refresh).grid(row=0, column=2, sticky="ne", padx=(10, 0))
+        self.recalc_btn = ttk.Button(
+            top,
+            text="重算并刷新",
+            command=self.recalc_and_refresh,
+        )
+        self.recalc_btn.grid(row=0, column=2, sticky="ne", padx=(10, 0))
         ttk.Button(top, text="导出诊断包", command=self.export_diagnostic_bundle).grid(row=0, column=4, sticky="ne", padx=(10, 0))
         ttk.Button(top, text="复制反馈信息", command=self.copy_feedback_info).grid(row=0, column=5, sticky="ne", padx=(10, 0))
         self.update_btn = ttk.Button(top, text="检查更新", command=self._do_svn_update)
@@ -23309,6 +24654,10 @@ class SowMergeApp:
         self._compute_lock = threading.Lock()
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
+        self._compute_exact_only_diff_requested: set[str] = set()
+        self._sheet_compute_generation: dict[str, int] = {
+            sheet: 0 for sheet in self.compare_sheets
+        }
         self._compute_thread = None
         self._compute_total = max(1, len(self.compare_sheets))
         self._compute_done = 0
@@ -23318,11 +24667,30 @@ class SowMergeApp:
         self._ui_task_lock = threading.Lock()
         self._ui_tasks = []
 
-        def _enqueue_sheet(sheet: str, front: bool = False):
+        def _enqueue_sheet(
+            sheet: str,
+            front: bool = False,
+            exact_only_diff: bool | None = None,
+            force_recompute: bool = False,
+        ):
             if self._is_closing:
                 return
             with self._compute_lock:
+                if exact_only_diff is None:
+                    queued_view = self.sheet_views.get(sheet)
+                    exact_only_diff = bool(
+                        queued_view.only_diff_var.get()
+                        if queued_view is not None
+                        else getattr(self, "only_diff_default", 0)
+                    )
+                if exact_only_diff:
+                    self._compute_exact_only_diff_requested.add(sheet)
                 if sheet in self._compute_inflight:
+                    if force_recompute and sheet not in self._compute_queue:
+                        if front:
+                            self._compute_queue.insert(0, sheet)
+                        else:
+                            self._compute_queue.append(sheet)
                     return
                 if sheet in self._compute_queue:
                     # move to front if requested
@@ -23769,6 +25137,7 @@ class SowMergeApp:
             sheet: str,
             wb_base_val=None,
             wb_base_edit=None,
+            need_exact_only_diff: bool = False,
         ):
             _check_bg_cancel()
             trimmed_rows_cache = {}
@@ -24026,7 +25395,17 @@ class SowMergeApp:
 
             # Large-sheet fast open: avoid full cell-by-cell precompute.
             # Still estimate display widths from head + tail samples to prevent 4-char collapse.
-            if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
+            # A request may be upgraded while this Sheet is already reading.
+            # Recheck after the expensive workbook/alignment pass so the same
+            # prepared tuples can satisfy only-diff without reopening files.
+            with self._compute_lock:
+                if sheet in self._compute_exact_only_diff_requested:
+                    need_exact_only_diff = True
+                    self._compute_exact_only_diff_requested.discard(sheet)
+            large_preview_only = bool(
+                max_row >= _LARGE_SHEET_ROW_THRESHOLD and not need_exact_only_diff
+            )
+            if large_preview_only:
                 has_diff = bool(column_comparison_cache.structural_diff_cols)
                 for idx in range(len(row_pairs) - 1, -1, -1):
                     if has_diff:
@@ -24084,15 +25463,75 @@ class SowMergeApp:
                     ra, rb = row_pairs[idx]
                     row_a_vals = _row_from_cache(sample_rows_a, ra, max_col)
                     row_b_vals = _row_from_cache(sample_rows_b, rb, max_col)
+                    row_a_edit_vals = _row_from_cache(rows_a_edit_all, ra, max_col)
+                    row_b_edit_vals = _row_from_cache(rows_b_edit_all, rb, max_col)
+                    comparison = compare_logical_row_2way(
+                        column_comparison_cache,
+                        row_a_vals,
+                        row_b_vals,
+                        row_a_edit_vals,
+                        row_b_edit_vals,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        mine_present=ra is not None,
+                        theirs_present=rb is not None,
+                    )
+                    pair_diff_cols[idx] = set(comparison.diff_cols)
+                    parts_a = []
+                    parts_b = []
                     for ci in range(max_col):
                         va = row_a_vals[ci] if ci < len(row_a_vals) else None
                         vb = row_b_vals[ci] if ci < len(row_b_vals) else None
-                        sa = _val_to_str(va)
-                        sb = _val_to_str(vb)
+                        va_edit = row_a_edit_vals[ci] if ci < len(row_a_edit_vals) else None
+                        vb_edit = row_b_edit_vals[ci] if ci < len(row_b_edit_vals) else None
+                        da, db, _eq = _cell_display_and_equal_from_values(
+                            va,
+                            vb,
+                            va_edit,
+                            vb_edit,
+                        )
+                        sa = _val_to_str(da)
+                        sb = _val_to_str(db)
+                        parts_a.append(sa)
+                        parts_b.append(sb)
                         w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
                         col_idx = ci + 1
                         if w > col_char_widths.get(col_idx, 0):
                             col_char_widths[col_idx] = w
+                    pair_parts_a[idx] = parts_a
+                    pair_parts_b[idx] = parts_b
+                    if ws_base is not None:
+                        pair_base_diff_cols[idx] = set()
+                        base_row = base_row_by_pair.get(idx)
+                        if base_row is None:
+                            pair_parts_base[idx] = []
+                            if ra is not None:
+                                pair_base_diff_cols[idx] = {-1}
+                        else:
+                            row_base_vals = _row_from_cache(
+                                rows_base_val_all, base_row, max_col
+                            )
+                            row_base_edit_vals = _row_from_cache(
+                                rows_base_edit_all, base_row, max_col
+                            )
+                            pair_parts_base[idx] = [
+                                _val_to_str(value) for value in row_base_vals
+                            ]
+                            if ra is not None:
+                                base_comparison = compare_logical_row_sides(
+                                    column_comparison_cache,
+                                    row_a_vals,
+                                    row_base_vals,
+                                    row_a_edit_vals,
+                                    row_base_edit_vals,
+                                    left_side="mine",
+                                    right_side="base",
+                                    left_row=ra,
+                                    right_row=base_row,
+                                )
+                                pair_base_diff_cols[idx] = set(
+                                    base_comparison.diff_cols
+                                )
             else:
                 rows_a_val = rows_a_val_all
                 rows_b_val = rows_b_val_all
@@ -24105,6 +25544,7 @@ class SowMergeApp:
                         _check_bg_cancel()
                     parts_a = []
                     parts_b = []
+                    parts_base = []
                     row_a_val = _row_from_cache(rows_a_val, ra, max_col)
                     row_b_val = _row_from_cache(rows_b_val, rb, max_col)
                     row_a_edit = _row_from_cache(rows_a_edit, ra, max_col)
@@ -24140,17 +25580,13 @@ class SowMergeApp:
                         w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
                         if w > col_char_widths.get(c, 0):
                             col_char_widths[c] = w
-                    pair_parts_a[idx] = parts_a
-                    pair_parts_b[idx] = parts_b
                     pair_diff_cols[idx] = cols
                     if ws_base is not None:
+                        pair_base_diff_cols[idx] = set()
                         base_row = base_row_by_pair.get(idx)
-                        if base_row is None:
-                            pair_parts_base[idx] = []
-                        else:
+                        if base_row is not None:
                             row_base_val = _row_from_cache(rows_base_val, base_row, max_col)
                             parts_base = [_val_to_str(value) for value in row_base_val]
-                            pair_parts_base[idx] = parts_base
                             for c, base_text in enumerate(parts_base, start=1):
                                 width = min(len(base_text), _COL_MAX_DISPLAY_WIDTH)
                                 if width > col_char_widths.get(c, 0):
@@ -24171,6 +25607,17 @@ class SowMergeApp:
                                 right_row=base_row,
                             )
                             pair_base_diff_cols[idx] = set(base_comparison.diff_cols)
+                    store_parts = bool(
+                        max_row < _LARGE_SHEET_ROW_THRESHOLD
+                        or idx < _LARGE_SHEET_INITIAL_ROWS
+                        or cols
+                        or pair_base_diff_cols.get(idx)
+                    )
+                    if store_parts:
+                        pair_parts_a[idx] = parts_a
+                        pair_parts_b[idx] = parts_b
+                        if ws_base is not None:
+                            pair_parts_base[idx] = parts_base
                 has_diff = (
                     bool(column_comparison_cache.structural_diff_cols)
                     or any(bool(v) for v in pair_diff_cols.values())
@@ -24182,6 +25629,37 @@ class SowMergeApp:
             # confirmed three-way structural change even when both new copies
             # have identical content (the A/B comparison alone is then clean).
             has_diff = bool(has_diff or common_sheet_added_vs_base)
+
+            exact_only_diff_rows = None
+            if not large_preview_only:
+                structural_cols = {
+                    int(col)
+                    for col in column_comparison_cache.structural_diff_cols
+                    if int(col) > 0
+                }
+                resolved_common_insertions = {
+                    slot.logical_idx + 1
+                    for slot in column_comparison_cache.model.slots
+                    if (
+                        slot.base_col is None
+                        and slot.mine_col is not None
+                        and slot.theirs_col is not None
+                        and slot.state != "unresolved"
+                        and not slot.confidence.ambiguous
+                    )
+                }
+                exact_only_diff_rows = []
+                for idx in range(len(row_pairs)):
+                    pair_cols = set(pair_diff_cols.get(idx, set()))
+                    visual_cols = pair_cols | set(pair_base_diff_cols.get(idx, set()))
+                    visual_cols.difference_update(structural_cols)
+                    visual_cols.difference_update(
+                        col
+                        for col in resolved_common_insertions
+                        if col not in pair_cols
+                    )
+                    if visual_cols:
+                        exact_only_diff_rows.append(idx)
 
             # Keep a readable lower bound and normalize missing columns.
             for c in range(1, max_col + 1):
@@ -24211,10 +25689,37 @@ class SowMergeApp:
                 "pair_base_row_override": pair_base_row_override,
                 "column_comparison_cache": column_comparison_cache,
                 "has_diff": has_diff,
+                "only_diff_rows": exact_only_diff_rows,
+                "completeness": {
+                    "formula_aware": True,
+                    "row_model_exact": True,
+                    "column_projection_exact": True,
+                    "ab_diff_exact": not large_preview_only,
+                    "base_diff_exact": bool(
+                        not large_preview_only
+                        and (ws_base is None or len(pair_base_diff_cols) >= len(row_pairs))
+                    ),
+                    "only_diff_rows_exact": bool(
+                        not large_preview_only
+                        and (
+                            ws_base is None
+                            or len(pair_base_diff_cols) >= len(row_pairs)
+                        )
+                    ),
+                    "mode": "preview" if large_preview_only else "full",
+                },
             }
 
         def _apply_sheet_cache(cache: dict):
             sheet = cache["sheet"]
+            cache_generation = int(cache.get("generation", 0))
+            current_generation = int(self._sheet_compute_generation.get(sheet, 0))
+            if cache_generation != current_generation:
+                _dlog(
+                    f"drop stale sheet cache sheet={sheet} "
+                    f"cache_generation={cache_generation} current={current_generation}"
+                )
+                return
             view = self.sheet_views.get(sheet)
             if view is None:
                 # Preserve the exact result for lazy tab creation. The previous
@@ -24267,6 +25772,8 @@ class SowMergeApp:
                 return
             # From this point we will apply this cache to the visible view.
             self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+            view._lifecycle_error = None
+            view._lifecycle_canceled = False
             view._invalidate_only_diff_snapshot_cache()
             view.max_row = cache["max_row"]
             view._effective_max_row_a = int(cache.get("max_row_a", view.max_row))
@@ -24300,45 +25807,50 @@ class SowMergeApp:
             view.theirs_to_base_row = cache.get("theirs_to_base_row", {}) or {}
             view.pair_base_row_override = cache.get("pair_base_row_override", {}) or {}
 
+            is_visible_sheet = getattr(self, "selected_sheet", None) == sheet
             pair_parts_a = cache.get("pair_parts_a", {}) or {}
             pair_parts_b = cache.get("pair_parts_b", {}) or {}
             pair_parts_base = cache.get("pair_parts_base", {}) or {}
-            view._projected_widths_from_cached_parts(
+            view._stage_cached_pair_parts(
                 pair_parts_a,
                 pair_parts_b,
                 pair_parts_base,
                 cache.get("col_char_widths", {}),
             )
-            if pair_parts_a or pair_parts_b:
-                view.pair_text_a = {}
-                view.pair_text_b = {}
-                for idx, parts in pair_parts_a.items():
-                    view.pair_text_a[idx] = view._render_line_from_raw_parts(list(parts), "A")
-                for idx, parts in pair_parts_b.items():
-                    view.pair_text_b[idx] = view._render_line_from_raw_parts(list(parts), "B")
-            else:
+            if is_visible_sheet:
+                view._materialize_staged_pair_parts()
+            elif not pair_parts_a and not pair_parts_b:
                 # Backward-compatible fallback for older cache shape.
                 view.pair_text_a = cache.get("pair_text_a", {})
                 view.pair_text_b = cache.get("pair_text_b", {})
-            view.pair_text_base = {}
-            for idx, parts in pair_parts_base.items():
-                base_parts = list(parts)
-                view.pair_text_base[int(idx)] = (
-                    view._render_line_from_raw_parts(base_parts, "BASE") if base_parts else ""
-                )
 
             view.row_a_to_pair_idx = cache["row_a_to_pair_idx"]
             view.row_b_to_pair_idx = cache["row_b_to_pair_idx"]
             view._align_rows_enabled = True
-            view._diff_partial = False
-            view._pair_diff_full_exact = True
+            completeness = cache.get("completeness", {}) or {}
+            view._cache_formula_aware = bool(completeness.get("formula_aware", False))
+            view._row_model_exact = bool(completeness.get("row_model_exact", False))
+            view._pair_diff_full_exact = bool(completeness.get("ab_diff_exact", False))
+            view._base_diff_full_exact = bool(completeness.get("base_diff_exact", False))
+            view._only_diff_rows_exact = bool(
+                completeness.get("only_diff_rows_exact", False)
+            )
+            view._diff_partial = not view._pair_diff_full_exact
             # Mark data as ready so refresh(rescan=False) uses it without rescanning
             view._data_ready = True
             view._invalidate_render_cache()
-            if not view._is_three_way_enabled() and not view._is_large_sheet:
-                view._cache_only_diff_rows_snapshot(
-                    idx for idx in view.pair_diff_cols if view._pair_has_visual_diff(idx)
-                )
+            if view._only_diff_rows_exact:
+                exact_rows = cache.get("only_diff_rows")
+                if exact_rows is None:
+                    exact_rows = [
+                        idx
+                        for idx in range(len(view.row_pairs))
+                        if view._pair_has_visual_diff(idx)
+                    ]
+                else:
+                    exact_rows = list(exact_rows)
+                view._cache_only_diff_rows_snapshot(exact_rows, exact=True)
+                view._install_exact_diff_map_cache(exact_rows)
 
             requested_only_diff = (
                 int(view._pending_only_diff_value)
@@ -24348,20 +25860,47 @@ class SowMergeApp:
             needs_exact_only_diff = bool(
                 requested_only_diff and not view._has_valid_only_diff_snapshot_cache()
             )
+            needs_exact_comparison = bool(
+                not view._pair_diff_full_exact
+                or (
+                    view._is_three_way_enabled()
+                    and getattr(self, "has_base", False)
+                    and not view._base_diff_full_exact
+                )
+            )
+            needs_exact_build = bool(
+                needs_exact_only_diff or needs_exact_comparison
+            )
             view._pending_only_diff_value = None
             view._prefer_only_diff_when_ready = False
-            # Render a useful full first page while an exact 3-way snapshot is
-            # built in the background. Temporarily changing the variable avoids
-            # synchronous base-diff expansion inside refresh().
-            render_only_diff_value = requested_only_diff
+            # Keep the requested checkbox value visible. Until exact rows are
+            # available, refresh renders one stable full preview behind the
+            # locked "计算中" state.
+            view._only_diff_preview_full = bool(needs_exact_only_diff)
+            if view._is_large_sheet and not view._full_render:
+                view._render_limit = min(
+                    max(1, int(view._render_limit or _LARGE_SHEET_INITIAL_ROWS)),
+                    _LARGE_SHEET_INITIAL_ROWS,
+                )
             if needs_exact_only_diff:
-                render_only_diff_value = 0
                 view._full_render = False
                 view._render_limit = min(
                     _LARGE_SHEET_INITIAL_ROWS if view._is_large_sheet else _FAST_RENDER_ROW_LIMIT,
                     view.max_row,
                 )
-            view.only_diff_var.set(render_only_diff_value)
+            view.only_diff_var.set(requested_only_diff)
+            if not is_visible_sheet:
+                view._pending_exact_render = True
+                view._hide_loading()
+                view._refresh_interaction_gate()
+                _dlog(
+                    f"SHEET_CACHE applied without render sheet={sheet} "
+                    f"exact_only_diff={view._only_diff_rows_exact}"
+                )
+                self.refresh_sheet_nav()
+                self._initial_sheet_ready_event.set()
+                return
+            self._reserve_ui_transition_window(350)
             # Preserve viewport/cursor when background cache is applied; otherwise
             # user operations (overwrite/resolve) appear to "jump to first row/first column".
             prev_first = 0.0
@@ -24410,14 +25949,39 @@ class SowMergeApp:
                 pass
             view._update_cursor_lines()
             view._hide_loading()
-            if needs_exact_only_diff:
-                view.only_diff_var.set(requested_only_diff)
+            if needs_exact_build:
                 view._start_async_large_only_diff_build()
+            view._refresh_interaction_gate()
             self.refresh_sheet_nav()
             # The first useful Sheet is now visible.  Let editable-workbook
             # preload begin while unopened-tab scans yield via
             # _edit_preload_active_event.
             self._initial_sheet_ready_event.set()
+
+        def _mark_sheet_compute_failed(
+            sheet: str,
+            error_text: str,
+            generation: int,
+        ):
+            if int(generation) != int(self._sheet_compute_generation.get(sheet, 0)):
+                _dlog(
+                    f"drop stale sheet failure sheet={sheet} "
+                    f"generation={generation}"
+                )
+                return
+            view = self.sheet_views.get(sheet)
+            if view is None:
+                return
+            view._lifecycle_error = str(error_text or "后台计算失败")
+            view._only_diff_preview_full = False
+            view._only_diff_async_building = False
+            try:
+                view.info.configure(text=f"计算失败：{view._lifecycle_error}")
+            except Exception:
+                pass
+            view._hide_loading()
+            view._refresh_interaction_gate()
+            self.refresh_sheet_nav()
 
         def _compute_worker():
             wb_a_ro = None
@@ -24439,6 +26003,19 @@ class SowMergeApp:
                         wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
                 except Exception as e:
                     _dlog(f"bg compute open read-only failed: {e}")
+                    with self._compute_lock:
+                        failed_jobs = [
+                            (name, int(self._sheet_compute_generation.get(name, 0)))
+                            for name in dict.fromkeys(
+                                list(self._compute_queue) + list(self._compute_inflight)
+                            )
+                        ]
+                    for failed_sheet, failed_generation in failed_jobs:
+                        _queue_ui_task(
+                            lambda s=failed_sheet, err=str(e), gen=failed_generation: (
+                                _mark_sheet_compute_failed(s, err, gen)
+                            )
+                        )
                     return
                 if wb_a_ro is None or wb_b_ro is None or wb_a_e is None or wb_b_e is None:
                     _dlog("bg compute read-only workbooks not available; skip background compute")
@@ -24451,6 +26028,13 @@ class SowMergeApp:
                         if not self._compute_queue:
                             break
                         sheet = self._compute_queue.pop(0)
+                        need_exact_only_diff = (
+                            sheet in self._compute_exact_only_diff_requested
+                        )
+                        self._compute_exact_only_diff_requested.discard(sheet)
+                        compute_generation = int(
+                            self._sheet_compute_generation.get(sheet, 0)
+                        )
                         self._compute_inflight.add(sheet)
                         progress_current = min(self._compute_done + 1, self._compute_total)
                         progress_total = self._compute_total
@@ -24472,7 +26056,9 @@ class SowMergeApp:
                             sheet,
                             wb_base_ro,
                             wb_base_e,
+                            need_exact_only_diff=need_exact_only_diff,
                         )
+                        cache["generation"] = compute_generation
                         if self._is_closing:
                             break
                         # Never call tkinter APIs from background threads.
@@ -24481,6 +26067,11 @@ class SowMergeApp:
                         break
                     except Exception as e:
                         _dlog(f"bg compute failed {sheet}: {e}")
+                        _queue_ui_task(
+                            lambda s=sheet, err=str(e), gen=compute_generation: (
+                                _mark_sheet_compute_failed(s, err, gen)
+                            )
+                        )
                     finally:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
@@ -24531,7 +26122,25 @@ class SowMergeApp:
             try:
                 tab_id = self.nb.select()
                 tab_text = self.nb.tab(tab_id, "text")
+                progress_owner = getattr(self, "_only_diff_progress_owner", None)
+                if progress_owner is not None:
+                    owner_view, owner_seq = progress_owner
+                    if tab_text != getattr(owner_view, "sheet", None):
+                        if not self._sheet_switch_guard:
+                            self._sheet_switch_guard = True
+                            try:
+                                owner_container = self._sheet_containers.get(owner_view.sheet)
+                                if owner_container is not None:
+                                    self.nb.select(owner_container)
+                            finally:
+                                self._sheet_switch_guard = False
+                        _dlog(
+                            f"ONLY_DIFF_TAB_REJECT requested={tab_text} "
+                            f"owner={owner_view.sheet} seq={owner_seq}"
+                        )
+                        return
                 self.selected_sheet = tab_text
+                self._cancel_priority_exact_for_hidden(tab_text)
                 self.refresh_sheet_nav()
                 if tab_text in self._sheet_containers and not self._sheet_loaded.get(tab_text, False):
                     _dlog(f"lazy create SheetView (ui only): {tab_text}")
@@ -24546,6 +26155,36 @@ class SowMergeApp:
                         # The background worker will compute diffs and call
                         # _apply_sheet_cache without blocking the UI thread.
                         view._show_loading()
+                active_view = self.sheet_views.get(tab_text)
+                if active_view is not None:
+                    active_view._materialize_staged_pair_parts()
+                    if (
+                        bool(getattr(active_view, "_pending_exact_render", False))
+                        and (
+                            not bool(active_view.only_diff_var.get())
+                            or active_view._has_valid_only_diff_snapshot_cache()
+                        )
+                    ):
+                        active_view._pending_exact_render = False
+                        active_view._refresh_mode_switch_preserving_selection(rescan=False)
+                    if (
+                        bool(getattr(active_view, "_data_ready", False))
+                        and (
+                            not bool(getattr(active_view, "_pair_diff_full_exact", False))
+                            or (
+                                active_view._is_three_way_enabled()
+                                and getattr(self, "has_base", False)
+                                and not bool(getattr(active_view, "_base_diff_full_exact", False))
+                            )
+                            or (
+                                bool(active_view.only_diff_var.get())
+                                and not active_view._has_valid_only_diff_snapshot_cache()
+                            )
+                        )
+                        and not bool(getattr(active_view, "_only_diff_async_building", False))
+                    ):
+                        active_view._start_async_large_only_diff_build()
+                    active_view._refresh_interaction_gate()
                 if tab_text in self._sheet_containers:
                     # Skip background recompute if data is already ready (no edits pending).
                     # Reopening workbooks on every tab switch is the main perf regression.
@@ -24583,7 +26222,9 @@ class SowMergeApp:
                                 if not still_background and not pending_ui_result:
                                     _enqueue_sheet(sheet_name, front=True)
                                     _kick_worker()
-                                v._show_loading(f"正在后台精确计算 {sheet_name}，界面仍可操作...")
+                                v._show_loading(
+                                    f"正在后台精确计算 {sheet_name}；当前可查看，修改操作将在 READY 后启用..."
+                                )
                                 self._safe_root_after(1500, _force_refresh_if_still_loading)
                             except Exception as e:
                                 _dlog(f"background refresh watchdog failed {sheet_name}: {e}")
@@ -24840,6 +26481,17 @@ class SowMergeApp:
         txt.configure(state="disabled")
 
     def _select_tab(self, tab_text: str):
+        progress_owner = getattr(self, "_only_diff_progress_owner", None)
+        if progress_owner is not None and tab_text != getattr(
+            progress_owner[0],
+            "sheet",
+            None,
+        ):
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+            return
         for tab_id in self.nb.tabs():
             if self.nb.tab(tab_id, "text") == tab_text:
                 self.nb.select(tab_id)
@@ -24856,6 +26508,13 @@ class SowMergeApp:
                 tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in self.display_sheets),
                 tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in self.display_sheets),
                 getattr(self, "selected_sheet", None),
+                getattr(
+                    getattr(self, "_only_diff_progress_owner", (None,))[0]
+                    if getattr(self, "_only_diff_progress_owner", None)
+                    else None,
+                    "sheet",
+                    None,
+                ),
             )
         except Exception:
             nav_sig = None
@@ -24896,6 +26555,13 @@ class SowMergeApp:
                           bd=2 if is_selected else 1,
                           padx=8, pady=2, bg=bg,
                           command=lambda: self._select_tab(tab_text))
+            progress_owner = getattr(self, "_only_diff_progress_owner", None)
+            if progress_owner is not None and tab_text != getattr(
+                progress_owner[0],
+                "sheet",
+                None,
+            ):
+                b.configure(state="disabled")
             try:
                 if is_selected and self._nav_font_bold:
                     b.configure(font=self._nav_font_bold)
@@ -25424,6 +27090,8 @@ class SowMergeApp:
 
     def recalc_and_refresh(self):
         # Manual: force Excel recalc to refresh cached values, then reload view.
+        if not self._guard_active_sheet_mutation("重算并刷新"):
+            return
         if self.modified_a or self.modified_b:
             messagebox.showwarning(
                 "存在未保存操作",
@@ -25520,6 +27188,7 @@ class SowMergeApp:
         elapsed_label.pack(anchor="e")
         pb.start(12)
         self.root.update_idletasks()
+        self._begin_interactive_action()
 
         if not run_in_background:
             try:
@@ -25530,6 +27199,7 @@ class SowMergeApp:
                     dlg.destroy()
                 except Exception:
                     pass
+                self._end_interactive_action()
 
         updates_lock = threading.Lock()
         updates: list[tuple[str | None, str | None, float | None]] = []
@@ -25571,6 +27241,7 @@ class SowMergeApp:
                 dlg.destroy()
             except Exception:
                 pass
+            self._end_interactive_action()
             raise RuntimeError("任务未能启动：应用正在关闭")
 
         def _poll():
@@ -25612,6 +27283,7 @@ class SowMergeApp:
             if gc_was_enabled:
                 gc.enable()
                 gc.collect()
+            self._end_interactive_action()
         if "error" in state:
             _dlog(f"progress task failed: {state.get('traceback', state['error'])}")
             raise state["error"]
@@ -25818,24 +27490,31 @@ class SowMergeApp:
 
     def _refresh_current_view_after_val_reload(self):
         try:
-            tab_id = self.nb.select()
-            tab_text = self.nb.tab(tab_id, "text")
-            view = self.sheet_views.get(tab_text)
-            if view:
-                view.refresh(row_only=None, rescan=True)
-                view._update_cursor_lines()
-        except Exception:
-            pass
-        try:
             self._refresh_sheet_catalog()
             self._sheet_diff_confirmed.clear()
             for s in self.compare_sheets:
                 self.sheet_diff_state[s] = 0
             with self._compute_lock:
-                self._compute_queue = [s for s in self.compare_sheets if s not in self._compute_inflight]
+                for sheet in self.compare_sheets:
+                    self._sheet_compute_generation[sheet] = (
+                        int(self._sheet_compute_generation.get(sheet, 0)) + 1
+                    )
+                self._compute_queue = list(self.compare_sheets)
                 self._compute_total = max(1, len(self.compare_sheets))
                 self._compute_done = 0
                 self._sheet_cache_store.clear()
+            for sheet, view in list(getattr(self, "sheet_views", {}).items()):
+                if view is None:
+                    continue
+                view._data_ready = False
+                view._row_model_exact = False
+                view._pair_diff_full_exact = False
+                view._base_diff_full_exact = False
+                view._only_diff_rows_exact = False
+                view._invalidate_only_diff_snapshot_cache()
+                view._refresh_interaction_gate()
+                if sheet == getattr(self, "selected_sheet", None):
+                    view._show_loading("正在后台应用重算结果...")
             self._kick_worker()
         except Exception:
             pass
@@ -25918,6 +27597,9 @@ class SowMergeApp:
             warning = f"{warning}\n\n{cache_warning}" if warning else cache_warning
             _dlog(f"post save formula cache patch failed: which={which} path={path} err={e}")
 
+        if which in ("A", "B"):
+            self._commit_saved_side_baseline(which)
+
         try:
             if which == "A":
                 self._apply_recalc_results(new_a=path)
@@ -25991,6 +27673,8 @@ class SowMergeApp:
                 pass
 
     def save_b_inplace(self):
+        if not self._guard_save_readiness("保存 B", "B"):
+            return
         self._ensure_edit_loaded()
         try:
             self._ensure_live_column_mappings_current("保存B")
@@ -26043,6 +27727,8 @@ class SowMergeApp:
             messagebox.showerror("保存失败", f"保存 B 失败：\n{e}")
 
     def save_a_inplace(self):
+        if not self._guard_save_readiness("保存 A", "A"):
+            return
         self._ensure_edit_loaded()
         try:
             self._ensure_live_column_mappings_current("保存A")
@@ -26096,6 +27782,8 @@ class SowMergeApp:
 
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:
+            return
+        if not self._guard_save_readiness("保存 Merged", "A"):
             return
         try:
             self._ensure_live_column_mappings_current("保存Merged")
