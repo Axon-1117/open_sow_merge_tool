@@ -4,6 +4,7 @@ import argparse
 import re
 import bisect
 import difflib
+import hashlib
 import tempfile
 import subprocess
 import traceback
@@ -11,6 +12,8 @@ import atexit
 import copy
 import gc
 import math
+from itertools import zip_longest
+from functools import lru_cache
 from datetime import date, datetime, time as datetime_time, timedelta
 import time
 import stat
@@ -19,7 +22,7 @@ import zipfile
 import posixpath
 import platform
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -28,15 +31,17 @@ import threading
 
 from openpyxl import load_workbook as _openpyxl_load_workbook, Workbook
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+from openpyxl.formula import Tokenizer
 from openpyxl.formula.translate import Translator
+from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-22.update54"
-APP_BUILD_TAG = "new131-onlydiff-block-navigation-fix"
+APP_VERSION = "2026-07-23.update56"
+APP_BUILD_TAG = "new133-region-mode-guided-apply"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -70,6 +75,8 @@ _FAST_RENDER_BATCH = 500
 _LARGE_SHEET_ROW_THRESHOLD = 2000
 _LARGE_SHEET_INITIAL_ROWS = 200
 _LARGE_SHEET_BLOCK_ROWS = 1000
+_LARGE_DIFF_NAV_PREVIEW_ROWS = 12
+_CELL_UNDO_INCREMENTAL_ROW_LIMIT = 24
 _ROW_ALIGN_MAX_ROWS = 2000
 _ROW_ALIGN_SOFT_MAX_ROWS = 50000
 _TABMARK_QUICK_TAIL_ROWS = 2000
@@ -282,6 +289,2020 @@ def _row_signature(row_values) -> str:
     )
 
 
+def _row_alignment_cell_token(value, edit_value=None) -> str:
+    """Stable row-identity token that does not depend on formula caches.
+
+    ``data_only`` workbooks legitimately expose ``None`` for formulas whose
+    cached result was discarded by an external editor (notably openpyxl after
+    inserting/deleting columns).  Treating that ``None`` as the row identity
+    makes every formula-bearing row appear inserted/deleted.  Formula text is
+    the durable identity; cached values remain part of the later cell-diff
+    classification, not row alignment.
+    """
+    literal_formula_text = (
+        isinstance(edit_value, str)
+        and edit_value.startswith("=")
+        and value == edit_value
+    )
+    if not literal_formula_text:
+        special = _special_formula_signature(edit_value)
+        if special is not None:
+            return "FORMULA:SPECIAL:" + repr(special)
+        formula = _norm_formula_text(edit_value)
+        if formula:
+            return "FORMULA:TEXT:" + formula
+    effective = value
+    if effective is None and edit_value is not None:
+        effective = edit_value
+    return _merge_cmp_value(effective)
+
+
+def _row_alignment_signature(row_values, row_edit_values, width: int, offsets=None) -> str:
+    values = _pad_row_values(row_values, width)
+    edits = _pad_row_values(row_edit_values, width) if row_edit_values is not None else (None,) * width
+    selected = offsets if offsets is not None else range(width)
+    # repr(tuple(...)) is an unambiguous length-framed serialization for Python
+    # strings.  A delimiter replacement would collapse native control
+    # characters (for example U+001E versus U+001F) into the same signature.
+    return repr(tuple(
+        _row_alignment_cell_token(values[offset], edits[offset])
+        for offset in selected
+    ))
+
+
+def _shared_physical_row_horizon(
+    ws_left,
+    ws_right,
+    effective_left: int,
+    effective_right: int,
+    ws_left_edit=None,
+    ws_right_edit=None,
+) -> tuple[int, int]:
+    """Retain a common styled row domain across pure column edits.
+
+    Column fixture/edit tools often populate a newly inserted column through
+    the worksheet's styled ``max_row``.  The opposite side still owns those
+    row coordinates even though every value cell is blank.  If both workbooks
+    expose the exact same physical row horizon, aligning only their different
+    *effective* value bounds incorrectly reports the blank coordinates as
+    inserted rows.  Unequal physical horizons remain conservative and keep the
+    effective bounds so genuine row inserts are not hidden.
+    """
+    try:
+        physical_left = max(
+            int(ws_left.max_row or 1),
+            int(ws_left_edit.max_row or 1) if ws_left_edit is not None else 1,
+        )
+        physical_right = max(
+            int(ws_right.max_row or 1),
+            int(ws_right_edit.max_row or 1) if ws_right_edit is not None else 1,
+        )
+    except Exception:
+        return max(1, int(effective_left or 1)), max(1, int(effective_right or 1))
+    if physical_left == physical_right:
+        return physical_left, physical_right
+    return max(1, int(effective_left or 1)), max(1, int(effective_right or 1))
+
+
+def _row_signatures_from_unique_column_anchors(
+    left_rows,
+    right_rows,
+    left_width: int,
+    right_width: int,
+    left_edit_rows=None,
+    right_edit_rows=None,
+) -> tuple[list[str], list[str]]:
+    """Build row identities resilient to inserted/deleted physical columns.
+
+    Unique non-empty first-row values are conservative column anchors.  When
+    available, row alignment compares only those shared anchors in right-side
+    order, so a preceding structural column change cannot shift row identity.
+    The legacy full-row signature remains the fallback for headerless or fully
+    ambiguous sheets.
+    """
+    left_rows = list(left_rows or ())
+    right_rows = list(right_rows or ())
+    left_edit_rows = list(left_edit_rows or ())
+    right_edit_rows = list(right_edit_rows or ())
+    left_width = max(0, int(left_width or 0))
+    right_width = max(0, int(right_width or 0))
+    if not left_rows or not right_rows or left_width <= 0 or right_width <= 0:
+        return (
+            [
+                _row_alignment_signature(
+                    row,
+                    left_edit_rows[idx] if idx < len(left_edit_rows) else None,
+                    left_width,
+                )
+                for idx, row in enumerate(left_rows)
+            ],
+            [
+                _row_alignment_signature(
+                    row,
+                    right_edit_rows[idx] if idx < len(right_edit_rows) else None,
+                    right_width,
+                )
+                for idx, row in enumerate(right_rows)
+            ],
+        )
+
+    left_header = _pad_row_values(left_rows[0], left_width)
+    right_header = _pad_row_values(right_rows[0], right_width)
+    left_edit_header = _pad_row_values(left_edit_rows[0], left_width) if left_edit_rows else (None,) * left_width
+    right_edit_header = _pad_row_values(right_edit_rows[0], right_width) if right_edit_rows else (None,) * right_width
+
+    def _unique_positions(row_values, row_edit_values):
+        positions = {}
+        duplicates = set()
+        for offset, value in enumerate(row_values):
+            token = _row_alignment_cell_token(value, row_edit_values[offset])
+            if token == "BLANK:":
+                continue
+            if token in positions:
+                duplicates.add(token)
+            else:
+                positions[token] = offset
+        for token in duplicates:
+            positions.pop(token, None)
+        return positions
+
+    left_positions = _unique_positions(left_header, left_edit_header)
+    right_positions = _unique_positions(right_header, right_edit_header)
+    anchors = sorted(
+        (
+            (left_positions[token], right_offset)
+            for token, right_offset in right_positions.items()
+            if token in left_positions
+        ),
+        key=lambda item: item[1],
+    )
+    if not anchors:
+        return (
+            [
+                _row_alignment_signature(
+                    row,
+                    left_edit_rows[idx] if idx < len(left_edit_rows) else None,
+                    left_width,
+                )
+                for idx, row in enumerate(left_rows)
+            ],
+            [
+                _row_alignment_signature(
+                    row,
+                    right_edit_rows[idx] if idx < len(right_edit_rows) else None,
+                    right_width,
+                )
+                for idx, row in enumerate(right_rows)
+            ],
+        )
+
+    def _project(rows, edit_rows, width: int, offsets):
+        signatures = []
+        for idx, row in enumerate(rows):
+            signatures.append(_row_alignment_signature(
+                row,
+                edit_rows[idx] if idx < len(edit_rows) else None,
+                width,
+                offsets,
+            ))
+        return signatures
+
+    return (
+        _project(left_rows, left_edit_rows, left_width, [left for left, _right in anchors]),
+        _project(right_rows, right_edit_rows, right_width, [right for _left, right in anchors]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnModelCacheKey:
+    """Version identity for a cached logical-column model."""
+
+    sheet_name: str
+    row_model_version: int
+    column_model_version: int
+    mine_edit_version: int = 0
+    base_edit_version: int = 0
+    theirs_edit_version: int = 0
+
+    def __post_init__(self):
+        if not isinstance(self.sheet_name, str):
+            raise TypeError("sheet_name must be an immutable string")
+        for field_name in (
+            "row_model_version",
+            "column_model_version",
+            "mine_edit_version",
+            "base_edit_version",
+            "theirs_edit_version",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+
+
+COLUMN_MAPPING_CAUSE_BLANK_COLUMN = "blank-column"
+COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE = "duplicate-intrinsic-signature"
+COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH = "formula-identity-mismatch"
+COLUMN_MAPPING_CAUSE_INCOMPATIBLE_CACHE = "incompatible-signature-cache"
+COLUMN_MAPPING_CAUSE_IMPLICIT_BOUNDARY = "implicit-column-boundary"
+COLUMN_MAPPING_CAUSE_COLUMN_LIMIT = "column-limit-exceeded"
+COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE = "low-confidence"
+_COLUMN_MAPPING_CAUSE_CODES = frozenset((
+    COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+    COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+    COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH,
+    COLUMN_MAPPING_CAUSE_INCOMPATIBLE_CACHE,
+    COLUMN_MAPPING_CAUSE_IMPLICIT_BOUNDARY,
+    COLUMN_MAPPING_CAUSE_COLUMN_LIMIT,
+    COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,
+))
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnMappingConfidence:
+    """Conservative confidence with stable leaf causes for UI diagnostics."""
+
+    score: float = 1.0
+    ambiguous: bool = False
+    reason: str = ""
+    evidence: tuple[str, ...] = ()
+    cause_codes: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if isinstance(self.score, bool) or not isinstance(self.score, (int, float)):
+            raise TypeError("column confidence score must be numeric")
+        if not isinstance(self.ambiguous, bool):
+            raise TypeError("column confidence ambiguous flag must be bool")
+        if not isinstance(self.reason, str):
+            raise TypeError("column confidence reason must be a string")
+        cause_codes = tuple(self.cause_codes)
+        if any(not isinstance(code, str) for code in cause_codes):
+            raise TypeError("column confidence cause codes must be strings")
+        unknown_codes = set(cause_codes) - _COLUMN_MAPPING_CAUSE_CODES
+        if unknown_codes:
+            raise ValueError(
+                "unknown column confidence cause code: "
+                + ", ".join(sorted(unknown_codes))
+            )
+        score = float(self.score)
+        if not 0.0 <= score <= 1.0:
+            raise ValueError("column confidence score must be between 0 and 1")
+        object.__setattr__(self, "score", score)
+        object.__setattr__(self, "evidence", tuple(str(item) for item in self.evidence))
+        object.__setattr__(self, "cause_codes", tuple(dict.fromkeys(cause_codes)))
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnSlot:
+    """One immutable logical column with optional physical columns per side.
+
+    ``base_boundary`` is the number of Base columns preceding a 3-way
+    insertion; ``origin_side`` identifies whether Mine, Theirs, or both sides
+    own the inserted logical column.
+    """
+
+    logical_idx: int
+    mine_col: int | None = None
+    base_col: int | None = None
+    theirs_col: int | None = None
+    state: str = "retained"
+    confidence: ColumnMappingConfidence = ColumnMappingConfidence()
+    base_boundary: int | None = None
+    origin_side: str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.logical_idx, bool) or not isinstance(self.logical_idx, int):
+            raise TypeError("logical_idx must be an integer")
+        if self.logical_idx < 0:
+            raise ValueError("logical_idx must be non-negative")
+        if self.mine_col is None and self.base_col is None and self.theirs_col is None:
+            raise ValueError("a column slot must own at least one physical column")
+        for field_name in ("mine_col", "base_col", "theirs_col"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{field_name} must be a positive Excel column")
+        if not isinstance(self.state, str):
+            raise TypeError("column slot state must be a string")
+        if not isinstance(self.confidence, ColumnMappingConfidence):
+            raise TypeError("column slot confidence must be ColumnMappingConfidence")
+        if self.base_boundary is not None:
+            if (
+                isinstance(self.base_boundary, bool)
+                or not isinstance(self.base_boundary, int)
+                or self.base_boundary < 0
+            ):
+                raise TypeError("base_boundary must be a non-negative integer")
+            if self.base_col is not None:
+                raise ValueError("a Base-relative insertion cannot own a Base column")
+        if self.origin_side not in (None, "mine", "theirs", "both"):
+            raise ValueError(
+                "origin_side must be 'mine', 'theirs', 'both', or None"
+            )
+        if (self.base_boundary is None) != (self.origin_side is None):
+            raise ValueError(
+                "base_boundary and origin_side must be set together for insertions"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnBlock:
+    """Immutable consecutive logical-column range and its structural state."""
+
+    ordinal: int
+    slot_indices: tuple[int, ...]
+    state: str
+    confidence: ColumnMappingConfidence = ColumnMappingConfidence()
+
+    def __post_init__(self):
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int):
+            raise TypeError("column block ordinal must be an integer")
+        indices = tuple(self.slot_indices)
+        if any(isinstance(idx, bool) or not isinstance(idx, int) for idx in indices):
+            raise TypeError("column block slot indices must be integers")
+        if self.ordinal < 0 or not indices:
+            raise ValueError("column block requires a non-negative ordinal and slots")
+        if any(idx < 0 for idx in indices):
+            raise ValueError("column block slot indices must be non-negative")
+        if any(right != left + 1 for left, right in zip(indices, indices[1:])):
+            raise ValueError("column block slot indices must be consecutive")
+        if not isinstance(self.state, str):
+            raise TypeError("column block state must be a string")
+        if not isinstance(self.confidence, ColumnMappingConfidence):
+            raise TypeError("column block confidence must be ColumnMappingConfidence")
+        object.__setattr__(self, "slot_indices", indices)
+
+    @property
+    def start_slot_idx(self) -> int:
+        return self.slot_indices[0]
+
+    @property
+    def end_slot_idx(self) -> int:
+        return self.slot_indices[-1]
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenIntLookup:
+    """Small immutable integer lookup used by cached column models."""
+
+    entries: tuple[tuple[int, int], ...] = ()
+    _keys: tuple[int, ...] = field(init=False, repr=False, compare=False, default=())
+
+    def __post_init__(self):
+        normalized_items = []
+        for key, value in self.entries:
+            if (
+                isinstance(key, bool) or not isinstance(key, int)
+                or isinstance(value, bool) or not isinstance(value, int)
+            ):
+                raise TypeError("immutable column lookup keys and values must be integers")
+            normalized_items.append((key, value))
+        normalized = tuple(sorted(normalized_items))
+        keys = tuple(key for key, _value in normalized)
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate key in immutable column lookup")
+        object.__setattr__(self, "entries", normalized)
+        object.__setattr__(self, "_keys", keys)
+
+    def get(self, key: int, default=None):
+        key = int(key)
+        idx = bisect.bisect_left(self._keys, key)
+        if idx < len(self.entries) and self.entries[idx][0] == key:
+            return self.entries[idx][1]
+        return default
+
+    def __getitem__(self, key: int) -> int:
+        marker = object()
+        value = self.get(key, marker)
+        if value is marker:
+            raise KeyError(key)
+        return value
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnModel:
+    """Immutable logical slots plus both physical/logical lookup directions."""
+
+    cache_key: ColumnModelCacheKey
+    slots: tuple[ColumnSlot, ...]
+    blocks: tuple[ColumnBlock, ...]
+    mine_physical_to_logical: FrozenIntLookup
+    base_physical_to_logical: FrozenIntLookup
+    theirs_physical_to_logical: FrozenIntLookup
+    mine_logical_to_physical: FrozenIntLookup
+    base_logical_to_physical: FrozenIntLookup
+    theirs_logical_to_physical: FrozenIntLookup
+    confidence: ColumnMappingConfidence = ColumnMappingConfidence()
+
+    def __post_init__(self):
+        if not isinstance(self.cache_key, ColumnModelCacheKey):
+            raise TypeError("column model cache_key must be ColumnModelCacheKey")
+        for field_name in (
+            "mine_physical_to_logical",
+            "base_physical_to_logical",
+            "theirs_physical_to_logical",
+            "mine_logical_to_physical",
+            "base_logical_to_physical",
+            "theirs_logical_to_physical",
+        ):
+            if not isinstance(getattr(self, field_name), FrozenIntLookup):
+                raise TypeError(f"{field_name} must be FrozenIntLookup")
+        if not isinstance(self.confidence, ColumnMappingConfidence):
+            raise TypeError("column model confidence must be ColumnMappingConfidence")
+        slots = tuple(self.slots)
+        blocks = tuple(self.blocks)
+        if any(not isinstance(slot, ColumnSlot) for slot in slots):
+            raise TypeError("column model slots must be immutable ColumnSlot records")
+        if any(not isinstance(block, ColumnBlock) for block in blocks):
+            raise TypeError("column model blocks must be immutable ColumnBlock records")
+        logical_indices = {slot.logical_idx for slot in slots}
+        if len(logical_indices) != len(slots):
+            raise ValueError("logical column indices must be unique")
+        for block in blocks:
+            if any(idx not in logical_indices for idx in block.slot_indices):
+                raise ValueError("column block refers to a missing logical slot")
+        object.__setattr__(self, "slots", slots)
+        object.__setattr__(self, "blocks", blocks)
+
+    @classmethod
+    def from_slots(
+        cls,
+        cache_key: ColumnModelCacheKey,
+        slots,
+        *,
+        blocks=(),
+        confidence: ColumnMappingConfidence | None = None,
+    ):
+        input_slots = tuple(slots)
+        input_blocks = tuple(blocks)
+        if any(not isinstance(slot, ColumnSlot) for slot in input_slots):
+            raise TypeError("from_slots requires immutable ColumnSlot records")
+        if any(not isinstance(block, ColumnBlock) for block in input_blocks):
+            raise TypeError("from_slots requires immutable ColumnBlock records")
+        ordered_slots = tuple(sorted(input_slots, key=lambda slot: slot.logical_idx))
+        logical_indices = tuple(slot.logical_idx for slot in ordered_slots)
+        if len(logical_indices) != len(set(logical_indices)):
+            raise ValueError("logical column indices must be unique")
+        ordered_blocks = input_blocks
+
+        def _maps(field_name: str):
+            physical_to_logical = []
+            logical_to_physical = []
+            for slot in ordered_slots:
+                physical = getattr(slot, field_name)
+                if physical is None:
+                    continue
+                physical_to_logical.append((physical, slot.logical_idx))
+                logical_to_physical.append((slot.logical_idx, physical))
+            return FrozenIntLookup(tuple(physical_to_logical)), FrozenIntLookup(tuple(logical_to_physical))
+
+        mine_p2l, mine_l2p = _maps("mine_col")
+        base_p2l, base_l2p = _maps("base_col")
+        theirs_p2l, theirs_l2p = _maps("theirs_col")
+        return cls(
+            cache_key=cache_key,
+            slots=ordered_slots,
+            blocks=ordered_blocks,
+            mine_physical_to_logical=mine_p2l,
+            base_physical_to_logical=base_p2l,
+            theirs_physical_to_logical=theirs_p2l,
+            mine_logical_to_physical=mine_l2p,
+            base_logical_to_physical=base_l2p,
+            theirs_logical_to_physical=theirs_l2p,
+            confidence=confidence or ColumnMappingConfidence(),
+        )
+
+    def logical_for_physical(self, side: str, physical_col: int) -> int | None:
+        side = str(side or "").upper()
+        lookup = {
+            "A": self.mine_physical_to_logical,
+            "MINE": self.mine_physical_to_logical,
+            "BASE": self.base_physical_to_logical,
+            "B": self.theirs_physical_to_logical,
+            "THEIRS": self.theirs_physical_to_logical,
+        }.get(side)
+        return lookup.get(physical_col) if lookup is not None else None
+
+    def physical_for_logical(self, side: str, logical_idx: int) -> int | None:
+        side = str(side or "").upper()
+        lookup = {
+            "A": self.mine_logical_to_physical,
+            "MINE": self.mine_logical_to_physical,
+            "BASE": self.base_logical_to_physical,
+            "B": self.theirs_logical_to_physical,
+            "THEIRS": self.theirs_logical_to_physical,
+        }.get(side)
+        return lookup.get(logical_idx) if lookup is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnSignature:
+    """Bounded multi-signal identity derived only from sequential row caches."""
+
+    physical_col: int
+    row_count: int
+    non_empty_count: int
+    first_non_empty_row: int | None
+    last_non_empty_row: int | None
+    header_signals: tuple[str, ...]
+    representative_signals: tuple[tuple[int, str], ...]
+    non_empty_pattern: tuple[int, ...]
+    formula_signals: tuple[tuple[int, str], ...]
+    intrinsic_key: str
+    left_context_key: str | None = None
+    right_context_key: str | None = None
+    ambiguous: bool = False
+    ambiguity_reason: str = ""
+    exact_content_key: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "header_signals", tuple(self.header_signals))
+        object.__setattr__(
+            self, "representative_signals", tuple(tuple(item) for item in self.representative_signals)
+        )
+        object.__setattr__(self, "non_empty_pattern", tuple(self.non_empty_pattern))
+        object.__setattr__(
+            self, "formula_signals", tuple(tuple(item) for item in self.formula_signals)
+        )
+        if self.exact_content_key is not None:
+            object.__setattr__(self, "exact_content_key", str(self.exact_content_key))
+
+    @property
+    def is_blank(self) -> bool:
+        return self.non_empty_count == 0
+
+    @property
+    def context_key(self) -> tuple[str | None, str, str | None]:
+        return self.left_context_key, self.intrinsic_key, self.right_context_key
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnSignatureSnapshot:
+    cache_key: ColumnModelCacheKey
+    signatures: tuple[ColumnSignature, ...]
+    header_row_limit: int
+    representative_row_limit: int
+    max_col: int
+    width_is_explicit: bool
+
+    def __post_init__(self):
+        signatures = tuple(self.signatures)
+        if not isinstance(self.cache_key, ColumnModelCacheKey):
+            raise TypeError("signature snapshot cache_key must be ColumnModelCacheKey")
+        if any(not isinstance(signature, ColumnSignature) for signature in signatures):
+            raise TypeError("signature snapshot requires immutable ColumnSignature records")
+        if isinstance(self.max_col, bool) or not isinstance(self.max_col, int) or self.max_col < 0:
+            raise TypeError("signature snapshot max_col must be a non-negative integer")
+        if len(signatures) != self.max_col:
+            raise ValueError("signature snapshot max_col must match its signature count")
+        if not isinstance(self.width_is_explicit, bool):
+            raise TypeError("signature snapshot width_is_explicit must be bool")
+        object.__setattr__(self, "signatures", signatures)
+
+
+def _stable_column_signal_digest(value) -> str:
+    return hashlib.sha256(repr(value).encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _column_cell_signal(value, edit_value) -> tuple[str, str | None, bool]:
+    """Return deterministic value/formula tokens without Worksheet access.
+
+    The complete column stream is already hashed by one SHA-256 accumulator in
+    ``build_column_signatures_from_row_cache``.  Hashing every individual cell
+    before feeding that accumulator performed hundreds of thousands of tiny
+    cryptographic calls on dense sheets without adding collision resistance to
+    the final exact-column digest.  ``repr`` of the tagged immutable payload is
+    unambiguous here and keeps the single, final column-level SHA-256 proof.
+    """
+    literal_formula_text = (
+        isinstance(edit_value, str)
+        and edit_value.startswith("=")
+        and value == edit_value
+    )
+    formula_identity = None
+    if not literal_formula_text:
+        special = _special_formula_signature(edit_value)
+        if special is not None:
+            formula_identity = ("SPECIAL", special)
+        else:
+            formula = _norm_formula_text(edit_value)
+            if formula:
+                formula_identity = ("FORMULA", formula)
+
+    if formula_identity is not None:
+        formula_digest = repr(formula_identity)
+        return (
+            # Formula text/special-formula structure is the column identity.
+            # Cached results are deliberately excluded: editors may discard
+            # them after inserting/deleting a column while leaving the formula
+            # itself unchanged. Cell comparison still evaluates available
+            # cached values after logical columns have been aligned.
+            repr(("FORMULA_CELL", formula_identity)),
+            formula_digest,
+            True,
+        )
+
+    chosen = value if value is not None else edit_value
+    if chosen in (None, ""):
+        return "", None, False
+    return repr(("VALUE", _merge_cmp_value(chosen))), None, True
+
+
+def _append_bounded_signal(accumulator: dict, prefix: str, item, limit: int):
+    if limit <= 0:
+        return
+    head_limit = (limit + 1) // 2
+    tail_limit = limit - head_limit
+    head = accumulator[prefix + "_head"]
+    tail = accumulator[prefix + "_tail"]
+    if len(head) < head_limit:
+        head.append(item)
+        return
+    if tail_limit <= 0:
+        return
+    tail.append(item)
+    if len(tail) > tail_limit:
+        del tail[0]
+
+
+def build_column_signatures_from_row_cache(
+    value_rows,
+    edit_rows=None,
+    *,
+    max_col: int | None = None,
+    header_row_limit: int = 8,
+    representative_row_limit: int = 24,
+) -> tuple[ColumnSignature, ...]:
+    """Build bounded column signals in one sequential pass over cached rows.
+
+    Inputs are row iterables already captured in memory.  The function never
+    receives a worksheet and therefore cannot perform ``Worksheet.cell`` or
+    high-row random reads.  Callers that need structural trailing blank columns
+    must pass ``max_col`` explicitly; otherwise width is inferred from row tuple
+    lengths and is intentionally treated as an unbounded observation.
+    """
+    header_limit = max(0, int(header_row_limit))
+    representative_limit = max(0, int(representative_row_limit))
+    width_is_explicit = max_col is not None
+    configured_width = max(0, int(max_col or 0))
+    accumulators: list[dict] = []
+    row_count = 0
+    physical_row_count = 0
+
+    def _ensure_width(width: int, prior_rows: int):
+        while len(accumulators) < width:
+            accumulator = {
+                "header": [""] * min(prior_rows, header_limit),
+                "non_empty_count": 0,
+                "first_non_empty": None,
+                "last_non_empty": None,
+                "rep_head": [],
+                "rep_tail": [],
+                "pattern_head": [],
+                "pattern_tail": [],
+                "formula_head": [],
+                "formula_tail": [],
+                "exact_digest": hashlib.sha256(),
+            }
+            for physical_ordinal in range(1, physical_row_count + 1):
+                accumulator["exact_digest"].update(
+                    f"{physical_ordinal}:0:".encode("utf-8")
+                )
+            accumulators.append(accumulator)
+
+    _ensure_width(configured_width, 0)
+    edit_iterable = edit_rows if edit_rows is not None else ()
+    for row_idx, (value_row, edit_row) in enumerate(
+        zip_longest(value_rows or (), edit_iterable, fillvalue=()),
+        start=1,
+    ):
+        row_count = row_idx
+        value_row = tuple(value_row or ())
+        edit_row = tuple(edit_row or ())
+        width = (
+            configured_width
+            if width_is_explicit
+            else max(len(value_row), len(edit_row))
+        )
+        _ensure_width(width, row_idx - 1)
+        row_signals = []
+        for offset in range(width):
+            value = value_row[offset] if offset < len(value_row) else None
+            edit_value = edit_row[offset] if offset < len(edit_row) else None
+            row_signals.append(_column_cell_signal(value, edit_value))
+        # Aligned row caches contain all-None placeholders for rows missing on
+        # one side.  Excluding those placeholders reconstructs the side's
+        # physical row stream, so a full-column copy remains exactly provable
+        # even when Mine and Theirs have independent row insertions/deletions.
+        row_is_present = any(non_empty for _signal, _formula, non_empty in row_signals)
+        if row_is_present:
+            physical_row_count += 1
+        for offset, (signal, formula_signal, non_empty) in enumerate(row_signals):
+            accumulator = accumulators[offset]
+            if row_is_present:
+                # Length framing makes adjacent records unambiguous even when a
+                # text/error value contains separators or NUL characters.
+                accumulator["exact_digest"].update(
+                    f"{physical_row_count}:{len(signal)}:{signal}".encode(
+                        "utf-8", errors="replace"
+                    )
+                )
+            if row_idx <= header_limit:
+                accumulator["header"].append(signal)
+            if not non_empty:
+                continue
+            accumulator["non_empty_count"] += 1
+            if accumulator["first_non_empty"] is None:
+                accumulator["first_non_empty"] = row_idx
+            accumulator["last_non_empty"] = row_idx
+            _append_bounded_signal(
+                accumulator, "rep", (row_idx, signal), representative_limit
+            )
+            _append_bounded_signal(
+                accumulator, "pattern", row_idx, representative_limit
+            )
+            if formula_signal is not None:
+                _append_bounded_signal(
+                    accumulator,
+                    "formula",
+                    (row_idx, formula_signal),
+                    representative_limit,
+                )
+
+    provisional = []
+    for offset, accumulator in enumerate(accumulators):
+        representative = tuple(accumulator["rep_head"] + accumulator["rep_tail"])
+        pattern = tuple(accumulator["pattern_head"] + accumulator["pattern_tail"])
+        formulas = tuple(accumulator["formula_head"] + accumulator["formula_tail"])
+        intrinsic_payload = (
+            row_count,
+            accumulator["non_empty_count"],
+            accumulator["first_non_empty"],
+            accumulator["last_non_empty"],
+            tuple(accumulator["header"]),
+            representative,
+            pattern,
+            formulas,
+        )
+        provisional.append(ColumnSignature(
+            physical_col=offset + 1,
+            row_count=row_count,
+            non_empty_count=accumulator["non_empty_count"],
+            first_non_empty_row=accumulator["first_non_empty"],
+            last_non_empty_row=accumulator["last_non_empty"],
+            header_signals=tuple(accumulator["header"]),
+            representative_signals=representative,
+            non_empty_pattern=pattern,
+            formula_signals=formulas,
+            intrinsic_key=_stable_column_signal_digest(intrinsic_payload),
+            exact_content_key=(
+                f"{physical_row_count}:"
+                f"{accumulator['exact_digest'].hexdigest()}"
+            ),
+        ))
+
+    counts: dict[str, int] = {}
+    for signature in provisional:
+        counts[signature.intrinsic_key] = counts.get(signature.intrinsic_key, 0) + 1
+
+    signatures = []
+    for idx, signature in enumerate(provisional):
+        is_duplicate = counts.get(signature.intrinsic_key, 0) > 1
+        ambiguous = signature.is_blank or is_duplicate
+        reason = "blank-column" if signature.is_blank else "duplicate-intrinsic-signature" if is_duplicate else ""
+        signatures.append(ColumnSignature(
+            physical_col=signature.physical_col,
+            row_count=signature.row_count,
+            non_empty_count=signature.non_empty_count,
+            first_non_empty_row=signature.first_non_empty_row,
+            last_non_empty_row=signature.last_non_empty_row,
+            header_signals=signature.header_signals,
+            representative_signals=signature.representative_signals,
+            non_empty_pattern=signature.non_empty_pattern,
+            formula_signals=signature.formula_signals,
+            intrinsic_key=signature.intrinsic_key,
+            left_context_key=provisional[idx - 1].intrinsic_key if idx > 0 else None,
+            right_context_key=provisional[idx + 1].intrinsic_key if idx + 1 < len(provisional) else None,
+            ambiguous=ambiguous,
+            ambiguity_reason=reason,
+            exact_content_key=signature.exact_content_key,
+        ))
+    return tuple(signatures)
+
+
+def build_column_signature_snapshot(
+    cache_key: ColumnModelCacheKey,
+    value_rows,
+    edit_rows=None,
+    *,
+    max_col: int | None = None,
+    header_row_limit: int = 8,
+    representative_row_limit: int = 24,
+) -> ColumnSignatureSnapshot:
+    width_is_explicit = max_col is not None
+    signatures = build_column_signatures_from_row_cache(
+        value_rows,
+        edit_rows,
+        max_col=max_col,
+        header_row_limit=header_row_limit,
+        representative_row_limit=representative_row_limit,
+    )
+    return ColumnSignatureSnapshot(
+        cache_key=cache_key,
+        signatures=signatures,
+        header_row_limit=max(0, int(header_row_limit)),
+        representative_row_limit=max(0, int(representative_row_limit)),
+        max_col=len(signatures),
+        width_is_explicit=width_is_explicit,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnAlignmentResult:
+    """Deterministic 2-way logical-column model and fallback diagnostics."""
+
+    model: ColumnModel
+    anchor_pairs: tuple[tuple[int, int], ...]
+    fallback_slot_indices: tuple[int, ...]
+    used_physical_fallback: bool
+    fallback_reason: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "anchor_pairs", tuple((int(left), int(right)) for left, right in self.anchor_pairs)
+        )
+        object.__setattr__(
+            self, "fallback_slot_indices", tuple(int(idx) for idx in self.fallback_slot_indices)
+        )
+
+    @property
+    def ranges(self) -> tuple[ColumnBlock, ...]:
+        return self.model.blocks
+
+    @property
+    def has_unresolved(self) -> bool:
+        return self.used_physical_fallback or bool(self.fallback_slot_indices)
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnAlignment3WayResult:
+    """Base-anchored 3-way model plus both independent side alignments."""
+
+    model: ColumnModel
+    mine_to_base: ColumnAlignmentResult
+    theirs_to_base: ColumnAlignmentResult
+    fallback_slot_indices: tuple[int, ...]
+    used_physical_fallback: bool
+    fallback_reason: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.model, ColumnModel):
+            raise TypeError("3-way column alignment requires an immutable ColumnModel")
+        if not isinstance(self.mine_to_base, ColumnAlignmentResult):
+            raise TypeError("mine_to_base must be ColumnAlignmentResult")
+        if not isinstance(self.theirs_to_base, ColumnAlignmentResult):
+            raise TypeError("theirs_to_base must be ColumnAlignmentResult")
+        object.__setattr__(
+            self,
+            "fallback_slot_indices",
+            tuple(int(idx) for idx in self.fallback_slot_indices),
+        )
+
+    @property
+    def ranges(self) -> tuple[ColumnBlock, ...]:
+        return self.model.blocks
+
+    @property
+    def has_unresolved(self) -> bool:
+        return self.used_physical_fallback or bool(self.fallback_slot_indices)
+
+
+_COLUMN_ALIGNMENT_MAX_COLUMNS = 256
+_COLUMN_ALIGNMENT_MIN_SCORE = 0.80
+_COLUMN_ALIGNMENT_MIN_MARGIN = 0.08
+
+
+def _column_positional_signal_similarity(left_values, right_values) -> float:
+    left_values = tuple(left_values or ())
+    right_values = tuple(right_values or ())
+    if left_values == right_values:
+        return 1.0
+    if len(left_values) == 1 and len(right_values) == 1:
+        return float(
+            left_values[0] in (None, "") and right_values[0] in (None, "")
+        )
+    width = max(len(left_values), len(right_values))
+    if width <= 0:
+        return 1.0
+    relevant = 0
+    equal = 0
+    for idx in range(width):
+        left = left_values[idx] if idx < len(left_values) else ""
+        right = right_values[idx] if idx < len(right_values) else ""
+        if left in (None, "") and right in (None, ""):
+            continue
+        relevant += 1
+        equal += int(left == right)
+    return (equal / relevant) if relevant else 1.0
+
+
+def _column_indexed_signal_similarity(left_values, right_values) -> float:
+    left_map = {int(row): signal for row, signal in (left_values or ())}
+    right_map = {int(row): signal for row, signal in (right_values or ())}
+    rows = set(left_map) | set(right_map)
+    if not rows:
+        return 1.0
+    return sum(left_map.get(row) == right_map.get(row) for row in rows) / len(rows)
+
+
+def _prepare_column_similarity_profile(signature: ColumnSignature):
+    representative_map = {
+        int(row): signal for row, signal in signature.representative_signals
+    }
+    formula_map = {
+        int(row): signal for row, signal in signature.formula_signals
+    }
+    return (
+        frozenset(representative_map.items()),
+        frozenset(representative_map),
+        frozenset(signature.non_empty_pattern),
+        frozenset(formula_map.items()),
+        frozenset(formula_map),
+    )
+
+
+def _prepared_indexed_signal_similarity(
+    left_items,
+    left_rows,
+    right_items,
+    right_rows,
+) -> float:
+    if left_items == right_items:
+        return 1.0
+    if not left_rows and not right_rows:
+        return 1.0
+    if left_rows == right_rows:
+        return len(left_items & right_items) / len(left_rows)
+    shared_row_count = len(left_rows & right_rows)
+    row_count = len(left_rows) + len(right_rows) - shared_row_count
+    return len(left_items & right_items) / row_count
+
+
+def _column_signature_similarity_prepared(
+    left: ColumnSignature,
+    right: ColumnSignature,
+    left_profile,
+    right_profile,
+) -> float:
+    if left.ambiguous or right.ambiguous:
+        return 0.0
+    if left.intrinsic_key == right.intrinsic_key:
+        return 1.0
+
+    if left.header_signals == right.header_signals:
+        header_score = 1.0
+    elif len(left.header_signals) == 1 and len(right.header_signals) == 1:
+        header_score = float(
+            left.header_signals[0] in (None, "")
+            and right.header_signals[0] in (None, "")
+        )
+    else:
+        header_score = _column_positional_signal_similarity(
+            left.header_signals, right.header_signals
+        )
+    if left_profile[0] == right_profile[0]:
+        representative_score = 1.0
+    else:
+        representative_score = _prepared_indexed_signal_similarity(
+            left_profile[0], left_profile[1], right_profile[0], right_profile[1]
+        )
+    left_pattern = left_profile[2]
+    right_pattern = right_profile[2]
+    if left_pattern == right_pattern:
+        pattern_score = 1.0
+    else:
+        pattern_intersection_count = len(left_pattern & right_pattern)
+        pattern_union_count = (
+            len(left_pattern) + len(right_pattern) - pattern_intersection_count
+        )
+        pattern_score = (
+            pattern_intersection_count / pattern_union_count
+            if pattern_union_count else 1.0
+        )
+    max_non_empty = (
+        left.non_empty_count
+        if left.non_empty_count >= right.non_empty_count
+        else right.non_empty_count
+    )
+    count_score = (
+        (
+            right.non_empty_count
+            if left.non_empty_count >= right.non_empty_count
+            else left.non_empty_count
+        ) / max_non_empty
+        if max_non_empty else 1.0
+    )
+    if left_profile[3] == right_profile[3]:
+        formula_score = 1.0
+    else:
+        formula_score = _prepared_indexed_signal_similarity(
+            left_profile[3], left_profile[4], right_profile[3], right_profile[4]
+        )
+    left_context = (left.left_context_key, left.right_context_key)
+    right_context = (right.left_context_key, right.right_context_key)
+    if left_context == right_context:
+        context_score = 1.0
+    else:
+        context_matches = 0
+        context_known = 0
+        for left_value, right_value in zip(left_context, right_context):
+            if left_value is None and right_value is None:
+                continue
+            context_known += 1
+            context_matches += int(
+                left_value is not None and left_value == right_value
+            )
+        context_score = (context_matches / context_known) if context_known else 1.0
+    score = (
+        0.35 * header_score
+        + 0.30 * representative_score
+        + 0.15 * pattern_score
+        + 0.10 * count_score
+        + 0.05 * formula_score
+        + 0.05 * context_score
+    )
+    # Formula references can change text solely because a preceding physical
+    # column was inserted.  Until logical-coordinate formula translation is
+    # available, never promote differing formula identities to an automatic
+    # high-confidence structural match.
+    if (
+        (left.formula_signals or right.formula_signals)
+        and left.formula_signals != right.formula_signals
+    ):
+        score = min(score, _COLUMN_ALIGNMENT_MIN_SCORE - 0.01)
+    return score
+
+
+def _column_signature_similarity(left: ColumnSignature, right: ColumnSignature) -> float:
+    """Bounded deterministic score; ambiguous identities never auto-match."""
+    return _column_signature_similarity_prepared(
+        left,
+        right,
+        _prepare_column_similarity_profile(left),
+        _prepare_column_similarity_profile(right),
+    )
+
+
+def _column_alignment_input(value):
+    if isinstance(value, ColumnSignatureSnapshot):
+        return tuple(value.signatures), value
+    return tuple(value or ()), None
+
+
+def _derive_column_alignment_cache_key(
+    left_snapshot: ColumnSignatureSnapshot | None,
+    right_snapshot: ColumnSignatureSnapshot | None,
+    explicit_key: ColumnModelCacheKey | None,
+) -> ColumnModelCacheKey:
+    if explicit_key is not None:
+        return explicit_key
+    if left_snapshot is None and right_snapshot is None:
+        return ColumnModelCacheKey("", 0, 0)
+    left_key = left_snapshot.cache_key if left_snapshot is not None else None
+    right_key = right_snapshot.cache_key if right_snapshot is not None else None
+    sheet_name = (
+        left_key.sheet_name if left_key is not None else right_key.sheet_name
+    )
+    return ColumnModelCacheKey(
+        sheet_name=sheet_name,
+        row_model_version=max(
+            left_key.row_model_version if left_key is not None else 0,
+            right_key.row_model_version if right_key is not None else 0,
+        ),
+        column_model_version=max(
+            left_key.column_model_version if left_key is not None else 0,
+            right_key.column_model_version if right_key is not None else 0,
+        ),
+        mine_edit_version=left_key.mine_edit_version if left_key is not None else 0,
+        base_edit_version=0,
+        theirs_edit_version=(
+            right_key.theirs_edit_version
+            if right_key is not None else 0
+        ),
+    )
+
+
+def _derive_column_alignment_cache_key_3way(
+    mine_snapshot: ColumnSignatureSnapshot | None,
+    base_snapshot: ColumnSignatureSnapshot | None,
+    theirs_snapshot: ColumnSignatureSnapshot | None,
+    explicit_key: ColumnModelCacheKey | None,
+) -> ColumnModelCacheKey:
+    if explicit_key is not None:
+        return explicit_key
+    snapshots = tuple(
+        snapshot
+        for snapshot in (mine_snapshot, base_snapshot, theirs_snapshot)
+        if snapshot is not None
+    )
+    if not snapshots:
+        return ColumnModelCacheKey("", 0, 0)
+    keys = tuple(snapshot.cache_key for snapshot in snapshots)
+    reference_key = (
+        base_snapshot.cache_key if base_snapshot is not None else keys[0]
+    )
+    return ColumnModelCacheKey(
+        sheet_name=reference_key.sheet_name,
+        row_model_version=max(key.row_model_version for key in keys),
+        column_model_version=max(key.column_model_version for key in keys),
+        mine_edit_version=(
+            mine_snapshot.cache_key.mine_edit_version
+            if mine_snapshot is not None else 0
+        ),
+        base_edit_version=(
+            base_snapshot.cache_key.base_edit_version
+            if base_snapshot is not None else 0
+        ),
+        theirs_edit_version=(
+            theirs_snapshot.cache_key.theirs_edit_version
+            if theirs_snapshot is not None else 0
+        ),
+    )
+
+
+def _column_alignment_snapshot_incompatibility_reason(
+    left_snapshot: ColumnSignatureSnapshot | None,
+    right_snapshot: ColumnSignatureSnapshot | None,
+) -> str:
+    if left_snapshot is None or right_snapshot is None:
+        return ""
+    if (
+        left_snapshot.cache_key.sheet_name != right_snapshot.cache_key.sheet_name
+        or left_snapshot.cache_key.row_model_version
+        != right_snapshot.cache_key.row_model_version
+        or left_snapshot.header_row_limit != right_snapshot.header_row_limit
+        or left_snapshot.representative_row_limit
+        != right_snapshot.representative_row_limit
+    ):
+        return "incompatible-signature-cache"
+    if (
+        left_snapshot.max_col != right_snapshot.max_col
+        and (
+            not left_snapshot.width_is_explicit
+            or not right_snapshot.width_is_explicit
+        )
+    ):
+        return "implicit-column-boundary"
+    return ""
+
+
+def _column_alignment_gap_cause_codes(
+    left,
+    right,
+    left_gap,
+    right_gap,
+    fallback_reason: str = "",
+) -> tuple[str, ...]:
+    causes = []
+    if fallback_reason in _COLUMN_MAPPING_CAUSE_CODES:
+        causes.append(fallback_reason)
+    gap_signatures = tuple(left[idx] for idx in left_gap) + tuple(
+        right[idx] for idx in right_gap
+    )
+    for signature in gap_signatures:
+        if signature.ambiguity_reason in (
+            COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+            COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+        ):
+            causes.append(signature.ambiguity_reason)
+
+    left_formulas = tuple(
+        left[idx].formula_signals
+        for idx in left_gap
+        if left[idx].formula_signals
+    )
+    right_formulas = tuple(
+        right[idx].formula_signals
+        for idx in right_gap
+        if right[idx].formula_signals
+    )
+    if (
+        left_gap
+        and right_gap
+        and (left_formulas or right_formulas)
+        and left_formulas != right_formulas
+    ):
+        causes.append(COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH)
+    if not causes and (
+        (left_gap and right_gap)
+        or any(signature.ambiguous for signature in gap_signatures)
+    ):
+        causes.append(COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE)
+    return tuple(dict.fromkeys(causes))
+
+
+def _ordered_column_anchor_pairs(candidates):
+    """Maximum-weight ordered candidate chain with deterministic tie breaks."""
+    candidates = sorted(
+        ((int(left), int(right), float(score), str(kind)) for left, right, score, kind in candidates),
+        key=lambda item: (item[0], item[1], -item[2], item[3]),
+    )
+    if not candidates:
+        return ()
+    best: list[tuple[float, int, tuple[tuple[int, int], ...]]] = []
+    for idx, (left, right, score, _kind) in enumerate(candidates):
+        best_score = score
+        best_path = ((left, right),)
+        for prev_idx in range(idx):
+            prev_left, prev_right, _prev_score, _prev_kind = candidates[prev_idx]
+            if prev_left >= left or prev_right >= right:
+                continue
+            prev_total, _prev_len, prev_path = best[prev_idx]
+            candidate_total = prev_total + score
+            candidate_path = prev_path + ((left, right),)
+            if (
+                candidate_total > best_score + 1e-12
+                or (
+                    abs(candidate_total - best_score) <= 1e-12
+                    and (len(candidate_path), tuple(candidate_path))
+                    > (len(best_path), tuple(best_path))
+                )
+            ):
+                best_score = candidate_total
+                best_path = candidate_path
+        best.append((best_score, len(best_path), best_path))
+    _score, _length, path = max(
+        best,
+        key=lambda item: (item[0], item[1], tuple((-a, -b) for a, b in item[2])),
+    )
+    return tuple(path)
+
+
+def _build_column_blocks(slots: tuple[ColumnSlot, ...]) -> tuple[ColumnBlock, ...]:
+    if not slots:
+        return ()
+
+    def _structural_block_key(slot: ColumnSlot):
+        # A two-sided unresolved column and an adjacent proven one-sided
+        # insertion/deletion are not one actionable range even when their
+        # confidence reason happens to match.  Preserve that boundary so the
+        # pure structural subset can be accepted without touching the
+        # unresolved neighbour.
+        return (
+            slot.state,
+            slot.confidence.ambiguous,
+            slot.confidence.reason,
+            slot.mine_col is not None,
+            slot.base_col is not None,
+            slot.theirs_col is not None,
+            slot.base_boundary,
+            slot.origin_side,
+        )
+
+    blocks = []
+    start = 0
+    for idx in range(1, len(slots) + 1):
+        boundary = idx == len(slots)
+        if not boundary:
+            previous = slots[idx - 1]
+            current = slots[idx]
+            boundary = _structural_block_key(current) != _structural_block_key(previous)
+        if not boundary:
+            continue
+        group = slots[start:idx]
+        confidence = ColumnMappingConfidence(
+            score=min(slot.confidence.score for slot in group),
+            ambiguous=any(slot.confidence.ambiguous for slot in group),
+            reason=next(
+                (slot.confidence.reason for slot in group if slot.confidence.reason),
+                "",
+            ),
+            evidence=tuple(dict.fromkeys(
+                evidence
+                for slot in group
+                for evidence in slot.confidence.evidence
+            )),
+            cause_codes=tuple(dict.fromkeys(
+                cause
+                for slot in group
+                for cause in slot.confidence.cause_codes
+            )),
+        )
+        blocks.append(ColumnBlock(
+            ordinal=len(blocks),
+            slot_indices=tuple(slot.logical_idx for slot in group),
+            state=group[0].state,
+            confidence=confidence,
+        ))
+        start = idx
+    return tuple(blocks)
+
+
+def align_column_signatures_2way(
+    left_signatures,
+    right_signatures,
+    *,
+    cache_key: ColumnModelCacheKey | None = None,
+    min_score: float = _COLUMN_ALIGNMENT_MIN_SCORE,
+    min_margin: float = _COLUMN_ALIGNMENT_MIN_MARGIN,
+    max_columns: int = _COLUMN_ALIGNMENT_MAX_COLUMNS,
+) -> ColumnAlignmentResult:
+    """Align cached 2-way column signatures without any worksheet access.
+
+    Only unique exact identities and mutually unique high-confidence candidates
+    become retained anchors.  Every ambiguous or low-confidence two-sided gap
+    is kept as an explicit unresolved range using deterministic physical-order
+    fallback slots.
+    """
+    left, left_snapshot = _column_alignment_input(left_signatures)
+    right, right_snapshot = _column_alignment_input(right_signatures)
+    model_key = _derive_column_alignment_cache_key(
+        left_snapshot, right_snapshot, cache_key
+    )
+    fallback_reason = ""
+    force_fallback = False
+    incompatibility_reason = _column_alignment_snapshot_incompatibility_reason(
+        left_snapshot, right_snapshot
+    )
+    if incompatibility_reason:
+        fallback_reason = incompatibility_reason
+        force_fallback = True
+    if len(left) > int(max_columns) or len(right) > int(max_columns):
+        fallback_reason = "column-limit-exceeded"
+        force_fallback = True
+
+    candidates = []
+    if not force_fallback:
+        left_counts: dict[str, int] = {}
+        right_counts: dict[str, int] = {}
+        for signature in left:
+            left_counts[signature.intrinsic_key] = left_counts.get(signature.intrinsic_key, 0) + 1
+        for signature in right:
+            right_counts[signature.intrinsic_key] = right_counts.get(signature.intrinsic_key, 0) + 1
+
+        exact_pairs = set()
+        right_by_key = {signature.intrinsic_key: idx for idx, signature in enumerate(right)}
+        for left_idx, signature in enumerate(left):
+            right_idx = right_by_key.get(signature.intrinsic_key)
+            if (
+                right_idx is not None
+                and not signature.ambiguous
+                and not right[right_idx].ambiguous
+                and left_counts.get(signature.intrinsic_key) == 1
+                and right_counts.get(signature.intrinsic_key) == 1
+            ):
+                exact_pairs.add((left_idx, right_idx))
+                candidates.append((left_idx, right_idx, 1.0, "exact"))
+
+        exact_left_indices = {left_idx for left_idx, _right_idx in exact_pairs}
+        exact_right_indices = {right_idx for _left_idx, right_idx in exact_pairs}
+        left_profiles = tuple(
+            _prepare_column_similarity_profile(signature) for signature in left
+        )
+        right_profiles = tuple(
+            _prepare_column_similarity_profile(signature) for signature in right
+        )
+        left_best: list[tuple[float, int] | None] = [None] * len(left)
+        left_second: list[tuple[float, int] | None] = [None] * len(left)
+        right_best: list[tuple[float, int] | None] = [None] * len(right)
+        right_second: list[tuple[float, int] | None] = [None] * len(right)
+
+        for left_idx, left_signature in enumerate(left):
+            if left_signature.ambiguous or left_idx in exact_left_indices:
+                continue
+            for right_idx, right_signature in enumerate(right):
+                if (
+                    right_signature.ambiguous
+                    or right_idx in exact_right_indices
+                ):
+                    continue
+                if (
+                    (left_signature.formula_signals or right_signature.formula_signals)
+                    and left_signature.formula_signals != right_signature.formula_signals
+                ):
+                    continue
+                score = _column_signature_similarity_prepared(
+                    left_signature,
+                    right_signature,
+                    left_profiles[left_idx],
+                    right_profiles[right_idx],
+                )
+                item = (score, right_idx)
+                first = left_best[left_idx]
+                if first is None or score > first[0] or (
+                    score == first[0] and right_idx < first[1]
+                ):
+                    left_second[left_idx] = first
+                    left_best[left_idx] = item
+                else:
+                    second = left_second[left_idx]
+                    if second is None or score > second[0] or (
+                        score == second[0] and right_idx < second[1]
+                    ):
+                        left_second[left_idx] = item
+
+                item = (score, left_idx)
+                first = right_best[right_idx]
+                if first is None or score > first[0] or (
+                    score == first[0] and left_idx < first[1]
+                ):
+                    right_second[right_idx] = first
+                    right_best[right_idx] = item
+                else:
+                    second = right_second[right_idx]
+                    if second is None or score > second[0] or (
+                        score == second[0] and left_idx < second[1]
+                    ):
+                        right_second[right_idx] = item
+
+        for left_idx, best in enumerate(left_best):
+            if best is None:
+                continue
+            best_score, right_idx = best
+            if best_score < float(min_score):
+                continue
+            left_second_score = (
+                left_second[left_idx][0] if left_second[left_idx] is not None else 0.0
+            )
+            right_best_candidate = right_best[right_idx]
+            if right_best_candidate is None or right_best_candidate[1] != left_idx:
+                continue
+            right_second_score = (
+                right_second[right_idx][0]
+                if right_second[right_idx] is not None
+                else 0.0
+            )
+            if (
+                best_score < 0.999999
+                and (
+                    best_score - left_second_score < float(min_margin)
+                    or best_score - right_second_score < float(min_margin)
+                )
+            ):
+                continue
+            candidates.append((left_idx, right_idx, best_score, "approximate"))
+
+    anchors = _ordered_column_anchor_pairs(candidates) if not force_fallback else ()
+    anchor_scores = {
+        (left_idx, right_idx): max(
+            score
+            for candidate_left, candidate_right, score, _kind in candidates
+            if candidate_left == left_idx and candidate_right == right_idx
+        )
+        for left_idx, right_idx in anchors
+    }
+
+    slots: list[ColumnSlot] = []
+    fallback_slot_indices: list[int] = []
+
+    def _append_slot(
+        left_idx: int | None,
+        right_idx: int | None,
+        state: str,
+        confidence: ColumnMappingConfidence,
+    ):
+        logical_idx = len(slots)
+        slots.append(ColumnSlot(
+            logical_idx=logical_idx,
+            mine_col=left[left_idx].physical_col if left_idx is not None else None,
+            theirs_col=right[right_idx].physical_col if right_idx is not None else None,
+            state=state,
+            confidence=confidence,
+        ))
+        if state == "unresolved":
+            fallback_slot_indices.append(logical_idx)
+
+    def _append_gap(left_start: int, left_end: int, right_start: int, right_end: int):
+        left_gap = list(range(left_start, left_end))
+        right_gap = list(range(right_start, right_end))
+        if not left_gap and not right_gap:
+            return
+        cause_codes = _column_alignment_gap_cause_codes(
+            left,
+            right,
+            left_gap,
+            right_gap,
+            fallback_reason,
+        )
+        if force_fallback:
+            confidence = ColumnMappingConfidence(
+                0.0,
+                True,
+                fallback_reason or "low-confidence-physical-fallback",
+                ("physical-order",),
+                cause_codes or (COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,),
+            )
+            common = min(len(left_gap), len(right_gap))
+            for offset in range(common):
+                _append_slot(
+                    left_gap[offset], right_gap[offset], "unresolved", confidence
+                )
+            for left_idx in left_gap[common:]:
+                _append_slot(left_idx, None, "unresolved", confidence)
+            for right_idx in right_gap[common:]:
+                _append_slot(None, right_idx, "unresolved", confidence)
+            return
+        if not left_gap:
+            ambiguous = any(right[idx].ambiguous for idx in right_gap)
+            state = "unresolved" if ambiguous else "inserted"
+            confidence = ColumnMappingConfidence(
+                0.0 if ambiguous else 0.95,
+                ambiguous,
+                "ambiguous-inserted-columns" if ambiguous else "side-only-insertion",
+                cause_codes=cause_codes,
+            )
+            for right_idx in right_gap:
+                _append_slot(None, right_idx, state, confidence)
+            return
+        if not right_gap:
+            ambiguous = any(left[idx].ambiguous for idx in left_gap)
+            state = "unresolved" if ambiguous else "deleted"
+            confidence = ColumnMappingConfidence(
+                0.0 if ambiguous else 0.95,
+                ambiguous,
+                "ambiguous-deleted-columns" if ambiguous else "side-only-deletion",
+                cause_codes=cause_codes,
+            )
+            for left_idx in left_gap:
+                _append_slot(left_idx, None, state, confidence)
+            return
+
+        confidence = ColumnMappingConfidence(
+            0.0,
+            True,
+            fallback_reason or "low-confidence-physical-fallback",
+            ("physical-order",),
+            cause_codes or (COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,),
+        )
+        common = min(len(left_gap), len(right_gap))
+        for offset in range(common):
+            _append_slot(left_gap[offset], right_gap[offset], "unresolved", confidence)
+        for left_idx in left_gap[common:]:
+            _append_slot(left_idx, None, "unresolved", confidence)
+        for right_idx in right_gap[common:]:
+            _append_slot(None, right_idx, "unresolved", confidence)
+
+    previous_left = 0
+    previous_right = 0
+    for left_idx, right_idx in anchors:
+        _append_gap(previous_left, left_idx, previous_right, right_idx)
+        score = anchor_scores[(left_idx, right_idx)]
+        exact = left[left_idx].intrinsic_key == right[right_idx].intrinsic_key
+        _append_slot(
+            left_idx,
+            right_idx,
+            "retained",
+            ColumnMappingConfidence(
+                score,
+                False,
+                "exact-anchor" if exact else "high-confidence-anchor",
+                ("intrinsic" if exact else "multi-signal",),
+            ),
+        )
+        previous_left = left_idx + 1
+        previous_right = right_idx + 1
+    _append_gap(previous_left, len(left), previous_right, len(right))
+
+    frozen_slots = tuple(slots)
+    blocks = _build_column_blocks(frozen_slots)
+    unresolved = force_fallback or bool(fallback_slot_indices)
+    overall_score = min(
+        (slot.confidence.score for slot in frozen_slots),
+        default=0.0 if force_fallback else 1.0,
+    )
+    model_cause_codes = [
+        cause
+        for slot in frozen_slots
+        for cause in slot.confidence.cause_codes
+    ]
+    if fallback_reason in _COLUMN_MAPPING_CAUSE_CODES:
+        model_cause_codes.append(fallback_reason)
+    model = ColumnModel.from_slots(
+        model_key,
+        frozen_slots,
+        blocks=blocks,
+        confidence=ColumnMappingConfidence(
+            overall_score,
+            unresolved,
+            "unresolved-column-range" if unresolved else "deterministic-two-way-alignment",
+            cause_codes=tuple(dict.fromkeys(model_cause_codes)),
+        ),
+    )
+    return ColumnAlignmentResult(
+        model=model,
+        anchor_pairs=tuple(
+            (left[left_idx].physical_col, right[right_idx].physical_col)
+            for left_idx, right_idx in anchors
+        ),
+        fallback_slot_indices=tuple(fallback_slot_indices),
+        used_physical_fallback=unresolved,
+        fallback_reason=(fallback_reason or "unresolved-column-range") if unresolved else "",
+    )
+
+
+def _project_side_alignment_to_base(
+    alignment: ColumnAlignmentResult,
+    base_count: int,
+):
+    """Return Base-column mappings and side insertions grouped by Base boundary."""
+    base_mapping = {}
+    insertions: list[list[tuple[int, ColumnMappingConfidence]]] = [
+        [] for _idx in range(base_count + 1)
+    ]
+    base_seen = 0
+    for slot in alignment.model.slots:
+        side_col = slot.mine_col
+        base_col = slot.theirs_col
+        if base_col is None:
+            if side_col is not None:
+                insertions[min(base_seen, base_count)].append(
+                    (side_col, slot.confidence)
+                )
+            continue
+        base_mapping[base_col] = (side_col, slot.confidence)
+        base_seen += 1
+    return base_mapping, tuple(tuple(group) for group in insertions)
+
+
+def align_column_signatures_3way(
+    mine_signatures,
+    base_signatures,
+    theirs_signatures,
+    *,
+    cache_key: ColumnModelCacheKey | None = None,
+    min_score: float = _COLUMN_ALIGNMENT_MIN_SCORE,
+    min_margin: float = _COLUMN_ALIGNMENT_MIN_MARGIN,
+    max_columns: int = _COLUMN_ALIGNMENT_MAX_COLUMNS,
+) -> ColumnAlignment3WayResult:
+    """Map Mine and Theirs to Base independently, then compose logical slots.
+
+    Every Base column owns exactly one slot.  Side-only columns are placed at
+    their Base-relative boundary.  Insertions on both sides are paired only
+    when a unique full-column value/formula digest proves their equivalence;
+    all unproved or incompatible remainder stays separate and unresolved.
+    """
+    mine, mine_snapshot = _column_alignment_input(mine_signatures)
+    base, base_snapshot = _column_alignment_input(base_signatures)
+    theirs, theirs_snapshot = _column_alignment_input(theirs_signatures)
+    model_key = _derive_column_alignment_cache_key_3way(
+        mine_snapshot,
+        base_snapshot,
+        theirs_snapshot,
+        cache_key,
+    )
+
+    mine_input = mine_snapshot if mine_snapshot is not None else mine
+    base_input = base_snapshot if base_snapshot is not None else base
+    theirs_input = theirs_snapshot if theirs_snapshot is not None else theirs
+    mine_to_base = align_column_signatures_2way(
+        mine_input,
+        base_input,
+        min_score=min_score,
+        min_margin=min_margin,
+        max_columns=max_columns,
+    )
+    theirs_to_base = align_column_signatures_2way(
+        theirs_input,
+        base_input,
+        min_score=min_score,
+        min_margin=min_margin,
+        max_columns=max_columns,
+    )
+
+    mine_by_base, mine_insertions = _project_side_alignment_to_base(
+        mine_to_base, len(base)
+    )
+    theirs_by_base, theirs_insertions = _project_side_alignment_to_base(
+        theirs_to_base, len(base)
+    )
+    mine_signature_by_col = {item.physical_col: item for item in mine}
+    theirs_signature_by_col = {item.physical_col: item for item in theirs}
+
+    def _exact_key_counts(signatures):
+        counts = {}
+        for signature in signatures:
+            key = signature.exact_content_key
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    mine_exact_counts = _exact_key_counts(mine)
+    theirs_exact_counts = _exact_key_counts(theirs)
+    slots: list[ColumnSlot] = []
+    fallback_slot_indices: list[int] = []
+
+    def _append_slot(
+        mine_col: int | None,
+        base_col: int | None,
+        theirs_col: int | None,
+        state: str,
+        confidence: ColumnMappingConfidence,
+        base_boundary: int | None = None,
+        origin_side: str | None = None,
+    ):
+        logical_idx = len(slots)
+        slots.append(ColumnSlot(
+            logical_idx=logical_idx,
+            mine_col=mine_col,
+            base_col=base_col,
+            theirs_col=theirs_col,
+            state=state,
+            confidence=confidence,
+            base_boundary=base_boundary,
+            origin_side=origin_side,
+        ))
+        if state == "unresolved" or confidence.ambiguous:
+            fallback_slot_indices.append(logical_idx)
+
+    def _insertion_confidence(
+        original: ColumnMappingConfidence,
+        side: str,
+        boundary: int,
+    ) -> tuple[str, ColumnMappingConfidence]:
+        ambiguous = original.ambiguous
+        return (
+            "unresolved" if ambiguous else "inserted",
+            ColumnMappingConfidence(
+                original.score,
+                ambiguous,
+                "ambiguous-side-insertion" if ambiguous else "side-only-insertion",
+                tuple(dict.fromkeys(
+                    original.evidence
+                    + (f"base-boundary:{boundary}", f"side:{side}")
+                )),
+                original.cause_codes or (
+                    (COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,) if ambiguous else ()
+                ),
+            ),
+        )
+
+    def _append_insertion_gap(
+        mine_group,
+        theirs_group,
+        boundary: int,
+    ):
+        def _append_competing_gap(mine_gap, theirs_gap):
+            if not mine_gap and not theirs_gap:
+                return
+            if not mine_gap or not theirs_gap:
+                side = "mine" if mine_gap else "theirs"
+                for physical_col, original in mine_gap or theirs_gap:
+                    state, confidence = _insertion_confidence(
+                        original, side, boundary
+                    )
+                    _append_slot(
+                        physical_col if side == "mine" else None,
+                        None,
+                        physical_col if side == "theirs" else None,
+                        state,
+                        confidence,
+                        boundary,
+                        side,
+                    )
+                return
+            cause_codes = tuple(dict.fromkeys(
+                cause
+                for _physical_col, original in mine_gap + theirs_gap
+                for cause in original.cause_codes
+            ))
+            confidence = ColumnMappingConfidence(
+                0.0,
+                True,
+                "ambiguous-competing-insertions",
+                (f"base-boundary:{boundary}", "separate-side-columns"),
+                cause_codes or (COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,),
+            )
+            for physical_col, _original in mine_gap:
+                _append_slot(
+                    physical_col,
+                    None,
+                    None,
+                    "unresolved",
+                    confidence,
+                    boundary,
+                    "mine",
+                )
+            for physical_col, _original in theirs_gap:
+                _append_slot(
+                    None,
+                    None,
+                    physical_col,
+                    "unresolved",
+                    confidence,
+                    boundary,
+                    "theirs",
+                )
+
+        # Build an ordered exact-match chain.  Requiring a non-blank digest to
+        # be unique on each complete side prevents duplicate/blank columns from
+        # being paired speculatively.  Gaps on both sides remain competing, so
+        # a two-column block with only its first column equal converges to one
+        # common slot plus a conservative two-slot conflict for the remainder.
+        candidates = []
+        for mine_pos, (mine_col, _mine_confidence) in enumerate(mine_group):
+            mine_signature = mine_signature_by_col.get(mine_col)
+            if mine_signature is None or mine_signature.is_blank:
+                continue
+            key = mine_signature.exact_content_key
+            if not key or mine_exact_counts.get(key) != 1:
+                continue
+            for theirs_pos, (theirs_col, _theirs_confidence) in enumerate(
+                theirs_group
+            ):
+                theirs_signature = theirs_signature_by_col.get(theirs_col)
+                if (
+                    theirs_signature is None
+                    or theirs_signature.is_blank
+                    or theirs_signature.exact_content_key != key
+                    or theirs_exact_counts.get(key) != 1
+                ):
+                    continue
+                candidates.append((mine_pos, theirs_pos))
+
+        matches = ()
+        if candidates:
+            best_paths = []
+            for mine_pos, theirs_pos in candidates:
+                best_path = ((mine_pos, theirs_pos),)
+                for previous_pos, (prev_mine, prev_theirs) in enumerate(candidates):
+                    if previous_pos >= len(best_paths):
+                        break
+                    if prev_mine >= mine_pos or prev_theirs >= theirs_pos:
+                        continue
+                    candidate_path = best_paths[previous_pos] + (
+                        (mine_pos, theirs_pos),
+                    )
+                    if (
+                        len(candidate_path) > len(best_path)
+                        or (
+                            len(candidate_path) == len(best_path)
+                            and candidate_path < best_path
+                        )
+                    ):
+                        best_path = candidate_path
+                best_paths.append(best_path)
+            matches = max(
+                best_paths,
+                key=lambda path: (len(path), tuple((-a, -b) for a, b in path)),
+            )
+
+        mine_cursor = 0
+        theirs_cursor = 0
+        for mine_pos, theirs_pos in matches:
+            _append_competing_gap(
+                mine_group[mine_cursor:mine_pos],
+                theirs_group[theirs_cursor:theirs_pos],
+            )
+            mine_col, _mine_confidence = mine_group[mine_pos]
+            theirs_col, _theirs_confidence = theirs_group[theirs_pos]
+            _append_slot(
+                mine_col,
+                None,
+                theirs_col,
+                "inserted",
+                ColumnMappingConfidence(
+                    1.0,
+                    False,
+                    "common-side-insertion",
+                    (
+                        f"base-boundary:{boundary}",
+                        "exact-full-column-content",
+                        "unique-on-both-sides",
+                    ),
+                ),
+                boundary,
+                "both",
+            )
+            mine_cursor = mine_pos + 1
+            theirs_cursor = theirs_pos + 1
+        _append_competing_gap(
+            mine_group[mine_cursor:],
+            theirs_group[theirs_cursor:],
+        )
+
+    def _append_insertions(boundary: int):
+        mine_group = mine_insertions[boundary]
+        theirs_group = theirs_insertions[boundary]
+        if not mine_group and not theirs_group:
+            return
+        _append_insertion_gap(
+            mine_group,
+            theirs_group,
+            boundary,
+        )
+
+    missing_mapping_confidence = ColumnMappingConfidence(
+        0.0,
+        True,
+        "missing-base-projection",
+        ("internal-safe-fallback",),
+        (COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,),
+    )
+    for base_idx, base_signature in enumerate(base):
+        _append_insertions(base_idx)
+        base_col = base_signature.physical_col
+        mine_col, mine_confidence = mine_by_base.get(
+            base_col, (None, missing_mapping_confidence)
+        )
+        theirs_col, theirs_confidence = theirs_by_base.get(
+            base_col, (None, missing_mapping_confidence)
+        )
+        ambiguous = mine_confidence.ambiguous or theirs_confidence.ambiguous
+        evidence = list(mine_confidence.evidence + theirs_confidence.evidence)
+        cause_codes = tuple(dict.fromkeys(
+            mine_confidence.cause_codes + theirs_confidence.cause_codes
+        ))
+        if mine_col is None:
+            evidence.append("mine-missing")
+        if theirs_col is None:
+            evidence.append("theirs-missing")
+        if ambiguous:
+            state = "unresolved"
+            reason = "unresolved-base-mapping"
+        elif mine_col is None and theirs_col is None:
+            state = "both-deleted"
+            reason = "base-column-missing-on-both-sides"
+        elif mine_col is None:
+            state = "mine-deleted"
+            reason = "base-column-missing-on-mine"
+        elif theirs_col is None:
+            state = "theirs-deleted"
+            reason = "base-column-missing-on-theirs"
+        else:
+            state = "retained"
+            reason = "base-anchored"
+        _append_slot(
+            mine_col,
+            base_col,
+            theirs_col,
+            state,
+            ColumnMappingConfidence(
+                min(mine_confidence.score, theirs_confidence.score),
+                ambiguous,
+                reason,
+                tuple(dict.fromkeys(evidence + ["base-identity"])),
+                cause_codes,
+            ),
+        )
+    _append_insertions(len(base))
+
+    frozen_slots = tuple(slots)
+    used_physical_fallback = (
+        mine_to_base.used_physical_fallback
+        or theirs_to_base.used_physical_fallback
+    )
+    unresolved = bool(fallback_slot_indices) or used_physical_fallback
+    fallback_reasons = []
+    if mine_to_base.fallback_reason:
+        fallback_reasons.append(f"mine-to-base:{mine_to_base.fallback_reason}")
+    if theirs_to_base.fallback_reason:
+        fallback_reasons.append(f"theirs-to-base:{theirs_to_base.fallback_reason}")
+    model = ColumnModel.from_slots(
+        model_key,
+        frozen_slots,
+        blocks=_build_column_blocks(frozen_slots),
+        confidence=ColumnMappingConfidence(
+            min(
+                (slot.confidence.score for slot in frozen_slots),
+                default=0.0 if used_physical_fallback else 1.0,
+            ),
+            unresolved,
+            (
+                "unresolved-three-way-column-range"
+                if unresolved else "deterministic-base-anchored-alignment"
+            ),
+            cause_codes=tuple(dict.fromkeys(
+                mine_to_base.model.confidence.cause_codes
+                + theirs_to_base.model.confidence.cause_codes
+                + tuple(
+                    cause
+                    for slot in frozen_slots
+                    for cause in slot.confidence.cause_codes
+                )
+            )),
+        ),
+    )
+    return ColumnAlignment3WayResult(
+        model=model,
+        mine_to_base=mine_to_base,
+        theirs_to_base=theirs_to_base,
+        fallback_slot_indices=tuple(fallback_slot_indices),
+        used_physical_fallback=used_physical_fallback,
+        fallback_reason=(
+            ";".join(fallback_reasons)
+            if fallback_reasons
+            else "unresolved-three-way-column-range" if unresolved else ""
+        ),
+    )
+
+
 def _compute_row_pairs_from_signatures(sig_a: list[str], sig_b: list[str]):
     """Align precomputed row signatures without rescanning worksheets.
 
@@ -393,20 +2414,184 @@ def _compute_row_pairs_from_signatures(sig_a: list[str], sig_b: list[str]):
     return pairs
 
 
-def _compute_row_pairs_generic(ws_a, ws_b, max_col: int, force: bool = False):
+def _compute_row_pairs_generic(
+    ws_a,
+    ws_b,
+    max_col: int,
+    force: bool = False,
+    *,
+    max_row_a: int | None = None,
+    max_row_b: int | None = None,
+    ws_a_edit=None,
+    ws_b_edit=None,
+):
     """Compute row alignment pairs between two worksheets."""
-    max_row_a = ws_a.max_row or 1
-    max_row_b = ws_b.max_row or 1
+    max_row_a = max(1, int(max_row_a if max_row_a is not None else (ws_a.max_row or 1)))
+    max_row_b = max(1, int(max_row_b if max_row_b is not None else (ws_b.max_row or 1)))
+    max_row_a, max_row_b = _shared_physical_row_horizon(
+        ws_a,
+        ws_b,
+        max_row_a,
+        max_row_b,
+        ws_a_edit,
+        ws_b_edit,
+    )
     max_row = max(max_row_a, max_row_b)
     if max_row <= 0:
         return []
     if not _should_auto_row_align(max_row_a, max_row_b, force=force):
         return [(r if r <= max_row_a else None, r if r <= max_row_b else None) for r in range(1, max_row + 1)]
 
-    sig_a = _row_sig_list_for_ws(ws_a, max_row_a, max_col)
-    sig_b = _row_sig_list_for_ws(ws_b, max_row_b, max_col)
+    source_width_a = max(
+        int(ws_a.max_column or 1),
+        int(ws_a_edit.max_column or 1) if ws_a_edit is not None else 1,
+    )
+    source_width_b = max(
+        int(ws_b.max_column or 1),
+        int(ws_b_edit.max_column or 1) if ws_b_edit is not None else 1,
+    )
+    width_a = max(1, min(int(max_col or 1), source_width_a))
+    width_b = max(1, min(int(max_col or 1), source_width_b))
+    rows_a_cache = _read_rows_into_cache(
+        ws_a, range(1, max_row_a + 1), width_a
+    )
+    rows_b_cache = _read_rows_into_cache(
+        ws_b, range(1, max_row_b + 1), width_b
+    )
+    edit_rows_a_cache = (
+        _read_rows_into_cache(ws_a_edit, range(1, max_row_a + 1), width_a)
+        if ws_a_edit is not None else {}
+    )
+    edit_rows_b_cache = (
+        _read_rows_into_cache(ws_b_edit, range(1, max_row_b + 1), width_b)
+        if ws_b_edit is not None else {}
+    )
+    rows_a = [_row_from_cache(rows_a_cache, row_idx, width_a) for row_idx in range(1, max_row_a + 1)]
+    rows_b = [_row_from_cache(rows_b_cache, row_idx, width_b) for row_idx in range(1, max_row_b + 1)]
+    edit_rows_a = (
+        [_row_from_cache(edit_rows_a_cache, row_idx, width_a) for row_idx in range(1, max_row_a + 1)]
+        if ws_a_edit is not None else None
+    )
+    edit_rows_b = (
+        [_row_from_cache(edit_rows_b_cache, row_idx, width_b) for row_idx in range(1, max_row_b + 1)]
+        if ws_b_edit is not None else None
+    )
+    sig_a, sig_b = _row_signatures_from_unique_column_anchors(
+        rows_a,
+        rows_b,
+        width_a,
+        width_b,
+        edit_rows_a,
+        edit_rows_b,
+    )
 
     return _compute_row_pairs_from_signatures(sig_a, sig_b)
+
+
+def _collapse_one_sided_blank_tail_padding(
+    display_pairs: list[tuple[int | None, int | None]],
+    ws_a_val,
+    ws_b_val,
+    ws_a_edit,
+    ws_b_edit,
+    effective_max_row_a: int,
+    effective_max_row_b: int,
+    max_col: int,
+    *,
+    cancel_check=None,
+) -> list[tuple[int | None, int | None]]:
+    """Drop value-empty coordinate padding before a real one-sided tail append.
+
+    Effective-bound alignment can expose a dense run of empty coordinates on
+    the longer side before its first real appended row.  Those coordinates are
+    spreadsheet padding, not inserted row records.  Only an empty *prefix* of a
+    consecutive one-sided tail run is folded; internal one-sided blank rows and
+    the real non-empty append remain structural differences.
+
+    Both the cached-value and edit/formula worksheets are required.  This keeps
+    missing-cache formulas (including formulas returning ``""``) non-empty and
+    makes the fallback conservative while edit data is still loading.
+    """
+    pairs = list(display_pairs or [])
+    if not pairs or ws_a_edit is None or ws_b_edit is None:
+        return pairs
+    try:
+        max_a = max(1, int(effective_max_row_a or 1))
+        max_b = max(1, int(effective_max_row_b or 1))
+        width = max(1, int(max_col or 1))
+    except Exception:
+        return pairs
+
+    candidates: dict[int, tuple[str, int]] = {}
+    rows_a: list[int] = []
+    rows_b: list[int] = []
+    for idx, (ra, rb) in enumerate(pairs):
+        if ra is None and rb is not None and int(rb) > max_a:
+            candidates[idx] = ("B", int(rb))
+            rows_b.append(int(rb))
+        elif rb is None and ra is not None and int(ra) > max_b:
+            candidates[idx] = ("A", int(ra))
+            rows_a.append(int(ra))
+    if not candidates:
+        return pairs
+
+    val_a = _read_rows_into_cache(
+        ws_a_val, rows_a, width, require_complete=True, cancel_check=cancel_check
+    )
+    edit_a = _read_rows_into_cache(
+        ws_a_edit, rows_a, width, require_complete=True, cancel_check=cancel_check
+    )
+    val_b = _read_rows_into_cache(
+        ws_b_val, rows_b, width, require_complete=True, cancel_check=cancel_check
+    )
+    edit_b = _read_rows_into_cache(
+        ws_b_edit, rows_b, width, require_complete=True, cancel_check=cancel_check
+    )
+    if (rows_a and (not val_a or not edit_a)) or (rows_b and (not val_b or not edit_b)):
+        return pairs
+
+    def _has_value_or_formula(side: str, row_idx: int) -> bool:
+        if side == "A":
+            value_row = _row_from_cache(val_a, row_idx, width)
+            edit_row = _row_from_cache(edit_a, row_idx, width)
+        else:
+            value_row = _row_from_cache(val_b, row_idx, width)
+            edit_row = _row_from_cache(edit_b, row_idx, width)
+        return any(
+            value not in (None, "") or edit_value not in (None, "")
+            for value, edit_value in zip(value_row, edit_row)
+        )
+
+    remove_indices: set[int] = set()
+    sorted_indices = sorted(candidates)
+    cursor = 0
+    while cursor < len(sorted_indices):
+        start = cursor
+        start_idx = sorted_indices[start]
+        side, row_idx = candidates[start_idx]
+        cursor += 1
+        while cursor < len(sorted_indices):
+            next_idx = sorted_indices[cursor]
+            next_side, next_row = candidates[next_idx]
+            prev_idx = sorted_indices[cursor - 1]
+            _prev_side, prev_row = candidates[prev_idx]
+            if next_idx != prev_idx + 1 or next_side != side or next_row != prev_row + 1:
+                break
+            cursor += 1
+
+        group = sorted_indices[start:cursor]
+        first_content = None
+        for pos, pair_idx in enumerate(group):
+            candidate_side, candidate_row = candidates[pair_idx]
+            if _has_value_or_formula(candidate_side, candidate_row):
+                first_content = pos
+                break
+        if first_content is not None and first_content > 0:
+            remove_indices.update(group[:first_content])
+
+    if not remove_indices:
+        return pairs
+    return [pair for idx, pair in enumerate(pairs) if idx not in remove_indices]
 
 
 def _row_map_from_pairs(pairs: list[tuple[int | None, int | None]]) -> dict[int, int]:
@@ -946,6 +3131,39 @@ def _effective_bounds_with_edit(ws_val, ws_edit=None):
     val_row, val_col = _effective_bounds(ws_val)
     if ws_edit is None or ws_edit is ws_val:
         return val_row, val_col
+    # Both workbooks are normal in-memory Worksheets on the interactive path.
+    # Their XML dimension can include a large style-only tail (Guide is a
+    # representative case: 19 populated columns but 33 styled columns).  The
+    # initial background cache trims that tail, so a foreground rescan must use
+    # the same semantic horizon or an insert/undo cycle appears to grow the
+    # logical model.  The edit workbook sees formulas whose data-only cache can
+    # be empty; taking the union of non-empty cells from both normal worksheets
+    # is therefore exact without losing uncached formulas.
+    def _populated_bounds_from_cells(ws):
+        try:
+            cells = getattr(ws, "_cells", None)
+            if cells is None:
+                return None
+            populated = [
+                cell for cell in cells.values()
+                if getattr(cell, "value", None) not in (None, "")
+            ]
+            if not populated:
+                return (1, 1)
+            return (
+                max(int(cell.row) for cell in populated),
+                max(int(cell.column) for cell in populated),
+            )
+        except Exception:
+            return None
+
+    exact_val = _populated_bounds_from_cells(ws_val)
+    exact_edit = _populated_bounds_from_cells(ws_edit)
+    if exact_val is not None and exact_edit is not None:
+        return (
+            max(1, int(exact_val[0]), int(exact_edit[0])),
+            max(1, int(exact_val[1]), int(exact_edit[1])),
+        )
     try:
         edit_row, edit_col = _effective_bounds(ws_edit)
         return max(val_row, edit_row), max(val_col, edit_col)
@@ -1131,6 +3349,34 @@ def _cell_display_and_equal(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int, c:
     return _cell_display_and_equal_from_values(va_val, vb_val, va_edit, vb_edit)
 
 
+def _cell_display_from_values(v_val, v_edit=None):
+    """Return one side's display value without running equality semantics.
+
+    Rendering previously compared every cell with itself, which normalized the
+    same formula twice before the real two-sided comparison immediately did it
+    again.  This helper intentionally mirrors only the display half of that
+    contract; formula/cache equality remains exclusively in the comparator.
+    """
+    if not _USE_CACHED_VALUES_ONLY:
+        return v_val
+    literal_formula_text = (
+        isinstance(v_edit, str)
+        and v_edit.startswith("=")
+        and v_val == v_edit
+    )
+    special = None if literal_formula_text else _special_formula_signature(v_edit)
+    formula = None if literal_formula_text else _formula_text(v_edit)
+    if v_val is not None:
+        return v_val
+    if formula:
+        return formula
+    if special is not None:
+        # Preserve the existing self-comparison display behavior for special
+        # formulas whose data-only cache is absent.
+        return None
+    return v_edit
+
+
 def _cell_display_and_equal_from_values(va_val, vb_val, va_edit=None, vb_edit=None):
     """Compare already-fetched cell values while preserving the existing fallback rules."""
     if _USE_CACHED_VALUES_ONLY:
@@ -1194,6 +3440,42 @@ def _pad_row_values(row_vals, max_col: int):
     return row + (None,) * (max_col - len(row))
 
 
+def _worksheet_cached_physical_max_column(ws) -> int:
+    """Return a normal Worksheet's physical horizon without repeated O(cells) scans.
+
+    ``Worksheet.max_column`` recomputes ``max(_cells)`` on every access.  Row
+    rendering calls this reader thousands of times, so using it inside the
+    hot path made a medium Sheet spend seconds rescanning the same cell map.
+    The map identity and size form a cheap conservative cache token; column
+    actions replace/change that map or explicitly invalidate it before the
+    next read.
+    """
+    cells = getattr(ws, "_cells", None)
+    if cells is None or ws.__class__.__name__ == "ReadOnlyWorksheet":
+        return max(1, int(getattr(ws, "max_column", 1) or 1))
+    token = (id(cells), len(cells))
+    if getattr(ws, "_sow_read_max_col_token", None) == token:
+        return max(1, int(getattr(ws, "_sow_read_max_col", 1) or 1))
+    try:
+        width = max((int(key[1]) for key in cells), default=1)
+    except Exception:
+        width = max(1, int(getattr(ws, "max_column", 1) or 1))
+    try:
+        ws._sow_read_max_col_token = token
+        ws._sow_read_max_col = max(1, int(width))
+    except Exception:
+        pass
+    return max(1, int(width))
+
+
+def _invalidate_worksheet_read_horizon(ws):
+    for name in ("_sow_read_max_col_token", "_sow_read_max_col"):
+        try:
+            delattr(ws, name)
+        except Exception:
+            pass
+
+
 def _read_rows_into_cache(
     ws,
     row_indices,
@@ -1214,13 +3496,50 @@ def _read_rows_into_cache(
     min_r = needed[0]
     max_r = needed[-1]
     needed_set = set(needed)
+    # Normal openpyxl worksheets materialize cells when iter_rows is asked to
+    # extend beyond the current physical horizon.  Logical projection often
+    # requests the wider peer width, so cap the actual read and pad in memory;
+    # otherwise a refresh can silently create an empty tail column on the
+    # untouched side and make column-action undo non-idempotent.
+    try:
+        read_max_col = min(
+            max(1, int(max_col)),
+            _worksheet_cached_physical_max_column(ws),
+        )
+    except Exception:
+        read_max_col = max(1, int(max_col))
+
+    # A normal editable openpyxl Worksheet stores its sparse cells in `_cells`.
+    # Calling iter_rows() over it creates Cell objects for every empty position
+    # in the requested rectangle; a projection rebuild could therefore turn a
+    # sparse real sheet into tens of thousands of persistent blank cells after
+    # an otherwise exact column-action undo.  Direct dictionary reads are
+    # in-memory only, preserve sparsity, and still build the same contiguous row
+    # cache consumed by signature/comparison code.  ReadOnlyWorksheet has no
+    # compatible sparse store and continues through the streaming path below.
+    sparse_cells = getattr(ws, "_cells", None)
+    if (
+        isinstance(sparse_cells, dict)
+        and str(getattr(ws.__class__, "__module__", "")).startswith("openpyxl.")
+    ):
+        for row_offset, row_idx in enumerate(needed):
+            if cancel_check is not None and (row_offset & 127) == 0:
+                cancel_check()
+            values = []
+            for col_idx in range(1, read_max_col + 1):
+                cell = sparse_cells.get((row_idx, col_idx))
+                values.append(
+                    getattr(cell, "value", cell) if cell is not None else None
+                )
+            rows[row_idx] = _pad_row_values(values, max_col)
+        return rows
     try:
         for idx, row in enumerate(
             ws.iter_rows(
                 min_row=min_r,
                 max_row=max_r,
                 min_col=1,
-                max_col=max_col,
+                max_col=read_max_col,
                 values_only=True,
             ),
             start=min_r,
@@ -1242,10 +3561,1330 @@ def _read_rows_into_cache(
     return rows
 
 
+def _read_rows_into_shared_cache(
+    ws,
+    row_indices,
+    max_col: int,
+    *,
+    cache_bundle: dict | None = None,
+    cache_key=None,
+):
+    """Reuse one sequential worksheet read within a foreground refresh.
+
+    The bundle is deliberately caller-owned and short-lived.  Worksheet
+    identity, physical width, and row coverage are checked before reuse so a
+    cache can never cross sheets, edit/value workbooks, or structural widths.
+    """
+    if ws is None:
+        return {}
+    try:
+        needed = frozenset(
+            int(row_idx)
+            for row_idx in row_indices
+            if row_idx is not None and int(row_idx) > 0
+        )
+    except Exception:
+        needed = frozenset()
+    if not needed:
+        return {}
+    width = max(1, int(max_col or 1))
+    if cache_bundle is not None and cache_key is not None:
+        entry = cache_bundle.get(cache_key)
+        if (
+            isinstance(entry, tuple)
+            and len(entry) == 4
+            and entry[0] is ws
+            and entry[1] == width
+            and needed.issubset(entry[2])
+        ):
+            return entry[3]
+    rows = _read_rows_into_cache(ws, needed, width)
+    if cache_bundle is not None and cache_key is not None:
+        cache_bundle[cache_key] = (ws, width, needed, rows)
+    return rows
+
+
 def _row_from_cache(rows_cache: dict[int, tuple], row_idx: int | None, max_col: int):
     if row_idx is None:
         return (None,) * max_col
     return rows_cache.get(int(row_idx), (None,) * max_col)
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalColumnComparisonCache:
+    """Reusable pure-data column mapping for foreground/background replay.
+
+    The cache owns the expensive signature/alignment result.  Row comparison,
+    only-diff filtering, navigation, and conflict classification consume this
+    immutable object and never need to revisit a Worksheet.
+    """
+
+    model: ColumnModel
+    two_way_alignment: ColumnAlignmentResult | None = None
+    three_way_alignment: ColumnAlignment3WayResult | None = None
+    structural_diff_cols: frozenset[int] = frozenset()
+    unresolved_cols: frozenset[int] = frozenset()
+
+    def __post_init__(self):
+        if not isinstance(self.model, ColumnModel):
+            raise TypeError("logical comparison cache requires a ColumnModel")
+        if self.two_way_alignment is not None and not isinstance(
+            self.two_way_alignment, ColumnAlignmentResult
+        ):
+            raise TypeError("two_way_alignment must be ColumnAlignmentResult")
+        if self.three_way_alignment is not None and not isinstance(
+            self.three_way_alignment, ColumnAlignment3WayResult
+        ):
+            raise TypeError("three_way_alignment must be ColumnAlignment3WayResult")
+        object.__setattr__(
+            self, "structural_diff_cols", frozenset(int(c) for c in self.structural_diff_cols)
+        )
+        object.__setattr__(
+            self, "unresolved_cols", frozenset(int(c) for c in self.unresolved_cols)
+        )
+
+
+_LOGICAL_COLUMN_PLACEHOLDER = "∅"
+_LOGICAL_COLUMN_STATE_MARKERS = {
+    "inserted": "+",
+    "deleted": "−",
+    "mine-deleted": "−",
+    "theirs-deleted": "−",
+    "both-deleted": "×",
+    "unresolved": "?",
+}
+
+_COLUMN_ACTION_METADATA_SCOPE = (
+    "values",
+    "formulas",
+    "column_dimensions",
+    "styles",
+    "comments",
+    "hyperlinks",
+    "data_validations",
+    "merged_cells",
+    "conditional_formatting",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnBlockActionPlan:
+    """Fully validated, immutable plan for one logical column-block action."""
+
+    action_id: str
+    sheet: str
+    block_ordinal: int
+    logical_start: int
+    logical_end: int
+    source_side: str
+    target_side: str
+    source_physical_cols: tuple[int, ...]
+    target_physical_cols: tuple[int, ...]
+    target_physical_anchor: int
+    count: int
+    action_kind: str
+    unresolved: bool = False
+    metadata_scope: tuple[str, ...] = _COLUMN_ACTION_METADATA_SCOPE
+
+    def __post_init__(self):
+        if self.action_kind not in ("insert_copy", "delete", "copy", "retain"):
+            raise ValueError(f"unknown column action kind: {self.action_kind!r}")
+        if self.source_side not in ("A", "BASE", "B"):
+            raise ValueError("source_side must be A, BASE, or B")
+        if self.target_side not in ("A", "B"):
+            raise ValueError("target_side must be A or B")
+        if int(self.logical_start) <= 0 or int(self.logical_end) < int(self.logical_start):
+            raise ValueError("invalid logical column range")
+        if int(self.count) != int(self.logical_end) - int(self.logical_start) + 1:
+            raise ValueError("column action count must match the logical range")
+        if int(self.target_physical_anchor) <= 0:
+            raise ValueError("target_physical_anchor must be positive")
+        object.__setattr__(self, "source_physical_cols", tuple(int(v) for v in self.source_physical_cols))
+        object.__setattr__(self, "target_physical_cols", tuple(int(v) for v in self.target_physical_cols))
+        object.__setattr__(self, "metadata_scope", tuple(str(v) for v in self.metadata_scope))
+
+    def operation_records(self) -> tuple[dict[str, object], ...]:
+        """Return ordered replay records; 4.x will consume these natively."""
+        common = {
+            "sheet": self.sheet,
+            "target_side": self.target_side,
+            "target_logical_slot": self.logical_start,
+            "target_physical_anchor": self.target_physical_anchor,
+            "count": self.count,
+            "source_side": self.source_side,
+            "source_physical_cols": list(self.source_physical_cols),
+            "metadata_scope": list(self.metadata_scope),
+            "batch_id": self.action_id,
+            "action_id": self.action_id,
+        }
+        if self.action_kind == "insert_copy":
+            return (
+                {**common, "kind": "insert_cols"},
+                {**common, "kind": "copy_cols"},
+            )
+        if self.action_kind == "delete":
+            return ({**common, "kind": "delete_cols"},)
+        if self.action_kind == "copy":
+            return ({**common, "kind": "copy_cols"},)
+        return ()
+
+
+def _normalize_logical_column_side(side: str) -> str:
+    normalized = str(side or "").strip().lower()
+    if normalized in ("a", "left", "mine"):
+        return "mine"
+    if normalized in ("base", "mid", "middle"):
+        return "base"
+    if normalized in ("b", "right", "theirs"):
+        return "theirs"
+    if normalized in ("logical", "slot", "c"):
+        return "logical"
+    raise ValueError(f"unknown logical column side: {side!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalColumnProjection:
+    """Shared render/interaction projection whose geometry is ``model.slots``.
+
+    The projection deliberately does not copy or reorder slots.  Rendering,
+    hit-testing, C-area actions and minimaps therefore consume one immutable
+    logical geometry and only resolve a physical worksheet column at the last
+    possible moment.
+    """
+
+    model: ColumnModel
+    block_ordinal_by_slot: tuple[int, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.model, ColumnModel):
+            raise TypeError("logical projection requires a ColumnModel")
+        ordinals = tuple(int(value) for value in self.block_ordinal_by_slot)
+        if len(ordinals) != len(self.model.slots):
+            raise ValueError("projection block lookup must match model.slots")
+        object.__setattr__(self, "block_ordinal_by_slot", ordinals)
+
+    @classmethod
+    def from_model(cls, model: ColumnModel):
+        block_by_slot = [-1] * len(model.slots)
+        for block in model.blocks:
+            for slot_idx in block.slot_indices:
+                if 0 <= int(slot_idx) < len(block_by_slot):
+                    block_by_slot[int(slot_idx)] = int(block.ordinal)
+        return cls(model=model, block_ordinal_by_slot=tuple(block_by_slot))
+
+    @property
+    def slots(self) -> tuple[ColumnSlot, ...]:
+        return self.model.slots
+
+    @property
+    def slot_count(self) -> int:
+        return len(self.model.slots)
+
+    def slot(self, logical_col: int) -> ColumnSlot | None:
+        try:
+            offset = int(logical_col) - 1
+        except Exception:
+            return None
+        if 0 <= offset < len(self.model.slots):
+            return self.model.slots[offset]
+        return None
+
+    def physical_col(self, side: str, logical_col: int) -> int | None:
+        slot = self.slot(logical_col)
+        if slot is None:
+            return None
+        normalized = _normalize_logical_column_side(side)
+        if normalized == "logical":
+            return int(logical_col)
+        return _logical_model_side_col(slot, normalized)
+
+    def logical_col(self, side: str, physical_col: int) -> int | None:
+        normalized = _normalize_logical_column_side(side)
+        if normalized == "logical":
+            try:
+                logical_col = int(physical_col)
+            except Exception:
+                return None
+            return logical_col if self.slot(logical_col) is not None else None
+        lookup = {
+            "mine": self.model.mine_physical_to_logical,
+            "base": self.model.base_physical_to_logical,
+            "theirs": self.model.theirs_physical_to_logical,
+        }[normalized]
+        logical_idx = lookup.get(int(physical_col))
+        return int(logical_idx) + 1 if logical_idx is not None else None
+
+    def is_missing(self, side: str, logical_col: int) -> bool:
+        return self.physical_col(side, logical_col) is None
+
+    def structural_marker(self, side: str, logical_col: int) -> str:
+        slot = self.slot(logical_col)
+        if slot is None:
+            return "?"
+        normalized = _normalize_logical_column_side(side)
+        if slot.state == "retained" and not slot.confidence.ambiguous:
+            return ""
+        if slot.confidence.ambiguous or slot.state == "unresolved":
+            return "?"
+        if normalized != "logical" and self.physical_col(normalized, logical_col) is None:
+            return "∅"
+        if slot.base_col is None and normalized in ("mine", "theirs"):
+            return "+"
+        return _LOGICAL_COLUMN_STATE_MARKERS.get(slot.state, "!")
+
+    def structural_reason(self, side: str, logical_col: int) -> str:
+        slot = self.slot(logical_col)
+        if slot is None:
+            return "logical-slot-missing"
+        normalized = _normalize_logical_column_side(side)
+        reasons = []
+        if normalized != "logical" and self.physical_col(normalized, logical_col) is None:
+            reasons.append(f"{normalized}-column-missing")
+        if slot.state != "retained":
+            reasons.append(slot.state)
+        if slot.confidence.reason:
+            reasons.append(slot.confidence.reason)
+        reasons.extend(slot.confidence.cause_codes)
+        if not reasons:
+            reasons.append("retained-column")
+        return "; ".join(dict.fromkeys(str(reason) for reason in reasons if reason))
+
+    def header_label(self, side: str, logical_col: int) -> str:
+        normalized = _normalize_logical_column_side(side)
+        marker = self.structural_marker(normalized, logical_col)
+        if normalized == "logical":
+            label = f"L{int(logical_col)}"
+        else:
+            physical = self.physical_col(normalized, logical_col)
+            label = get_column_letter(physical) if physical is not None else _LOGICAL_COLUMN_PLACEHOLDER
+        return f"{marker}{label}" if marker and marker != label else label
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalRowComparison:
+    """Pure-data result for one logical 2-way row comparison."""
+
+    diff_cols: frozenset[int]
+    needs_formula_check: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "diff_cols", frozenset(int(c) for c in self.diff_cols))
+
+    @property
+    def has_diff(self) -> bool:
+        return bool(self.diff_cols)
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalThreeWayRowComparison:
+    """Base-relative value/formula changes for one aligned logical row."""
+
+    mine_changed_cols: frozenset[int]
+    theirs_changed_cols: frozenset[int]
+    conflict_cols: frozenset[int]
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "mine_changed_cols", frozenset(int(c) for c in self.mine_changed_cols)
+        )
+        object.__setattr__(
+            self, "theirs_changed_cols", frozenset(int(c) for c in self.theirs_changed_cols)
+        )
+        object.__setattr__(self, "conflict_cols", frozenset(int(c) for c in self.conflict_cols))
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalColumnState:
+    logical_col: int
+    state: str
+    mine_changed: bool = False
+    theirs_changed: bool = False
+    automatically_resolvable: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalColumnStructuralConflict:
+    logical_col: int
+    kind: str
+    state: str
+    base_boundary: int | None = None
+    cause_codes: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "cause_codes", tuple(dict.fromkeys(self.cause_codes)))
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalThreeWayColumnAnalysis:
+    states: tuple[LogicalColumnState, ...]
+    structural_conflicts: tuple[LogicalColumnStructuralConflict, ...]
+
+    def __post_init__(self):
+        object.__setattr__(self, "states", tuple(self.states))
+        object.__setattr__(self, "structural_conflicts", tuple(self.structural_conflicts))
+
+    @property
+    def has_unresolved(self) -> bool:
+        return bool(self.structural_conflicts)
+
+
+def _logical_model_side_col(slot: ColumnSlot, side: str) -> int | None:
+    side = str(side or "").lower()
+    if side in ("a", "left", "mine"):
+        return slot.mine_col
+    if side == "base":
+        return slot.base_col
+    if side in ("b", "right", "theirs"):
+        return slot.theirs_col
+    raise ValueError(f"unknown logical column side: {side!r}")
+
+
+def _logical_row_value(row_values, physical_col: int | None):
+    """Read one mapped value without ever substituting another side's column."""
+    if physical_col is None:
+        return None
+    values = row_values or ()
+    offset = int(physical_col) - 1
+    if offset < 0 or offset >= len(values):
+        return None
+    return values[offset]
+
+
+def _logical_cell_has_content(value_row, edit_row, physical_col: int | None) -> bool:
+    if physical_col is None:
+        return False
+    value = _logical_row_value(value_row, physical_col)
+    edit = _logical_row_value(edit_row, physical_col)
+    if value not in (None, ""):
+        return True
+    if edit in (None, ""):
+        return False
+    return bool(_formula_text(edit) or edit not in (None, ""))
+
+
+def _logical_cell_payload(
+    row_values,
+    edit_values,
+    physical_col: int,
+    *,
+    source_row: int | None,
+    compare_row: int | None,
+    logical_col: int,
+    physical_to_logical=None,
+):
+    value = _logical_row_value(row_values, physical_col)
+    edit = _logical_row_value(edit_values, physical_col)
+    if source_row is not None and compare_row is not None:
+        edit = _translate_normal_formula_for_compare(
+            value,
+            edit,
+            int(source_row),
+            int(physical_col),
+            int(compare_row),
+            int(physical_col),
+        )
+    return value, edit
+
+
+@lru_cache(maxsize=2048)
+def _one_based_formula_mapping(
+    zero_based_entries: tuple[tuple[int, int], ...],
+) -> FrozenIntLookup:
+    """Cache an immutable physical→1-based-logical formula projection."""
+    return FrozenIntLookup(tuple(
+        (int(physical), int(logical_idx) + 1)
+        for physical, logical_idx in zero_based_entries
+    ))
+
+
+def _formula_mapping_for_model_side(model: ColumnModel, side: str) -> FrozenIntLookup:
+    normalized = _normalize_logical_column_side(side)
+    lookup = {
+        "mine": model.mine_physical_to_logical,
+        "base": model.base_physical_to_logical,
+        "theirs": model.theirs_physical_to_logical,
+    }[normalized]
+    return _one_based_formula_mapping(tuple(lookup.entries))
+
+
+def build_logical_column_comparison_cache_2way(
+    cache_key: ColumnModelCacheKey,
+    mine_value_rows,
+    theirs_value_rows,
+    mine_edit_rows=None,
+    theirs_edit_rows=None,
+    *,
+    mine_max_col: int | None = None,
+    theirs_max_col: int | None = None,
+) -> LogicalColumnComparisonCache:
+    """Build a reusable 2-way mapping only from sequential in-memory rows."""
+    mine_snapshot = build_column_signature_snapshot(
+        cache_key,
+        mine_value_rows,
+        mine_edit_rows,
+        max_col=mine_max_col,
+    )
+    theirs_snapshot = build_column_signature_snapshot(
+        cache_key,
+        theirs_value_rows,
+        theirs_edit_rows,
+        max_col=theirs_max_col,
+    )
+    alignment = align_column_signatures_2way(
+        mine_snapshot,
+        theirs_snapshot,
+        cache_key=cache_key,
+    )
+    mine_width = max(0, int(mine_max_col or 0))
+    theirs_width = max(0, int(theirs_max_col or 0))
+    if mine_width > 0 and mine_width == theirs_width:
+        width = mine_width
+
+        def _first_row(rows):
+            try:
+                return tuple(rows[0]) if rows else ()
+            except Exception:
+                return ()
+
+        def _header_token(value_row, edit_row, physical_col):
+            value = _logical_row_value(value_row, physical_col)
+            edit = _logical_row_value(edit_row, physical_col)
+            formula = _formula_text(edit) or _special_formula_signature(edit)
+            if formula is not None:
+                return ("formula", formula)
+            effective = value
+            if effective is None and edit is not None and not _formula_text(edit):
+                effective = edit
+            if effective in (None, ""):
+                return None
+            return ("value", _merge_cmp_value(effective))
+
+        mine_header = _first_row(mine_value_rows)
+        theirs_header = _first_row(theirs_value_rows)
+        mine_header_edit = _first_row(mine_edit_rows)
+        theirs_header_edit = _first_row(theirs_edit_rows)
+        mine_tokens = tuple(
+            _header_token(mine_header, mine_header_edit, physical_col)
+            for physical_col in range(1, width + 1)
+        )
+        theirs_tokens = tuple(
+            _header_token(theirs_header, theirs_header_edit, physical_col)
+            for physical_col in range(1, width + 1)
+        )
+        mine_unique = {
+            token for token in mine_tokens
+            if token is not None and mine_tokens.count(token) == 1
+        }
+        theirs_unique = {
+            token for token in theirs_tokens
+            if token is not None and theirs_tokens.count(token) == 1
+        }
+
+        def _same_ordinal_content_evidence(physical_col: int) -> bool:
+            """Prove a same-width fallback column still shares real content.
+
+            A normal cell edit can change the first sampled/header value and
+            weaken a tiny column's signature.  One identical non-blank payload
+            at the same ordinal proves this is not a wholly unrelated column,
+            while blank/duplicate/formula-conflict causes remain blocked below.
+            """
+            row_count = max(
+                len(mine_value_rows or ()),
+                len(theirs_value_rows or ()),
+                len(mine_edit_rows or ()),
+                len(theirs_edit_rows or ()),
+            )
+
+            def _row(rows, index):
+                try:
+                    return rows[index]
+                except (IndexError, TypeError):
+                    return ()
+
+            equal_count = 0
+            different_count = 0
+            for row_index in range(row_count):
+                mine_value_row = _row(mine_value_rows, row_index)
+                theirs_value_row = _row(theirs_value_rows, row_index)
+                mine_edit_row = _row(mine_edit_rows, row_index)
+                theirs_edit_row = _row(theirs_edit_rows, row_index)
+                if not (
+                    _logical_cell_has_content(
+                        mine_value_row, mine_edit_row, physical_col
+                    )
+                    and _logical_cell_has_content(
+                        theirs_value_row, theirs_edit_row, physical_col
+                    )
+                ):
+                    continue
+                mine_key = _merge_cell_compare_key(
+                    _logical_row_value(mine_value_row, physical_col),
+                    _logical_row_value(mine_edit_row, physical_col),
+                )
+                theirs_key = _merge_cell_compare_key(
+                    _logical_row_value(theirs_value_row, physical_col),
+                    _logical_row_value(theirs_edit_row, physical_col),
+                )
+                if mine_key == theirs_key:
+                    equal_count += 1
+                else:
+                    different_count += 1
+            # A lone coincidental default in an otherwise replaced column is
+            # not enough.  Stable same-ordinal payloads must be at least as
+            # numerous as differing comparable payloads.
+            return equal_count > 0 and equal_count >= different_count
+
+        normalized_slots = []
+        changed = False
+        for slot in alignment.model.slots:
+            physical_col = slot.logical_idx + 1
+            token = mine_tokens[physical_col - 1] if physical_col <= width else None
+            single_column_same_ordinal = bool(
+                width == 1
+                and slot.mine_col == slot.theirs_col == physical_col == 1
+            )
+            can_promote = bool(
+                slot.state == "unresolved"
+                and slot.mine_col == slot.theirs_col == physical_col
+                and (
+                    single_column_same_ordinal
+                    or (
+                        token is not None
+                        and token == theirs_tokens[physical_col - 1]
+                        and token in mine_unique
+                        and token in theirs_unique
+                    )
+                )
+            )
+            content_same_ordinal = bool(
+                slot.state == "unresolved"
+                and slot.mine_col == slot.theirs_col == physical_col
+                and physical_col <= width
+                and not (
+                    set(slot.confidence.cause_codes)
+                    & {
+                        COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+                        COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+                        COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH,
+                        COLUMN_MAPPING_CAUSE_INCOMPATIBLE_CACHE,
+                        COLUMN_MAPPING_CAUSE_IMPLICIT_BOUNDARY,
+                        COLUMN_MAPPING_CAUSE_COLUMN_LIMIT,
+                    }
+                )
+                and _same_ordinal_content_evidence(physical_col)
+            )
+            can_promote = can_promote or content_same_ordinal
+            if can_promote:
+                normalized_slots.append(ColumnSlot(
+                    logical_idx=slot.logical_idx,
+                    mine_col=slot.mine_col,
+                    base_col=slot.base_col,
+                    theirs_col=slot.theirs_col,
+                    state="retained",
+                    confidence=ColumnMappingConfidence(
+                        1.0,
+                        False,
+                        "single-column-same-ordinal"
+                        if single_column_same_ordinal
+                        else "same-ordinal-content-evidence"
+                        if content_same_ordinal
+                        else "unique-header-same-ordinal",
+                        (
+                            "content" if content_same_ordinal else "header",
+                            "same-ordinal",
+                        ),
+                    ),
+                    base_boundary=slot.base_boundary,
+                    origin_side=slot.origin_side,
+                ))
+                changed = True
+            else:
+                normalized_slots.append(slot)
+        if changed:
+            normalized_slots = tuple(normalized_slots)
+            remaining_fallback = tuple(
+                slot.logical_idx
+                for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            )
+            normalized_model = ColumnModel.from_slots(
+                cache_key,
+                normalized_slots,
+                blocks=_build_column_blocks(normalized_slots),
+                confidence=ColumnMappingConfidence(
+                    min((slot.confidence.score for slot in normalized_slots), default=1.0),
+                    bool(remaining_fallback),
+                    "unresolved-column-range" if remaining_fallback else "unique-header-same-ordinal",
+                ),
+            )
+            alignment = ColumnAlignmentResult(
+                normalized_model,
+                alignment.anchor_pairs,
+                remaining_fallback,
+                bool(remaining_fallback),
+                "unresolved-column-range" if remaining_fallback else "",
+            )
+    structural = frozenset(
+        slot.logical_idx + 1
+        for slot in alignment.model.slots
+        if slot.mine_col is None or slot.theirs_col is None
+    )
+    unresolved = frozenset(
+        slot.logical_idx + 1
+        for slot in alignment.model.slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    )
+    return LogicalColumnComparisonCache(
+        model=alignment.model,
+        two_way_alignment=alignment,
+        structural_diff_cols=structural,
+        unresolved_cols=unresolved,
+    )
+
+
+def build_logical_column_comparison_cache_3way(
+    cache_key: ColumnModelCacheKey,
+    mine_value_rows,
+    base_value_rows,
+    theirs_value_rows,
+    mine_edit_rows=None,
+    base_edit_rows=None,
+    theirs_edit_rows=None,
+    *,
+    mine_max_col: int | None = None,
+    base_max_col: int | None = None,
+    theirs_max_col: int | None = None,
+) -> LogicalColumnComparisonCache:
+    """Build a Base-anchored reusable mapping from sequential row caches."""
+    mine_snapshot = build_column_signature_snapshot(
+        cache_key, mine_value_rows, mine_edit_rows, max_col=mine_max_col
+    )
+    base_snapshot = build_column_signature_snapshot(
+        cache_key, base_value_rows, base_edit_rows, max_col=base_max_col
+    )
+    theirs_snapshot = build_column_signature_snapshot(
+        cache_key, theirs_value_rows, theirs_edit_rows, max_col=theirs_max_col
+    )
+    alignment = align_column_signatures_3way(
+        mine_snapshot,
+        base_snapshot,
+        theirs_snapshot,
+        cache_key=cache_key,
+    )
+
+    # Row insertions can weaken full-column signatures even when the physical
+    # column structure is unchanged.  Promote only the strongest conservative
+    # cases when all three sides have the same width/order: either the unique
+    # header identity agrees, or the complete value/formula digest agrees at
+    # that ordinal on all three sides.  The latter safely handles identical
+    # blank/duplicate columns without accepting a content-different mapping.
+    widths = (
+        max(0, int(mine_max_col or 0)),
+        max(0, int(base_max_col or 0)),
+        max(0, int(theirs_max_col or 0)),
+    )
+    if widths[0] > 0 and widths[0] == widths[1] == widths[2]:
+        width = widths[0]
+
+        def _first_row(rows):
+            try:
+                return tuple(rows[0]) if rows else ()
+            except Exception:
+                return ()
+
+        def _header_token(value_row, edit_row, physical_col):
+            value = _logical_row_value(value_row, physical_col)
+            edit = _logical_row_value(edit_row, physical_col)
+            formula = _formula_text(edit) or _special_formula_signature(edit)
+            if formula is not None:
+                return ("formula", formula)
+            effective = value
+            if effective is None and edit is not None and not _formula_text(edit):
+                effective = edit
+            if effective in (None, ""):
+                return None
+            return ("value", _merge_cmp_value(effective))
+
+        mine_header = _first_row(mine_value_rows)
+        base_header = _first_row(base_value_rows)
+        theirs_header = _first_row(theirs_value_rows)
+        mine_header_edit = _first_row(mine_edit_rows)
+        base_header_edit = _first_row(base_edit_rows)
+        theirs_header_edit = _first_row(theirs_edit_rows)
+        side_tokens = []
+        for value_row, edit_row in (
+            (mine_header, mine_header_edit),
+            (base_header, base_header_edit),
+            (theirs_header, theirs_header_edit),
+        ):
+            side_tokens.append(tuple(
+                _header_token(value_row, edit_row, physical_col)
+                for physical_col in range(1, width + 1)
+            ))
+        unique_tokens = [
+            {
+                token
+                for token in tokens
+                if token is not None and tokens.count(token) == 1
+            }
+            for tokens in side_tokens
+        ]
+        normalized_slots = []
+        changed = False
+        for slot in alignment.model.slots:
+            physical_col = slot.logical_idx + 1
+            exact_same_ordinal = False
+            if (
+                physical_col <= width
+                and slot.mine_col == slot.base_col == slot.theirs_col == physical_col
+            ):
+                mine_signature = mine_snapshot.signatures[physical_col - 1]
+                base_signature = base_snapshot.signatures[physical_col - 1]
+                theirs_signature = theirs_snapshot.signatures[physical_col - 1]
+                exact_same_ordinal = bool(
+                    mine_signature.exact_content_key
+                    and mine_signature.exact_content_key
+                    == base_signature.exact_content_key
+                    == theirs_signature.exact_content_key
+                )
+            single_column_same_ordinal = bool(
+                width == 1
+                and slot.mine_col == slot.base_col == slot.theirs_col == physical_col == 1
+            )
+            can_promote = bool(
+                slot.state == "unresolved"
+                and slot.mine_col == slot.base_col == slot.theirs_col == physical_col
+                and physical_col <= width
+            )
+            if can_promote and not (
+                single_column_same_ordinal or exact_same_ordinal
+            ):
+                token = side_tokens[0][physical_col - 1]
+                can_promote = bool(
+                    token is not None
+                    and token == side_tokens[1][physical_col - 1]
+                    and token == side_tokens[2][physical_col - 1]
+                    and all(token in tokens for tokens in unique_tokens)
+                )
+            if can_promote:
+                normalized_slots.append(ColumnSlot(
+                    logical_idx=slot.logical_idx,
+                    mine_col=slot.mine_col,
+                    base_col=slot.base_col,
+                    theirs_col=slot.theirs_col,
+                    state="retained",
+                    confidence=ColumnMappingConfidence(
+                        1.0,
+                        False,
+                        "single-column-same-ordinal"
+                        if single_column_same_ordinal
+                        else "exact-content-same-ordinal"
+                        if exact_same_ordinal
+                        else "unique-header-same-ordinal",
+                        (
+                            "exact-full-column-content"
+                            if exact_same_ordinal else "header",
+                            "same-ordinal",
+                        ),
+                    ),
+                    base_boundary=slot.base_boundary,
+                    origin_side=slot.origin_side,
+                ))
+                changed = True
+            else:
+                normalized_slots.append(slot)
+        if changed:
+            normalized_slots = tuple(normalized_slots)
+            remaining_fallback = tuple(
+                slot.logical_idx
+                for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            )
+            normalized_model = ColumnModel.from_slots(
+                cache_key,
+                normalized_slots,
+                blocks=_build_column_blocks(normalized_slots),
+                confidence=ColumnMappingConfidence(
+                    min((slot.confidence.score for slot in normalized_slots), default=1.0),
+                    bool(remaining_fallback),
+                    "unresolved-column-range" if remaining_fallback else "unique-header-same-ordinal",
+                ),
+            )
+            alignment = ColumnAlignment3WayResult(
+                normalized_model,
+                alignment.mine_to_base,
+                alignment.theirs_to_base,
+                remaining_fallback,
+                bool(remaining_fallback),
+                "unresolved-column-range" if remaining_fallback else "",
+            )
+    structural = frozenset(
+        slot.logical_idx + 1
+        for slot in alignment.model.slots
+        if slot.mine_col is None or slot.theirs_col is None
+    )
+    unresolved = frozenset(
+        slot.logical_idx + 1
+        for slot in alignment.model.slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    )
+    return LogicalColumnComparisonCache(
+        model=alignment.model,
+        three_way_alignment=alignment,
+        structural_diff_cols=structural,
+        unresolved_cols=unresolved,
+    )
+
+
+def compare_logical_row_sides(
+    column_cache: LogicalColumnComparisonCache,
+    left_value_row,
+    right_value_row,
+    left_edit_row=None,
+    right_edit_row=None,
+    *,
+    left_side: str = "mine",
+    right_side: str = "theirs",
+    left_row: int | None = None,
+    right_row: int | None = None,
+    left_present: bool = True,
+    right_present: bool = True,
+    values_only: bool = False,
+) -> LogicalRowComparison:
+    """Compare any two model sides with cached rows and zero Worksheet access."""
+    if not left_present or not right_present:
+        if left_present != right_present:
+            return LogicalRowComparison(frozenset((-1,)), False)
+        return LogicalRowComparison(frozenset(), False)
+
+    diff_cols = set()
+    needs_formula_check = False
+    compare_row = left_row if left_row is not None else right_row
+    left_physical_to_logical = _formula_mapping_for_model_side(
+        column_cache.model, left_side
+    )
+    right_physical_to_logical = _formula_mapping_for_model_side(
+        column_cache.model, right_side
+    )
+    for slot in column_cache.model.slots:
+        logical_col = slot.logical_idx + 1
+        left_col = _logical_model_side_col(slot, left_side)
+        right_col = _logical_model_side_col(slot, right_side)
+        if left_col is None and right_col is None:
+            continue
+        if left_col is None or right_col is None:
+            existing_row = right_value_row if left_col is None else left_value_row
+            existing_edit_row = right_edit_row if left_col is None else left_edit_row
+            existing_col = right_col if left_col is None else left_col
+            if _logical_cell_has_content(existing_row, existing_edit_row, existing_col):
+                diff_cols.add(logical_col)
+            continue
+        left_value = _logical_row_value(left_value_row, left_col)
+        right_value = _logical_row_value(right_value_row, right_col)
+        if values_only:
+            if _merge_cmp_value(left_value) != _merge_cmp_value(right_value):
+                diff_cols.add(logical_col)
+            if left_edit_row is None or right_edit_row is None:
+                needs_formula_check = True
+            continue
+        left_value, left_edit = _logical_cell_payload(
+            left_value_row,
+            left_edit_row,
+            left_col,
+            source_row=left_row,
+            compare_row=compare_row,
+            logical_col=logical_col,
+            physical_to_logical=left_physical_to_logical,
+        )
+        right_value, right_edit = _logical_cell_payload(
+            right_value_row,
+            right_edit_row,
+            right_col,
+            source_row=right_row,
+            compare_row=compare_row,
+            logical_col=logical_col,
+            physical_to_logical=right_physical_to_logical,
+        )
+        left_edit = _canonicalize_formula_column_references(
+            left_edit, left_physical_to_logical
+        )
+        right_edit = _canonicalize_formula_column_references(
+            right_edit, right_physical_to_logical
+        )
+        _left_display, _right_display, equal = _cell_display_and_equal_from_values(
+            left_value,
+            right_value,
+            left_edit,
+            right_edit,
+        )
+        if not equal:
+            diff_cols.add(logical_col)
+    return LogicalRowComparison(frozenset(diff_cols), needs_formula_check)
+
+
+def compare_logical_row_2way(
+    column_cache: LogicalColumnComparisonCache,
+    mine_value_row,
+    theirs_value_row,
+    mine_edit_row=None,
+    theirs_edit_row=None,
+    *,
+    mine_row: int | None = None,
+    theirs_row: int | None = None,
+    mine_present: bool = True,
+    theirs_present: bool = True,
+    values_only: bool = False,
+) -> LogicalRowComparison:
+    """Compare Mine and Theirs through cached logical slots."""
+    return compare_logical_row_sides(
+        column_cache,
+        mine_value_row,
+        theirs_value_row,
+        mine_edit_row,
+        theirs_edit_row,
+        left_side="mine",
+        right_side="theirs",
+        left_row=mine_row,
+        right_row=theirs_row,
+        left_present=mine_present,
+        right_present=theirs_present,
+        values_only=values_only,
+    )
+
+
+def compare_logical_row_3way(
+    column_cache: LogicalColumnComparisonCache,
+    mine_value_row,
+    base_value_row,
+    theirs_value_row,
+    mine_edit_row=None,
+    base_edit_row=None,
+    theirs_edit_row=None,
+    *,
+    mine_row: int | None = None,
+    base_row: int | None = None,
+    theirs_row: int | None = None,
+) -> LogicalThreeWayRowComparison:
+    """Classify one aligned 3-way row through Base-anchored logical slots."""
+    mine_changed = set()
+    theirs_changed = set()
+    conflicts = set()
+    compare_row = (
+        mine_row if mine_row is not None
+        else theirs_row if theirs_row is not None
+        else base_row
+    )
+    mine_physical_to_logical = _formula_mapping_for_model_side(
+        column_cache.model, "mine"
+    )
+    base_physical_to_logical = _formula_mapping_for_model_side(
+        column_cache.model, "base"
+    )
+    theirs_physical_to_logical = _formula_mapping_for_model_side(
+        column_cache.model, "theirs"
+    )
+    for slot in column_cache.model.slots:
+        if slot.base_col is None:
+            continue
+        logical_col = slot.logical_idx + 1
+
+        base_value, base_edit = _logical_cell_payload(
+            base_value_row,
+            base_edit_row,
+            slot.base_col,
+            source_row=base_row,
+            compare_row=compare_row,
+            logical_col=logical_col,
+            physical_to_logical=base_physical_to_logical,
+        )
+
+        if slot.mine_col is None:
+            mine_value = None
+            mine_edit = None
+            mine_key = None
+        else:
+            mine_value, mine_edit = _logical_cell_payload(
+                mine_value_row,
+                mine_edit_row,
+                slot.mine_col,
+                source_row=mine_row,
+                compare_row=compare_row,
+                logical_col=logical_col,
+                physical_to_logical=mine_physical_to_logical,
+            )
+
+        if slot.theirs_col is None:
+            theirs_value = None
+            theirs_edit = None
+            theirs_key = None
+        else:
+            theirs_value, theirs_edit = _logical_cell_payload(
+                theirs_value_row,
+                theirs_edit_row,
+                slot.theirs_col,
+                source_row=theirs_row,
+                compare_row=compare_row,
+                logical_col=logical_col,
+                physical_to_logical=theirs_physical_to_logical,
+            )
+
+        base_edit = _canonicalize_formula_column_references(
+            base_edit, base_physical_to_logical
+        )
+        if slot.mine_col is not None:
+            mine_edit = _canonicalize_formula_column_references(
+                mine_edit, mine_physical_to_logical
+            )
+        if slot.theirs_col is not None:
+            theirs_edit = _canonicalize_formula_column_references(
+                theirs_edit, theirs_physical_to_logical
+            )
+
+        base_key = _merge_cell_compare_key(base_value, base_edit)
+        if slot.mine_col is None:
+            mine_changed.add(logical_col)
+        else:
+            mine_key = _merge_cell_compare_key(mine_value, mine_edit)
+            if mine_key != base_key:
+                mine_changed.add(logical_col)
+
+        if slot.theirs_col is None:
+            theirs_changed.add(logical_col)
+        else:
+            theirs_key = _merge_cell_compare_key(theirs_value, theirs_edit)
+            if theirs_key != base_key:
+                theirs_changed.add(logical_col)
+
+        if (
+            slot.mine_col is not None
+            and slot.theirs_col is not None
+            and logical_col in mine_changed
+            and logical_col in theirs_changed
+            and mine_key != theirs_key
+        ):
+            conflicts.add(logical_col)
+    return LogicalThreeWayRowComparison(
+        frozenset(mine_changed),
+        frozenset(theirs_changed),
+        frozenset(conflicts),
+    )
+
+
+def classify_logical_columns_3way(
+    column_cache: LogicalColumnComparisonCache,
+    *,
+    mine_changed_cols=(),
+    theirs_changed_cols=(),
+    mine_metadata_changed_cols=(),
+    theirs_metadata_changed_cols=(),
+    trusted_same_ordinal_cols=(),
+) -> LogicalThreeWayColumnAnalysis:
+    """Classify Base identities and conservatively expose structural conflicts."""
+    mine_changed = {int(c) for c in mine_changed_cols} | {
+        int(c) for c in mine_metadata_changed_cols
+    }
+    theirs_changed = {int(c) for c in theirs_changed_cols} | {
+        int(c) for c in theirs_metadata_changed_cols
+    }
+    trusted_same_ordinal = {int(c) for c in trusted_same_ordinal_cols}
+    states = []
+    conflicts = []
+    competing_boundaries = {
+        slot.base_boundary
+        for slot in column_cache.model.slots
+        if (
+            slot.base_col is None
+            and slot.base_boundary is not None
+            and slot.origin_side in ("mine", "theirs")
+        )
+        for other in column_cache.model.slots
+        if (
+            other.base_col is None
+            and other.base_boundary == slot.base_boundary
+            and other.origin_side in ("mine", "theirs")
+            and other.origin_side != slot.origin_side
+        )
+    }
+    for slot in column_cache.model.slots:
+        logical_col = slot.logical_idx + 1
+        mine_modified = logical_col in mine_changed
+        theirs_modified = logical_col in theirs_changed
+        conflict_kind = ""
+        ambiguous = slot.state == "unresolved" or slot.confidence.ambiguous
+        benign_same_ordinal_fallback = bool(
+            ambiguous
+            and slot.base_col is not None
+            and slot.mine_col == slot.base_col == slot.theirs_col
+            and logical_col in trusted_same_ordinal
+            and not (
+                set(slot.confidence.cause_codes)
+                & {
+                    COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+                    COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+                }
+            )
+        )
+        if benign_same_ordinal_fallback:
+            # A value edit can weaken the only available column signature on a
+            # narrow sheet.  When every side still owns the same ordinal and no
+            # blank/duplicate/formula ambiguity exists, preserve legacy cell
+            # conflict behavior instead of inventing a structural conflict.
+            ambiguous = False
+        if slot.base_col is None:
+            state = "inserted"
+            if (
+                slot.origin_side in ("mine", "theirs")
+                and slot.base_boundary in competing_boundaries
+            ):
+                conflict_kind = "competing-insertion"
+            elif ambiguous:
+                conflict_kind = "unresolved-mapping"
+        elif slot.mine_col is None and slot.theirs_col is None:
+            state = "both-deleted"
+            if ambiguous:
+                conflict_kind = "unresolved-mapping"
+        elif slot.mine_col is None:
+            state = "mine-deleted"
+            if theirs_modified:
+                conflict_kind = "delete-versus-modify"
+            elif ambiguous:
+                conflict_kind = "unresolved-mapping"
+        elif slot.theirs_col is None:
+            state = "theirs-deleted"
+            if mine_modified:
+                conflict_kind = "delete-versus-modify"
+            elif ambiguous:
+                conflict_kind = "unresolved-mapping"
+        elif ambiguous:
+            state = "unresolved"
+            conflict_kind = "unresolved-mapping"
+        elif mine_modified or theirs_modified:
+            state = "modified"
+        else:
+            state = "retained"
+        automatically_resolvable = not conflict_kind and not slot.confidence.ambiguous
+        states.append(LogicalColumnState(
+            logical_col,
+            state,
+            mine_modified,
+            theirs_modified,
+            automatically_resolvable,
+        ))
+        if conflict_kind:
+            conflicts.append(LogicalColumnStructuralConflict(
+                logical_col,
+                conflict_kind,
+                state,
+                slot.base_boundary,
+                slot.confidence.cause_codes,
+            ))
+    return LogicalThreeWayColumnAnalysis(tuple(states), tuple(conflicts))
+
+
+def _worksheet_column_metadata_fingerprints(ws, max_col: int) -> tuple[str, ...]:
+    """Build bounded per-column metadata identities without Worksheet.cell reads."""
+    max_col = max(0, int(max_col or 0))
+    signals: list[list[object]] = [[] for _idx in range(max_col)]
+    if ws is None:
+        return tuple(_stable_column_signal_digest(()) for _idx in range(max_col))
+    try:
+        dimensions = getattr(ws, "column_dimensions", {})
+        for physical_col in range(1, max_col + 1):
+            dimension = dimensions.get(get_column_letter(physical_col))
+            if dimension is None:
+                continue
+            signals[physical_col - 1].append((
+                "dimension",
+                getattr(dimension, "width", None),
+                bool(getattr(dimension, "hidden", False)),
+                int(getattr(dimension, "outlineLevel", 0) or 0),
+                bool(getattr(dimension, "collapsed", False)),
+                int(getattr(dimension, "style_id", 0) or 0),
+            ))
+    except Exception:
+        pass
+    try:
+        cells = getattr(ws, "_cells", {}) or {}
+        for (row_idx, physical_col), cell in cells.items():
+            physical_col = int(physical_col)
+            if physical_col < 1 or physical_col > max_col:
+                continue
+            comment = getattr(cell, "comment", None)
+            hyperlink = getattr(cell, "hyperlink", None)
+            style_id = int(getattr(cell, "style_id", 0) or 0)
+            number_format = str(getattr(cell, "number_format", "") or "")
+            if (
+                style_id == 0
+                and number_format in ("", "General")
+                and comment is None
+                and hyperlink is None
+            ):
+                continue
+            signals[physical_col - 1].append((
+                "cell",
+                int(row_idx),
+                style_id,
+                number_format,
+                (
+                    str(getattr(comment, "author", "") or ""),
+                    str(getattr(comment, "text", "") or ""),
+                ) if comment is not None else None,
+                (
+                    str(getattr(hyperlink, "target", "") or ""),
+                    str(getattr(hyperlink, "location", "") or ""),
+                    str(getattr(hyperlink, "tooltip", "") or ""),
+                ) if hyperlink is not None else None,
+            ))
+    except Exception:
+        pass
+    try:
+        validations = getattr(getattr(ws, "data_validations", None), "dataValidation", ()) or ()
+        for validation in validations:
+            ref_text = str(getattr(validation, "sqref", "") or "")
+            validation_signal = (
+                "validation",
+                ref_text,
+                str(getattr(validation, "type", "") or ""),
+                str(getattr(validation, "formula1", "") or ""),
+                str(getattr(validation, "formula2", "") or ""),
+            )
+            for match in re.finditer(
+                r"(?:^|\s)\$?([A-Z]+)\$?\d*(?::\$?([A-Z]+)\$?\d*)?",
+                ref_text.upper(),
+            ):
+                start_col = _col_index_from_ref(match.group(1))
+                end_col = _col_index_from_ref(match.group(2) or match.group(1))
+                for physical_col in range(max(1, start_col), min(max_col, end_col) + 1):
+                    signals[physical_col - 1].append(validation_signal)
+    except Exception:
+        pass
+    return tuple(
+        _stable_column_signal_digest(tuple(sorted(column_signals, key=repr)))
+        for column_signals in signals
+    )
+
+
+def logical_metadata_changes_from_base(
+    column_cache: LogicalColumnComparisonCache,
+    mine_metadata,
+    base_metadata,
+    theirs_metadata,
+) -> tuple[frozenset[int], frozenset[int]]:
+    """Project metadata identities through Base slots and return changed columns."""
+    mine_changed = set()
+    theirs_changed = set()
+    for slot in column_cache.model.slots:
+        if slot.base_col is None:
+            continue
+        logical_col = slot.logical_idx + 1
+        base_value = _logical_row_value(base_metadata, slot.base_col)
+        if slot.mine_col is not None:
+            if _logical_row_value(mine_metadata, slot.mine_col) != base_value:
+                mine_changed.add(logical_col)
+        if slot.theirs_col is not None:
+            if _logical_row_value(theirs_metadata, slot.theirs_col) != base_value:
+                theirs_changed.add(logical_col)
+    return frozenset(mine_changed), frozenset(theirs_changed)
 
 
 def _cell_display_and_equal_by_row(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra: int | None, rb: int | None, c: int):
@@ -1305,11 +4944,8 @@ def _ensure_formula_copy_supported(src_edit, dst_edit=None):
     )
 
 
-def _norm_formula_text(v):
-    f = _formula_text(v)
-    if not f:
-        return None
-    s = str(f).strip()
+def _normalize_formula_text_uncached(formula: str) -> str:
+    s = str(formula).strip()
     if s.startswith("="):
         s = s[1:]
     # Excel identifiers/functions are case-insensitive, but string literals and
@@ -1331,6 +4967,20 @@ def _norm_formula_text(v):
             out.append(ch if in_string else ch.upper())
         idx += 1
     return "".join(out)
+
+
+@lru_cache(maxsize=8192)
+def _normalize_normal_formula_text_cached(formula: str) -> str:
+    return _normalize_formula_text_uncached(formula)
+
+
+def _norm_formula_text(v):
+    f = _formula_text(v)
+    if not f:
+        return None
+    if isinstance(v, str) and not isinstance(v, _LiteralText):
+        return _normalize_normal_formula_text_cached(str(f))
+    return _normalize_formula_text_uncached(str(f))
 
 
 def _same_formula(a, b):
@@ -1398,6 +5048,264 @@ def _translate_normal_formula_for_compare(
         # If translation cannot be proven, retain the original formula so the
         # comparator reports a conservative difference instead of hiding one.
         return v_edit
+
+
+_LOCAL_A1_REFERENCE_RE = re.compile(
+    r"^(?P<col_abs>\$?)(?P<col>[A-Za-z]{1,3})(?P<row_abs>\$?)(?P<row>[1-9][0-9]*)$"
+)
+_LOCAL_COLUMN_REFERENCE_RE = re.compile(
+    r"^(?P<col_abs>\$?)(?P<col>[A-Za-z]{1,3})$"
+)
+
+
+def _immutable_formula_mapping_entries(physical_to_logical) -> tuple[tuple[int, int], ...]:
+    entries = getattr(physical_to_logical, "entries", None)
+    if entries is not None:
+        return tuple((int(key), int(value)) for key, value in entries)
+    try:
+        return tuple(sorted(
+            (int(key), int(value))
+            for key, value in physical_to_logical.items()
+        ))
+    except Exception:
+        return ()
+
+
+@lru_cache(maxsize=16384)
+def _canonicalize_normal_formula_cached(
+    formula: str,
+    mapping_entries: tuple[tuple[int, int], ...],
+) -> str:
+    physical_to_logical = dict(mapping_entries)
+
+    def _mapped_endpoint(raw: str, *, allow_column_only: bool) -> str | None:
+        match = _LOCAL_A1_REFERENCE_RE.fullmatch(raw)
+        if match is not None:
+            try:
+                physical = column_index_from_string(match.group("col"))
+                logical = physical_to_logical.get(int(physical))
+            except Exception:
+                logical = None
+            if logical is None:
+                return None
+            return (
+                match.group("col_abs")
+                + get_column_letter(int(logical))
+                + match.group("row_abs")
+                + match.group("row")
+            )
+        if allow_column_only:
+            match = _LOCAL_COLUMN_REFERENCE_RE.fullmatch(raw)
+            if match is not None:
+                try:
+                    physical = column_index_from_string(match.group("col"))
+                    logical = physical_to_logical.get(int(physical))
+                except Exception:
+                    logical = None
+                if logical is not None:
+                    return match.group("col_abs") + get_column_letter(int(logical))
+        return None
+
+    try:
+        tokenizer = Tokenizer(formula)
+        for token in tokenizer.items:
+            if token.type != "OPERAND" or token.subtype != "RANGE":
+                continue
+            raw = str(token.value or "")
+            if not raw or "!" in raw or "[" in raw or "]" in raw:
+                continue
+            parts = raw.split(":")
+            if len(parts) == 1:
+                mapped = _mapped_endpoint(parts[0], allow_column_only=False)
+                if mapped is not None:
+                    token.value = mapped
+                continue
+            if len(parts) != 2:
+                continue
+            allow_column_only = bool(
+                _LOCAL_COLUMN_REFERENCE_RE.fullmatch(parts[0])
+                and _LOCAL_COLUMN_REFERENCE_RE.fullmatch(parts[1])
+            )
+            left = _mapped_endpoint(parts[0], allow_column_only=allow_column_only)
+            right = _mapped_endpoint(parts[1], allow_column_only=allow_column_only)
+            if left is not None and right is not None:
+                token.value = left + ":" + right
+        return tokenizer.render()
+    except Exception:
+        return formula
+
+
+def _canonicalize_formula_column_references(edit_value, physical_to_logical) -> object:
+    """Map provable local A1 references from physical to logical columns.
+
+    Whole-formula translation is incorrect around an inserted column: a
+    formula cell may move while references before the insertion stay fixed and
+    references after it move. Tokenizing lets us canonicalize each unqualified
+    local reference independently. Sheet-qualified/external/structured/name
+    operands remain untouched when their meaning cannot be proved here.
+    """
+    if _special_formula_signature(edit_value) is not None:
+        return edit_value
+    formula = _formula_text(edit_value)
+    mapping_entries = _immutable_formula_mapping_entries(physical_to_logical)
+    if not formula or not mapping_entries:
+        return edit_value
+    # Identity geometry cannot change any provable local reference.  Avoid the
+    # tokenizer entirely on the overwhelmingly common non-structural sheet.
+    if all(physical == logical for physical, logical in mapping_entries):
+        return edit_value
+    return _canonicalize_normal_formula_cached(str(formula), mapping_entries)
+
+
+def _formula_sheet_name_from_qualifier(raw_qualifier: str) -> str | None:
+    qualifier = str(raw_qualifier or "")
+    if not qualifier or "[" in qualifier or "]" in qualifier:
+        return None
+    if qualifier.startswith("'") and qualifier.endswith("'"):
+        qualifier = qualifier[1:-1].replace("''", "'")
+    return qualifier
+
+
+def _transform_formula_for_column_structure(
+    edit_value,
+    *,
+    formula_sheet: str,
+    target_sheet: str,
+    anchor: int,
+    count: int,
+    insert: bool,
+):
+    """Apply Excel-like whole-column reference movement to one formula.
+
+    Only local A1/cell-range/whole-column RANGE tokens whose worksheet target
+    can be proved are changed. Structured references, names, external links,
+    and references to unrelated sheets remain byte-for-byte untouched.
+    """
+    if _special_formula_signature(edit_value) is not None:
+        return edit_value
+    formula = _formula_text(edit_value)
+    if not formula:
+        return edit_value
+    anchor = max(1, int(anchor))
+    count = max(1, int(count))
+    deleted_end = anchor + count - 1
+
+    def _parse_endpoint(raw: str, *, allow_column_only: bool):
+        match = _LOCAL_A1_REFERENCE_RE.fullmatch(raw)
+        if match is not None:
+            try:
+                physical_col = int(column_index_from_string(match.group("col")))
+            except Exception:
+                return None
+            return (
+                "cell",
+                physical_col,
+                match.group("col_abs"),
+                match.group("row_abs"),
+                match.group("row"),
+            )
+        if allow_column_only:
+            match = _LOCAL_COLUMN_REFERENCE_RE.fullmatch(raw)
+            if match is not None:
+                try:
+                    physical_col = int(column_index_from_string(match.group("col")))
+                except Exception:
+                    return None
+                return ("column", physical_col, match.group("col_abs"), "", "")
+        return None
+
+    def _render_endpoint(parsed, new_col: int) -> str:
+        kind, _old_col, col_abs, row_abs, row = parsed
+        rendered = col_abs + get_column_letter(int(new_col))
+        if kind == "cell":
+            rendered += row_abs + row
+        return rendered
+
+    def _shift_single_col(old_col: int) -> int | None:
+        if insert:
+            return old_col + count if old_col >= anchor else old_col
+        if old_col < anchor:
+            return old_col
+        if old_col > deleted_end:
+            return old_col - count
+        return None
+
+    def _transform_reference(reference: str) -> str | None:
+        parts = reference.split(":")
+        if len(parts) == 1:
+            parsed = _parse_endpoint(parts[0], allow_column_only=False)
+            if parsed is None:
+                return None
+            new_col = _shift_single_col(parsed[1])
+            return "#REF!" if new_col is None else _render_endpoint(parsed, new_col)
+        if len(parts) != 2:
+            return None
+        allow_column_only = bool(
+            _LOCAL_COLUMN_REFERENCE_RE.fullmatch(parts[0])
+            and _LOCAL_COLUMN_REFERENCE_RE.fullmatch(parts[1])
+        )
+        left = _parse_endpoint(parts[0], allow_column_only=allow_column_only)
+        right = _parse_endpoint(parts[1], allow_column_only=allow_column_only)
+        if left is None or right is None or left[0] != right[0]:
+            return None
+        left_col = int(left[1])
+        right_col = int(right[1])
+        # Reversed Excel ranges are unusual and their deletion behavior is not
+        # safe to infer; leave them conservative.
+        if left_col > right_col:
+            return None
+        if insert:
+            new_left = _shift_single_col(left_col)
+            new_right = _shift_single_col(right_col)
+        else:
+            if left_col < anchor:
+                new_left = left_col
+            elif left_col > deleted_end:
+                new_left = left_col - count
+            elif right_col > deleted_end:
+                new_left = anchor
+            else:
+                new_left = None
+
+            if right_col > deleted_end:
+                new_right = right_col - count
+            elif right_col < anchor:
+                new_right = right_col
+            elif left_col < anchor:
+                new_right = anchor - 1
+            else:
+                new_right = None
+        if new_left is None or new_right is None or new_left > new_right:
+            return "#REF!"
+        return _render_endpoint(left, new_left) + ":" + _render_endpoint(right, new_right)
+
+    try:
+        tokenizer = Tokenizer(formula)
+        for token in tokenizer.items:
+            if token.type != "OPERAND" or token.subtype != "RANGE":
+                continue
+            raw = str(token.value or "")
+            if not raw or "[" in raw or "]" in raw:
+                continue
+            qualifier = ""
+            reference = raw
+            if "!" in raw:
+                qualifier, reference = raw.rsplit("!", 1)
+                qualified_sheet = _formula_sheet_name_from_qualifier(qualifier)
+                if (
+                    qualified_sheet is None
+                    or qualified_sheet.casefold() != str(target_sheet).casefold()
+                ):
+                    continue
+            elif str(formula_sheet).casefold() != str(target_sheet).casefold():
+                continue
+            transformed = _transform_reference(reference)
+            if transformed is None:
+                continue
+            token.value = (qualifier + "!" if qualifier else "") + transformed
+        return tokenizer.render()
+    except Exception:
+        return edit_value
 
 
 def _formula_edit_value_map(ws_edit) -> dict[tuple[int, int], object]:
@@ -1728,9 +5636,15 @@ def _filter_noop_manual_ops(src_xlsx: str, manual_ops: dict) -> dict:
         _wbs_close(wb)
 
 
-def _prepare_manual_ops_for_save(src_xlsx: str, manual_ops: dict, row_ops=None, sheet_ops=None) -> dict:
+def _prepare_manual_ops_for_save(
+    src_xlsx: str,
+    manual_ops: dict,
+    row_ops=None,
+    sheet_ops=None,
+    column_ops=None,
+) -> dict:
     """Filter cell no-ops only when coordinates still match the source snapshot."""
-    if row_ops or sheet_ops:
+    if row_ops or sheet_ops or column_ops:
         return dict(manual_ops or {})
     return _filter_noop_manual_ops(src_xlsx, manual_ops or {})
 
@@ -2110,6 +6024,165 @@ def _excel_com_cell_op(sheet: str, row: int, col: int, value) -> dict:
     }
 
 
+def _validated_column_replay_operations(column_ops) -> list[dict[str, object]]:
+    """Return a JSON-safe, strictly ordered native column replay plan."""
+    normalized = []
+    seen_orders = set()
+    for raw in column_ops or ():
+        op = dict(raw or {})
+        kind = str(op.get("kind") or "")
+        sheet = str(op.get("sheet") or "")
+        target_side = str(op.get("target_side") or "").upper()
+        source_side = str(op.get("source_side") or "").upper()
+        order = int(op.get("order", 0) or 0)
+        anchor = int(op.get("target_physical_anchor", 0) or 0)
+        count = int(op.get("count", 0) or 0)
+        source_cols = [int(value) for value in (op.get("source_physical_cols") or [])]
+        if kind not in ("insert_cols", "delete_cols", "copy_cols"):
+            raise ValueError(f"unsupported native column operation: {kind!r}")
+        if not sheet or target_side not in ("A", "B"):
+            raise ValueError("native column operation has no valid Sheet/target")
+        if source_side not in ("A", "BASE", "B"):
+            raise ValueError("native column operation has no valid source")
+        if order <= 0 or order in seen_orders or anchor <= 0 or count <= 0:
+            raise ValueError("native column operation order/range is invalid")
+        if kind == "copy_cols":
+            if len(source_cols) != count or any(
+                right != left + 1 for left, right in zip(source_cols, source_cols[1:])
+            ):
+                raise ValueError("native column copy source must be one consecutive block")
+        seen_orders.add(order)
+        op.update({
+            "kind": kind,
+            "sheet": sheet,
+            "target_side": target_side,
+            "source_side": source_side,
+            "order": order,
+            "target_physical_anchor": anchor,
+            "count": count,
+            "source_physical_cols": source_cols,
+            "metadata_scope": list(op.get("metadata_scope") or _COLUMN_ACTION_METADATA_SCOPE),
+        })
+        normalized.append(op)
+    normalized.sort(key=lambda op: int(op["order"]))
+    return normalized
+
+
+def _validated_structural_replay_operations(row_ops, column_ops) -> list[dict[str, object]]:
+    """Return row/column operations in the exact order applied in memory.
+
+    Row and column adoption can overlap.  Replaying all rows before all columns
+    (or the reverse) changes the winner at their intersection, so newly-recorded
+    operations share one monotonic structural order.  Legacy row records without
+    an order remain supported and are placed after every explicitly ordered
+    operation, matching the save behavior that existed before shared ordering.
+    """
+    columns = _validated_column_replay_operations(column_ops)
+    normalized = []
+    seen_orders = {int(op["order"]) for op in columns}
+    max_explicit_order = max(seen_orders, default=0)
+    legacy_rows = []
+    for raw in row_ops or ():
+        op = dict(raw or {})
+        kind = str(op.get("kind") or "")
+        sheet = str(op.get("sheet") or "")
+        row = int(op.get("row", 0) or 0)
+        count = int(op.get("count", 0) or 0)
+        source_side = str(op.get("source_side") or "").upper()
+        source_rows = [int(value) for value in (op.get("source_rows") or [])]
+        if kind != "insert_rows" or not sheet or row <= 0 or count <= 0:
+            raise ValueError("native row operation kind/range is invalid")
+        if source_side not in ("", "A", "BASE", "B", "THEIRS"):
+            raise ValueError("native row operation source is invalid")
+        if source_rows and len(source_rows) != count:
+            raise ValueError("native row copy source must match inserted row count")
+        order = int(op.get("order", 0) or 0)
+        op.update({
+            "kind": kind,
+            "sheet": sheet,
+            "row": row,
+            "count": count,
+            "source_side": source_side,
+            "source_rows": source_rows,
+            "structural_kind": "row",
+        })
+        if order > 0:
+            if order in seen_orders:
+                raise ValueError("native structural operation order is duplicated")
+            seen_orders.add(order)
+            max_explicit_order = max(max_explicit_order, order)
+            op["order"] = order
+            normalized.append(op)
+        else:
+            legacy_rows.append(op)
+    for op in columns:
+        item = dict(op)
+        item["structural_kind"] = "column"
+        normalized.append(item)
+    for op in legacy_rows:
+        max_explicit_order += 1
+        while max_explicit_order in seen_orders:
+            max_explicit_order += 1
+        op["order"] = max_explicit_order
+        seen_orders.add(max_explicit_order)
+        normalized.append(op)
+    normalized.sort(key=lambda op: int(op["order"]))
+    return normalized
+
+
+def _run_excel_powershell_with_transient_retry(script: str, *, timeout: int):
+    """Run an Excel COM script, retrying only the transient logon-session fault."""
+    result = None
+    for attempt in range(4):
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        error_text = str(getattr(result, "stderr", "") or "")
+        if int(getattr(result, "returncode", 1) or 0) == 0:
+            return result
+        if "80070520" not in error_text or attempt >= 3:
+            return result
+        _dlog(f"Excel COM logon session unavailable; transient retry {attempt + 2}/4")
+        time.sleep(float(attempt + 1))
+    return result
+
+
+def _excel_reopen_validate(path: str) -> bool:
+    """Require Excel itself to reopen the final native-replay package."""
+    if not _workbook_package_ready(path):
+        return False
+    try:
+        ps = (
+            "$ErrorActionPreference='Stop';"
+            "$p='" + str(path).replace("'", "''") + "';"
+            "$xl=$null;$wb=$null;"
+            "try{"
+            "$xl=New-Object -ComObject Excel.Application;"
+            "$xl.Visible=$false;$xl.DisplayAlerts=$false;$xl.AskToUpdateLinks=$false;$xl.EnableEvents=$false;"
+            "$wb=$xl.Workbooks.Open($p,0,$true);"
+            "if($wb -eq $null){throw 'Excel reopen returned null'};"
+            "}finally{"
+            "if($wb -ne $null){try{$wb.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb)}catch{}};"
+            "if($xl -ne $null){try{$xl.Quit()}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($xl)}catch{}};"
+            "[GC]::Collect();[GC]::WaitForPendingFinalizers();[GC]::Collect();[GC]::WaitForPendingFinalizers();"
+            "};"
+        )
+        result = _run_excel_powershell_with_transient_retry(ps, timeout=120)
+        if result.returncode != 0:
+            _dlog(f"Excel reopen validation failed: {result.stderr.strip()}")
+            return False
+        return True
+    except Exception as exc:
+        _dlog(f"Excel reopen validation exception: {exc}")
+        return False
+
+
 def _build_manual_merge_output_with_excel(
     src_xlsx: str,
     out_xlsx: str,
@@ -2117,9 +6190,10 @@ def _build_manual_merge_output_with_excel(
     row_ops: list[dict] | None = None,
     sheet_ops: list[dict] | None = None,
     source_paths: dict[str, str] | None = None,
+    column_ops: list[dict] | None = None,
 ) -> bool:
     """Apply manual ops through Excel COM to preserve workbook fidelity."""
-    if not manual_ops and not row_ops and not sheet_ops:
+    if not manual_ops and not row_ops and not sheet_ops and not column_ops:
         try:
             shutil.copy2(src_xlsx, out_xlsx)
             return True
@@ -2127,14 +6201,29 @@ def _build_manual_merge_output_with_excel(
             return False
     row_ops = list(row_ops or [])
     sheet_ops = list(sheet_ops or [])
+    try:
+        column_ops = _validated_column_replay_operations(column_ops)
+        structural_ops = _validated_structural_replay_operations(row_ops, column_ops)
+    except Exception as exc:
+        _dlog(f"excel native save: invalid column replay plan: {exc}")
+        return False
     ops = []
     for (sheet, r, c), v in manual_ops.items():
         ops.append(_excel_com_cell_op(sheet, r, c, v))
     try:
-        ops_json = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merge_ops_{os.getpid()}_{int(time.time())}.json")
+        ops_json = os.path.join(
+            tempfile.gettempdir(),
+            f"{APP_NAME}_merge_ops_{os.getpid()}_{time.time_ns()}.json",
+        )
         with open(ops_json, "w", encoding="utf-8") as f:
             json.dump(
-                {"row_ops": row_ops, "cell_ops": ops, "sheet_ops": sheet_ops},
+                {
+                    "row_ops": row_ops,
+                    "cell_ops": ops,
+                    "sheet_ops": sheet_ops,
+                    "column_ops": column_ops,
+                    "structural_ops": structural_ops,
+                },
                 f,
                 ensure_ascii=False,
                 allow_nan=False,
@@ -2142,8 +6231,34 @@ def _build_manual_merge_output_with_excel(
     except Exception as e:
         _dlog(f"excel native save: write ops json failed: {e}")
         return False
+    source_stage_dir = None
     try:
+        if os.path.exists(out_xlsx):
+            os.remove(out_xlsx)
         source_paths = source_paths or {}
+        # Excel refuses to keep two workbooks with the same basename open in a
+        # single COM instance.  Real SVN three-way inputs intentionally share
+        # that basename (for example Base/Guide.xlsx and Theirs/Guide.xlsx), so
+        # stage read-only replay sources under unique names before opening them.
+        # The destination workbook already uses a unique snapshot name.
+        staged_source_paths = {}
+        if any(path for path in source_paths.values()):
+            source_stage_dir = tempfile.mkdtemp(
+                prefix=f"{APP_NAME}_native_sources_{os.getpid()}_"
+            )
+            for index, (side, source_path) in enumerate(source_paths.items()):
+                if not source_path:
+                    continue
+                staged_path = os.path.join(
+                    source_stage_dir,
+                    f"{index:02d}_{str(side).lower()}{_workbook_ext(source_path)}",
+                )
+                # Besides avoiding Excel's same-basename restriction, this is
+                # the save transaction's immutable source snapshot.  A live
+                # SVN/local file may otherwise change between replay steps.
+                shutil.copy2(source_path, staged_path)
+                staged_source_paths[str(side).upper()] = staged_path
+        source_paths = staged_source_paths
         mine_src = str(source_paths.get("A") or "").replace("'", "''")
         base_src = str(source_paths.get("BASE") or "").replace("'", "''")
         theirs_src = str(source_paths.get("B") or source_paths.get("THEIRS") or "").replace("'", "''")
@@ -2160,10 +6275,11 @@ def _build_manual_merge_output_with_excel(
             "$baseSrc='" + base_src + "';"
             "$theirsSrc='" + theirs_src + "';"
             "$payload=Get-Content -Raw -LiteralPath $opsPath | ConvertFrom-Json;"
-            "$xl=$null;$wb=$null;$wbMine=$null;$wbBase=$null;$wbTheirs=$null;"
+            "$xl=$null;$wb=$null;$wbMine=$null;$wbBase=$null;$wbTheirs=$null;$wbCheck=$null;"
             "try{"
             "$xl=New-Object -ComObject Excel.Application;"
             "$xl.Visible=$false;"
+            "$xl.ScreenUpdating=$false;"
             "$xl.DisplayAlerts=$false;"
             "$xl.AskToUpdateLinks=$false;"
             "$xl.EnableEvents=$false;"
@@ -2196,11 +6312,12 @@ def _build_manual_merge_output_with_excel(
             "    try{$newWs.Name=$op.sheet}catch{};"
             "  }"
             "};"
-            "foreach($op in @($payload.row_ops)){"
+            "foreach($op in @($payload.structural_ops | Sort-Object {[int]$_.order})){"
             "  if($null -eq $op){continue};"
-            "  $ws=$wb.Worksheets.Item($op.sheet);"
-            "  if($op.kind -eq 'insert_rows'){"
-            "    for($i=0;$i -lt [int]$op.count;$i++){[void]$ws.Rows.Item([int]$op.row).Insert()}"
+            "  $ws=$wb.Worksheets.Item([string]$op.sheet);"
+            "  if($op.structural_kind -eq 'row'){"
+            "    if($op.kind -ne 'insert_rows'){throw ('unsupported row operation: '+$op.kind)};"
+            "    for($i=0;$i -lt [int]$op.count;$i++){[void]$ws.Rows.Item([int]$op.row).Insert()};"
             "    $srcWs=$null;"
             "    if(($op.source_side -eq 'B' -or $op.source_side -eq 'THEIRS') -and $wbTheirs -ne $null){$srcWs=$wbTheirs.Worksheets.Item($op.sheet)}"
             "    elseif($op.source_side -eq 'BASE' -and $wbBase -ne $null){$srcWs=$wbBase.Worksheets.Item($op.sheet)};"
@@ -2212,15 +6329,58 @@ def _build_manual_merge_output_with_excel(
             "        $srcRow=[int]$srcRows[$i];$dstRow=[int]$op.row+$i;"
             "        $srcRange=$srcWs.Range($srcWs.Cells.Item($srcRow,1),$srcWs.Cells.Item($srcRow,$lastCol));"
             "        $dstRange=$ws.Range($ws.Cells.Item($dstRow,1),$ws.Cells.Item($dstRow,$lastCol));"
-            # xlPasteAll preserves comments, hyperlinks, validation and cell
-            # metadata. Explicit cell_ops run afterwards and remain the source
-            # of truth for translated formulas and cached-value decisions.
             "        [void]$srcRange.Copy();[void]$dstRange.PasteSpecial(-4104);"
             "        try{$ws.Rows.Item($dstRow).RowHeight=$srcWs.Rows.Item($srcRow).RowHeight}catch{}"
             "      }"
-            "    }"
-            "  }"
+            "    };"
+            "    continue"
+            "  };"
+            "  if($op.structural_kind -ne 'column'){throw ('unsupported structural operation: '+$op.structural_kind)};"
+            "  $anchor=[int]$op.target_physical_anchor;$count=[int]$op.count;"
+            "  if($anchor -lt 1 -or $count -lt 1){throw 'invalid column operation range'};"
+            "  $last=$anchor+$count-1;"
+            "  if($op.kind -eq 'insert_cols'){"
+            "    $dstRange=$ws.Range($ws.Columns.Item($anchor),$ws.Columns.Item($last)).EntireColumn;"
+            "    [void]$dstRange.Insert();continue"
+            "  };"
+            "  if($op.kind -eq 'delete_cols'){"
+            "    $dstRange=$ws.Range($ws.Columns.Item($anchor),$ws.Columns.Item($last)).EntireColumn;"
+            "    [void]$dstRange.Delete();continue"
+            "  };"
+            "  if($op.kind -ne 'copy_cols'){throw ('unsupported column operation: '+$op.kind)};"
+            "  $srcWs=$null;"
+            "  if($op.source_side -eq 'BASE' -and $wbBase -ne $null){$srcWs=$wbBase.Worksheets.Item([string]$op.sheet)}"
+            "  elseif(($op.source_side -eq 'B' -or $op.source_side -eq 'THEIRS') -and $wbTheirs -ne $null){$srcWs=$wbTheirs.Worksheets.Item([string]$op.sheet)}"
+            "  elseif($op.source_side -eq 'A' -and $wbMine -ne $null){$srcWs=$wbMine.Worksheets.Item([string]$op.sheet)}"
+            "  elseif($op.source_side -eq $op.target_side){$srcWs=$ws};"
+            "  if($srcWs -eq $null){throw ('column copy source unavailable: '+$op.source_side)};"
+            "  $srcCols=@($op.source_physical_cols);"
+            "  if($srcCols.Count -ne $count){throw 'column copy source count mismatch'};"
+            "  $srcFirst=[int]$srcCols[0];$srcLast=[int]$srcCols[$srcCols.Count-1];"
+            "  $srcRange=$srcWs.Range($srcWs.Columns.Item($srcFirst),$srcWs.Columns.Item($srcLast)).EntireColumn;"
+            "  $dstRange=$ws.Range($ws.Columns.Item($anchor),$ws.Columns.Item($last)).EntireColumn;"
+            # Passing Destination avoids the Windows clipboard/PasteSpecial
+            # round-trip while retaining Excel's native formula translation
+            # and full cell/column metadata copy semantics.
+            "  [void]$srcRange.Copy($dstRange);"
+            "  for($i=0;$i -lt $count;$i++){"
+            "    $srcColumn=$srcWs.Columns.Item([int]$srcCols[$i]);$dstColumn=$ws.Columns.Item($anchor+$i);"
+            "    try{$dstColumn.ColumnWidth=$srcColumn.ColumnWidth}catch{};"
+            "    try{$dstColumn.Hidden=$srcColumn.Hidden}catch{};"
+            "  };"
+            "  try{$xl.CutCopyMode=0}catch{}"
             "};"
+            # Replay sources are no longer needed once sheet/row/column copies
+            # finish. Closing them before explicit cell edits and SaveCopyAs
+            # reduces Excel's save working set without weakening immutable
+            # source staging or the final same-instance reopen validation.
+            "$srcRange=$null;$srcWs=$null;$srcColumn=$null;"
+            "if($wbTheirs -ne $null){$wbTheirs.Close($false);[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbTheirs);$wbTheirs=$null};"
+            "if($wbBase -ne $null){$wbBase.Close($false);[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbBase);$wbBase=$null};"
+            "if($wbMine -ne $null){$wbMine.Close($false);[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbMine);$wbMine=$null};"
+            # xlPasteAll preserves comments, hyperlinks, validation and cell
+            # metadata. Explicit cell_ops run afterwards and remain the source
+            # of truth for translated formulas and cached-value decisions.
             "foreach($op in @($payload.cell_ops)){"
             "  if($null -eq $op){continue};"
             "  $ws=$wb.Worksheets.Item($op.sheet);"
@@ -2238,35 +6398,52 @@ def _build_manual_merge_output_with_excel(
             "  else{$cell.Value2=$op.value}"
             "};"
             "$wb.SaveCopyAs($out);"
+            "if($wb -ne $null){$wb.Close($false);[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb);$wb=$null};"
+            "$wbCheck=$xl.Workbooks.Open($out,0,$true);"
+            "if($wbCheck -eq $null){throw 'Excel reopen validation failed'};"
+            "$wbCheck.Close($false);"
+            "[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbCheck);$wbCheck=$null;"
             "}finally{"
-            "  $cell=$null;$ws=$null;$srcRange=$null;$dstRange=$null;$srcWs=$null;$newWs=$null;$after=$null;"
+            "  $cell=$null;$ws=$null;$srcRange=$null;$dstRange=$null;$srcWs=$null;$srcColumn=$null;$dstColumn=$null;$newWs=$null;$after=$null;"
+            "  if($wbCheck -ne $null){try{$wbCheck.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbCheck)}catch{}};"
             "  if($wbTheirs -ne $null){try{$wbTheirs.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbTheirs)}catch{}};"
             "  if($wbBase -ne $null){try{$wbBase.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbBase)}catch{}};"
             "  if($wbMine -ne $null){try{$wbMine.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wbMine)}catch{}};"
             "  if($wb -ne $null){try{$wb.Close($false)}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb)}catch{}};"
             "  if($xl -ne $null){try{$xl.Quit()}catch{};try{[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($xl)}catch{}};"
-            "  [GC]::Collect();[GC]::WaitForPendingFinalizers();[GC]::Collect();[GC]::WaitForPendingFinalizers();"
+            "  [GC]::Collect();[GC]::WaitForPendingFinalizers();"
             "};"
         )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=180,
-        )
+        r = _run_excel_powershell_with_transient_retry(ps, timeout=180)
         if r.returncode != 0:
             _dlog(f"excel native save failed rc={r.returncode} err={r.stderr.strip()}")
+            try:
+                if os.path.exists(out_xlsx):
+                    os.remove(out_xlsx)
+            except Exception:
+                pass
             return False
         valid, reason = _validate_xlsx_package(out_xlsx)
         if not valid:
             _dlog(f"excel native save produced invalid package: {reason}")
+            try:
+                if os.path.exists(out_xlsx):
+                    os.remove(out_xlsx)
+            except Exception:
+                pass
             return False
-        _dlog(f"excel native save ok: {out_xlsx} sheet_ops={len(sheet_ops)} row_ops={len(row_ops)} cell_ops={len(ops)}")
+        _dlog(
+            f"excel native save ok: {out_xlsx} sheet_ops={len(sheet_ops)} "
+            f"row_ops={len(row_ops)} column_ops={len(column_ops)} cell_ops={len(ops)}"
+        )
         return True
     except Exception as e:
         _dlog(f"excel native save exception: {e}")
+        try:
+            if os.path.exists(out_xlsx):
+                os.remove(out_xlsx)
+        except Exception:
+            pass
         return False
     finally:
         try:
@@ -2274,6 +6451,11 @@ def _build_manual_merge_output_with_excel(
                 os.remove(ops_json)
         except Exception:
             pass
+        if source_stage_dir:
+            try:
+                shutil.rmtree(source_stage_dir)
+            except Exception:
+                pass
 
 
 def _build_manual_merge_output_with_openpyxl(
@@ -3475,6 +7657,7 @@ def _ensure_stable_copy(path: str) -> str:
     """If path looks like a temp/svn artifact, copy to a stable temp file."""
     if not path:
         return path
+    tmp = None
     try:
         temp_root = os.path.abspath(tempfile.gettempdir()).lower()
         p_abs = os.path.abspath(path)
@@ -3487,18 +7670,39 @@ def _ensure_stable_copy(path: str) -> str:
                 raise RuntimeError(f"SVN 临时 Excel 文件尚未完整生成或已损坏：{path}")
             if base.lower().startswith(f"{APP_NAME}_stable_"):
                 return p_abs
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_stable_{ts}_{base}")
+            stable_prefix = (
+                f"{APP_NAME}_stable_{os.getpid()}_{time.time_ns()}_"
+            )
+            fd, tmp = tempfile.mkstemp(
+                prefix=stable_prefix,
+                suffix=f"_{base}",
+                dir=tempfile.gettempdir(),
+            )
+            os.close(fd)
             ext = _workbook_ext(path)
             if not tmp.lower().endswith(ext):
-                tmp += ext
+                renamed = tmp + ext
+                os.replace(tmp, renamed)
+                tmp = renamed
             shutil.copy2(path, tmp)
             if not _workbook_package_ready(tmp):
                 raise RuntimeError(f"SVN 临时 Excel 文件稳定副本校验失败：{path}")
             return tmp
     except RuntimeError:
+        if tmp:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
         raise
     except Exception:
+        if tmp:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
         pass
     return path
 
@@ -3553,6 +7757,28 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
 
     Returns (conflicts, merged_preview_path, conflict_cells_by_sheet).
     """
+    # The legacy auto-merge loop below is intentionally physical-column based.
+    # Reuse the authoritative logical scan first and refuse to auto-write any
+    # sheet with column structure/unresolved mapping; this prevents row mapping
+    # from diverging between conflict scan and automatic save until the logical
+    # column write pipeline is implemented in the later merge phase.
+    _scan_three_way_conflicts(base_path, mine_path, theirs_path)
+    structural_sheets = []
+    for sheet_name, analysis in _LAST_THREE_WAY_COLUMN_ANALYSIS.items():
+        if analysis.structural_conflicts or any(
+            state.state not in ("retained", "modified")
+            for state in analysis.states
+        ):
+            structural_sheets.append(sheet_name)
+    if structural_sheets:
+        preview = "、".join(structural_sheets[:6])
+        if len(structural_sheets) > 6:
+            preview += f" 等{len(structural_sheets)}张Sheet"
+        raise RuntimeError(
+            "检测到列插入、删除或待确认映射，已停止旧版自动合并，"
+            f"避免按物理列写错数据。涉及：{preview}"
+        )
+
     base_path = _ensure_xlsx_copy(base_path)
     mine_path = _ensure_xlsx_copy(mine_path)
     theirs_path = _ensure_xlsx_copy(theirs_path)
@@ -3634,20 +7860,99 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
         formula_map_b = _formula_edit_value_map(ws_b_edit)
         formula_map_t = _formula_edit_value_map(ws_t_edit)
 
-        max_col = max(ws_m_val.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
+        mine_row_count, mine_width = _effective_bounds_with_edit(ws_m_val, ws_m_edit)
+        theirs_row_count, theirs_width = _effective_bounds_with_edit(ws_t, ws_t_edit)
+        if ws_b is not None:
+            base_row_count, base_width = _effective_bounds_with_edit(ws_b, ws_b_edit)
+        else:
+            base_row_count, base_width = 0, 0
+        max_col = max(mine_width, theirs_width, base_width, 1)
 
-        # Same row-alignment pipeline as _scan_three_way_conflicts so auto-merge and
-        # the UI agree on which cells line up across inserted/deleted rows.
-        mine_sigs = _row_sig_list_for_ws(ws_m_val, ws_m_val.max_row or 1, max_col)
-        theirs_sigs = _row_sig_list_for_ws(ws_t, ws_t.max_row or 1, max_col)
-        base_sigs = _row_sig_list_for_ws(ws_b, ws_b.max_row or 1, max_col) if ws_b is not None else []
+        mine_display_count, theirs_display_count = _shared_physical_row_horizon(
+            ws_m_val,
+            ws_t,
+            mine_row_count,
+            theirs_row_count,
+            ws_m_edit,
+            ws_t_edit,
+        )
+        mine_base_count = mine_row_count
+        theirs_base_count = theirs_row_count
+        base_mine_count = base_row_count
+        base_theirs_count = base_row_count
+        if ws_b is not None:
+            mine_base_count, base_mine_count = _shared_physical_row_horizon(
+                ws_m_val,
+                ws_b,
+                mine_row_count,
+                base_row_count,
+                ws_m_edit,
+                ws_b_edit,
+            )
+            theirs_base_count, base_theirs_count = _shared_physical_row_horizon(
+                ws_t,
+                ws_b,
+                theirs_row_count,
+                base_row_count,
+                ws_t_edit,
+                ws_b_edit,
+            )
+        mine_read_count = max(mine_display_count, mine_base_count)
+        theirs_read_count = max(theirs_display_count, theirs_base_count)
+        base_read_count = max(base_mine_count, base_theirs_count)
+
+        def _cached_rows(ws, row_count: int, width: int):
+            if ws is None or row_count <= 0 or width <= 0:
+                return []
+            cache = _read_rows_into_cache(ws, range(1, row_count + 1), width)
+            return [
+                _row_from_cache(cache, row_idx, width)
+                for row_idx in range(1, row_count + 1)
+            ]
+
+        mine_value_rows = _cached_rows(ws_m_val, mine_read_count, max_col)
+        theirs_value_rows = _cached_rows(ws_t, theirs_read_count, max_col)
+        base_value_rows = _cached_rows(ws_b, base_read_count, max_col)
+        mine_edit_rows = _cached_rows(ws_m_edit, mine_read_count, max_col)
+        theirs_edit_rows = _cached_rows(ws_t_edit, theirs_read_count, max_col)
+        base_edit_rows = _cached_rows(ws_b_edit, base_read_count, max_col)
+
+        # Same typed, formula-aware row-alignment pipeline as
+        # _scan_three_way_conflicts so auto-merge and the UI cannot diverge
+        # when formula caches are absent after a structural column edit.
+        mine_sigs, base_sigs_for_mine = _row_signatures_from_unique_column_anchors(
+            mine_value_rows[:mine_base_count],
+            base_value_rows[:base_mine_count],
+            mine_width,
+            base_width,
+            mine_edit_rows[:mine_base_count],
+            base_edit_rows[:base_mine_count],
+        )
+        theirs_sigs, base_sigs_for_theirs = _row_signatures_from_unique_column_anchors(
+            theirs_value_rows[:theirs_base_count],
+            base_value_rows[:base_theirs_count],
+            theirs_width,
+            base_width,
+            theirs_edit_rows[:theirs_base_count],
+            base_edit_rows[:base_theirs_count],
+        )
         mine_to_base = _row_map_from_pairs(
-            _compute_row_pairs_from_signatures(mine_sigs, base_sigs)
+            _compute_row_pairs_from_signatures(mine_sigs, base_sigs_for_mine)
         ) if ws_b is not None else {}
         theirs_to_base = _row_map_from_pairs(
-            _compute_row_pairs_from_signatures(theirs_sigs, base_sigs)
+            _compute_row_pairs_from_signatures(theirs_sigs, base_sigs_for_theirs)
         ) if ws_b is not None else {}
-        display_pairs = _compute_row_pairs_from_signatures(mine_sigs, theirs_sigs)
+        mine_display_sigs, theirs_display_sigs = _row_signatures_from_unique_column_anchors(
+            mine_value_rows[:mine_display_count],
+            theirs_value_rows[:theirs_display_count],
+            mine_width,
+            theirs_width,
+            mine_edit_rows[:mine_display_count],
+            theirs_edit_rows[:theirs_display_count],
+        )
+        display_pairs = _compute_row_pairs_from_signatures(
+            mine_display_sigs, theirs_display_sigs
+        )
         if ws_b is not None:
             display_pairs = _split_tail_independent_append_pairs(
                 display_pairs, mine_to_base, theirs_to_base,
@@ -3748,8 +8053,11 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     return _merge_result
 
 
+_LAST_THREE_WAY_COLUMN_ANALYSIS: dict[str, LogicalThreeWayColumnAnalysis] = {}
+
+
 def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
-    """Detect 3-way conflicts only; do NOT auto-apply theirs before UI."""
+    """Detect cell and structural conflicts through cached logical columns."""
     base_path = _ensure_xlsx_copy(base_path)
     mine_path = _ensure_xlsx_copy(mine_path)
     theirs_path = _ensure_xlsx_copy(theirs_path)
@@ -3774,115 +8082,348 @@ def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
 
         conflicts = []
         conflict_cells_by_sheet = {}
+        seen_conflicts = set()
+        analyses = {}
 
         set_base = set(wb_base_val.sheetnames)
         set_mine = set(wb_mine_val.sheetnames)
         set_theirs = set(wb_theirs_val.sheetnames)
-        common = sorted(set_mine & set_theirs)
 
-        def _cmp_cell(
-            ws_val,
-            ws_edit,
-            formula_map,
-            row_idx: int | None,
-            col_idx: int,
-            compare_row: int | None = None,
-        ):
-            if ws_val is None or row_idx is None or row_idx <= 0:
-                return None, _merge_cell_compare_key(None, None)
-            try:
-                vv = ws_val.cell(row=row_idx, column=col_idx).value
-            except Exception:
-                vv = None
-            missing_formula = object()
-            ve = formula_map.get((int(row_idx), int(col_idx)), missing_formula)
-            if ve is missing_formula:
-                ve = None
-                if vv is None:
-                    try:
-                        if ws_edit is not None:
-                            ve = ws_edit.cell(row=row_idx, column=col_idx).value
-                    except Exception:
-                        ve = None
-            if compare_row is not None and row_idx != compare_row:
-                ve = _translate_normal_formula_for_compare(
-                    vv, ve, row_idx, col_idx, compare_row, col_idx
+        def _sequential_rows(ws, max_row: int, max_col: int):
+            if ws is None or max_row <= 0 or max_col <= 0:
+                return []
+            rows = []
+            for row in ws.iter_rows(
+                min_row=1,
+                max_row=max_row,
+                min_col=1,
+                max_col=max_col,
+                values_only=True,
+            ):
+                rows.append(_pad_row_values(row, max_col))
+            return rows
+
+        def _row(rows, row_idx: int | None, width: int):
+            if row_idx is None or row_idx <= 0 or row_idx > len(rows):
+                return (None,) * width
+            return _pad_row_values(rows[row_idx - 1], width)
+
+        def _effective_display(value_row, edit_row, physical_col: int | None):
+            if physical_col is None:
+                return None
+            value = _logical_row_value(value_row, physical_col)
+            edit = _logical_row_value(edit_row, physical_col)
+            if value is None and edit is not None and not _formula_text(edit):
+                return edit
+            return value if value is not None else _formula_text(edit)
+
+        def _add_conflict(name, row_idx, logical_col, mine_value, theirs_value):
+            row_idx = max(1, int(row_idx or 1))
+            logical_col = max(1, int(logical_col))
+            key = (name, row_idx, logical_col)
+            if key in seen_conflicts:
+                return
+            seen_conflicts.add(key)
+            conflicts.append((name, row_idx, logical_col, mine_value, theirs_value))
+            conflict_cells_by_sheet.setdefault(name, {}).setdefault(row_idx, set()).add(logical_col)
+
+        for name in sorted(set_mine & set_theirs):
+            ws_base_val = wb_base_val[name] if name in set_base else None
+            ws_mine_val = wb_mine_val[name]
+            ws_theirs_val = wb_theirs_val[name]
+            ws_mine_edit = wb_mine_edit[name]
+            ws_base_edit = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
+            ws_theirs_edit = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
+
+            mine_row_count, mine_width = _effective_bounds_with_edit(
+                ws_mine_val, ws_mine_edit
+            )
+            theirs_row_count, theirs_width = _effective_bounds_with_edit(
+                ws_theirs_val, ws_theirs_edit
+            )
+            if ws_base_val is not None:
+                base_row_count, base_width = _effective_bounds_with_edit(
+                    ws_base_val, ws_base_edit
                 )
-            cmp_v = vv
-            try:
-                if cmp_v is None:
-                    if ve is not None and not _formula_text(ve):
-                        cmp_v = ve
-            except Exception:
-                pass
-            return cmp_v, _merge_cell_compare_key(vv, ve)
+            else:
+                base_row_count, base_width = 0, 0
+            scan_width = max(mine_width, base_width, theirs_width, 1)
 
-        for name in common:
-            ws_b = wb_base_val[name] if name in set_base else None
-            ws_m = wb_mine_val[name]
-            ws_t = wb_theirs_val[name]
-            ws_m_e = wb_mine_edit[name]
-            ws_b_e = wb_base_edit[name] if name in wb_base_edit.sheetnames else None
-            ws_t_e = wb_theirs_edit[name] if name in wb_theirs_edit.sheetnames else None
-            formula_map_m = _formula_edit_value_map(ws_m_e)
-            formula_map_b = _formula_edit_value_map(ws_b_e)
-            formula_map_t = _formula_edit_value_map(ws_t_e)
+            mine_display_count, theirs_display_count = _shared_physical_row_horizon(
+                ws_mine_val,
+                ws_theirs_val,
+                mine_row_count,
+                theirs_row_count,
+                ws_mine_edit,
+                ws_theirs_edit,
+            )
+            mine_base_count = mine_row_count
+            theirs_base_count = theirs_row_count
+            base_mine_count = base_row_count
+            base_theirs_count = base_row_count
+            if ws_base_val is not None:
+                mine_base_count, base_mine_count = _shared_physical_row_horizon(
+                    ws_mine_val,
+                    ws_base_val,
+                    mine_row_count,
+                    base_row_count,
+                    ws_mine_edit,
+                    ws_base_edit,
+                )
+                theirs_base_count, base_theirs_count = _shared_physical_row_horizon(
+                    ws_theirs_val,
+                    ws_base_val,
+                    theirs_row_count,
+                    base_row_count,
+                    ws_theirs_edit,
+                    ws_base_edit,
+                )
+            mine_read_count = max(mine_display_count, mine_base_count)
+            theirs_read_count = max(theirs_display_count, theirs_base_count)
+            base_read_count = max(base_mine_count, base_theirs_count)
 
-            max_col = max(ws_m.max_column or 1, ws_t.max_column or 1, (ws_b.max_column or 1) if ws_b else 1)
-            mine_sigs = _row_sig_list_for_ws(ws_m, ws_m.max_row or 1, max_col)
-            theirs_sigs = _row_sig_list_for_ws(ws_t, ws_t.max_row or 1, max_col)
-            base_sigs = _row_sig_list_for_ws(ws_b, ws_b.max_row or 1, max_col) if ws_b is not None else []
-            mine_to_base = _row_map_from_pairs(
-                _compute_row_pairs_from_signatures(mine_sigs, base_sigs)
-            ) if ws_b is not None else {}
-            theirs_to_base = _row_map_from_pairs(
-                _compute_row_pairs_from_signatures(theirs_sigs, base_sigs)
-            ) if ws_b is not None else {}
-            display_pairs = _compute_row_pairs_from_signatures(mine_sigs, theirs_sigs)
-            if ws_b is not None:
+            mine_value_rows = _sequential_rows(ws_mine_val, mine_read_count, scan_width)
+            theirs_value_rows = _sequential_rows(ws_theirs_val, theirs_read_count, scan_width)
+            base_value_rows = _sequential_rows(ws_base_val, base_read_count, scan_width)
+            mine_edit_rows = _sequential_rows(ws_mine_edit, mine_read_count, scan_width)
+            theirs_edit_rows = _sequential_rows(ws_theirs_edit, theirs_read_count, scan_width)
+            base_edit_rows = _sequential_rows(ws_base_edit, base_read_count, scan_width)
+
+            mine_sigs, base_sigs_for_mine = _row_signatures_from_unique_column_anchors(
+                mine_value_rows[:mine_base_count],
+                base_value_rows[:base_mine_count],
+                mine_width,
+                base_width,
+                mine_edit_rows[:mine_base_count],
+                base_edit_rows[:base_mine_count],
+            )
+            theirs_sigs, base_sigs_for_theirs = _row_signatures_from_unique_column_anchors(
+                theirs_value_rows[:theirs_base_count],
+                base_value_rows[:base_theirs_count],
+                theirs_width,
+                base_width,
+                theirs_edit_rows[:theirs_base_count],
+                base_edit_rows[:base_theirs_count],
+            )
+            mine_to_base = (
+                _row_map_from_pairs(
+                    _compute_row_pairs_from_signatures(mine_sigs, base_sigs_for_mine)
+                )
+                if base_sigs_for_mine else {}
+            )
+            theirs_to_base = (
+                _row_map_from_pairs(
+                    _compute_row_pairs_from_signatures(theirs_sigs, base_sigs_for_theirs)
+                )
+                if base_sigs_for_theirs else {}
+            )
+            mine_display_sigs, theirs_display_sigs = _row_signatures_from_unique_column_anchors(
+                mine_value_rows[:mine_display_count],
+                theirs_value_rows[:theirs_display_count],
+                mine_width,
+                theirs_width,
+                mine_edit_rows[:mine_display_count],
+                theirs_edit_rows[:theirs_display_count],
+            )
+            display_pairs = _compute_row_pairs_from_signatures(
+                mine_display_sigs, theirs_display_sigs
+            )
+            if ws_base_val is not None:
                 display_pairs = _split_tail_independent_append_pairs(
-                    display_pairs, mine_to_base, theirs_to_base,
-                    ws_m, ws_t, max_col,
+                    display_pairs,
+                    mine_to_base,
+                    theirs_to_base,
+                    ws_mine_val,
+                    ws_theirs_val,
+                    scan_width,
                 )
                 display_pairs = _split_low_similarity_tail_pairs(
                     display_pairs,
                     mine_to_base,
                     theirs_to_base,
-                    ws_m,
-                    ws_t,
-                    max_col,
+                    ws_mine_val,
+                    ws_theirs_val,
+                    scan_width,
                 )
 
-            for ra, rb in display_pairs:
-                base_row_m = mine_to_base.get(ra) if ra is not None else None
-                base_row_t = theirs_to_base.get(rb) if rb is not None else None
-                for c in range(1, max_col + 1):
-                    compare_row = ra if ra is not None else rb
-                    vm_cmp, vm_key = _cmp_cell(ws_m, ws_m_e, formula_map_m, ra, c, compare_row)
-                    vt_cmp, vt_key = _cmp_cell(ws_t, ws_t_e, formula_map_t, rb, c, compare_row)
-                    conflict_row = ra if ra is not None else (rb if rb is not None else 0)
+            aligned_base_rows = []
+            aligned_base_edit_rows = []
+            for mine_row, theirs_row in display_pairs:
+                base_mine_row = mine_to_base.get(mine_row) if mine_row is not None else None
+                base_theirs_row = theirs_to_base.get(theirs_row) if theirs_row is not None else None
+                common_base_row = (
+                    base_mine_row
+                    if base_mine_row is not None and base_mine_row == base_theirs_row
+                    else base_mine_row if theirs_row is None
+                    else base_theirs_row if mine_row is None
+                    else None
+                )
+                aligned_base_rows.append(_row(base_value_rows, common_base_row, scan_width))
+                aligned_base_edit_rows.append(_row(base_edit_rows, common_base_row, scan_width))
+            aligned_mine_rows = [_row(mine_value_rows, ra, scan_width) for ra, _rb in display_pairs]
+            aligned_theirs_rows = [_row(theirs_value_rows, rb, scan_width) for _ra, rb in display_pairs]
+            aligned_mine_edit_rows = [_row(mine_edit_rows, ra, scan_width) for ra, _rb in display_pairs]
+            aligned_theirs_edit_rows = [_row(theirs_edit_rows, rb, scan_width) for _ra, rb in display_pairs]
 
-                    if ra is not None and rb is not None and base_row_m is not None and base_row_m == base_row_t:
-                        vb_cmp, vb_key = _cmp_cell(ws_b, ws_b_e, formula_map_b, base_row_m, c, compare_row)
-                        if vb_cmp is None and vt_cmp is not None and ws_b_e is not None and ws_t_e is not None:
-                            try:
-                                if _same_formula(ws_b_e.cell(row=base_row_m, column=c).value, ws_t_e.cell(row=rb, column=c).value):
-                                    vb_cmp = vt_cmp
-                                    vb_key = vt_key
-                            except Exception:
-                                pass
-                        mine_changed = (vm_key != vb_key)
-                        theirs_changed = (vt_key != vb_key)
-                        if mine_changed and theirs_changed and vm_key != vt_key:
-                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
-                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
-                        continue
+            column_cache = build_logical_column_comparison_cache_3way(
+                ColumnModelCacheKey(name, 1, 1),
+                aligned_mine_rows,
+                aligned_base_rows,
+                aligned_theirs_rows,
+                aligned_mine_edit_rows,
+                aligned_base_edit_rows,
+                aligned_theirs_edit_rows,
+                mine_max_col=mine_width,
+                base_max_col=base_width,
+                theirs_max_col=theirs_width,
+            )
+            mine_changed_cols = set()
+            theirs_changed_cols = set()
+            first_mine_change_row = {}
+            first_theirs_change_row = {}
 
-                    if ra is not None and rb is not None and base_row_m is None and base_row_t is None:
-                        if vm_key != vt_key:
-                            conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
-                            conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
+            for pair_idx, (mine_row, theirs_row) in enumerate(display_pairs):
+                base_mine_row = mine_to_base.get(mine_row) if mine_row is not None else None
+                base_theirs_row = theirs_to_base.get(theirs_row) if theirs_row is not None else None
+                mine_value_row = aligned_mine_rows[pair_idx]
+                theirs_value_row = aligned_theirs_rows[pair_idx]
+                mine_edit_row = aligned_mine_edit_rows[pair_idx]
+                theirs_edit_row = aligned_theirs_edit_rows[pair_idx]
+                conflict_row = mine_row if mine_row is not None else theirs_row
 
+                if (
+                    mine_row is not None
+                    and theirs_row is not None
+                    and base_mine_row is not None
+                    and base_mine_row == base_theirs_row
+                ):
+                    base_value_row = _row(base_value_rows, base_mine_row, scan_width)
+                    base_edit_row = _row(base_edit_rows, base_mine_row, scan_width)
+                    row_result = compare_logical_row_3way(
+                        column_cache,
+                        mine_value_row,
+                        base_value_row,
+                        theirs_value_row,
+                        mine_edit_row,
+                        base_edit_row,
+                        theirs_edit_row,
+                        mine_row=mine_row,
+                        base_row=base_mine_row,
+                        theirs_row=theirs_row,
+                    )
+                    mine_changed_cols.update(row_result.mine_changed_cols)
+                    theirs_changed_cols.update(row_result.theirs_changed_cols)
+                    for logical_col in row_result.mine_changed_cols:
+                        first_mine_change_row.setdefault(logical_col, conflict_row or 1)
+                    for logical_col in row_result.theirs_changed_cols:
+                        first_theirs_change_row.setdefault(logical_col, conflict_row or 1)
+                    for logical_col in row_result.conflict_cols:
+                        slot = column_cache.model.slots[logical_col - 1]
+                        _add_conflict(
+                            name,
+                            conflict_row,
+                            logical_col,
+                            _effective_display(mine_value_row, mine_edit_row, slot.mine_col),
+                            _effective_display(theirs_value_row, theirs_edit_row, slot.theirs_col),
+                        )
+                    continue
+
+                if (
+                    mine_row is not None
+                    and theirs_row is not None
+                    and base_mine_row is None
+                    and base_theirs_row is None
+                ):
+                    added_row_result = compare_logical_row_2way(
+                        column_cache,
+                        mine_value_row,
+                        theirs_value_row,
+                        mine_edit_row,
+                        theirs_edit_row,
+                        mine_row=mine_row,
+                        theirs_row=theirs_row,
+                    )
+                    for logical_col in added_row_result.diff_cols:
+                        if logical_col < 1:
+                            continue
+                        slot = column_cache.model.slots[logical_col - 1]
+                        _add_conflict(
+                            name,
+                            conflict_row,
+                            logical_col,
+                            _effective_display(mine_value_row, mine_edit_row, slot.mine_col),
+                            _effective_display(theirs_value_row, theirs_edit_row, slot.theirs_col),
+                        )
+
+            mine_metadata = _worksheet_column_metadata_fingerprints(ws_mine_edit, mine_width)
+            base_metadata = _worksheet_column_metadata_fingerprints(ws_base_edit, base_width)
+            theirs_metadata = _worksheet_column_metadata_fingerprints(ws_theirs_edit, theirs_width)
+            mine_metadata_changed, theirs_metadata_changed = logical_metadata_changes_from_base(
+                column_cache,
+                mine_metadata,
+                base_metadata,
+                theirs_metadata,
+            )
+            trusted_same_ordinal_cols = set()
+            mine_header_values = _row(mine_value_rows, 1, scan_width)
+            base_header_values = _row(base_value_rows, 1, scan_width)
+            theirs_header_values = _row(theirs_value_rows, 1, scan_width)
+            mine_header_edits = _row(mine_edit_rows, 1, scan_width)
+            base_header_edits = _row(base_edit_rows, 1, scan_width)
+            theirs_header_edits = _row(theirs_edit_rows, 1, scan_width)
+            for slot in column_cache.model.slots:
+                if not (
+                    slot.base_col is not None
+                    and slot.mine_col == slot.base_col == slot.theirs_col
+                ):
+                    continue
+                mine_header_key = _merge_cell_compare_key(
+                    _logical_row_value(mine_header_values, slot.mine_col),
+                    _logical_row_value(mine_header_edits, slot.mine_col),
+                )
+                base_header_key = _merge_cell_compare_key(
+                    _logical_row_value(base_header_values, slot.base_col),
+                    _logical_row_value(base_header_edits, slot.base_col),
+                )
+                theirs_header_key = _merge_cell_compare_key(
+                    _logical_row_value(theirs_header_values, slot.theirs_col),
+                    _logical_row_value(theirs_header_edits, slot.theirs_col),
+                )
+                if mine_header_key == base_header_key == theirs_header_key:
+                    trusted_same_ordinal_cols.add(slot.logical_idx + 1)
+            analysis = classify_logical_columns_3way(
+                column_cache,
+                mine_changed_cols=mine_changed_cols,
+                theirs_changed_cols=theirs_changed_cols,
+                mine_metadata_changed_cols=mine_metadata_changed,
+                theirs_metadata_changed_cols=theirs_metadata_changed,
+                trusted_same_ordinal_cols=trusted_same_ordinal_cols,
+            )
+            analyses[name] = analysis
+            for structural_conflict in analysis.structural_conflicts:
+                logical_col = structural_conflict.logical_col
+                slot = column_cache.model.slots[logical_col - 1]
+                if structural_conflict.kind == "delete-versus-modify":
+                    if structural_conflict.state == "mine-deleted":
+                        row_idx = first_theirs_change_row.get(logical_col, 1)
+                    else:
+                        row_idx = first_mine_change_row.get(logical_col, 1)
+                else:
+                    row_idx = 1
+                mine_value_row = _row(mine_value_rows, row_idx, scan_width)
+                theirs_value_row = _row(theirs_value_rows, row_idx, scan_width)
+                mine_edit_row = _row(mine_edit_rows, row_idx, scan_width)
+                theirs_edit_row = _row(theirs_edit_rows, row_idx, scan_width)
+                _add_conflict(
+                    name,
+                    row_idx,
+                    logical_col,
+                    _effective_display(mine_value_row, mine_edit_row, slot.mine_col),
+                    _effective_display(theirs_value_row, theirs_edit_row, slot.theirs_col),
+                )
+
+        _LAST_THREE_WAY_COLUMN_ANALYSIS.clear()
+        _LAST_THREE_WAY_COLUMN_ANALYSIS.update(analyses)
         return conflicts, conflict_cells_by_sheet
     finally:
         _wbs_close(wb_base_val, wb_mine_val, wb_theirs_val, wb_mine_edit, wb_base_edit, wb_theirs_edit)
@@ -3927,7 +8468,9 @@ class SheetView:
         self.max_col = 1
         self.col_max_a = 1  # column count of side A (may differ from B)
         self.col_max_b = 1  # column count of side B
+        self.col_max_base = 1
         self._bounds_checked = False
+        self._base_bounds_checked = False
         # Per-column max display width (chars), computed during diff scan
         self.col_char_widths: dict[int, int] = {}
         self._rownum_display_width: int = 3  # right-justified row number gutter width
@@ -3943,6 +8486,7 @@ class SheetView:
         self.row_pairs: list[tuple[int | None, int | None]] = []
         self.pair_text_a: dict[int, str] = {}
         self.pair_text_b: dict[int, str] = {}
+        self.pair_text_base: dict[int, str] = {}
         self.pair_diff_cols: dict[int, set[int]] = {}
         self.pair_base_diff_cols: dict[int, set[int]] = {}
         self.row_a_to_pair_idx: dict[int, int] = {}
@@ -3951,6 +8495,19 @@ class SheetView:
         self.theirs_to_base_row: dict[int, int] = {}
         self.pair_base_row_override: dict[int, int | None] = {}
         self._missing_base_row_map: dict[int, int] = {}
+        self.column_comparison_cache: LogicalColumnComparisonCache | None = None
+        self.column_projection: LogicalColumnProjection | None = None
+        self.column_alignment_2way: ColumnAlignmentResult | None = None
+        self.column_alignment_3way: ColumnAlignment3WayResult | None = None
+        self.logical_column_states: tuple[LogicalColumnState, ...] = ()
+        self.logical_column_structural_conflicts: tuple[LogicalColumnStructuralConflict, ...] = ()
+        self._row_model_version = 0
+        self._column_model_version = 0
+        self._mine_edit_version = 0
+        self._base_edit_version = 0
+        self._theirs_edit_version = 0
+        self._column_projection_generation = 0
+        self._column_mapping_stale_reason = ""
 
         # Render state
         # display_rows stores pair indices (into row_pairs)
@@ -3974,6 +8531,11 @@ class SheetView:
         self._last_selected_line: int | None = None
         self._main_sel_col: int | None = None
         self._main_sel_line: int | None = None
+        self.selected_column_block_ordinal: int | None = None
+        self.selected_column_logical_range: tuple[int, int] | None = None
+        self.selected_column_source_side: str | None = None
+        self._selected_column_projection_generation: int | None = None
+        self._retained_column_decisions: set[tuple[int, int, str]] = set()
         self._applied_main_sel_col: int | None = None
         self._applied_main_sel_line: int | None = None
         self._cursor_cmp_sel_col: int | None = None
@@ -3988,6 +8550,13 @@ class SheetView:
         self._prefer_only_diff_when_ready = False
         self._pending_only_diff_value: int | None = None
         self._diff_partial = False
+        # True only when ``pair_diff_cols`` represents an exact 2-way scan of
+        # every aligned pair (equal rows may be omitted).  Column actions may
+        # reuse that model only after proving the old/new slot mapping; every
+        # other path falls back to the normal full scan.
+        self._pair_diff_full_exact = False
+        self._pending_column_only_diff_seed = None
+        self._column_diff_seed_last = {"used": False, "reason": "not-attempted"}
         self._align_rows_enabled = True
         self._force_sequence_align = False
         # After user-triggered rescan/toggle, ignore late background cache apply for this sheet
@@ -4246,6 +8815,48 @@ class SheetView:
         self._load_all_btn = ttk.Button(bar, text="加载全部", command=self._load_all_rows)
         if _FAST_OPEN_ENABLED:
             self._load_all_btn.pack(side="right", padx=(6, 0))
+
+        # Structural-column action bar.  Buttons stay disabled until a user
+        # selects a highlighted logical block from a header or minimap marker.
+        self.column_action_bar = ttk.Frame(self.frame)
+        self.column_action_bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.column_action_status_var = tk.StringVar(
+            value="列块：点击带 + / − / ? 标记的表头或下方橙色列标记进行选择"
+        )
+        ttk.Label(
+            self.column_action_bar,
+            textvariable=self.column_action_status_var,
+            foreground="#6A4A00",
+        ).pack(side="left", fill="x", expand=True)
+        self.use_theirs_col_btn = tk.Button(
+            self.column_action_bar,
+            text="采用Theirs列",
+            padx=8,
+            pady=1,
+            state="disabled",
+            command=lambda: self._on_column_action_button("B"),
+        )
+        self.use_base_col_btn = tk.Button(
+            self.column_action_bar,
+            text="采用Base列",
+            padx=8,
+            pady=1,
+            state="disabled",
+            command=lambda: self._on_column_action_button("BASE"),
+        )
+        self.use_mine_col_btn = tk.Button(
+            self.column_action_bar,
+            text="保留Mine列",
+            padx=8,
+            pady=1,
+            state="disabled",
+            command=lambda: self._on_column_action_button("A"),
+        )
+        self.use_theirs_col_btn.pack(side="right", padx=(4, 0))
+        if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
+            self.use_base_col_btn.pack(side="right", padx=(4, 0))
+        self.use_mine_col_btn.pack(side="right", padx=(4, 0))
+        self._refresh_column_action_buttons()
 
         # Path bar (requested red-box area): show full paths above the diff panes
         path_bar = ttk.Frame(self.frame)
@@ -4676,8 +9287,10 @@ class SheetView:
         self.right.tag_raise("paddingrow")
         # paddingcol: grey span for columns that exist only on the other side (新增列).
         self.left.tag_configure("paddingcol", background="#A0A0A0")
+        self.base.tag_configure("paddingcol", background="#A0A0A0")
         self.right.tag_configure("paddingcol", background="#A0A0A0")
         self.left.tag_raise("paddingcol")
+        self.base.tag_raise("paddingcol")
         self.right.tag_raise("paddingcol")
 
         # selection should not overwrite diff colors
@@ -4712,13 +9325,12 @@ class SheetView:
             w.bind("<Button-5>", self._on_mousewheel)
             w.bind("<KeyRelease>", lambda e: self._update_cursor_lines())
             w.bind("<ButtonRelease-1>", lambda e: self._update_cursor_lines())
-            if getattr(self.app, "merge_conflict_mode", False):
-                #快捷键：下一处/上一处冲突
-                # F4 is reserved for hover panel pin/unpin toggle.
-                w.bind("<F4>", self._on_hover_compare_f4_toggle)
-                w.bind("<Shift-F4>", lambda e: (self._goto_prev_diff_block(), "break"))
-                w.bind("<Control-n>", lambda e: (self._goto_next_diff_block(), "break"))
-                w.bind("<Control-p>", lambda e: (self._goto_prev_diff_block(), "break"))
+            # F4 remains reserved for hover-panel pin/unpin. Block navigation
+            # applies to normal 2-way/3-way views as well as conflict-only mode.
+            w.bind("<F4>", self._on_hover_compare_f4_toggle)
+            w.bind("<Shift-F4>", self._on_prev_diff_block_shortcut)
+            w.bind("<Control-n>", self._on_next_diff_block_shortcut)
+            w.bind("<Control-p>", self._on_prev_diff_block_shortcut)
 
         # Click handling (selection + arrow action)
         left_click_dir = "MINE2A" if (getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False)) else "A2B"
@@ -4738,6 +9350,9 @@ class SheetView:
         self.left.bind("<Double-Button-1>", lambda e, d=left_click_dir: self._copy_cell(d, e))
         self.base.bind("<Double-Button-1>", lambda e: self._copy_cell("BASE2A", e))
         self.right.bind("<Double-Button-1>", lambda e: self._copy_cell("B2A", e))
+        self.left_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.left_colhdr, e, "A"))
+        self.base_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.base_colhdr, e, "BASE"))
+        self.right_colhdr.bind("<Button-1>", lambda e: self._on_column_header_click(self.right_colhdr, e, "B"))
         self.left_ln.bind("<Button-1>", lambda e, d=left_click_dir: self._on_row_header_click(self.left_ln, e, d))
         self.base_ln.bind("<Button-1>", lambda e: self._on_row_header_click(self.base_ln, e, "BASE2A"))
         self.right_ln.bind("<Button-1>", lambda e: self._on_row_header_click(self.right_ln, e, "B2A"))
@@ -4769,7 +9384,7 @@ class SheetView:
                                          font=self.editor_font, bg="#efefef", fg="#555555", relief="flat", takefocus=0, cursor="arrow")
         self.cursor_cmp_corner.pack(side="left", fill="y")
         ttk.Separator(c_head, orient="vertical").pack(side="left", fill="y")
-        self.cursor_cmp_colhdr.pack(side="left", fill="x", expand=True)
+        self.cursor_cmp_colhdr.pack(side="left", fill="y", expand=False)
 
         c_body = ttk.Frame(c_text_frame)
         c_body.pack(side="top", fill="x")
@@ -4795,7 +9410,7 @@ class SheetView:
         self.cursor_cmp.tag_configure("diffcell", background=_DIFF_CELL_BG)
         # Explicit C-area click target highlight
         self.cursor_cmp.tag_configure("cselcell", background="#8EB9FF")
-        self.cursor_cmp.pack(side="left", fill="x", expand=True)
+        self.cursor_cmp.pack(side="left", fill="y", expand=False)
 
         for w in (self.cursor_cmp_corner, self.cursor_cmp_colhdr, self.cursor_cmp_ln):
             try:
@@ -4815,6 +9430,10 @@ class SheetView:
         self.cursor_cmp.bind("<Button-3>", self._on_cursor_cmp_right_click)
         self.cursor_cmp.bind("<Motion>", self._on_cursor_cmp_hover_tooltip)
         self.cursor_cmp.bind("<Leave>", lambda e: self._on_hover_compare_leave())
+        self.cursor_cmp_colhdr.bind(
+            "<Button-1>",
+            lambda e: self._on_column_header_click(self.cursor_cmp_colhdr, e, "LOGICAL"),
+        )
 
         # ---- C2: cell-aligned view (optional; can be hidden if not useful/performance) ----
         self._enable_c_cell = False  # user feedback: not useful; keep hidden by default
@@ -5155,6 +9774,7 @@ class SheetView:
             self.frame.after(0, self._keep_panes_equal)
         except Exception:
             pass
+        self._refresh_column_action_buttons()
 
     def _sync_main_x_to_frac(self, first):
         try:
@@ -5174,6 +9794,28 @@ class SheetView:
         finally:
             self._xsyncing = prev_xsync
 
+    def _sync_c_projection_viewport_width(self):
+        """Give C the same viewport width as one main logical-slot pane.
+
+        C spans the lower notebook, but a full-window Text viewport clamps its
+        native xview long before the three main panes.  Keeping the actual Text
+        viewport one-pane wide preserves one canonical xview fraction without
+        padding or duplicating logical content; the remaining lower-area width
+        is simply unused inspection space.
+        """
+        try:
+            from tkinter import font as tkfont
+
+            main_px = max(1, int(self.left.winfo_width()))
+            font = tkfont.Font(font=self.editor_font)
+            char_px = max(1, int(font.measure("0")))
+            width_chars = max(12, int(round(main_px / char_px)))
+            for widget in (self.cursor_cmp, self.cursor_cmp_colhdr):
+                if int(widget.cget("width")) != width_chars:
+                    widget.configure(width=width_chars)
+        except Exception:
+            pass
+
     def _sync_c_x_to_frac(self, first):
         try:
             frac = float(first)
@@ -5184,8 +9826,9 @@ class SheetView:
         prev_suppress = bool(getattr(self, "_suppress_c_xsync", False))
         self._suppress_c_xsync = True
         try:
+            self._sync_c_projection_viewport_width()
             try:
-                c_first = self._map_xfirst_between_widgets(self.left, self.cursor_cmp, frac)
+                c_first = frac
                 self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
                     self.cursor_cmp_colhdr.xview_moveto(c_first)
@@ -5275,14 +9918,19 @@ class SheetView:
                 return 0.0
 
     def _sync_main_x_from_widget(self, src_widget: tk.Text, src_first):
-        """Sync A/B(/BASE) using source-widget absolute x position."""
+        """Sync A/B(/BASE) in the shared logical-slot coordinate system."""
         try:
-            left_first = self._map_xfirst_between_widgets(src_widget, self.left, src_first)
-            right_first = self._map_xfirst_between_widgets(src_widget, self.right, src_first)
+            # Every main pane now renders exactly the same slot widths and
+            # separators.  Re-mapping through independently inferred pixel
+            # totals introduces rounding drift (notably after a click), so the
+            # canonical logical fraction is applied directly to all peers.
+            canonical_first = max(0.0, float(src_first))
+            left_first = canonical_first
+            right_first = canonical_first
             self.left.xview_moveto(left_first)
             self.right.xview_moveto(right_first)
             if self._is_three_way_enabled():
-                base_first = self._map_xfirst_between_widgets(src_widget, self.base, src_first)
+                base_first = canonical_first
                 self.base.xview_moveto(base_first)
             if getattr(self, "left_colhdr", None) is not None:
                 self.left_colhdr.xview_moveto(left_first)
@@ -5302,12 +9950,13 @@ class SheetView:
             pass
 
     def _sync_c_x_from_widget(self, src_widget: tk.Text, src_first):
-        """Sync C panes using source-widget absolute x position."""
+        """Sync C panes using the canonical logical-slot x fraction."""
         prev_suppress = bool(getattr(self, "_suppress_c_xsync", False))
         self._suppress_c_xsync = True
         try:
+            self._sync_c_projection_viewport_width()
             try:
-                c_first = self._map_xfirst_between_widgets(src_widget, self.cursor_cmp, src_first)
+                c_first = float(src_first)
                 self.cursor_cmp.xview_moveto(c_first)
                 if getattr(self, "cursor_cmp_colhdr", None) is not None:
                     self.cursor_cmp_colhdr.xview_moveto(c_first)
@@ -5442,10 +10091,11 @@ class SheetView:
     def _toggle_grid_overlay(self):
         try:
             self._invalidate_render_cache()
-            # pair_text_a/b cache formatted line strings; must be cleared so
+            # pair_text_a/b/base cache formatted line strings; must be cleared so
             # _build_row_and_diff_pair re-runs with the new grid-on/off separator.
             self.pair_text_a = {}
             self.pair_text_b = {}
+            self.pair_text_base = {}
             # Rescan widths to avoid stale narrow columns when toggling grid mode.
             self.refresh(row_only=None, rescan=True)
             self._update_cursor_lines()
@@ -5594,6 +10244,10 @@ class SheetView:
             canvas = self.hdiff_left if pane == "left" else (self.hdiff_mid if pane == "mid" else self.hdiff_right)
             w = max(1, canvas.winfo_width())
             frac = min(1.0, max(0.0, float(event.x) / float(w)))
+            logical_count = max(1, self._logical_slot_count())
+            logical_col = min(logical_count, max(1, int(frac * logical_count) + 1))
+            source_side = "A" if pane == "left" else ("BASE" if pane == "mid" else "B")
+            self._select_column_block_by_logical_col(logical_col, source_side)
             self._sync_main_x_to_frac(frac)
             self._sync_c_x_to_frac(frac)
         except Exception:
@@ -5620,6 +10274,11 @@ class SheetView:
         for cols in (self.pair_diff_cols or {}).values():
             if cols:
                 diff_cols.update(c for c in cols if c > 0)
+        try:
+            diff_cols.update(self._active_column_comparison_cache().structural_diff_cols)
+            diff_cols.update(self._active_column_comparison_cache().unresolved_cols)
+        except Exception:
+            pass
         data = (total_pairs, diff_rows, sorted(diff_cols))
         self._diff_map_cache = data
         self._diff_map_cache_version = ver
@@ -5663,7 +10322,7 @@ class SheetView:
 
         # Horizontal diff maps (under each pane scrollbar; by diff columns)
         try:
-            max_col = max(1, int(self.max_col or 1))
+            max_col = self._logical_slot_count()
             canvases = [self.hdiff_left, self.hdiff_right]
             if self._is_three_way_enabled():
                 canvases.insert(1, self.hdiff_mid)
@@ -6047,11 +10706,15 @@ class SheetView:
             ra = self._row_for_side(pair, "A")
             rb = self._row_for_side(pair, "B")
             base_r = self._base_row_for_pair(pair_idx, pair) if self._is_three_way_enabled() else None
-            if ra is not None:
+            if ra is not None and self._slot_exists_on_side("A", col):
                 self.left.tag_add("selcell", f"{line}.{s}", f"{line}.{e}")
-            if self._is_three_way_enabled() and base_r is not None:
+            if (
+                self._is_three_way_enabled()
+                and base_r is not None
+                and self._slot_exists_on_side("BASE", col)
+            ):
                 self.base.tag_add("selcell", f"{line}.{s}", f"{line}.{e}")
-            if rb is not None:
+            if rb is not None and self._slot_exists_on_side("B", col):
                 self.right.tag_add("selcell", f"{line}.{s}", f"{line}.{e}")
             self._applied_main_sel_line = int(line)
             self._applied_main_sel_col = int(col)
@@ -6693,6 +11356,11 @@ class SheetView:
             if row_no is None:
                 values.append("<missing>")
                 continue
+            physical_col = self._physical_col_for_logical(side, target_col)
+            if physical_col is None:
+                reason = self._active_column_projection().structural_reason(side, target_col)
+                values.append(f"<{_LOGICAL_COLUMN_PLACEHOLDER}: {reason}>")
+                continue
             try:
                 if side == "A":
                     ws_val = self.app.ws_a_val(self.sheet)
@@ -6700,7 +11368,7 @@ class SheetView:
                     ws_val = self.app.ws_base_val(self.sheet)
                 else:
                     ws_val = self.app.ws_b_val(self.sheet)
-                v_disp = ws_val.cell(row=row_no, column=target_col).value
+                v_disp = ws_val.cell(row=row_no, column=physical_col).value
                 # Keep tooltip value source aligned with row rendering:
                 # when cached-values mode misses literals, rendering falls back to edit WB.
                 if _USE_CACHED_VALUES_ONLY and v_disp is None:
@@ -6718,7 +11386,7 @@ class SheetView:
                             ws_edit = None
                     if ws_edit is not None:
                         try:
-                            v_edit = ws_edit.cell(row=row_no, column=target_col).value
+                            v_edit = ws_edit.cell(row=row_no, column=physical_col).value
                             if v_edit is not None and not _formula_text(v_edit):
                                 v_disp = v_edit
                         except Exception:
@@ -6734,7 +11402,12 @@ class SheetView:
 
         width = max(1, int(self.col_char_widths.get(target_col, 1)))
         # 新增行：只要有一侧 row_no 为 None（该侧无数据），面板必须显示
-        need_tip = bool(force_show) or any(row_no is None for row_no in rows) or any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
+        need_tip = (
+            bool(force_show)
+            or any(row_no is None for row_no in rows)
+            or any(self._physical_col_for_logical(side, target_col) is None for side in sides)
+            or any((row_no is not None and len(v) > width) for row_no, v in zip(rows, values))
+        )
         if not need_tip and not force_panel:
             return None
 
@@ -7186,13 +11859,13 @@ class SheetView:
             ws_base = self.app.ws_base_val(self.sheet)
         except Exception:
             return cols
+        rows_a = _read_rows_into_cache(ws_a, (r,), max_col)
+        rows_base = _read_rows_into_cache(ws_base, (r,), max_col)
+        row_a = _row_from_cache(rows_a, r, max_col)
+        row_base = _row_from_cache(rows_base, r, max_col)
         for c in range(1, max_col + 1):
-            try:
-                va = ws_a.cell(row=r, column=c).value
-                vb = ws_base.cell(row=r, column=c).value
-            except Exception:
-                va = None
-                vb = None
+            va = row_a[c - 1]
+            vb = row_base[c - 1]
             if _val_to_str(va) != _val_to_str(vb):
                 cols.add(c)
         return cols
@@ -7227,7 +11900,10 @@ class SheetView:
             pair = self.row_pairs[pair_idx] if pair_idx is not None and pair_idx < len(self.row_pairs) else None
             ra = self._row_for_side(pair, "A")
             rb = self._row_for_side(pair, "B")
-            diff_cols = self._visual_diff_cols_for_pair(pair_idx) if pair_idx is not None else set()
+            # C-area is an inspection surface: keep raw logical differences
+            # visible even when an unresolved/structural slot is intentionally
+            # excluded from the only-diff row predicate.
+            diff_cols = self._all_logical_diff_cols_for_pair(pair_idx) if pair_idx is not None else set()
             a_text = self.pair_text_a.get(pair_idx, "") if pair_idx is not None else ""
             b_text = self.pair_text_b.get(pair_idx, "") if pair_idx is not None else ""
             base_text = ""
@@ -7284,13 +11960,13 @@ class SheetView:
             # Cell-level diff highlight
             if diff_cols:
                 for c in diff_cols:
-                    if is_three and c in spans_base:
+                    if is_three and c in spans_base and self._slot_exists_on_side("BASE", c):
                         s, e = spans_base[c]
                         self.cursor_cmp.tag_add("diffcell", f"1.{s}", f"1.{e}")
-                    if c in spans_a:
+                    if c in spans_a and self._slot_exists_on_side("A", c):
                         s, e = spans_a[c]
                         self.cursor_cmp.tag_add("diffcell", f"{2 if is_three else 1}.{s}", f"{2 if is_three else 1}.{e}")
-                    if c in spans_b:
+                    if c in spans_b and self._slot_exists_on_side("B", c):
                         s, e = spans_b[c]
                         self.cursor_cmp.tag_add("diffcell", f"{3 if is_three else 2}.{s}", f"{3 if is_three else 2}.{e}")
 
@@ -7338,17 +12014,23 @@ class SheetView:
                         ws_a_val = self.app.ws_a_val(self.sheet)
                         ws_b_val = self.app.ws_b_val(self.sheet)
                         show_only_diff = bool(self.c_only_diff_cells.get())
-                        cols_to_show = sorted(diff_cols) if show_only_diff else list(range(1, self.max_col + 1))
+                        cols_to_show = (
+                            sorted(c for c in diff_cols if c > 0)
+                            if show_only_diff
+                            else list(range(1, self._logical_slot_count() + 1))
+                        )
 
                         if show_only_diff:
                             parts_a = []
                             parts_b = []
                             widths = []
                             for c in cols_to_show:
-                                va = ws_a_val.cell(row=ra, column=c).value if ra is not None else None
-                                vb = ws_b_val.cell(row=rb, column=c).value if rb is not None else None
-                                a_s = _val_to_str(va)
-                                b_s = _val_to_str(vb)
+                                ca = self._physical_col_for_logical("A", c)
+                                cb = self._physical_col_for_logical("B", c)
+                                va = ws_a_val.cell(row=ra, column=ca).value if ra is not None and ca is not None else None
+                                vb = ws_b_val.cell(row=rb, column=cb).value if rb is not None and cb is not None else None
+                                a_s = _val_to_str(va) if ca is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                                b_s = _val_to_str(vb) if cb is not None else _LOGICAL_COLUMN_PLACEHOLDER
                                 parts_a.append(a_s)
                                 parts_b.append(b_s)
                                 widths.append(max(4, min(max(len(a_s), len(b_s)), _COL_MAX_DISPLAY_WIDTH)))
@@ -7370,10 +12052,12 @@ class SheetView:
                         else:
                             line_no = 1
                             for c in cols_to_show:
-                                va = ws_a_val.cell(row=ra, column=c).value if ra is not None else None
-                                vb = ws_b_val.cell(row=rb, column=c).value if rb is not None else None
-                                a_s = _val_to_str(va)
-                                b_s = _val_to_str(vb)
+                                ca = self._physical_col_for_logical("A", c)
+                                cb = self._physical_col_for_logical("B", c)
+                                va = ws_a_val.cell(row=ra, column=ca).value if ra is not None and ca is not None else None
+                                vb = ws_b_val.cell(row=rb, column=cb).value if rb is not None and cb is not None else None
+                                a_s = _val_to_str(va) if ca is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                                b_s = _val_to_str(vb) if cb is not None else _LOGICAL_COLUMN_PLACEHOLDER
 
                                 self.cell_cmp_text.insert("end", a_s + "\n")
                                 self.cell_cmp_text.insert("end", b_s + "\n")
@@ -7419,6 +12103,2195 @@ class SheetView:
                 pass
             pass
 
+    def _selected_column_block(self) -> ColumnBlock | None:
+        ordinal = getattr(self, "selected_column_block_ordinal", None)
+        if ordinal is None:
+            return None
+        if getattr(self, "_selected_column_projection_generation", None) != getattr(
+            self, "_column_projection_generation", None
+        ):
+            return None
+        for block in self._active_column_projection().model.blocks:
+            if int(block.ordinal) == int(ordinal):
+                return block
+        return None
+
+    def _column_block_is_structural(self, block: ColumnBlock) -> bool:
+        special = set(self._active_column_comparison_cache().structural_diff_cols)
+        special.update(self._active_column_comparison_cache().unresolved_cols)
+        return any(int(slot_idx) + 1 in special for slot_idx in block.slot_indices)
+
+    def _column_block_cause_text(self, block: ColumnBlock) -> str:
+        cause_labels = {
+            COLUMN_MAPPING_CAUSE_BLANK_COLUMN: "空白列无法唯一识别",
+            COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE: "重复列特征",
+            COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH: "公式结构不一致",
+            COLUMN_MAPPING_CAUSE_INCOMPATIBLE_CACHE: "缓存版本不兼容",
+            COLUMN_MAPPING_CAUSE_IMPLICIT_BOUNDARY: "列边界不明确",
+            COLUMN_MAPPING_CAUSE_COLUMN_LIMIT: "超过列对齐上限",
+            COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE: "匹配置信度不足",
+        }
+        reason_labels = {
+            "side-only-insertion": "单侧新增列",
+            "ambiguous-side-insertion": "单侧新增列身份不明确",
+            "ambiguous-inserted-columns": "新增列身份不明确",
+            "ambiguous-deleted-columns": "删除列身份不明确",
+            "ambiguous-competing-insertions": "双方在同一位置新增了不同列",
+            "competing-insertion": "同一位置存在竞争性新增列",
+            "bounded-ambiguity": "相邻可靠列之间存在待确认范围",
+            "unresolved-column-range": "列范围匹配待确认",
+            "unresolved-three-way-column-range": "三方列范围匹配待确认",
+            "low-confidence-physical-fallback": "匹配置信度不足，当前仅按物理位置候选",
+            "exact-anchor": "精确列锚点",
+            "high-confidence-anchor": "高置信度列锚点",
+            "base-anchored": "按Base列锚点定位",
+            "deterministic-base-anchored-alignment": "按Base确定性对齐",
+            "separate-side-columns": "两侧独立新增列",
+            "unique-header-same-ordinal": "唯一表头且物理顺序一致",
+            "single-column-same-ordinal": "单列工作表物理顺序一致",
+            "internal-safe-fallback": "内部安全回退",
+        }
+        causes = []
+        projection = self._active_column_projection()
+        for slot_idx in block.slot_indices:
+            slot = projection.slot(int(slot_idx) + 1)
+            if slot is None:
+                continue
+            causes.extend(cause_labels.get(code, code) for code in slot.confidence.cause_codes)
+            if slot.confidence.reason:
+                causes.append(reason_labels.get(slot.confidence.reason, "结构列变化（内部判定）"))
+        return "；".join(dict.fromkeys(str(value) for value in causes if value)) or "结构列变化"
+
+    def _refresh_column_action_buttons(self):
+        selected = self._selected_column_block() is not None
+        state = "normal" if selected else "disabled"
+        for name in ("use_mine_col_btn", "use_theirs_col_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                try:
+                    widget.configure(state=state)
+                except Exception:
+                    pass
+        base_button = getattr(self, "use_base_col_btn", None)
+        if base_button is not None:
+            try:
+                base_button.configure(state=(state if self._is_three_way_enabled() else "disabled"))
+            except Exception:
+                pass
+        try:
+            self.use_mine_col_btn.configure(
+                text="保留Mine列" if self._is_three_way_enabled() else "采用左侧(A)列"
+            )
+            self.use_theirs_col_btn.configure(
+                text="采用Theirs列" if self._is_three_way_enabled() else "采用右侧(B)列"
+            )
+        except Exception:
+            pass
+
+    def _apply_column_block_selection_tags(self):
+        selection = getattr(self, "selected_column_logical_range", None)
+        for widget in (
+            getattr(self, "left_colhdr", None),
+            getattr(self, "base_colhdr", None),
+            getattr(self, "right_colhdr", None),
+            getattr(self, "cursor_cmp_colhdr", None),
+        ):
+            if widget is None:
+                continue
+            try:
+                widget.tag_configure("colblocksel", background="#8EB9FF", foreground="#153A66")
+                widget.tag_remove("colblocksel", "1.0", "end")
+                if not selection:
+                    continue
+                start_col, end_col = selection
+                spans = self._spans_for_line(widget.get("1.0", "1.end"))
+                args = []
+                for logical_col in range(int(start_col), int(end_col) + 1):
+                    if logical_col in spans:
+                        start, end = spans[logical_col]
+                        args.extend([f"1.{start}", f"1.{end}"])
+                if args:
+                    widget.tag_add("colblocksel", *args)
+                    widget.tag_raise("colblocksel")
+            except Exception:
+                pass
+
+    def _select_column_block_by_logical_col(self, logical_col: int, source_side: str = "LOGICAL") -> ColumnBlock | None:
+        projection = self._ensure_column_projection_current("选择结构列块")
+        logical_col = int(logical_col)
+        block = next(
+            (candidate for candidate in projection.model.blocks if logical_col - 1 in candidate.slot_indices),
+            None,
+        )
+        if block is None or not self._column_block_is_structural(block):
+            self.selected_column_block_ordinal = None
+            self.selected_column_logical_range = None
+            self.selected_column_source_side = None
+            self._selected_column_projection_generation = None
+            self._apply_column_block_selection_tags()
+            self._refresh_column_action_buttons()
+            try:
+                self.column_action_status_var.set(f"L{logical_col} 不是结构差异列块")
+            except Exception:
+                pass
+            return None
+        start_col = int(block.start_slot_idx) + 1
+        end_col = int(block.end_slot_idx) + 1
+        normalized_source = str(source_side or "LOGICAL").upper()
+        self.selected_column_block_ordinal = int(block.ordinal)
+        self.selected_column_logical_range = (start_col, end_col)
+        self.selected_column_source_side = normalized_source
+        self._selected_column_projection_generation = int(self._column_projection_generation)
+        range_text = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
+        source_text = {"A": "Mine", "BASE": "Base", "B": "Theirs", "LOGICAL": "逻辑列"}.get(
+            normalized_source, normalized_source
+        )
+        unresolved = any(
+            (projection.slot(idx + 1).state == "unresolved" or projection.slot(idx + 1).confidence.ambiguous)
+            for idx in block.slot_indices
+            if projection.slot(idx + 1) is not None
+        )
+        state_text = "待显式确认" if unresolved else "可执行"
+        try:
+            self.column_action_status_var.set(
+                f"已选择列块 {range_text}｜来源 {source_text}｜{state_text}｜原因：{self._column_block_cause_text(block)}"
+            )
+        except Exception:
+            pass
+        self._apply_column_block_selection_tags()
+        self._refresh_column_action_buttons()
+        return block
+
+    def _on_column_header_click(self, widget: tk.Text, event, source_side: str):
+        try:
+            char_pos = int(str(widget.index(f"@{event.x},{event.y}")).split(".")[1])
+            logical_col = self._col_from_char(char_pos)
+            if logical_col is not None:
+                self._select_column_block_by_logical_col(logical_col, source_side)
+        except Exception:
+            pass
+        return "break"
+
+    @staticmethod
+    def _require_consecutive_columns(columns: tuple[int, ...], label: str):
+        if not columns:
+            return
+        if any(right != left + 1 for left, right in zip(columns, columns[1:])):
+            raise RuntimeError(f"{label}物理列不连续，已阻止结构操作。")
+
+    def _plan_selected_column_block_action(
+        self,
+        source_side: str,
+        target_side: str | None = None,
+        *,
+        confirm_unresolved: bool = False,
+        action_id: str | None = None,
+    ) -> ColumnBlockActionPlan:
+        projection = self._ensure_column_projection_current("规划列结构操作")
+        block = self._selected_column_block()
+        if block is None:
+            raise RuntimeError("请先点击结构列块表头或橙色列标记。")
+        source_side = str(source_side or "").upper()
+        if source_side not in ("A", "BASE", "B"):
+            raise ValueError("source_side must be A, BASE, or B")
+        if target_side is None:
+            target_side = "A" if self._is_three_way_enabled() else ("B" if source_side == "A" else "A")
+        target_side = str(target_side or "").upper()
+        if target_side not in ("A", "B"):
+            raise ValueError("target_side must be A or B")
+        slots = [projection.slot(idx + 1) for idx in block.slot_indices]
+        if any(slot is None for slot in slots):
+            raise RuntimeError("列块模型已失效，请刷新后重试。")
+        unresolved = any(slot.state == "unresolved" or slot.confidence.ambiguous for slot in slots)
+        if unresolved and not confirm_unresolved:
+            start_col = int(block.start_slot_idx) + 1
+            end_col = int(block.end_slot_idx) + 1
+            raise RuntimeError(
+                f"逻辑列块 L{start_col}:L{end_col} 映射待确认：{self._column_block_cause_text(block)}。"
+                "必须显式确认后才能执行列结构操作。"
+            )
+        source_values = tuple(projection.physical_col(source_side, idx + 1) for idx in block.slot_indices)
+        target_values = tuple(projection.physical_col(target_side, idx + 1) for idx in block.slot_indices)
+        source_present = tuple(value is not None for value in source_values)
+        target_present = tuple(value is not None for value in target_values)
+        if len(set(source_present)) > 1 or len(set(target_present)) > 1:
+            raise RuntimeError("列块在源侧或目标侧存在混合缺列状态，已阻止部分修改相邻列。")
+        source_cols = tuple(int(value) for value in source_values if value is not None)
+        target_cols = tuple(int(value) for value in target_values if value is not None)
+        self._require_consecutive_columns(source_cols, "源侧")
+        self._require_consecutive_columns(target_cols, "目标侧")
+        logical_start = int(block.start_slot_idx) + 1
+        logical_end = int(block.end_slot_idx) + 1
+        count = logical_end - logical_start + 1
+        if source_side == target_side:
+            action_kind = "retain"
+            anchor = target_cols[0] if target_cols else 1
+        elif source_cols and not target_cols:
+            action_kind = "insert_copy"
+            next_physical = None
+            for logical_col in range(logical_end + 1, projection.slot_count + 1):
+                next_physical = projection.physical_col(target_side, logical_col)
+                if next_physical is not None:
+                    break
+            if next_physical is None:
+                previous = [
+                    projection.physical_col(target_side, logical_col)
+                    for logical_col in range(1, logical_start)
+                ]
+                previous = [int(value) for value in previous if value is not None]
+                anchor = (previous[-1] + 1) if previous else 1
+            else:
+                anchor = int(next_physical)
+        elif not source_cols and target_cols:
+            action_kind = "delete"
+            anchor = target_cols[0]
+        elif source_cols and target_cols:
+            action_kind = "copy"
+            anchor = target_cols[0]
+        else:
+            raise RuntimeError("源侧和目标侧都缺少所选列块，无法执行。")
+        return ColumnBlockActionPlan(
+            action_id=action_id or self.app.next_manual_column_action_id(),
+            sheet=self.sheet,
+            block_ordinal=int(block.ordinal),
+            logical_start=logical_start,
+            logical_end=logical_end,
+            source_side=source_side,
+            target_side=target_side,
+            source_physical_cols=source_cols,
+            target_physical_cols=target_cols,
+            target_physical_anchor=int(anchor),
+            count=count,
+            action_kind=action_kind,
+            unresolved=unresolved,
+        )
+
+    @staticmethod
+    def _column_action_cell_key_snapshot(cells) -> dict[str, object]:
+        """Capture exact materialized-cell membership compactly.
+
+        Normal action sheets are dense enough that a bit per physical position
+        is dramatically smaller than retaining a set of coordinate tuples.  A
+        sparse fallback avoids allocating a huge bitmap for unusual far-away
+        cells.
+        """
+        max_row = 0
+        max_col = 0
+        for row, col in cells:
+            row = int(row)
+            col = int(col)
+            if row > max_row:
+                max_row = row
+            if col > max_col:
+                max_col = col
+        span = max_row * max_col
+        if 0 < span <= 64_000_000:
+            bitmap = bytearray((span + 7) // 8)
+            for row, col in cells:
+                offset = (int(row) - 1) * max_col + int(col) - 1
+                bitmap[offset >> 3] |= 1 << (offset & 7)
+            return {
+                "kind": "bitmap",
+                "max_row": max_row,
+                "max_col": max_col,
+                "bits": bytes(bitmap),
+            }
+        return {"kind": "set", "keys": frozenset(cells)}
+
+    @staticmethod
+    def _column_action_cell_key_was_present(key_snapshot, row: int, col: int) -> bool:
+        if not key_snapshot:
+            return False
+        if key_snapshot.get("kind") == "bitmap":
+            max_row = int(key_snapshot.get("max_row", 0) or 0)
+            max_col = int(key_snapshot.get("max_col", 0) or 0)
+            if not (1 <= int(row) <= max_row and 1 <= int(col) <= max_col):
+                return False
+            offset = (int(row) - 1) * max_col + int(col) - 1
+            bits = key_snapshot.get("bits") or b""
+            byte_index = offset >> 3
+            return byte_index < len(bits) and bool(bits[byte_index] & (1 << (offset & 7)))
+        return (int(row), int(col)) in (key_snapshot.get("keys") or ())
+
+    @staticmethod
+    def _shift_worksheet_columns_fast(ws, anchor: int, count: int, *, insert: bool):
+        """Shift materialized cells in one O(cells) dictionary rebuild.
+
+        openpyxl's structural helper first materializes an entire rectangular
+        ``iter_cols`` result and then rekeys cells individually.  Column actions
+        already manage dimensions and range metadata explicitly, so a direct
+        rekey preserves the same Cell objects and avoids that temporary matrix.
+        """
+        anchor = max(1, int(anchor))
+        count = max(1, int(count))
+        deleted_end = anchor + count - 1
+        old_cells = getattr(ws, "_cells", {}) or {}
+        new_cells = {}
+        for (row, col), cell in old_cells.items():
+            row = int(row)
+            col = int(col)
+            if insert:
+                new_col = col + count if col >= anchor else col
+            else:
+                if anchor <= col <= deleted_end:
+                    continue
+                new_col = col - count if col > deleted_end else col
+            new_cells[(row, new_col)] = cell
+            if new_col != col:
+                cell.column = int(new_col)
+        ws._cells = new_cells
+        _invalidate_worksheet_read_horizon(ws)
+
+    @staticmethod
+    def _pack_exact_pair_diff_map(pair_diff_cols, pair_count: int, slot_count: int) -> dict:
+        """Detach an exact diff map into a compact row-major bitmap."""
+        pair_count = max(0, int(pair_count))
+        slot_count = max(0, int(slot_count))
+        stride = max(1, (slot_count + 1 + 7) // 8)  # bit 0 is sentinel -1
+        bits = bytearray(pair_count * stride)
+        for raw_pair_idx, raw_cols in (pair_diff_cols or {}).items():
+            pair_idx = int(raw_pair_idx)
+            if not (0 <= pair_idx < pair_count):
+                raise ValueError("pair diff index is outside the exact row model")
+            offset = pair_idx * stride
+            for raw_col in raw_cols or ():
+                logical_col = int(raw_col)
+                bit = 0 if logical_col == -1 else logical_col
+                if not (0 <= bit <= slot_count):
+                    raise ValueError("pair diff column is outside the exact slot model")
+                bits[offset + (bit >> 3)] |= 1 << (bit & 7)
+        return {
+            "pair_count": pair_count,
+            "slot_count": slot_count,
+            "stride": stride,
+            "bits": bytes(bits),
+        }
+
+    @staticmethod
+    def _unpack_exact_pair_diff_map(packed) -> dict[int, set[int]]:
+        if not isinstance(packed, dict):
+            raise ValueError("missing packed exact diff map")
+        pair_count = max(0, int(packed.get("pair_count", 0)))
+        slot_count = max(0, int(packed.get("slot_count", 0)))
+        stride = max(1, int(packed.get("stride", 0)))
+        bits = packed.get("bits") or b""
+        if len(bits) != pair_count * stride:
+            raise ValueError("packed exact diff map length mismatch")
+        result: dict[int, set[int]] = {}
+        for pair_idx in range(pair_count):
+            offset = pair_idx * stride
+            mask = int.from_bytes(bits[offset:offset + stride], "little")
+            if not mask:
+                continue
+            cols = {-1} if (mask & 1) else set()
+            mask >>= 1
+            logical_col = 1
+            while mask and logical_col <= slot_count:
+                if mask & 1:
+                    cols.add(logical_col)
+                logical_col += 1
+                mask >>= 1
+            if cols:
+                result[pair_idx] = cols
+        return result
+
+    def _capture_column_action_diff_seed(self, plan: ColumnBlockActionPlan):
+        """Retain an exact pre-action 2-way diff model for a proved remap.
+
+        This is deliberately a narrow optimization.  The exact map is detached
+        into a compact bitmap so later only-diff/background activity cannot
+        mutate an undo layer and dense workbooks do not retain one dict/set graph
+        per action.
+        """
+        reason = "eligible"
+        try:
+            if not bool(getattr(self, "_is_large_sheet", False)):
+                reason = "not-large"
+            elif self._is_three_way_enabled() or bool(getattr(self.app, "has_base", False)):
+                reason = "not-2way"
+            elif bool(getattr(self.app, "merge_conflict_mode", False)):
+                reason = "conflict-mode"
+            elif not bool(getattr(self, "_pair_diff_full_exact", False)):
+                reason = "no-exact-full-diff"
+            elif not bool(getattr(self, "_data_ready", False)):
+                reason = "data-not-ready"
+            elif not self._column_mapping_is_current():
+                reason = "mapping-stale"
+            elif plan.action_kind not in ("insert_copy", "delete", "copy"):
+                reason = "unsupported-action"
+            elif str(plan.source_side).upper() not in ("A", "B"):
+                reason = "unsupported-source"
+            else:
+                projection = self._active_column_projection()
+                if not isinstance(projection, LogicalColumnProjection):
+                    reason = "missing-old-projection"
+                else:
+                    return {
+                        "projection": projection,
+                        "comparison_cache": self._active_column_comparison_cache(),
+                        "row_pairs": tuple(self.row_pairs),
+                        "pair_diff_bitmap": self._pack_exact_pair_diff_map(
+                            self.pair_diff_cols,
+                            len(self.row_pairs),
+                            projection.slot_count,
+                        ),
+                        "row_model_version": int(getattr(self, "_row_model_version", 0)),
+                        "pair_diff_full_exact": True,
+                        "column_projection_generation": int(
+                            getattr(self, "_column_projection_generation", 0)
+                        ),
+                        # Undo restores the physically identical projection, so
+                        # these already-proved display widths avoid rereading the
+                        # first large-sheet render window a second time.
+                        "col_char_widths": tuple(
+                            sorted(
+                                (int(col), int(width))
+                                for col, width in getattr(
+                                    self, "col_char_widths", {}
+                                ).items()
+                            )
+                        ),
+                        "rownum_display_width": int(
+                            getattr(self, "_rownum_display_width", 0)
+                        ),
+                        "effective_bounds": (
+                            int(getattr(self, "_effective_max_row_a", 1)),
+                            int(getattr(self, "col_max_a", 1)),
+                            int(getattr(self, "_effective_max_row_b", 1)),
+                            int(getattr(self, "col_max_b", 1)),
+                        ),
+                    }
+        except Exception as exc:
+            reason = f"capture-error:{type(exc).__name__}"
+        self._column_diff_seed_last = {"used": False, "reason": reason}
+        return None
+
+    @staticmethod
+    def _pack_column_diff_map(diff_map) -> tuple[tuple[int, int], ...]:
+        """Compact a logical diff map into pair-index/bitmask records."""
+        packed = []
+        for pair_idx, cols in sorted((diff_map or {}).items()):
+            mask = 0
+            for col in cols or ():
+                col = int(col)
+                bit = 0 if col == -1 else col
+                if bit < 0:
+                    raise ValueError(f"invalid logical diff column: {col}")
+                mask |= 1 << bit
+            packed.append((int(pair_idx), mask))
+        return tuple(packed)
+
+    @staticmethod
+    def _unpack_column_diff_map(packed) -> dict[int, set[int]]:
+        restored = {}
+        for pair_idx, raw_mask in packed or ():
+            mask = int(raw_mask)
+            cols = set()
+            bit = 0
+            while mask:
+                if mask & 1:
+                    cols.add(-1 if bit == 0 else bit)
+                mask >>= 1
+                bit += 1
+            restored[int(pair_idx)] = cols
+        return restored
+
+    def _capture_column_action_comparison_state(self, diff_seed=None):
+        """Capture the exact pre-action comparison channels for atomic undo."""
+        try:
+            projection = self._active_column_projection()
+            cache = self._active_column_comparison_cache()
+            if not self._column_mapping_is_current():
+                return None
+            state = {
+                "slots": tuple(projection.model.slots),
+                "blocks": tuple(projection.model.blocks),
+                "structural_diff_cols": frozenset(cache.structural_diff_cols),
+                "unresolved_cols": frozenset(cache.unresolved_cols),
+                # Column-only refresh is required to preserve row alignment.
+                # Keep only that identity check plus compact exact diff maps;
+                # full row text is rebuilt from the restored workbooks.
+                "row_pairs": self.row_pairs,
+                "pair_base_diff_cols": self._pack_column_diff_map(
+                    self.pair_base_diff_cols
+                ),
+                "logical_column_states": tuple(
+                    getattr(self, "logical_column_states", ()) or ()
+                ),
+                "logical_column_structural_conflicts": tuple(
+                    getattr(self, "logical_column_structural_conflicts", ()) or ()
+                ),
+                "pair_diff_full_exact": bool(
+                    getattr(self, "_pair_diff_full_exact", False)
+                ),
+                "diff_partial": bool(getattr(self, "_diff_partial", False)),
+            }
+            # Reuse the large-sheet seed's immutable bitmap when available;
+            # do not retain a second dict/set graph or duplicate bitmap for the
+            # same undo layer. Small/partial views use the compact bitmask tuple.
+            if isinstance(diff_seed, dict) and isinstance(
+                diff_seed.get("pair_diff_bitmap"), dict
+            ):
+                state["pair_diff_bitmap"] = diff_seed["pair_diff_bitmap"]
+            else:
+                state["pair_diff_cols"] = self._pack_column_diff_map(
+                    self.pair_diff_cols
+                )
+            return state
+        except Exception as exc:
+            _dlog(
+                f"COLUMN_COMPARISON_STATE_CAPTURE_SKIPPED sheet={self.sheet} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+            return None
+
+    def _restore_column_action_comparison_state(self, state) -> bool:
+        """Restore an exact diff state only after the rebuilt model proves equal."""
+        if not isinstance(state, dict):
+            return False
+        try:
+            projection = self._active_column_projection()
+            cache = self._active_column_comparison_cache()
+            if not self._column_mapping_is_current():
+                return False
+            if tuple(projection.model.slots) != tuple(state.get("slots") or ()):
+                return False
+            if tuple(projection.model.blocks) != tuple(state.get("blocks") or ()):
+                return False
+            if frozenset(cache.structural_diff_cols) != frozenset(
+                state.get("structural_diff_cols") or ()
+            ):
+                return False
+            if frozenset(cache.unresolved_cols) != frozenset(
+                state.get("unresolved_cols") or ()
+            ):
+                return False
+            if tuple(self.row_pairs) != tuple(state.get("row_pairs") or ()):
+                return False
+
+            if isinstance(state.get("pair_diff_bitmap"), dict):
+                self.pair_diff_cols = self._unpack_exact_pair_diff_map(
+                    state.get("pair_diff_bitmap")
+                )
+            else:
+                self.pair_diff_cols = self._unpack_column_diff_map(
+                    state.get("pair_diff_cols")
+                )
+            self.pair_base_diff_cols = self._unpack_column_diff_map(
+                state.get("pair_base_diff_cols")
+            )
+            self.logical_column_states = tuple(
+                state.get("logical_column_states") or ()
+            )
+            self.logical_column_structural_conflicts = tuple(
+                state.get("logical_column_structural_conflicts") or ()
+            )
+            self._pair_diff_full_exact = bool(
+                state.get("pair_diff_full_exact", False)
+            )
+            self._diff_partial = bool(state.get("diff_partial", False))
+            self._invalidate_render_cache()
+            _dlog(f"COLUMN_COMPARISON_STATE_RESTORED sheet={self.sheet}")
+            return True
+        except Exception as exc:
+            _dlog(
+                f"COLUMN_COMPARISON_STATE_RESTORE_SKIPPED sheet={self.sheet} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+            return False
+
+    @staticmethod
+    def _column_action_shifted_physical_col(
+        physical_col: int | None,
+        plan: ColumnBlockActionPlan,
+    ) -> int | None:
+        if physical_col is None:
+            return None
+        physical_col = int(physical_col)
+        anchor = int(plan.target_physical_anchor)
+        end = anchor + int(plan.count) - 1
+        if plan.action_kind == "insert_copy":
+            return physical_col + int(plan.count) if physical_col >= anchor else physical_col
+        if plan.action_kind == "delete":
+            if anchor <= physical_col <= end:
+                return None
+            return physical_col - int(plan.count) if physical_col > end else physical_col
+        return physical_col
+
+    @staticmethod
+    def _sparse_row_values_for_columns(ws, row: int | None, columns, width: int) -> tuple:
+        if row is None:
+            return (None,) * max(1, int(width))
+        values = [None] * max(1, int(width))
+        cells = getattr(ws, "_cells", {}) or {}
+        for physical_col in columns:
+            physical_col = int(physical_col)
+            if not (1 <= physical_col <= len(values)):
+                continue
+            cell = cells.get((int(row), physical_col))
+            if cell is not None:
+                values[physical_col - 1] = getattr(cell, "value", None)
+        return tuple(values)
+
+    def _try_apply_column_action_bounds_seed(self, request) -> bool:
+        """Reuse exact semantic bounds for a proved 2-way insert/copy/restore."""
+        if not isinstance(request, dict):
+            return False
+        state = request.get("state")
+        plan = request.get("plan")
+        mode = str(request.get("mode") or "apply")
+        if (
+            not isinstance(state, dict)
+            or not isinstance(plan, ColumnBlockActionPlan)
+            or self._is_three_way_enabled()
+            or bool(getattr(self.app, "has_base", False))
+            or bool(getattr(self.app, "merge_conflict_mode", False))
+            or not bool(state.get("pair_diff_full_exact", False))
+        ):
+            return False
+        try:
+            a_row, a_col, b_row, b_col = (
+                int(value) for value in state.get("effective_bounds")
+            )
+        except Exception:
+            return False
+        if mode == "restore":
+            pass
+        elif mode == "apply" and plan.action_kind in ("insert_copy", "copy"):
+            if plan.target_side == "A":
+                a_row = max(a_row, b_row)
+                if plan.action_kind == "insert_copy":
+                    a_col += int(plan.count)
+            elif plan.target_side == "B":
+                b_row = max(a_row, b_row)
+                if plan.action_kind == "insert_copy":
+                    b_col += int(plan.count)
+            else:
+                return False
+        else:
+            return False
+        self._effective_max_row_a = max(1, a_row)
+        self._effective_max_row_b = max(1, b_row)
+        self.col_max_a = max(1, a_col)
+        self.col_max_b = max(1, b_col)
+        self.max_row = max(self._effective_max_row_a, self._effective_max_row_b)
+        self.max_col = max(self.col_max_a, self.col_max_b)
+        self._bounds_checked = True
+        self._is_large_sheet = self.max_row >= _LARGE_SHEET_ROW_THRESHOLD
+        if self._is_large_sheet:
+            self._prefer_only_diff_when_ready = True
+        return True
+
+    def _try_install_column_action_projection_seed(self, request) -> bool:
+        """Install a deterministic 2-way projection for one owned column action.
+
+        The seed is intentionally narrower than ordinary alignment: it is only
+        accepted after an exact full diff, with unchanged row identity, and when
+        every source identity/target shift can be proved from the immutable old
+        model and validated action plan.  Any missing proof leaves the normal
+        full-signature rebuild in charge.
+        """
+
+        def _fallback(reason: str) -> bool:
+            self._column_projection_seed_last = {
+                "used": False,
+                "reason": str(reason),
+            }
+            return False
+
+        if not isinstance(request, dict):
+            return _fallback("no-request")
+        state = request.get("state")
+        plan = request.get("plan")
+        mode = str(request.get("mode") or "apply")
+        if not isinstance(state, dict) or not isinstance(plan, ColumnBlockActionPlan):
+            return _fallback("invalid-request")
+        if self._is_three_way_enabled() or bool(getattr(self.app, "has_base", False)):
+            return _fallback("not-2way")
+        if bool(getattr(self.app, "merge_conflict_mode", False)):
+            return _fallback("conflict-mode")
+        if not bool(getattr(self, "_is_large_sheet", False)):
+            return _fallback("not-large")
+        if not bool(state.get("pair_diff_full_exact", False)):
+            return _fallback("old-diff-not-exact")
+        if int(state.get("row_model_version", -1)) != int(
+            getattr(self, "_row_model_version", 0)
+        ):
+            return _fallback("row-model-changed")
+        if tuple(self.row_pairs) != tuple(state.get("row_pairs") or ()):
+            return _fallback("row-pairs-changed")
+        if bool(plan.unresolved):
+            return _fallback("unresolved-action")
+
+        old_projection = state.get("projection")
+        old_cache = state.get("comparison_cache")
+        if not isinstance(old_projection, LogicalColumnProjection) or not isinstance(
+            old_cache, LogicalColumnComparisonCache
+        ):
+            return _fallback("missing-old-model")
+        if old_cache.model is not old_projection.model:
+            return _fallback("old-model-identity-mismatch")
+        if old_cache.three_way_alignment is not None:
+            return _fallback("old-model-not-2way")
+
+        old_slots = tuple(old_projection.model.slots)
+        selected = set(range(int(plan.logical_start), int(plan.logical_end) + 1))
+        if (
+            not selected
+            or len(selected) != int(plan.count)
+            or max(selected) > len(old_slots)
+        ):
+            return _fallback("invalid-old-range")
+        source_side = str(plan.source_side).upper()
+        target_side = str(plan.target_side).upper()
+        if source_side not in ("A", "B") or target_side not in ("A", "B"):
+            return _fallback("invalid-sides")
+        if source_side == target_side:
+            return _fallback("same-side-action")
+
+        old_source_selected = tuple(
+            old_projection.physical_col(source_side, logical_col)
+            for logical_col in sorted(selected)
+        )
+        old_target_selected = tuple(
+            old_projection.physical_col(target_side, logical_col)
+            for logical_col in sorted(selected)
+        )
+        if mode == "restore":
+            transformed_slots = old_slots
+            model_confidence = old_projection.model.confidence
+        elif mode == "apply":
+            if plan.action_kind == "insert_copy":
+                if old_source_selected != tuple(plan.source_physical_cols) or any(
+                    value is not None for value in old_target_selected
+                ):
+                    return _fallback("insert-precondition-mismatch")
+            elif plan.action_kind == "delete":
+                if any(value is not None for value in old_source_selected) or tuple(
+                    value for value in old_target_selected if value is not None
+                ) != tuple(plan.target_physical_cols):
+                    return _fallback("delete-precondition-mismatch")
+            elif plan.action_kind == "copy":
+                if (
+                    old_source_selected != tuple(plan.source_physical_cols)
+                    or old_target_selected != tuple(plan.target_physical_cols)
+                    or any(
+                        old_slots[logical_col - 1].confidence.ambiguous
+                        for logical_col in selected
+                    )
+                ):
+                    return _fallback("copy-precondition-mismatch")
+            else:
+                return _fallback("unsupported-action")
+
+            adopted_confidence = ColumnMappingConfidence(
+                1.0,
+                False,
+                "exact-anchor",
+                ("intrinsic",),
+            )
+            transformed = []
+            for old_slot in old_slots:
+                old_logical = int(old_slot.logical_idx) + 1
+                if plan.action_kind == "delete" and old_logical in selected:
+                    continue
+                mine_col = old_slot.mine_col
+                theirs_col = old_slot.theirs_col
+                if target_side == "A":
+                    mine_col = self._column_action_shifted_physical_col(mine_col, plan)
+                else:
+                    theirs_col = self._column_action_shifted_physical_col(theirs_col, plan)
+                adopted = old_logical in selected and plan.action_kind in (
+                    "insert_copy", "copy"
+                )
+                if adopted:
+                    offset = old_logical - int(plan.logical_start)
+                    adopted_target = int(plan.target_physical_anchor) + offset
+                    if target_side == "A":
+                        mine_col = adopted_target
+                    else:
+                        theirs_col = adopted_target
+                transformed.append(ColumnSlot(
+                    logical_idx=len(transformed),
+                    mine_col=mine_col,
+                    base_col=None,
+                    theirs_col=theirs_col,
+                    state="retained" if adopted else old_slot.state,
+                    confidence=adopted_confidence if adopted else old_slot.confidence,
+                ))
+            transformed_slots = tuple(transformed)
+            unresolved = any(
+                slot.state == "unresolved" or slot.confidence.ambiguous
+                for slot in transformed_slots
+            )
+            model_confidence = ColumnMappingConfidence(
+                min((slot.confidence.score for slot in transformed_slots), default=1.0),
+                unresolved,
+                "unresolved-column-range" if unresolved else "deterministic-two-way-alignment",
+                cause_codes=tuple(dict.fromkeys(
+                    cause
+                    for slot in transformed_slots
+                    for cause in slot.confidence.cause_codes
+                )),
+            )
+        else:
+            return _fallback("unsupported-mode")
+
+        mine_cols = sorted(
+            int(slot.mine_col) for slot in transformed_slots if slot.mine_col is not None
+        )
+        theirs_cols = sorted(
+            int(slot.theirs_col) for slot in transformed_slots if slot.theirs_col is not None
+        )
+        if mine_cols != list(range(1, int(getattr(self, "col_max_a", 0)) + 1)):
+            return _fallback("mine-physical-coverage-mismatch")
+        if theirs_cols != list(range(1, int(getattr(self, "col_max_b", 0)) + 1)):
+            return _fallback("theirs-physical-coverage-mismatch")
+
+        blocks = _build_column_blocks(transformed_slots)
+        model = ColumnModel.from_slots(
+            self._expected_column_model_cache_key(),
+            transformed_slots,
+            blocks=blocks,
+            confidence=model_confidence,
+        )
+        fallback_slots = tuple(
+            slot.logical_idx
+            for slot in transformed_slots
+            if slot.state == "unresolved" or slot.confidence.ambiguous
+        )
+        alignment = ColumnAlignmentResult(
+            model=model,
+            anchor_pairs=tuple(
+                (int(slot.mine_col), int(slot.theirs_col))
+                for slot in transformed_slots
+                if slot.mine_col is not None and slot.theirs_col is not None
+            ),
+            fallback_slot_indices=fallback_slots,
+            used_physical_fallback=bool(fallback_slots),
+            fallback_reason="unresolved-column-range" if fallback_slots else "",
+        )
+        cache = LogicalColumnComparisonCache(
+            model=model,
+            two_way_alignment=alignment,
+            structural_diff_cols=frozenset(
+                slot.logical_idx + 1
+                for slot in transformed_slots
+                if slot.mine_col is None or slot.theirs_col is None
+            ),
+            unresolved_cols=frozenset(slot.logical_idx + 1 for slot in transformed_slots if (
+                slot.state == "unresolved" or slot.confidence.ambiguous
+            )),
+        )
+        self._install_column_projection(cache)
+        self.column_alignment_2way = self.column_comparison_cache.two_way_alignment
+        self.column_alignment_3way = None
+        self._column_projection_seed_last = {
+            "used": True,
+            "reason": f"{mode}-{plan.action_kind}",
+        }
+        return True
+
+    def _try_apply_column_action_diff_seed(
+        self,
+        request,
+        *,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+    ) -> bool:
+        """Install a proved incremental diff map, else record a full-scan reason."""
+
+        def _fallback(reason: str) -> bool:
+            self._column_diff_seed_last = {"used": False, "reason": str(reason)}
+            _dlog(f"COLUMN_DIFF_SEED_FALLBACK sheet={self.sheet} reason={reason}")
+            return False
+
+        if not isinstance(request, dict):
+            return _fallback("no-request")
+        state = request.get("state")
+        plan = request.get("plan")
+        mode = str(request.get("mode") or "apply")
+        if not isinstance(state, dict) or not isinstance(plan, ColumnBlockActionPlan):
+            return _fallback("invalid-request")
+        if self._is_three_way_enabled() or bool(getattr(self.app, "has_base", False)):
+            return _fallback("not-2way")
+        if not bool(getattr(self, "_is_large_sheet", False)):
+            return _fallback("not-large")
+        if tuple(self.row_pairs) != tuple(state.get("row_pairs") or ()):
+            return _fallback("row-pairs-changed")
+        old_projection = state.get("projection")
+        new_projection = self._active_column_projection()
+        if not isinstance(old_projection, LogicalColumnProjection) or not isinstance(
+            new_projection, LogicalColumnProjection
+        ):
+            return _fallback("missing-projection")
+        try:
+            old_diff_map = self._unpack_exact_pair_diff_map(state.get("pair_diff_bitmap"))
+        except Exception:
+            return _fallback("missing-exact-map")
+
+        # Undo/rollback restores the exact old workbooks.  Reuse is allowed only
+        # if the rebuilt projection is physically identical on both sides.
+        if mode == "restore":
+            if old_projection.slot_count != new_projection.slot_count:
+                return _fallback("restore-slot-count-changed")
+            for logical_col in range(1, old_projection.slot_count + 1):
+                for side in ("A", "B"):
+                    if old_projection.physical_col(side, logical_col) != new_projection.physical_col(
+                        side, logical_col
+                    ):
+                        return _fallback("restore-projection-mismatch")
+            self.pair_diff_cols = {
+                int(pair_idx): set(cols)
+                for pair_idx, cols in old_diff_map.items()
+                if cols
+            }
+            widths_restored = False
+            try:
+                width_records = tuple(state.get("col_char_widths") or ())
+                widths = {
+                    int(logical_col): int(width)
+                    for logical_col, width in width_records
+                }
+                expected_cols = set(range(1, new_projection.slot_count + 1))
+                if set(widths) == expected_cols and all(width >= 1 for width in widths.values()):
+                    self.col_char_widths = widths
+                    self._rownum_display_width = int(
+                        state.get("rownum_display_width", 0)
+                    )
+                    self._col_widths_version = int(
+                        getattr(self, "_col_widths_version", 0)
+                    ) + 1
+                    widths_restored = True
+            except Exception:
+                widths_restored = False
+            self._pair_diff_full_exact = True
+            self._column_diff_seed_last = {
+                "used": True,
+                "reason": "restore-exact",
+                "widths_restored": widths_restored,
+            }
+            _dlog(f"COLUMN_DIFF_SEED_USED sheet={self.sheet} mode=restore")
+            return True
+
+        if mode != "apply" or plan.action_kind not in ("insert_copy", "delete", "copy"):
+            return _fallback("unsupported-mode")
+        source_side = str(plan.source_side).upper()
+        target_side = str(plan.target_side).upper()
+        if source_side not in ("A", "B") or target_side not in ("A", "B") or source_side == target_side:
+            return _fallback("invalid-sides")
+        selected = set(range(int(plan.logical_start), int(plan.logical_end) + 1))
+        if not selected or max(selected) > old_projection.slot_count:
+            return _fallback("invalid-old-range")
+
+        old_source_selected = tuple(
+            old_projection.physical_col(source_side, logical_col)
+            for logical_col in sorted(selected)
+        )
+        old_target_selected = tuple(
+            old_projection.physical_col(target_side, logical_col)
+            for logical_col in sorted(selected)
+        )
+        if plan.action_kind == "insert_copy":
+            if old_source_selected != tuple(plan.source_physical_cols) or any(
+                value is not None for value in old_target_selected
+            ):
+                return _fallback("insert-precondition-mismatch")
+            expected_slot_count = old_projection.slot_count
+        elif plan.action_kind == "delete":
+            if any(value is not None for value in old_source_selected) or tuple(
+                value for value in old_target_selected if value is not None
+            ) != tuple(plan.target_physical_cols):
+                return _fallback("delete-precondition-mismatch")
+            expected_slot_count = old_projection.slot_count - int(plan.count)
+        else:
+            if old_source_selected != tuple(plan.source_physical_cols) or old_target_selected != tuple(
+                plan.target_physical_cols
+            ):
+                return _fallback("copy-precondition-mismatch")
+            expected_slot_count = old_projection.slot_count
+        if new_projection.slot_count != expected_slot_count:
+            return _fallback("new-slot-count-mismatch")
+
+        old_to_new: dict[int, int] = {}
+        used_new = set()
+        for old_logical in range(1, old_projection.slot_count + 1):
+            if old_logical in selected:
+                continue
+            source_physical = old_projection.physical_col(source_side, old_logical)
+            old_target_physical = old_projection.physical_col(target_side, old_logical)
+            expected_target = self._column_action_shifted_physical_col(
+                old_target_physical, plan
+            )
+            if source_physical is not None:
+                new_logical = new_projection.logical_col(source_side, source_physical)
+            elif expected_target is not None:
+                # The target side is structurally shifted but existing Cell
+                # identities outside the action range move deterministically.
+                new_logical = new_projection.logical_col(target_side, expected_target)
+            else:
+                return _fallback("untracked-unaffected-slot")
+            if new_logical is None or new_logical in used_new:
+                return _fallback("unproved-unaffected-slot-remap")
+            if new_projection.physical_col(source_side, new_logical) != source_physical:
+                return _fallback("source-slot-identity-mismatch")
+            if new_projection.physical_col(target_side, new_logical) != expected_target:
+                return _fallback("target-slot-shift-mismatch")
+            old_to_new[old_logical] = new_logical
+            used_new.add(new_logical)
+
+        affected_new: tuple[int, ...]
+        if plan.action_kind == "delete":
+            affected_new = ()
+        else:
+            mapped = tuple(
+                new_projection.logical_col(source_side, physical_col)
+                for physical_col in plan.source_physical_cols
+            )
+            if any(value is None for value in mapped) or len(set(mapped)) != int(plan.count):
+                return _fallback("unproved-affected-slot-remap")
+            affected_new = tuple(int(value) for value in mapped)
+            for offset, logical_col in enumerate(affected_new):
+                if new_projection.physical_col(target_side, logical_col) != int(
+                    plan.target_physical_anchor
+                ) + offset:
+                    return _fallback("affected-target-slot-mismatch")
+        if used_new | set(affected_new) != set(range(1, new_projection.slot_count + 1)):
+            return _fallback("new-slot-coverage-mismatch")
+
+        seeded: dict[int, set[int]] = {}
+        for pair_idx, old_cols in old_diff_map.items():
+            pair_idx = int(pair_idx)
+            if not (0 <= pair_idx < len(self.row_pairs)):
+                return _fallback("invalid-pair-index")
+            remapped = set()
+            for old_col in set(old_cols or ()):
+                old_col = int(old_col)
+                if old_col == -1:
+                    remapped.add(-1)
+                elif old_col in selected:
+                    continue
+                elif old_col in old_to_new:
+                    remapped.add(old_to_new[old_col])
+                else:
+                    return _fallback("invalid-old-diff-column")
+            if remapped:
+                seeded[pair_idx] = remapped
+
+        # The action can only change the selected logical block.  Recompute that
+        # block for every pair from sparse, non-materializing _cells lookups so
+        # formulas, cached values, blanks, and one-sided tail rows keep the same
+        # comparison semantics as a full scan.
+        if affected_new:
+            affected_slots = tuple(
+                (
+                    int(logical_col),
+                    new_projection.physical_col("A", logical_col),
+                    new_projection.physical_col("B", logical_col),
+                )
+                for logical_col in affected_new
+            )
+            a_val_cells = getattr(ws_a_val, "_cells", {}) or {}
+            b_val_cells = getattr(ws_b_val, "_cells", {}) or {}
+            a_edit_cells = getattr(ws_a_edit, "_cells", {}) or {} if ws_a_edit is not None else {}
+            b_edit_cells = getattr(ws_b_edit, "_cells", {}) or {} if ws_b_edit is not None else {}
+
+            def _raw(cells, row, physical_col):
+                cell = cells.get((int(row), int(physical_col)))
+                return getattr(cell, "value", None) if cell is not None else None
+
+            for pair_idx, (ra, rb) in enumerate(self.row_pairs):
+                if (ra is None) != (rb is None):
+                    seeded.setdefault(pair_idx, set()).add(-1)
+                    continue
+                if ra is None and rb is None:
+                    continue
+                compare_row = int(ra)
+                changed = set()
+                for logical_col, a_col, b_col in affected_slots:
+                    if a_col is None and b_col is None:
+                        continue
+                    if a_col is None or b_col is None:
+                        existing_row = rb if a_col is None else ra
+                        existing_col = b_col if a_col is None else a_col
+                        value_cells = b_val_cells if a_col is None else a_val_cells
+                        edit_cells = b_edit_cells if a_col is None else a_edit_cells
+                        value = _raw(value_cells, existing_row, existing_col)
+                        edit = _raw(edit_cells, existing_row, existing_col)
+                        if value not in (None, "") or edit not in (None, ""):
+                            changed.add(logical_col)
+                        continue
+
+                    a_value = _raw(a_val_cells, ra, a_col)
+                    b_value = _raw(b_val_cells, rb, b_col)
+                    a_edit = _raw(a_edit_cells, ra, a_col)
+                    b_edit = _raw(b_edit_cells, rb, b_col)
+                    a_edit = _translate_normal_formula_for_compare(
+                        a_value,
+                        a_edit,
+                        int(ra),
+                        int(a_col),
+                        compare_row,
+                        logical_col,
+                    )
+                    b_edit = _translate_normal_formula_for_compare(
+                        b_value,
+                        b_edit,
+                        int(rb),
+                        int(b_col),
+                        compare_row,
+                        logical_col,
+                    )
+                    _a_display, _b_display, equal = _cell_display_and_equal_from_values(
+                        a_value,
+                        b_value,
+                        a_edit,
+                        b_edit,
+                    )
+                    if not equal:
+                        changed.add(logical_col)
+                if changed:
+                    seeded.setdefault(pair_idx, set()).update(changed)
+        self.pair_diff_cols = seeded
+        widths_restored = False
+        if plan.action_kind == "insert_copy":
+            try:
+                width_records = tuple(state.get("col_char_widths") or ())
+                widths = {
+                    int(logical_col): int(width)
+                    for logical_col, width in width_records
+                }
+                expected_cols = set(range(1, new_projection.slot_count + 1))
+                if set(widths) == expected_cols and all(width >= 1 for width in widths.values()):
+                    self.col_char_widths = widths
+                    self._rownum_display_width = int(
+                        state.get("rownum_display_width", 0)
+                    )
+                    self._col_widths_version = int(
+                        getattr(self, "_col_widths_version", 0)
+                    ) + 1
+                    widths_restored = True
+            except Exception:
+                widths_restored = False
+        self._pair_diff_full_exact = True
+        self._column_diff_seed_last = {
+            "used": True,
+            "reason": f"apply-{plan.action_kind}",
+            "affected_cols": len(affected_new),
+            "widths_restored": widths_restored,
+        }
+        _dlog(
+            f"COLUMN_DIFF_SEED_USED sheet={self.sheet} mode=apply "
+            f"kind={plan.action_kind} affected={len(affected_new)}"
+        )
+        return True
+
+    def _column_action_workbook_snapshot(
+        self,
+        target_side: str,
+        plan: ColumnBlockActionPlan | None = None,
+    ) -> dict[str, object]:
+        """Capture a bounded inverse snapshot before a column mutation.
+
+        Insert undo needs no Cell copies because the original Cell objects are
+        shifted back.  Delete/copy retain only the affected block.  Exact sparse
+        ``_cells`` membership is represented by a compact bitmap so foreground
+        values-only reads can be cleaned up again during rollback/undo.
+        """
+        target_side = str(target_side or "").upper()
+        self.app._ensure_edit_loaded()
+        if target_side == "A":
+            wb_edit = self.app._wb_a_edit
+            wb_val = self.app._wb_a_val
+            manual_ops = self.app.manual_a_column_ops
+            manual_cell_ops = self.app.manual_a_cell_ops
+            manual_formula_cache_ops = self.app.manual_a_formula_cache_ops
+        elif target_side == "B":
+            wb_edit = self.app._wb_b_edit
+            wb_val = self.app._wb_b_val
+            manual_ops = self.app.manual_b_column_ops
+            manual_cell_ops = self.app.manual_b_cell_ops
+            manual_formula_cache_ops = self.app.manual_b_formula_cache_ops
+        else:
+            raise ValueError("target_side must be A or B")
+        if wb_edit is None or wb_val is None:
+            raise RuntimeError("目标工作簿尚未加载，无法建立原子回滚点。")
+
+        def _sheet_state(ws):
+            cells = getattr(ws, "_cells", {}) or {}
+            action_kind = plan.action_kind if isinstance(plan, ColumnBlockActionPlan) else "full"
+            anchor = int(plan.target_physical_anchor) if isinstance(plan, ColumnBlockActionPlan) else 1
+            count = int(plan.count) if isinstance(plan, ColumnBlockActionPlan) else 0
+            affected_end = anchor + count - 1
+            if action_kind == "full":
+                saved_cells = {
+                    key: copy.copy(cell)
+                    for key, cell in cells.items()
+                }
+                key_snapshot = None
+            else:
+                saved_cells = {
+                    key: copy.copy(cell)
+                    for key, cell in cells.items()
+                    if action_kind in ("delete", "copy")
+                    and anchor <= int(key[1]) <= affected_end
+                }
+                key_snapshot = self._column_action_cell_key_snapshot(cells)
+            return {
+                "cells": saved_cells,
+                "cell_snapshot_mode": action_kind,
+                "cell_keys": key_snapshot,
+                "anchor": anchor,
+                "count": count,
+                "structure_applied": False,
+                "copy_started": False,
+                "restored_once": False,
+                "column_dimensions": self._column_action_dimension_snapshot(ws),
+                "data_validations": copy.deepcopy(ws.data_validations),
+                # Preserve ConditionalFormatting objects as grouped in the
+                # original XML.  Flattening by individual range changed one
+                # multi-range object into many objects after undo.
+                "conditional_formatting_rules": copy.deepcopy(
+                    getattr(ws.conditional_formatting, "_cf_rules", {})
+                ),
+                "merged_cells": self._column_action_merged_ranges(ws),
+                "current_row": int(getattr(ws, "_current_row", 0) or 0),
+            }
+
+        diff_seed = self._capture_column_action_diff_seed(plan) if isinstance(
+            plan, ColumnBlockActionPlan
+        ) else None
+        comparison_state = self._capture_column_action_comparison_state(diff_seed)
+        formula_transformations = ()
+        if (
+            isinstance(plan, ColumnBlockActionPlan)
+            and plan.action_kind in ("insert_copy", "delete")
+        ):
+            formula_transformations = self._capture_column_formula_transformations(
+                wb_edit,
+                plan,
+            )
+        return {
+            "target_side": target_side,
+            "sheet": self.sheet,
+            "edit_sheet": _sheet_state(wb_edit[self.sheet]),
+            "value_sheet": _sheet_state(wb_val[self.sheet]),
+            "manual_column_ops": copy.deepcopy(list(manual_ops)),
+            "manual_cell_ops": copy.deepcopy(dict(manual_cell_ops)),
+            "manual_formula_cache_ops": copy.deepcopy(dict(manual_formula_cache_ops)),
+            "modified_a": bool(getattr(self.app, "modified_a", False)),
+            "modified_b": bool(getattr(self.app, "modified_b", False)),
+            "modified_sheets_a": set(getattr(self.app, "modified_sheets_a", set()) or set()),
+            "modified_sheets_b": set(getattr(self.app, "modified_sheets_b", set()) or set()),
+            "selection": {
+                "block_ordinal": self.selected_column_block_ordinal,
+                "logical_range": self.selected_column_logical_range,
+                "source_side": self.selected_column_source_side,
+                "cell": self._snapshot_explicit_selection_state(),
+            },
+            "retained_decisions": set(self._retained_column_decisions),
+            "column_diff_seed": diff_seed,
+            "column_comparison_state": comparison_state,
+            # Excel's inverse structural operation cannot reconstruct formulas
+            # that became #REF! during a deletion.  Retain only formulas whose
+            # text will actually change, across every sheet that references the
+            # structurally edited worksheet, so rollback/undo is exact without
+            # copying whole workbooks.
+            "formula_transformations": formula_transformations,
+        }
+
+    @staticmethod
+    def _capture_column_formula_transformations(
+        wb_edit,
+        plan: ColumnBlockActionPlan,
+    ) -> tuple[tuple[str, int, int, object, str, object], ...]:
+        """Return changed normal-formula values for one structural action.
+
+        Formulas on the target sheet can contain unqualified references;
+        formulas on any other sheet can contain a target-sheet-qualified
+        reference.  Special multi-cell formula objects stay conservative.
+        """
+        records = []
+        insert = plan.action_kind == "insert_copy"
+        target_sheet = str(plan.sheet)
+        target_sheet_folded = target_sheet.casefold()
+        unquoted_target = target_sheet_folded + "!"
+        quoted_target = "'" + target_sheet.replace("'", "''").casefold() + "'!"
+        for worksheet in getattr(wb_edit, "worksheets", ()) or ():
+            formula_sheet = str(getattr(worksheet, "title", "") or "")
+            for (row_idx, col_idx), cell in (
+                (getattr(worksheet, "_cells", {}) or {}).items()
+            ):
+                if getattr(cell, "data_type", None) != "f":
+                    continue
+                old_value = cell.value
+                if _special_formula_signature(old_value) is not None:
+                    continue
+                # An unqualified reference belongs to the formula's own sheet.
+                # Other sheets can be affected only through an explicit target
+                # sheet qualifier.  This lexical guard is deliberately only a
+                # negative filter; possible matches still go through Tokenizer,
+                # which rejects strings, names, external links and structured
+                # references conservatively.  Large production workbooks often
+                # contain tens of thousands of unrelated-sheet formulas.
+                if formula_sheet.casefold() != target_sheet_folded:
+                    formula_folded = str(_formula_text(old_value) or "").casefold()
+                    if (
+                        unquoted_target not in formula_folded
+                        and quoted_target not in formula_folded
+                    ):
+                        continue
+                new_value = _transform_formula_for_column_structure(
+                    old_value,
+                    formula_sheet=formula_sheet,
+                    target_sheet=target_sheet,
+                    anchor=int(plan.target_physical_anchor),
+                    count=int(plan.count),
+                    insert=insert,
+                )
+                if new_value == old_value:
+                    continue
+                records.append((
+                    formula_sheet,
+                    int(row_idx),
+                    int(col_idx),
+                    copy.deepcopy(old_value),
+                    str(getattr(cell, "data_type", "f") or "f"),
+                    new_value,
+                ))
+        return tuple(records)
+
+    @staticmethod
+    def _apply_column_formula_transformations(wb_edit, records) -> None:
+        """Apply captured formula text before target-sheet cells are shifted."""
+        for sheet, row_idx, col_idx, _old_value, _old_type, new_value in records or ():
+            if sheet not in wb_edit.sheetnames:
+                raise RuntimeError(f"公式所在工作表已不可用：{sheet}")
+            cell = (getattr(wb_edit[sheet], "_cells", {}) or {}).get(
+                (int(row_idx), int(col_idx))
+            )
+            if cell is None:
+                raise RuntimeError(
+                    f"公式单元格已不可用：{sheet}!{get_column_letter(int(col_idx))}{int(row_idx)}"
+                )
+            _assign_edit_cell_value(cell, new_value)
+
+    @staticmethod
+    def _restore_column_formula_transformations(wb_edit, records) -> None:
+        """Restore exact pre-action formula text after inverse structure."""
+        for sheet, row_idx, col_idx, old_value, old_type, _new_value in records or ():
+            if sheet not in wb_edit.sheetnames:
+                raise RuntimeError(f"公式所在工作表已不可用：{sheet}")
+            worksheet = wb_edit[sheet]
+            cell = (getattr(worksheet, "_cells", {}) or {}).get(
+                (int(row_idx), int(col_idx))
+            )
+            if cell is None:
+                cell = worksheet.cell(row=int(row_idx), column=int(col_idx))
+            _assign_edit_cell_value(cell, copy.deepcopy(old_value))
+            cell.data_type = str(old_type or "f")
+
+    def _restore_column_action_workbook_snapshot(
+        self,
+        snapshot: dict[str, object],
+        *,
+        post_refresh_cleanup: bool = False,
+    ):
+        target_side = str(snapshot.get("target_side") or "").upper()
+        sheet = str(snapshot.get("sheet") or self.sheet)
+        if target_side == "A":
+            wb_edit = self.app._wb_a_edit
+            wb_value = self.app._wb_a_val
+            self.app.manual_a_column_ops[:] = copy.deepcopy(snapshot.get("manual_column_ops") or [])
+            manual_cell_ops = self.app.manual_a_cell_ops
+            manual_formula_cache_ops = self.app.manual_a_formula_cache_ops
+        elif target_side == "B":
+            wb_edit = self.app._wb_b_edit
+            wb_value = self.app._wb_b_val
+            self.app.manual_b_column_ops[:] = copy.deepcopy(snapshot.get("manual_column_ops") or [])
+            manual_cell_ops = self.app.manual_b_cell_ops
+            manual_formula_cache_ops = self.app.manual_b_formula_cache_ops
+        else:
+            raise ValueError("invalid rollback target")
+        if wb_edit is None or wb_value is None or sheet not in wb_edit.sheetnames or sheet not in wb_value.sheetnames:
+            raise RuntimeError("目标工作表已不可用，无法恢复列结构操作。")
+
+        def _restore_sheet_state(ws, state):
+            state = state or {}
+            mode = str(state.get("cell_snapshot_mode") or "full")
+            saved_cells = state.get("cells") or {}
+            if mode == "full":
+                ws._cells = {
+                    key: copy.copy(cell)
+                    for key, cell in saved_cells.items()
+                }
+            else:
+                anchor = max(1, int(state.get("anchor", 1) or 1))
+                count = max(1, int(state.get("count", 1) or 1))
+                if not bool(state.get("restored_once", False)):
+                    if mode == "insert_copy" and bool(state.get("structure_applied", False)):
+                        self._shift_worksheet_columns_fast(
+                            ws, anchor, count, insert=False
+                        )
+                    elif mode == "delete" and bool(state.get("structure_applied", False)):
+                        self._shift_worksheet_columns_fast(
+                            ws, anchor, count, insert=True
+                        )
+                    state["restored_once"] = True
+
+                # Remove empty Cells materialized by mapping/prescan/render so
+                # the exact original sparse-key contract survives refresh.
+                key_snapshot = state.get("cell_keys")
+                for row, col in list(getattr(ws, "_cells", {}).keys()):
+                    if not self._column_action_cell_key_was_present(
+                        key_snapshot, int(row), int(col)
+                    ):
+                        ws._cells.pop((row, col), None)
+
+                if mode in ("delete", "copy") and (
+                    bool(state.get("structure_applied", False))
+                    or bool(state.get("copy_started", False))
+                ):
+                    affected_end = anchor + count - 1
+                    for row, col in list(getattr(ws, "_cells", {}).keys()):
+                        if anchor <= int(col) <= affected_end:
+                            ws._cells.pop((row, col), None)
+                    for key, cell in saved_cells.items():
+                        restored_cell = copy.copy(cell)
+                        restored_cell.row = int(key[0])
+                        restored_cell.column = int(key[1])
+                        ws._cells[key] = restored_cell
+            _invalidate_worksheet_read_horizon(ws)
+            ws._current_row = int(state.get("current_row", 0) or 0)
+            if post_refresh_cleanup:
+                # The first restore already reinstated workbook metadata and
+                # operation history.  The post-refresh pass exists only to
+                # remove Cells materialized by read/render code (and to put
+                # affected delete/copy Cells back byte-exactly); repeating all
+                # deep metadata copies here adds latency without changing state.
+                return
+            ws.column_dimensions.clear()
+            for physical_col, dimension in sorted((state.get("column_dimensions") or {}).items()):
+                key = get_column_letter(int(physical_col))
+                ws.column_dimensions[key] = copy.copy(dimension)
+            ws.data_validations = copy.deepcopy(state.get("data_validations"))
+            ws.conditional_formatting._cf_rules = copy.deepcopy(
+                state.get("conditional_formatting_rules") or {}
+            )
+            ws.merged_cells = MultiCellRange(
+                [str(cell_range) for cell_range in (state.get("merged_cells") or ())]
+            )
+
+        _restore_sheet_state(wb_edit[sheet], snapshot.get("edit_sheet"))
+        _restore_sheet_state(wb_value[sheet], snapshot.get("value_sheet"))
+        if not post_refresh_cleanup:
+            self._restore_column_formula_transformations(
+                wb_edit,
+                snapshot.get("formula_transformations") or (),
+            )
+        if post_refresh_cleanup:
+            return
+        manual_cell_ops.clear()
+        manual_cell_ops.update(copy.deepcopy(snapshot.get("manual_cell_ops") or {}))
+        manual_formula_cache_ops.clear()
+        manual_formula_cache_ops.update(
+            copy.deepcopy(snapshot.get("manual_formula_cache_ops") or {})
+        )
+        self.app.modified_a = bool(snapshot.get("modified_a", False))
+        self.app.modified_b = bool(snapshot.get("modified_b", False))
+        self.app.modified_sheets_a.clear()
+        self.app.modified_sheets_a.update(snapshot.get("modified_sheets_a") or set())
+        self.app.modified_sheets_b.clear()
+        self.app.modified_sheets_b.update(snapshot.get("modified_sheets_b") or set())
+        self._retained_column_decisions = set(snapshot.get("retained_decisions") or set())
+
+    @staticmethod
+    def _column_action_dimension_snapshot(ws) -> dict[int, object]:
+        result = {}
+        for key, dimension in list(getattr(ws, "column_dimensions", {}).items()):
+            physical_col = _col_index_from_ref(str(key))
+            if physical_col > 0:
+                result[physical_col] = copy.copy(dimension)
+        return result
+
+    @staticmethod
+    def _restore_shifted_column_dimensions(ws, dimensions, anchor: int, count: int, *, insert: bool):
+        try:
+            ws.column_dimensions.clear()
+        except Exception:
+            return
+        deleted_end = int(anchor) + int(count) - 1
+        for old_col, old_dimension in sorted((dimensions or {}).items()):
+            if insert:
+                new_col = old_col + count if old_col >= anchor else old_col
+            else:
+                if anchor <= old_col <= deleted_end:
+                    continue
+                new_col = old_col - count if old_col > deleted_end else old_col
+            dimension = copy.copy(old_dimension)
+            letter = get_column_letter(new_col)
+            try:
+                dimension.index = letter
+                dimension.min = new_col
+                dimension.max = new_col
+            except Exception:
+                pass
+            ws.column_dimensions[letter] = dimension
+
+    @staticmethod
+    def _copy_one_column_dimension(src_ws, dst_ws, src_col: int, dst_col: int):
+        src_key = get_column_letter(int(src_col))
+        dst_key = get_column_letter(int(dst_col))
+        try:
+            dst_ws.column_dimensions.pop(dst_key, None)
+        except Exception:
+            pass
+        src_dimension = getattr(src_ws, "column_dimensions", {}).get(src_key)
+        if src_dimension is None:
+            return
+        dimension = copy.copy(src_dimension)
+        try:
+            dimension.index = dst_key
+            dimension.min = int(dst_col)
+            dimension.max = int(dst_col)
+        except Exception:
+            pass
+        dst_ws.column_dimensions[dst_key] = dimension
+
+    @staticmethod
+    def _column_action_validation_ranges(ws):
+        result = []
+        validations = getattr(getattr(ws, "data_validations", None), "dataValidation", ()) or ()
+        for validation in validations:
+            for cell_range in getattr(getattr(validation, "ranges", None), "ranges", ()) or ():
+                result.append((validation, copy.copy(cell_range)))
+        return result
+
+    @staticmethod
+    def _replace_validation_ranges(ws, entries):
+        validations = getattr(getattr(ws, "data_validations", None), "dataValidation", None)
+        if validations is None:
+            return
+        grouped = {}
+        for validation, cell_range in entries:
+            grouped.setdefault(id(validation), [validation, []])[1].append(cell_range)
+        ws.data_validations.dataValidation = []
+        for validation, ranges in grouped.values():
+            cloned = copy.copy(validation)
+            cloned.sqref = MultiCellRange(ranges)
+            ws.add_data_validation(cloned)
+
+    @staticmethod
+    def _shift_column_validation_ranges(entries, anchor: int, count: int, *, insert: bool):
+        shifted = []
+        deleted_end = anchor + count - 1
+        for validation, cell_range in entries:
+            rng = copy.copy(cell_range)
+            if insert:
+                if rng.min_col >= anchor:
+                    rng.shift(col_shift=count)
+                elif rng.max_col >= anchor:
+                    rng.max_col += count
+            else:
+                if rng.max_col < anchor:
+                    pass
+                elif rng.min_col > deleted_end:
+                    rng.shift(col_shift=-count)
+                else:
+                    left_count = max(0, anchor - rng.min_col)
+                    right_count = max(0, rng.max_col - deleted_end)
+                    if left_count + right_count <= 0:
+                        continue
+                    # When the range starts inside the deleted block and
+                    # continues on its right, the surviving right fragment
+                    # moves to the deletion anchor.  Keeping the old min_col
+                    # would shift C:E / delete B:C to C:D instead of B:C.
+                    if left_count <= 0:
+                        rng.min_col = anchor
+                    rng.max_col = rng.min_col + left_count + right_count - 1
+            shifted.append((validation, rng))
+        return shifted
+
+    def _prepare_column_copy_payload(self, plan: ColumnBlockActionPlan, src_edit, src_val, dst_edit, dst_val):
+        payload = []
+        max_row = max(
+            int(getattr(src_edit, "max_row", 1) or 1),
+            int(getattr(src_val, "max_row", 1) or 1),
+            int(getattr(dst_edit, "max_row", 1) or 1),
+            int(getattr(dst_val, "max_row", 1) or 1),
+        )
+        for offset, src_col in enumerate(plan.source_physical_cols):
+            dst_col = plan.target_physical_anchor + offset
+            for row in range(1, max_row + 1):
+                source_edit_cell = getattr(src_edit, "_cells", {}).get((row, src_col))
+                source_value_cell = getattr(src_val, "_cells", {}).get((row, src_col))
+                target_edit_cell = getattr(dst_edit, "_cells", {}).get((row, dst_col))
+                source_edit_value = source_edit_cell.value if source_edit_cell is not None else None
+                source_value = source_value_cell.value if source_value_cell is not None else None
+                target_edit_value = target_edit_cell.value if target_edit_cell is not None else None
+                edit_value = _copy_edit_value_for_destination(
+                    source_value,
+                    source_edit_value,
+                    target_edit_value,
+                    src_row=row,
+                    src_col=src_col,
+                    dst_row=row,
+                    dst_col=dst_col,
+                )
+                payload.append((
+                    row,
+                    src_col,
+                    dst_col,
+                    edit_value,
+                    copy.deepcopy(source_value),
+                    copy.copy(source_edit_cell._style) if source_edit_cell is not None else None,
+                    copy.copy(source_edit_cell.comment) if source_edit_cell is not None else None,
+                    copy.copy(source_edit_cell.hyperlink) if source_edit_cell is not None else None,
+                ))
+        return payload
+
+    def _apply_column_copy_payload(self, payload, src_edit, dst_edit, dst_val):
+        for row, _src_col, dst_col, edit_value, value, style, comment, hyperlink in payload:
+            edit_cell = dst_edit.cell(row=row, column=dst_col)
+            value_cell = dst_val.cell(row=row, column=dst_col)
+            _assign_edit_cell_value(edit_cell, edit_value)
+            value_cell.value = value
+            edit_cell._style = copy.copy(style)
+            value_cell._style = copy.copy(style)
+            edit_cell.comment = copy.copy(comment)
+            value_cell.comment = copy.copy(comment)
+            edit_cell._hyperlink = copy.copy(hyperlink)
+            value_cell._hyperlink = copy.copy(hyperlink)
+
+    def _copy_column_validations(self, src_ws, dst_ws, plan: ColumnBlockActionPlan):
+        target_start = int(plan.target_physical_anchor)
+        target_end = target_start + plan.count - 1
+        kept = []
+        for validation, rng in self._column_action_validation_ranges(dst_ws):
+            if rng.max_col < target_start or rng.min_col > target_end:
+                kept.append((validation, rng))
+        source_entries = self._column_action_validation_ranges(src_ws)
+        source_map = dict(zip(plan.source_physical_cols, range(target_start, target_end + 1)))
+        for validation, rng in source_entries:
+            for source_col, destination_col in source_map.items():
+                if rng.min_col <= source_col <= rng.max_col:
+                    cloned_range = copy.copy(rng)
+                    cloned_range.min_col = destination_col
+                    cloned_range.max_col = destination_col
+                    kept.append((validation, cloned_range))
+        self._replace_validation_ranges(dst_ws, kept)
+
+    @staticmethod
+    def _column_action_conditional_ranges(ws):
+        result = []
+        conditional = getattr(ws, "conditional_formatting", None)
+        rules_map = getattr(conditional, "_cf_rules", {}) if conditional is not None else {}
+        for conditional_range, rules in list(rules_map.items()):
+            for cell_range in getattr(getattr(conditional_range, "sqref", None), "ranges", ()) or ():
+                result.append((copy.deepcopy(list(rules)), copy.copy(cell_range)))
+        return result
+
+    @staticmethod
+    def _replace_conditional_ranges(ws, entries):
+        conditional = getattr(ws, "conditional_formatting", None)
+        if conditional is None:
+            return
+        try:
+            conditional._cf_rules.clear()
+        except Exception:
+            return
+        for rules, cell_range in entries:
+            for rule in rules:
+                conditional.add(str(cell_range), copy.deepcopy(rule))
+
+    def _copy_column_conditionals(self, src_ws, dst_ws, plan: ColumnBlockActionPlan):
+        target_start = int(plan.target_physical_anchor)
+        target_end = target_start + plan.count - 1
+        kept = []
+        for rules, rng in self._column_action_conditional_ranges(dst_ws):
+            if rng.max_col < target_start or rng.min_col > target_end:
+                kept.append((rules, rng))
+        source_map = dict(zip(plan.source_physical_cols, range(target_start, target_end + 1)))
+        for rules, rng in self._column_action_conditional_ranges(src_ws):
+            for source_col, destination_col in source_map.items():
+                if rng.min_col <= source_col <= rng.max_col:
+                    cloned_range = copy.copy(rng)
+                    cloned_range.min_col = destination_col
+                    cloned_range.max_col = destination_col
+                    kept.append((rules, cloned_range))
+        self._replace_conditional_ranges(dst_ws, kept)
+
+    @staticmethod
+    def _column_action_merged_ranges(ws):
+        return [CellRange(str(value)) for value in list(ws.merged_cells.ranges)]
+
+    @staticmethod
+    def _replace_merged_ranges(ws, ranges):
+        for value in list(ws.merged_cells.ranges):
+            try:
+                ws.unmerge_cells(str(value))
+            except Exception:
+                pass
+        for cell_range in ranges:
+            try:
+                ws.merge_cells(str(cell_range))
+            except Exception:
+                pass
+
+    def _copy_column_merges(self, src_ws, dst_ws, plan: ColumnBlockActionPlan):
+        target_start = int(plan.target_physical_anchor)
+        target_end = target_start + plan.count - 1
+        existing = []
+        for rng in self._column_action_merged_ranges(dst_ws):
+            intersects = not (rng.max_col < target_start or rng.min_col > target_end)
+            if intersects and not (target_start <= rng.min_col and rng.max_col <= target_end):
+                raise RuntimeError("目标侧存在跨出所选列块的合并单元格，已阻止修改相邻列。")
+            if not intersects:
+                existing.append(rng)
+        source_start = plan.source_physical_cols[0]
+        source_end = plan.source_physical_cols[-1]
+        delta = target_start - source_start
+        for rng in self._column_action_merged_ranges(src_ws):
+            intersects = not (rng.max_col < source_start or rng.min_col > source_end)
+            if intersects and not (source_start <= rng.min_col and rng.max_col <= source_end):
+                raise RuntimeError("源侧存在跨出所选列块的合并单元格，已阻止部分复制。")
+            if intersects:
+                cloned = copy.copy(rng)
+                cloned.shift(col_shift=delta)
+                existing.append(cloned)
+        self._replace_merged_ranges(dst_ws, existing)
+
+    def _validate_column_merge_boundaries(self, src_ws, dst_ws, plan: ColumnBlockActionPlan):
+        if plan.source_physical_cols:
+            source_start = plan.source_physical_cols[0]
+            source_end = plan.source_physical_cols[-1]
+            for rng in self._column_action_merged_ranges(src_ws):
+                intersects = not (rng.max_col < source_start or rng.min_col > source_end)
+                if intersects and not (source_start <= rng.min_col and rng.max_col <= source_end):
+                    raise RuntimeError("源侧存在跨出所选列块的合并单元格，已阻止部分复制。")
+        if plan.action_kind == "copy":
+            target_start = plan.target_physical_anchor
+            target_end = target_start + plan.count - 1
+            for rng in self._column_action_merged_ranges(dst_ws):
+                intersects = not (rng.max_col < target_start or rng.min_col > target_end)
+                if intersects and not (target_start <= rng.min_col and rng.max_col <= target_end):
+                    raise RuntimeError("目标侧存在跨出所选列块的合并单元格，已阻止修改相邻列。")
+
+    def _apply_selected_column_block(
+        self,
+        source_side: str,
+        target_side: str | None = None,
+        *,
+        confirm_unresolved: bool = False,
+        _failure_injector=None,
+    ) -> ColumnBlockActionPlan:
+        plan = self._plan_selected_column_block_action(
+            source_side,
+            target_side,
+            confirm_unresolved=confirm_unresolved,
+        )
+        selection_before = {
+            "block_ordinal": self.selected_column_block_ordinal,
+            "logical_range": self.selected_column_logical_range,
+            "source_side": self.selected_column_source_side,
+            "cell": self._snapshot_explicit_selection_state(),
+        }
+        if plan.action_kind == "retain":
+            previous = set(self._retained_column_decisions)
+            self._retained_column_decisions.add((plan.logical_start, plan.logical_end, plan.source_side))
+            self.app.push_undo({
+                "kind": "column_action",
+                "sheet": self.sheet,
+                "target": "COLUMN_ACTION",
+                "plan": plan,
+                "snapshot": None,
+                "retained_decisions": previous,
+                "selection": selection_before,
+            })
+            self.column_action_status_var.set(
+                f"已保留Mine列块 L{plan.logical_start}:L{plan.logical_end}；工作簿未改动。"
+            )
+            return plan
+
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive()
+        snapshot = None
+        try:
+            self.root.configure(cursor="watch")
+            self.column_action_status_var.set(
+                f"正在验证并采用列块 L{plan.logical_start}:L{plan.logical_end}..."
+            )
+            self.root.update_idletasks()
+            source_edit = self._display_ws(plan.source_side, edit=True)
+            source_value = self._display_ws(plan.source_side, edit=False)
+            target_edit = self._display_ws(plan.target_side, edit=True)
+            target_value = self._display_ws(plan.target_side, edit=False)
+            # Establish rollback before payload inspection.  Even a read via
+            # Worksheet.cell() can materialize an empty Cell, so the payload
+            # builder also uses the non-mutating _cells lookup below.
+            snapshot = self._column_action_workbook_snapshot(plan.target_side, plan)
+            copy_payload = []
+            if plan.action_kind in ("insert_copy", "copy"):
+                self._validate_column_merge_boundaries(source_edit, target_edit, plan)
+                copy_payload = self._prepare_column_copy_payload(
+                    plan, source_edit, source_value, target_edit, target_value
+                )
+            if callable(_failure_injector):
+                _failure_injector("after_snapshot", plan)
+
+            if plan.action_kind in ("insert_copy", "delete"):
+                # Update formula references while every formula still lives at
+                # its pre-action coordinate.  The target worksheet's normal
+                # cell shift below then moves formula cells themselves; other
+                # worksheets remain stationary while their qualified
+                # references track the edited sheet.
+                self._apply_column_formula_transformations(
+                    target_edit.parent,
+                    snapshot.get("formula_transformations") or (),
+                )
+
+            for state_name, worksheet in (
+                ("edit_sheet", target_edit),
+                ("value_sheet", target_value),
+            ):
+                sheet_snapshot = snapshot[state_name]
+                dimensions = self._column_action_dimension_snapshot(worksheet)
+                validation_entries = self._column_action_validation_ranges(worksheet)
+                conditional_entries = self._column_action_conditional_ranges(worksheet)
+                merged_entries = self._column_action_merged_ranges(worksheet)
+                if plan.action_kind in ("insert_copy", "delete"):
+                    self._replace_merged_ranges(worksheet, ())
+                if plan.action_kind == "insert_copy":
+                    self._shift_worksheet_columns_fast(
+                        worksheet,
+                        plan.target_physical_anchor,
+                        plan.count,
+                        insert=True,
+                    )
+                    sheet_snapshot["structure_applied"] = True
+                    self._restore_shifted_column_dimensions(
+                        worksheet, dimensions, plan.target_physical_anchor, plan.count, insert=True
+                    )
+                    self._replace_validation_ranges(
+                        worksheet,
+                        self._shift_column_validation_ranges(
+                            validation_entries, plan.target_physical_anchor, plan.count, insert=True
+                        ),
+                    )
+                    self._replace_conditional_ranges(
+                        worksheet,
+                        self._shift_column_validation_ranges(
+                            conditional_entries, plan.target_physical_anchor, plan.count, insert=True
+                        ),
+                    )
+                    shifted_merges = self._shift_column_validation_ranges(
+                        [(None, rng) for rng in merged_entries],
+                        plan.target_physical_anchor,
+                        plan.count,
+                        insert=True,
+                    )
+                    self._replace_merged_ranges(worksheet, [rng for _none, rng in shifted_merges])
+                elif plan.action_kind == "delete":
+                    self._shift_worksheet_columns_fast(
+                        worksheet,
+                        plan.target_physical_anchor,
+                        plan.count,
+                        insert=False,
+                    )
+                    sheet_snapshot["structure_applied"] = True
+                    self._restore_shifted_column_dimensions(
+                        worksheet, dimensions, plan.target_physical_anchor, plan.count, insert=False
+                    )
+                    self._replace_validation_ranges(
+                        worksheet,
+                        self._shift_column_validation_ranges(
+                            validation_entries, plan.target_physical_anchor, plan.count, insert=False
+                        ),
+                    )
+                    self._replace_conditional_ranges(
+                        worksheet,
+                        self._shift_column_validation_ranges(
+                            conditional_entries, plan.target_physical_anchor, plan.count, insert=False
+                        ),
+                    )
+                    shifted_merges = self._shift_column_validation_ranges(
+                        [(None, rng) for rng in merged_entries],
+                        plan.target_physical_anchor,
+                        plan.count,
+                        insert=False,
+                    )
+                    self._replace_merged_ranges(worksheet, [rng for _none, rng in shifted_merges])
+                if plan.action_kind in ("insert_copy", "delete"):
+                    _invalidate_worksheet_read_horizon(worksheet)
+
+            if callable(_failure_injector):
+                _failure_injector("after_structure", plan)
+            if plan.action_kind in ("insert_copy", "copy"):
+                # Payload was validated before mutation, so the following loop
+                # cannot discover a late formula/mapping failure halfway through.
+                snapshot["edit_sheet"]["copy_started"] = True
+                snapshot["value_sheet"]["copy_started"] = True
+                self._apply_column_copy_payload(copy_payload, source_edit, target_edit, target_value)
+                for offset, source_col in enumerate(plan.source_physical_cols):
+                    destination_col = plan.target_physical_anchor + offset
+                    self._copy_one_column_dimension(source_edit, target_edit, source_col, destination_col)
+                    self._copy_one_column_dimension(source_value, target_value, source_col, destination_col)
+                self._copy_column_validations(source_edit, target_edit, plan)
+                self._copy_column_validations(source_value, target_value, plan)
+                self._copy_column_conditionals(source_edit, target_edit, plan)
+                self._copy_column_conditionals(source_value, target_value, plan)
+                self._copy_column_merges(source_edit, target_edit, plan)
+                self._copy_column_merges(source_value, target_value, plan)
+            if callable(_failure_injector):
+                _failure_injector("after_copy", plan)
+
+            self.app.remap_manual_cell_operations_for_column_action(
+                plan.target_side,
+                plan,
+            )
+            records = plan.operation_records()
+            self.app.record_manual_column_operations(plan.target_side, records)
+            if plan.target_side == "A":
+                self.app.modified_a = True
+                self.app.modified_sheets_a.add(self.sheet)
+            else:
+                self.app.modified_b = True
+                self.app.modified_sheets_b.add(self.sheet)
+            self._mark_column_mapping_stale(
+                "column-block-action",
+                column_structure=True,
+                edited_sides=(plan.target_side,),
+            )
+            self._invalidate_only_diff_snapshot_cache()
+            self._invalidate_render_cache()
+            self._pending_column_only_diff_seed = {
+                "state": snapshot.get("column_diff_seed"),
+                "comparison_state": snapshot.get("column_comparison_state"),
+                "plan": plan,
+                "mode": "apply",
+            }
+            self.refresh(row_only=None, rescan=True, column_only=True)
+            if callable(_failure_injector):
+                _failure_injector("after_refresh", plan)
+            self.app.push_undo({
+                "kind": "column_action",
+                "sheet": self.sheet,
+                "target": "COLUMN_ACTION",
+                "plan": plan,
+                "snapshot": snapshot,
+                "selection": selection_before,
+            })
+            self.selected_column_block_ordinal = None
+            self.selected_column_logical_range = None
+            self.selected_column_source_side = None
+            self._selected_column_projection_generation = None
+            self._apply_column_block_selection_tags()
+            self._refresh_column_action_buttons()
+            self.column_action_status_var.set(
+                f"已完成列块 L{plan.logical_start}:L{plan.logical_end}，"
+                f"{plan.source_side} → {plan.target_side}；可单步撤销。"
+            )
+            return plan
+        except Exception:
+            if snapshot is not None:
+                self._restore_column_action_workbook_snapshot(snapshot)
+                self._mark_column_mapping_stale(
+                    "column-block-action-rollback",
+                    column_structure=True,
+                    edited_sides=(plan.target_side,),
+                )
+                self._pending_column_only_diff_seed = {
+                    "state": snapshot.get("column_diff_seed"),
+                    "comparison_state": snapshot.get("column_comparison_state"),
+                    "plan": plan,
+                    "mode": "restore",
+                }
+                self.refresh(row_only=None, rescan=True, column_only=True)
+                # Rendering can intern a default StyleArray on previously
+                # unstyled cells.  Reapply the immutable rollback point after
+                # caches/UI have been rebuilt so failure rollback stays byte-
+                # semantics exact as well as visually exact.
+                self._restore_column_action_workbook_snapshot(
+                    snapshot, post_refresh_cleanup=True
+                )
+                self._restore_column_block_selection(selection_before)
+            raise
+        finally:
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
+            if callable(end_interactive):
+                end_interactive()
+
+    def _restore_column_block_selection(self, selection):
+        selection = selection or {}
+        logical_range = selection.get("logical_range")
+        source_side = selection.get("source_side") or "LOGICAL"
+        if logical_range:
+            try:
+                self._select_column_block_by_logical_col(int(logical_range[0]), source_side)
+            except Exception:
+                pass
+        else:
+            self.selected_column_block_ordinal = None
+            self.selected_column_logical_range = None
+            self.selected_column_source_side = None
+            self._selected_column_projection_generation = None
+            self._apply_column_block_selection_tags()
+            self._refresh_column_action_buttons()
+        cell_selection = selection.get("cell")
+        if cell_selection:
+            self._restore_explicit_selection_state(cell_selection)
+            self._update_cursor_lines()
+
+    def _undo_column_action(self, action: dict) -> bool:
+        snapshot = action.get("snapshot")
+        if snapshot is None:
+            self._retained_column_decisions = set(action.get("retained_decisions") or set())
+            self._restore_column_block_selection(action.get("selection"))
+            self.column_action_status_var.set("已撤销保留列块决定。")
+            return True
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        if callable(begin_interactive):
+            begin_interactive()
+        try:
+            self._restore_column_action_workbook_snapshot(snapshot)
+            plan = action.get("plan")
+            target_side = plan.target_side if isinstance(plan, ColumnBlockActionPlan) else snapshot.get("target_side")
+            self._mark_column_mapping_stale(
+                "undo-column-block-action",
+                column_structure=True,
+                edited_sides=(target_side,),
+            )
+            self._invalidate_only_diff_snapshot_cache()
+            self._invalidate_render_cache()
+            self._pending_column_only_diff_seed = {
+                "state": snapshot.get("column_diff_seed"),
+                "comparison_state": snapshot.get("column_comparison_state"),
+                "plan": plan,
+                "mode": "restore",
+            }
+            self.refresh(row_only=None, rescan=True, column_only=True)
+            # Keep the workbook state exact even when render-time style inspection
+            # materializes a default style on cells that originally had no style.
+            self._restore_column_action_workbook_snapshot(
+                snapshot, post_refresh_cleanup=True
+            )
+            self._restore_column_block_selection(action.get("selection") or snapshot.get("selection"))
+            self._update_cursor_lines()
+            self.column_action_status_var.set("已完整撤销列结构操作并恢复列映射与选择。")
+            return True
+        finally:
+            if callable(end_interactive):
+                end_interactive()
+
+    def _on_column_action_button(self, source_side: str):
+        try:
+            block = self._selected_column_block()
+            if block is None:
+                return
+            projection = self._active_column_projection()
+            unresolved = any(
+                projection.slot(idx + 1).state == "unresolved"
+                or projection.slot(idx + 1).confidence.ambiguous
+                for idx in block.slot_indices
+            )
+            confirmed = False
+            if unresolved:
+                confirmed = bool(messagebox.askyesno(
+                    "确认待定列映射",
+                    "该列块映射置信度不足。继续会按当前可见映射执行整个列块，"
+                    "普通单元格覆盖仍保持禁用。\n\n"
+                    f"原因：{self._column_block_cause_text(block)}\n\n是否明确确认？",
+                ))
+                if not confirmed:
+                    return
+            edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
+            if callable(edit_ready) and not edit_ready():
+                if bool(getattr(self, "_pending_column_action_after_edit_load", False)):
+                    return
+                self._pending_column_action_after_edit_load = True
+                request_preload = getattr(self.app, "_request_edit_preload", None)
+                if callable(request_preload):
+                    request_preload()
+                self.column_action_status_var.set(
+                    "正在后台加载公式、样式和批注；完成后将自动执行所选列操作..."
+                )
+                for name in ("use_mine_col_btn", "use_base_col_btn", "use_theirs_col_btn"):
+                    button = getattr(self, name, None)
+                    if button is not None:
+                        try:
+                            button.configure(state="disabled")
+                        except Exception:
+                            pass
+
+                def _continue_when_edit_ready():
+                    if getattr(self.app, "_is_closing", False):
+                        self._pending_column_action_after_edit_load = False
+                        return
+                    if not edit_ready():
+                        schedule = getattr(self.app, "_safe_root_after", None)
+                        if callable(schedule):
+                            schedule(100, _continue_when_edit_ready)
+                        else:
+                            self.root.after(100, _continue_when_edit_ready)
+                        return
+                    self._pending_column_action_after_edit_load = False
+                    try:
+                        self._apply_selected_column_block(
+                            source_side,
+                            confirm_unresolved=confirmed,
+                        )
+                    except Exception as exc:
+                        messagebox.showerror("列结构操作失败", str(exc))
+                    finally:
+                        self._refresh_column_action_buttons()
+
+                schedule = getattr(self.app, "_safe_root_after", None)
+                if callable(schedule):
+                    schedule(100, _continue_when_edit_ready)
+                else:
+                    self.root.after(100, _continue_when_edit_ready)
+                return
+            self._apply_selected_column_block(
+                source_side,
+                confirm_unresolved=confirmed,
+            )
+        except Exception as exc:
+            messagebox.showerror("列结构操作失败", str(exc))
+
+    def _action_physical_columns(
+        self, direction: str, logical_col: int
+    ) -> tuple[int, int] | None:
+        projection = self._ensure_column_projection_current("执行覆盖操作")
+        slot = projection.slot(logical_col)
+        if slot is None:
+            return None
+        if slot.state == "unresolved" or slot.confidence.ambiguous:
+            raise RuntimeError(
+                f"逻辑列 L{logical_col} 的映射待确认，已阻止覆盖以避免写入错误物理列。"
+            )
+        side_pair = {
+            "A2B": ("A", "B"),
+            "B2A": ("B", "A"),
+            "BASE2A": ("BASE", "A"),
+        }.get(direction)
+        if side_pair is None:
+            return None
+        source_col = projection.physical_col(side_pair[0], logical_col)
+        destination_col = projection.physical_col(side_pair[1], logical_col)
+        if source_col is None or destination_col is None:
+            raise RuntimeError(
+                f"逻辑列 L{logical_col} 在源侧或目标侧不存在；请使用列结构操作，不能按单元格覆盖。"
+            )
+        return int(source_col), int(destination_col)
+
     def _copy_single_cell_by_pair(self, pair_idx: int, direction: str, c: int):
         try:
             if pair_idx is None or pair_idx >= len(self.row_pairs):
@@ -7441,47 +14314,53 @@ class SheetView:
                 src_r = rb
                 dst_r = ra if ra is not None else rb
 
+            logical_col = int(c)
+            physical_cols = self._action_physical_columns(direction, logical_col)
+            if physical_cols is None:
+                return
+            src_col, dst_col = physical_cols
+
             anchor = self._capture_view_anchor()
             adopted_formula_cache = False
             if direction == "A2B":
-                old_edit = self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c).value
-                old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value
-                v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=c).value
-                v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=c).value
+                old_edit = self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=dst_col).value
+                old_val = self.app.ws_b_val(self.sheet).cell(row=dst_r, column=dst_col).value
+                v_edit = self.app.ws_a_edit(self.sheet).cell(row=src_r, column=src_col).value
+                v_val = self.app.ws_a_val(self.sheet).cell(row=src_r, column=src_col).value
                 new_edit = _copy_edit_value_for_destination(
                     v_val, v_edit, old_edit,
-                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                    src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                 )
                 formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
                 if formula_mode == "noop":
                     return
                 if formula_mode == "cache":
-                    self.app.record_manual_b_formula_cache(self.sheet, dst_r, c, v_val)
+                    self.app.record_manual_b_formula_cache(self.sheet, dst_r, dst_col, v_val)
                     adopted_formula_cache = True
                 else:
-                    self.app.clear_manual_b_formula_cache(self.sheet, dst_r, c)
+                    self.app.clear_manual_b_formula_cache(self.sheet, dst_r, dst_col)
                     _assign_edit_cell_value(
-                        self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=c),
+                        self.app.ws_b_edit(self.sheet).cell(row=dst_r, column=dst_col),
                         new_edit,
                     )
-                    self.app.record_manual_b_cell(self.sheet, dst_r, c, new_edit)
-                self.app.ws_b_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    self.app.record_manual_b_cell(self.sheet, dst_r, dst_col, new_edit)
+                self.app.ws_b_val(self.sheet).cell(row=dst_r, column=dst_col).value = v_val
                 self.app.modified_b = True
                 self.app.modified_sheets_b.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, c, old_edit, old_val)]})
+                self.app.push_undo({"sheet": self.sheet, "target": "B", "cells": [(dst_r, dst_col, old_edit, old_val)]})
             elif direction == "BASE2A":
-                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
-                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
+                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=dst_col).value
+                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=dst_col).value
                 if src_r is None:
                     v_edit = None
                     v_val = None
                 else:
-                    v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=c).value
-                    v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=c).value
+                    v_edit = self.app.ws_base_edit(self.sheet).cell(row=src_r, column=src_col).value
+                    v_val = self.app.ws_base_val(self.sheet).cell(row=src_r, column=src_col).value
                 new_edit = (
                     _copy_edit_value_for_destination(
                         v_val, v_edit, old_edit,
-                        src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                        src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                     )
                     if src_r is not None else None
                 )
@@ -7490,43 +14369,50 @@ class SheetView:
                     return
                 if formula_mode == "cache":
                     new_edit = old_edit
-                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, dst_col, v_val)
                     adopted_formula_cache = True
                 else:
-                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
-                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=dst_col), new_edit)
+                    self.app.record_manual_a_cell(self.sheet, dst_r, dst_col, new_edit)
+                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=dst_col).value = v_val
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, dst_col, old_edit, old_val)]})
             else:
-                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c).value
-                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value
-                v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=c).value
-                v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=c).value
+                old_edit = self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=dst_col).value
+                old_val = self.app.ws_a_val(self.sheet).cell(row=dst_r, column=dst_col).value
+                v_edit = self.app.ws_b_edit(self.sheet).cell(row=src_r, column=src_col).value
+                v_val = self.app.ws_b_val(self.sheet).cell(row=src_r, column=src_col).value
                 new_edit = _copy_edit_value_for_destination(
                     v_val, v_edit, old_edit,
-                    src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                    src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                 )
                 formula_mode = self._same_formula_copy_mode(new_edit, old_edit, v_val, old_val)
                 if formula_mode == "noop":
                     return
                 if formula_mode == "cache":
                     new_edit = old_edit
-                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
+                    self.app.record_manual_a_formula_cache(self.sheet, dst_r, dst_col, v_val)
                     adopted_formula_cache = True
                 else:
-                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=c), new_edit)
-                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=c).value = v_val
+                    _assign_edit_cell_value(self.app.ws_a_edit(self.sheet).cell(row=dst_r, column=dst_col), new_edit)
+                    self.app.record_manual_a_cell(self.sheet, dst_r, dst_col, new_edit)
+                self.app.ws_a_val(self.sheet).cell(row=dst_r, column=dst_col).value = v_val
                 self.app.modified_a = True
                 self.app.modified_sheets_a.add(self.sheet)
-                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, c, old_edit, old_val)]})
+                self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": [(dst_r, dst_col, old_edit, old_val)]})
+
+            if getattr(self.app, "merge_conflict_mode", False):
+                self.app.user_touched_conflicts = True
+                self._resolve_conflict_row(dst_r, {logical_col})
 
             touched_r = ra or rb
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
-            self._invalidate_only_diff_snapshot_cache()
+            self._mark_nonstructural_cell_edit(
+                "cell-overwrite",
+                edited_sides=("B",) if direction == "A2B" else ("A",),
+            )
             self._invalidate_render_cache()
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
@@ -7739,6 +14625,12 @@ class SheetView:
                 return
             else:
                 return
+            self._mark_column_mapping_stale(
+                "sheet-structure-change",
+                row_structure=True,
+                column_structure=True,
+                edited_sides=("B",) if direction == "A2B" else ("A",),
+            )
             self._data_ready = False
             self._bounds_checked = False
             self._invalidate_only_diff_snapshot_cache()
@@ -8060,6 +14952,196 @@ class SheetView:
             end_pair_idx += 1
         return list(range(start_pair_idx, end_pair_idx + 1))
 
+    def _region_pair_has_applicable_diff(
+        self,
+        direction: str,
+        pair_idx: int,
+        writable_col_cache: dict[tuple[str, int], bool] | None = None,
+    ) -> bool:
+        """Return whether one cached pair contains a safe write for ``direction``.
+
+        This is intentionally an in-memory geometry check.  Region-button
+        fallback must stay responsive and must not discover candidates by
+        rereading worksheet cells.
+        """
+        pair_idx = self._normalize_pair_idx(pair_idx)
+        if pair_idx is None:
+            return False
+        direction = str(direction or "")
+        pair = self.row_pairs[pair_idx]
+        ra = self._row_for_side(pair, "A")
+        rb = self._row_for_side(pair, "B")
+        if direction == "A2B":
+            if ra is None:
+                return False
+            source_side, destination_side = "A", "B"
+            cols = set(self.pair_diff_cols.get(pair_idx, set()))
+        elif direction == "B2A":
+            if rb is None:
+                return False
+            source_side, destination_side = "B", "A"
+            cols = set(self.pair_diff_cols.get(pair_idx, set()))
+        elif direction == "BASE2A":
+            if ra is None or not getattr(self.app, "has_base", False):
+                return False
+            if self._base_row_for_pair(pair_idx, pair) is None:
+                return False
+            source_side, destination_side = "BASE", "A"
+            cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
+        else:
+            return False
+        if not cols:
+            return False
+
+        # A missing destination row can be created from the selected source.
+        if -1 in cols:
+            if direction == "A2B" and rb is None:
+                return True
+            if direction == "B2A" and ra is None:
+                return True
+
+        projection = None
+        for logical_col in (int(col) for col in cols if int(col) > 0):
+            cache_key = (direction, logical_col)
+            if writable_col_cache is not None and cache_key in writable_col_cache:
+                if writable_col_cache[cache_key]:
+                    return True
+                continue
+            if projection is None:
+                try:
+                    projection = self._active_column_projection()
+                except Exception:
+                    return False
+            slot = projection.slot(logical_col)
+            writable = bool(
+                slot is not None
+                and slot.state != "unresolved"
+                and not slot.confidence.ambiguous
+                and projection.physical_col(source_side, logical_col) is not None
+                and projection.physical_col(destination_side, logical_col) is not None
+            )
+            if writable_col_cache is not None:
+                writable_col_cache[cache_key] = writable
+            if writable:
+                return True
+        return False
+
+    def _region_action_visual_blocks(self) -> list[_DiffBlock]:
+        """Return safe-to-navigate visual blocks for the current display mode."""
+        if self._diff_block_model_ready():
+            return list(self._ensure_full_diff_blocks())
+        # Full mode may render only a prefix of a large sheet.  Its lazy loader
+        # assumes that prefix remains stable; jumping to an unrendered remote
+        # row via the only-diff bounded-preview path would violate that
+        # invariant. Restrict fallback to currently materialized rows.
+        return self._group_diff_pair_rows(
+            pair_idx
+            for pair_idx in self.display_rows
+            if self._pair_has_visual_diff(pair_idx)
+        )
+
+    def _resolve_region_action_target(
+        self,
+        direction: str,
+        preferred_pair_idx=None,
+    ) -> tuple[_DiffBlock, bool] | None:
+        """Resolve the selected, nearest, or first applicable region.
+
+        The boolean result says whether the command had to leave the preferred
+        pair.  Equal-distance ties choose the earlier block for deterministic
+        keyboard/mouse behavior.
+        """
+        direction = str(direction or "")
+        # Large only-diff snapshots intentionally keep these maps sparse.  An
+        # empty direction map proves in O(1) that no block can be applied and
+        # avoids walking a 100k+ row visual block on the Tk event thread.
+        direction_map = (
+            self.pair_base_diff_cols
+            if direction == "BASE2A"
+            else self.pair_diff_cols
+        )
+        if not direction_map:
+            return None
+        preferred = self._normalize_pair_idx(preferred_pair_idx)
+        nearest = None
+        nearest_key = None
+        writable_col_cache: dict[tuple[str, int], bool] = {}
+        # Resolve while iterating instead of first materializing every
+        # direction-applicable block.  The common no-selection case stops at
+        # the first safe block; a preferred pair still keeps deterministic
+        # nearest/earlier tie-breaking.
+        for block in self._region_action_visual_blocks():
+            if not any(
+                self._region_pair_has_applicable_diff(
+                    direction,
+                    pair_idx,
+                    writable_col_cache,
+                )
+                for pair_idx in block.pair_indices
+            ):
+                continue
+            if preferred is None:
+                return block, True
+            if block.start_pair_idx <= preferred <= block.end_pair_idx:
+                return block, False
+            if preferred < block.start_pair_idx:
+                distance = block.start_pair_idx - preferred
+            else:
+                distance = preferred - block.end_pair_idx
+            key = (distance, block.start_pair_idx)
+            if nearest_key is None or key < nearest_key:
+                nearest = block
+                nearest_key = key
+        if nearest is None:
+            return None
+        return nearest, True
+
+    def _locate_region_action_block(self, block: _DiffBlock) -> bool:
+        """Materialize and select a region start through the existing navigator."""
+        pair_idx = self._normalize_pair_idx(block.start_pair_idx)
+        if pair_idx is None or not self._materialize_pair_for_navigation(pair_idx):
+            return False
+        line = self.row_to_line.get(pair_idx)
+        if line is None:
+            return False
+        self._goto_block_start(int(line))
+        return self._normalize_pair_idx(self.selected_pair_idx) == pair_idx
+
+    def _show_region_action_feedback(self, direction: str, reason: str = "none"):
+        source_label = {
+            "A2B": "左侧",
+            "B2A": "右侧",
+            "BASE2A": "Base",
+        }.get(str(direction or ""), "所选侧")
+        if reason == "calculating":
+            text = "差异区域仍在计算，请稍后再试。"
+        elif reason == "locate-failed":
+            text = f"找到可使用的{source_label}差异区域，但暂时无法定位；请刷新当前 Sheet 后重试。"
+        elif reason == "unchanged":
+            text = f"已定位到{source_label}差异区域，但其中没有可写入的内容。"
+        elif reason == "located":
+            text = (
+                f"已定位到可使用的{source_label}差异区域，"
+                f"请再次点击“使用{source_label}区域”。"
+            )
+        elif reason == "direction-unavailable":
+            text = f"当前差异区域不能使用{source_label}内容，请选择另一侧或其他差异区域。"
+        elif reason == "not-visible":
+            text = (
+                f"当前已加载范围内没有可使用的{source_label}差异区域；"
+                "可切换“只看差异”后重试。"
+            )
+        else:
+            text = f"当前 Sheet 没有可使用的{source_label}差异区域。"
+        try:
+            self.info.configure(text=text)
+        except Exception:
+            pass
+        _dlog(
+            f"OVERWRITE_REGION_FEEDBACK sheet={self.sheet} dir={direction} "
+            f"reason={reason} text={text}"
+        )
+
     def _copy_selected_region(self, direction: str):
         """Copy contiguous diff block around current line using diff-cell columns only."""
         started = time.perf_counter()
@@ -8072,9 +15154,9 @@ class SheetView:
             begin_interactive()
         self._suppress_bg_apply = True
         direction_text = {
-            "B2A": "右侧区域到 mine",
-            "A2B": "左侧区域到 theirs",
-            "BASE2A": "Base 区域到 mine",
+            "B2A": "右侧区域",
+            "A2B": "左侧区域",
+            "BASE2A": "Base 区域",
         }.get(direction, direction)
         try:
             formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
@@ -8085,22 +15167,80 @@ class SheetView:
             # the selected/hovered pair first; region actions must do the same.
             selected_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
             has_selected_row = getattr(self, "_last_selected_line", None) is not None
-            if selected_pair_idx is not None and (
-                self.has_explicit_cell_selection() or has_selected_row
-            ):
+            has_explicit_selection = bool(
+                selected_pair_idx is not None
+                and (self.has_explicit_cell_selection() or has_selected_row)
+            )
+            if has_explicit_selection:
                 # Region actions are commands, not hover previews. A deliberate
                 # cell/row selection must win over stale hover state left behind
                 # when the pointer moves from the grid to the toolbar button.
                 anchor_pair_idx = selected_pair_idx
             else:
                 anchor_pair_idx = self.resolved_pair_idx_for_c_area()
-            region_pair_indices = self._logical_diff_pair_block_for_pair(anchor_pair_idx)
-            if not region_pair_indices:
+
+            selected_visual_block = None
+            if has_explicit_selection:
+                for block in self._region_action_visual_blocks():
+                    if selected_pair_idx in block.pair_indices:
+                        if any(
+                            self._pair_has_visual_diff(pair_idx)
+                            for pair_idx in block.pair_indices
+                        ):
+                            selected_visual_block = block
+                        break
+            if selected_visual_block is not None:
+                writable_col_cache: dict[tuple[str, int], bool] = {}
+                if not any(
+                    self._region_pair_has_applicable_diff(
+                        direction,
+                        pair_idx,
+                        writable_col_cache,
+                    )
+                    for pair_idx in selected_visual_block.pair_indices
+                ):
+                    self._show_region_action_feedback(direction, "direction-unavailable")
+                    return
+                target = (selected_visual_block, False)
+                locate_only = False
+            else:
+                target = self._resolve_region_action_target(direction, anchor_pair_idx)
+                # No explicit selection, or an explicit ordinary/non-diff row,
+                # requires a second click before any data is changed.
+                locate_only = True
+            if target is None:
                 _dlog(
                     f"OVERWRITE_REGION_NO_BLOCK sheet={self.sheet} dir={direction} "
                     f"line={line} pair={anchor_pair_idx}"
                 )
+                reason = (
+                    "calculating"
+                    if bool(getattr(self, "_only_diff_async_building", False))
+                    else (
+                        "not-visible"
+                        if (
+                            not bool(self.only_diff_var.get())
+                            and len(self.display_rows) < len(self.row_pairs)
+                        )
+                        else "none"
+                    )
+                )
+                self._show_region_action_feedback(direction, reason)
                 return
+            target_block, relocated = target
+            if locate_only or relocated:
+                if not self._locate_region_action_block(target_block):
+                    self._show_region_action_feedback(direction, "locate-failed")
+                    return
+                anchor_pair_idx = target_block.start_pair_idx
+                _dlog(
+                    f"OVERWRITE_REGION_AUTO_LOCATE sheet={self.sheet} dir={direction} "
+                    f"pair={anchor_pair_idx} block={target_block.ordinal}"
+                )
+            if locate_only:
+                self._show_region_action_feedback(direction, "located")
+                return
+            region_pair_indices = list(target_block.pair_indices)
             total_region_rows = len(region_pair_indices)
             _dlog(
                 f"OVERWRITE_REGION_START sheet={self.sheet} dir={direction} "
@@ -8216,13 +15356,17 @@ class SheetView:
                     applied_cols = set()
                     row_undo = []
                     for c in sorted(int(c) for c in cols):
-                        old_edit = ws_a_edit_fast.cell(row=ra, column=c).value
-                        old_val = ws_a_val_fast.cell(row=ra, column=c).value
-                        source_edit = ws_b_edit_fast.cell(row=rb, column=c).value
-                        source_val = ws_b_val_fast.cell(row=rb, column=c).value
+                        physical_cols = self._action_physical_columns("B2A", c)
+                        if physical_cols is None:
+                            continue
+                        src_col, dst_col = physical_cols
+                        old_edit = ws_a_edit_fast.cell(row=ra, column=dst_col).value
+                        old_val = ws_a_val_fast.cell(row=ra, column=dst_col).value
+                        source_edit = ws_b_edit_fast.cell(row=rb, column=src_col).value
+                        source_val = ws_b_val_fast.cell(row=rb, column=src_col).value
                         new_edit = _copy_edit_value_for_destination(
                             source_val, source_edit, old_edit,
-                            src_row=rb, src_col=c, dst_row=ra, dst_col=c,
+                            src_row=rb, src_col=src_col, dst_row=ra, dst_col=dst_col,
                         )
                         formula_mode = self._same_formula_copy_mode(
                             new_edit, old_edit, source_val, old_val
@@ -8230,13 +15374,13 @@ class SheetView:
                         if formula_mode == "noop":
                             continue
                         if formula_mode == "cache":
-                            ws_a_val_fast.cell(row=ra, column=c).value = source_val
-                            self.app.record_manual_a_formula_cache(self.sheet, ra, c, source_val)
+                            ws_a_val_fast.cell(row=ra, column=dst_col).value = source_val
+                            self.app.record_manual_a_formula_cache(self.sheet, ra, dst_col, source_val)
                         else:
-                            _assign_edit_cell_value(ws_a_edit_fast.cell(row=ra, column=c), new_edit)
-                            ws_a_val_fast.cell(row=ra, column=c).value = source_val
-                            self.app.record_manual_a_cell(self.sheet, ra, c, new_edit)
-                        row_undo.append((ra, c, old_edit, old_val))
+                            _assign_edit_cell_value(ws_a_edit_fast.cell(row=ra, column=dst_col), new_edit)
+                            ws_a_val_fast.cell(row=ra, column=dst_col).value = source_val
+                            self.app.record_manual_a_cell(self.sheet, ra, dst_col, new_edit)
+                        row_undo.append((ra, dst_col, old_edit, old_val))
                         applied_cols.add(c)
                     if row_undo:
                         undo_cells_region.extend(row_undo)
@@ -8283,13 +15427,23 @@ class SheetView:
             if changed_any:
                 if undo_cells_region:
                     self.app.push_undo({"sheet": self.sheet, "target": undo_target, "cells": undo_cells_region})
-                self._invalidate_only_diff_snapshot_cache()
+                self._mark_nonstructural_cell_edit(
+                    "region-overwrite",
+                    edited_sides=("B",) if direction == "A2B" else ("A",),
+                )
                 self._invalidate_render_cache()
-                # pair_text_a/b were not updated during suppress_refresh loop;
-                # clear them so refresh rebuilds each row from the new cell values.
-                self.pair_text_a = {}
-                self.pair_text_b = {}
+                exact_region_rows = self._refresh_pair_indices_exact(region_pair_indices)
+                if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
+                    self._cache_only_diff_rows_from_exact_pair_maps()
+                # Exact pair caches above already contain every changed row;
+                # one non-rescanning render is sufficient for any region size.
                 self.refresh(row_only=None, rescan=False)
+                self._invalidate_render_cache()
+                self._refresh_diff_block_ui()
+                _dlog(
+                    f"OVERWRITE_REGION_EXACT_REFRESH sheet={self.sheet} "
+                    f"pairs={exact_region_rows} visible={len(self.display_rows)}"
+                )
                 self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
                 try:
@@ -8299,6 +15453,8 @@ class SheetView:
                     )
                 except Exception:
                     pass
+            else:
+                self._show_region_action_feedback(direction, "unchanged")
             formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
             if formula_skipped > 0:
                 self._show_formula_copy_skip_notice(formula_skipped)
@@ -8353,6 +15509,43 @@ class SheetView:
         self.next_diff_btn.configure(state=("normal" if has_next else "disabled"))
         self._update_diff_block_indicator()
 
+    def _replace_rendered_rows_for_navigation(self, rows: list[int]):
+        """Replace the visible only-diff page with a bounded navigation preview."""
+        rows = [int(pair_idx) for pair_idx in rows]
+        saved_x = 0.0
+        try:
+            saved_x = float((self.left.xview() or (0.0, 1.0))[0])
+        except Exception:
+            pass
+        for widget in (self.left, self.base, self.right):
+            try:
+                widget.delete("1.0", "end")
+            except Exception:
+                pass
+        for widget in (self.left_ln, self.base_ln, self.right_ln):
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.configure(state="disabled")
+            except Exception:
+                pass
+        self.display_rows = []
+        self.row_to_line = {}
+        self._display_diff_row_count = 0
+        self._render_limit = len(rows)
+        self._append_rows(rows, refresh_block_ui=False)
+        # Apply boundary tags once. _goto_block_start() will update the indicator
+        # after selecting the target, so doing the full refresh here duplicated
+        # model/indicator work on every navigation click.
+        self._apply_diff_block_presentation()
+        try:
+            # _goto_block_start reads the current main-pane fraction and then
+            # restores all synchronized panes, so only the main pane is needed
+            # here.
+            self._sync_main_x_to_frac(saved_x)
+        except Exception:
+            pass
+
     def _materialize_pair_for_navigation(self, pair_idx: int) -> bool:
         pair_idx = self._normalize_pair_idx(pair_idx)
         if pair_idx is None:
@@ -8365,9 +15558,10 @@ class SheetView:
                 return False
         except Exception:
             return False
-        # Navigation targets a logical block, not an isolated row.  Materialize
-        # the complete target block so the user never lands on a half-rendered
-        # region when its first row is beyond the large-sheet render limit.
+        # Navigation targets a logical block.  On large sheets, materializing
+        # every preceding diff row (or a 400+ row block) makes a button click
+        # seconds long.  A bounded preview keeps the interaction synchronous and
+        # the full logical block model remains available to region actions.
         target_end_pos = target_pos
         target_block = self._full_diff_block_for_pair(pair_idx)
         if target_block is not None:
@@ -8386,7 +15580,35 @@ class SheetView:
                 target_end_pos = target_pos
         old_limit = len(self.display_rows)
         new_limit = min(len(self._full_display_rows), target_end_pos + 1)
-        if new_limit <= old_limit:
+        rendered_is_prefix = self.display_rows == self._full_display_rows[:old_limit]
+        if new_limit <= old_limit and rendered_is_prefix:
+            return pair_idx in self.row_to_line
+        if self._is_large_sheet and (
+            (not rendered_is_prefix)
+            or (new_limit - old_limit) > _LARGE_DIFF_NAV_PREVIEW_ROWS
+        ):
+            preview_end = min(
+                target_end_pos + 1,
+                target_pos + _LARGE_DIFF_NAV_PREVIEW_ROWS,
+            )
+            preview_rows = self._full_display_rows[target_pos:preview_end]
+            try:
+                self.info.configure(
+                    text=f"正在定位差异块：显示 {len(preview_rows)} 条预览行..."
+                )
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            self._replace_rendered_rows_for_navigation(preview_rows)
+            self._diff_navigation_last = {
+                "mode": "bounded-preview",
+                "rows": len(preview_rows),
+                "pair": pair_idx,
+            }
+            _dlog(
+                f"DIFF_BLOCK_NAV_PREVIEW sheet={self.sheet} pair={pair_idx} "
+                f"rows={len(preview_rows)} cap={_LARGE_DIFF_NAV_PREVIEW_ROWS} rescan=0"
+            )
             return pair_idx in self.row_to_line
         try:
             self.info.configure(text=f"正在定位差异块：加载到第 {new_limit} 条差异行...")
@@ -8395,6 +15617,11 @@ class SheetView:
             pass
         self._render_limit = max(int(self._render_limit or 0), new_limit)
         self._append_rows(self._full_display_rows[old_limit:new_limit])
+        self._diff_navigation_last = {
+            "mode": "append",
+            "rows": new_limit - old_limit,
+            "pair": pair_idx,
+        }
         _dlog(
             f"DIFF_BLOCK_MATERIALIZE sheet={self.sheet} pair={pair_idx} "
             f"rows={old_limit}->{new_limit} rescan=0"
@@ -8440,6 +15667,9 @@ class SheetView:
             self._highlight_selected_line(start_line)
             pair = self._pair_for_line(start_line)
             self.selected_pair_idx = self._pair_idx_for_line(start_line)
+            self.hover_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+            self.hover_col_idx = None
+            self.hover_side = None
             self.selected_excel_row_a = self._row_for_side(pair, "A")
             self.selected_excel_row_b = self._row_for_side(pair, "B")
             self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
@@ -8471,6 +15701,11 @@ class SheetView:
                 return
         self._update_diff_nav_state()
 
+    def _on_next_diff_block_shortcut(self, event=None):
+        """Handle the keyboard shortcut for the next logical diff block."""
+        self._goto_next_diff_block()
+        return "break"
+
     def _goto_prev_diff_block(self):
         try:
             if bool(self.only_diff_var.get()):
@@ -8493,6 +15728,11 @@ class SheetView:
         if prev is not None:
             self._goto_block_start(prev)
         self._update_diff_nav_state()
+
+    def _on_prev_diff_block_shortcut(self, event=None):
+        """Handle the keyboard shortcuts for the previous logical diff block."""
+        self._goto_prev_diff_block()
+        return "break"
 
     # ---------- Diff calculation helpers ----------
     def _get_row_values(self, ws, r: int):
@@ -8546,29 +15786,28 @@ class SheetView:
     def _build_row_and_diff_pair(self, ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra: int | None, rb: int | None):
         """Build display lines and diff columns for a row pair.
         col_char_widths must be pre-populated before calling (see _prescan_col_widths)."""
-        raw_a = []
-        raw_b = []
-        cols = set()
-        for c in range(1, self.max_col + 1):
-            da, db, eq = _cell_display_and_equal_by_row(ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, ra, rb, c)
-            raw_a.append(_val_to_str(da))
-            raw_b.append(_val_to_str(db))
-            if not eq:
-                cols.add(c)
-        # 新增行/删除行：整行只存在于一侧，视为行级差异。
-        # 用哨兵值 -1 确保空行也出现在"只看差异"中，同时渲染层不对任一侧施加单元格红色高亮。
-        if (ra is None) != (rb is None):
-            cols = {-1}
-        grid_on = self._is_grid_overlay_enabled()
-        sep = _COL_SEP if grid_on else "   "
-        trail = " \u2502" if grid_on else ""
-        cells_a = sep.join(_format_cell(raw_a[i], self.col_char_widths.get(i + 1, 1)) for i in range(len(raw_a))) + trail
-        cells_b = sep.join(_format_cell(raw_b[i], self.col_char_widths.get(i + 1, 1)) for i in range(len(raw_b))) + trail
-        line_a = cells_a
-        line_b = cells_b
-        return line_a, line_b, cols
+        rows_a_val = _read_rows_into_cache(ws_a_val, (ra,), self.max_col)
+        rows_b_val = _read_rows_into_cache(ws_b_val, (rb,), self.max_col)
+        rows_a_edit = (
+            _read_rows_into_cache(ws_a_edit, (ra,), self.max_col)
+            if ws_a_edit is not None else {}
+        )
+        rows_b_edit = (
+            _read_rows_into_cache(ws_b_edit, (rb,), self.max_col)
+            if ws_b_edit is not None else {}
+        )
+        return self._build_row_and_diff_pair_from_values(
+            _row_from_cache(rows_a_val, ra, self.max_col),
+            _row_from_cache(rows_b_val, rb, self.max_col),
+            ra=ra,
+            rb=rb,
+            row_a_edit_vals=_row_from_cache(rows_a_edit, ra, self.max_col),
+            row_b_edit_vals=_row_from_cache(rows_b_edit, rb, self.max_col),
+        )
 
-    def _render_line_from_raw_parts(self, raw_parts: list[str]) -> str:
+    def _render_line_from_raw_parts(self, raw_parts: list[str], side: str | None = None) -> str:
+        if side is not None:
+            raw_parts = self._project_raw_parts(raw_parts, side)
         grid_on = self._is_grid_overlay_enabled()
         sep = _COL_SEP if grid_on else "   "
         trail = " \u2502" if grid_on else ""
@@ -8577,25 +15816,455 @@ class SheetView:
             for i in range(len(raw_parts))
         ) + trail
 
-    def _raw_parts_from_row_values(self, row_vals) -> list[str]:
-        row_vals = _pad_row_values(row_vals, self.max_col)
+    def _raw_parts_from_row_values(self, row_vals, max_col: int | None = None) -> list[str]:
+        row_vals = _pad_row_values(row_vals, int(max_col or self.max_col))
         return [_val_to_str(v) for v in row_vals]
 
-    def _quick_diff_cols_from_value_rows(self, row_left_vals, row_right_vals) -> tuple[set[int], bool]:
-        row_left_vals = _pad_row_values(row_left_vals, self.max_col)
-        row_right_vals = _pad_row_values(row_right_vals, self.max_col)
-        if row_left_vals == row_right_vals:
-            return set(), False
-        cols: set[int] = set()
+    def _expected_column_model_cache_key(self) -> ColumnModelCacheKey:
+        return ColumnModelCacheKey(
+            self.sheet,
+            max(0, int(getattr(self, "_row_model_version", 0))),
+            max(0, int(getattr(self, "_column_model_version", 0))),
+            max(0, int(getattr(self, "_mine_edit_version", 0))),
+            max(0, int(getattr(self, "_base_edit_version", 0))),
+            max(0, int(getattr(self, "_theirs_edit_version", 0))),
+        )
+
+    def _retag_column_comparison_cache(
+        self,
+        cache: LogicalColumnComparisonCache,
+        cache_key: ColumnModelCacheKey,
+    ) -> LogicalColumnComparisonCache:
+        if cache.model.cache_key == cache_key:
+            return cache
+        # A value/formula edit advances edit versions but cannot change column
+        # geometry. Retag the immutable model while preserving its slot/block
+        # and lookup objects; rebuilding signatures/lookups here turned a
+        # single-cell edit into a full-sheet structural scan.
+        old_model = cache.model
+        model = ColumnModel(
+            cache_key=cache_key,
+            slots=old_model.slots,
+            blocks=old_model.blocks,
+            mine_physical_to_logical=old_model.mine_physical_to_logical,
+            base_physical_to_logical=old_model.base_physical_to_logical,
+            theirs_physical_to_logical=old_model.theirs_physical_to_logical,
+            mine_logical_to_physical=old_model.mine_logical_to_physical,
+            base_logical_to_physical=old_model.base_logical_to_physical,
+            theirs_logical_to_physical=old_model.theirs_logical_to_physical,
+            confidence=old_model.confidence,
+        )
+        return LogicalColumnComparisonCache(
+            model=model,
+            two_way_alignment=cache.two_way_alignment,
+            three_way_alignment=cache.three_way_alignment,
+            structural_diff_cols=cache.structural_diff_cols,
+            unresolved_cols=cache.unresolved_cols,
+        )
+
+    def _mark_column_mapping_stale(
+        self,
+        reason: str,
+        *,
+        row_structure: bool = False,
+        column_structure: bool = False,
+        edited_sides=(),
+    ):
+        if row_structure:
+            self._row_model_version = int(getattr(self, "_row_model_version", 0)) + 1
+        if column_structure:
+            self._column_model_version = int(getattr(self, "_column_model_version", 0)) + 1
+        normalized_sides = set()
+        for side in edited_sides or ():
+            try:
+                normalized_sides.add(_normalize_logical_column_side(side))
+            except Exception:
+                continue
+        if "mine" in normalized_sides:
+            self._mine_edit_version = int(getattr(self, "_mine_edit_version", 0)) + 1
+        if "base" in normalized_sides:
+            self._base_edit_version = int(getattr(self, "_base_edit_version", 0)) + 1
+        if "theirs" in normalized_sides:
+            self._theirs_edit_version = int(getattr(self, "_theirs_edit_version", 0)) + 1
+        self._column_mapping_stale_reason = str(reason or "worksheet-edited")
+        self._invalidate_only_diff_snapshot_cache()
+        self._diff_map_cache = None
+        self._diff_map_cache_version = None
+
+    def _mark_nonstructural_cell_edit(self, reason: str, *, edited_sides=()):
+        """Advance edit versions while keeping proven column geometry current."""
+        cache = self._active_column_comparison_cache()
+        self._mark_column_mapping_stale(reason, edited_sides=edited_sides)
+        self._install_column_projection(
+            self._retag_column_comparison_cache(
+                cache,
+                self._expected_column_model_cache_key(),
+            )
+        )
+
+    def _column_mapping_is_current(self) -> bool:
+        cache = getattr(self, "column_comparison_cache", None)
+        projection = getattr(self, "column_projection", None)
+        return bool(
+            isinstance(cache, LogicalColumnComparisonCache)
+            and isinstance(projection, LogicalColumnProjection)
+            and projection.model is cache.model
+            and cache.model.cache_key == self._expected_column_model_cache_key()
+            and not getattr(self, "_column_mapping_stale_reason", "")
+        )
+
+    def _ensure_column_projection_current(
+        self,
+        operation: str,
+        *,
+        ws_a_val=None,
+        ws_b_val=None,
+        ws_a_edit=None,
+        ws_b_edit=None,
+        ws_base_val=None,
+        ws_base_edit=None,
+        allow_rebuild: bool = True,
+    ) -> LogicalColumnProjection:
+        if self._column_mapping_is_current():
+            return self.column_projection
+        stale_reason = getattr(self, "_column_mapping_stale_reason", "") or "版本不一致"
+        if not allow_rebuild:
+            raise RuntimeError(
+                f"{operation}前的列映射已过期（{stale_reason}），已安全停止。"
+            )
+        if self._is_missing_sheet_view():
+            # A sheet-level action can legitimately leave one comparison side
+            # absent (for example BaseOnly copied to mine while theirs still has
+            # no such sheet).  Saving that whole-sheet operation does not need a
+            # signature rebuild, and must not call ws_* for the absent side.
+            # Install a version-current physical-order projection whose absent
+            # sides have no physical columns instead.
+            return self._install_column_projection(
+                self._identity_column_comparison_cache()
+            )
+        try:
+            ws_a_val = ws_a_val or self.app.ws_a_val(self.sheet)
+            ws_b_val = ws_b_val or self.app.ws_b_val(self.sheet)
+            ws_a_edit = ws_a_edit or self.app.ws_a_edit(self.sheet)
+            ws_b_edit = ws_b_edit or self.app.ws_b_edit(self.sheet)
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                ws_base_val = ws_base_val or self.app.ws_base_val(self.sheet)
+                ws_base_edit = ws_base_edit or self.app.ws_base_edit(self.sheet)
+            self._rebuild_column_comparison_cache_from_worksheets(
+                ws_a_val,
+                ws_b_val,
+                ws_a_edit,
+                ws_b_edit,
+                ws_base_val=ws_base_val,
+                ws_base_edit=ws_base_edit,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"{operation}前无法重建过期列映射（{stale_reason}）：{exc}"
+            ) from exc
+        if not self._column_mapping_is_current():
+            raise RuntimeError(f"{operation}前列映射版本校验失败，已安全停止。")
+        return self.column_projection
+
+    def _install_column_projection(
+        self, cache: LogicalColumnComparisonCache
+    ) -> LogicalColumnProjection:
+        cache = self._retag_column_comparison_cache(
+            cache, self._expected_column_model_cache_key()
+        )
+        projection = LogicalColumnProjection.from_model(cache.model)
+        self.column_comparison_cache = cache
+        self.column_projection = projection
+        self._column_projection_generation = int(
+            getattr(self, "_column_projection_generation", 0)
+        ) + 1
+        self._column_mapping_stale_reason = ""
+        self._base_spans_cache = None
+        self._base_spans_cache_key = None
+        return projection
+
+    def _active_column_projection(self) -> LogicalColumnProjection:
+        cache = self._active_column_comparison_cache()
+        projection = getattr(self, "column_projection", None)
+        if (
+            isinstance(projection, LogicalColumnProjection)
+            and projection.model is cache.model
+        ):
+            return projection
+        return self._install_column_projection(cache)
+
+    def _logical_slot_count(self) -> int:
+        return max(1, int(self._active_column_projection().slot_count or 0))
+
+    def _physical_col_for_logical(self, side: str, logical_col: int) -> int | None:
+        return self._active_column_projection().physical_col(side, logical_col)
+
+    def _logical_col_for_physical(self, side: str, physical_col: int) -> int | None:
+        return self._active_column_projection().logical_col(side, physical_col)
+
+    def _slot_exists_on_side(self, side: str, logical_col: int) -> bool:
+        return self._physical_col_for_logical(side, logical_col) is not None
+
+    def _project_raw_parts(self, raw_parts, side: str) -> list[str]:
+        projection = self._active_column_projection()
+        values = list(raw_parts or ())
+        projected = []
+        for logical_col in range(1, projection.slot_count + 1):
+            physical_col = projection.physical_col(side, logical_col)
+            if physical_col is None:
+                projected.append(_LOGICAL_COLUMN_PLACEHOLDER)
+                continue
+            offset = int(physical_col) - 1
+            projected.append(values[offset] if 0 <= offset < len(values) else "")
+        return projected
+
+    def _projected_widths_from_cached_parts(
+        self,
+        pair_parts_a=None,
+        pair_parts_b=None,
+        pair_parts_base=None,
+        fallback_physical_widths=None,
+    ):
+        projection = self._active_column_projection()
+        widths = {}
+        side_maps = (
+            ("A", pair_parts_a or {}),
+            ("B", pair_parts_b or {}),
+            ("BASE", pair_parts_base or {}),
+        )
+        for side, parts_by_pair in side_maps:
+            for parts in parts_by_pair.values():
+                projected = self._project_raw_parts(parts, side)
+                for logical_col, value in enumerate(projected, start=1):
+                    width = min(len(str(value)), _COL_MAX_DISPLAY_WIDTH)
+                    if width > widths.get(logical_col, 0):
+                        widths[logical_col] = width
+        fallback = fallback_physical_widths or {}
+        for logical_col in range(1, projection.slot_count + 1):
+            header_width = max(
+                len(projection.header_label(side, logical_col))
+                for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B"))
+            )
+            fallback_width = 0
+            for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B")):
+                physical_col = projection.physical_col(side, logical_col)
+                if physical_col is not None:
+                    fallback_width = max(
+                        fallback_width,
+                        int(fallback.get(int(physical_col), 0) or 0),
+                    )
+            widths[logical_col] = max(
+                4,
+                header_width,
+                min(max(widths.get(logical_col, 0), fallback_width), _COL_MAX_DISPLAY_WIDTH),
+            )
+        self.col_char_widths = widths
+        self._col_widths_version = int(getattr(self, "_col_widths_version", 0)) + 1
+        self._base_spans_cache = None
+        self._base_spans_cache_key = None
+        return widths
+
+    def _identity_column_comparison_cache(self) -> LogicalColumnComparisonCache:
+        """Return an immutable physical-order model until a signature cache is ready."""
+        missing_view = self._is_missing_sheet_view()
+        mine_width = (
+            max(0, int(getattr(self, "col_max_a", self.max_col) or 0))
+            if (not missing_view or self._side_has_sheet("A")) else 0
+        )
+        theirs_width = (
+            max(0, int(getattr(self, "col_max_b", self.max_col) or 0))
+            if (not missing_view or self._side_has_sheet("B")) else 0
+        )
+        base_width = (
+            max(0, int(getattr(self, "col_max_base", self.max_col) or 0))
+            if (
+                self._is_three_way_enabled()
+                and (not missing_view or self._side_has_sheet("BASE"))
+            ) else 0
+        )
+        logical_width = max(mine_width, base_width, theirs_width)
+        slots = []
+        for offset in range(logical_width):
+            mine_col = offset + 1 if offset < mine_width else None
+            base_col = offset + 1 if offset < base_width else None
+            theirs_col = offset + 1 if offset < theirs_width else None
+            state = (
+                "retained"
+                if mine_col is not None and theirs_col is not None
+                and (not self._is_three_way_enabled() or base_col is not None)
+                else "unresolved"
+            )
+            slots.append(ColumnSlot(
+                logical_idx=offset,
+                mine_col=mine_col,
+                base_col=base_col,
+                theirs_col=theirs_col,
+                state=state,
+            ))
+        key = self._expected_column_model_cache_key()
+        model = ColumnModel.from_slots(key, tuple(slots), blocks=_build_column_blocks(tuple(slots)))
+        return LogicalColumnComparisonCache(
+            model=model,
+            structural_diff_cols=frozenset(
+                slot.logical_idx + 1
+                for slot in slots
+                if slot.mine_col is None or slot.theirs_col is None
+            ),
+        )
+
+    def _active_column_comparison_cache(self) -> LogicalColumnComparisonCache:
+        cache = getattr(self, "column_comparison_cache", None)
+        if isinstance(cache, LogicalColumnComparisonCache):
+            return cache
+        return self._identity_column_comparison_cache()
+
+    def _rebuild_column_comparison_cache_from_worksheets(
+        self,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+        *,
+        ws_base_val=None,
+        ws_base_edit=None,
+        row_cache_bundle: dict | None = None,
+    ) -> LogicalColumnComparisonCache:
+        """Build signatures once from contiguous row reads and cache their model."""
+        # Base is immutable during an interactive merge.  Once the background
+        # scan has established its value/formula-aware effective width, retain
+        # that bound instead of expanding to formatted all-blank tail columns
+        # reported by Worksheet.max_column during a later forced rebuild.
+        if ws_base_val is not None and not bool(
+            getattr(self, "_base_bounds_checked", False)
+        ):
+            _base_row, base_width = _effective_bounds_with_edit(
+                ws_base_val, ws_base_edit
+            )
+            self._base_bounds_checked = True
+        else:
+            base_width = max(1, int(getattr(self, "col_max_base", 1) or 1))
+        self.col_max_base = base_width
+        max_col = max(1, int(self.max_col or 1), base_width)
+        rows_a_needed = [ra for ra, _rb in self.row_pairs if ra is not None]
+        rows_b_needed = [rb for _ra, rb in self.row_pairs if rb is not None]
+        rows_a_val = _read_rows_into_shared_cache(
+            ws_a_val, rows_a_needed, max_col,
+            cache_bundle=row_cache_bundle, cache_key="a_val",
+        )
+        rows_b_val = _read_rows_into_shared_cache(
+            ws_b_val, rows_b_needed, max_col,
+            cache_bundle=row_cache_bundle, cache_key="b_val",
+        )
+        rows_a_edit = (
+            _read_rows_into_shared_cache(
+                ws_a_edit, rows_a_needed, max_col,
+                cache_bundle=row_cache_bundle, cache_key="a_edit",
+            )
+            if ws_a_edit is not None else {}
+        )
+        rows_b_edit = (
+            _read_rows_into_shared_cache(
+                ws_b_edit, rows_b_needed, max_col,
+                cache_bundle=row_cache_bundle, cache_key="b_edit",
+            )
+            if ws_b_edit is not None else {}
+        )
+        aligned_a_val = [_row_from_cache(rows_a_val, ra, max_col) for ra, _rb in self.row_pairs]
+        aligned_b_val = [_row_from_cache(rows_b_val, rb, max_col) for _ra, rb in self.row_pairs]
+        aligned_a_edit = [_row_from_cache(rows_a_edit, ra, max_col) for ra, _rb in self.row_pairs]
+        aligned_b_edit = [_row_from_cache(rows_b_edit, rb, max_col) for _ra, rb in self.row_pairs]
+        cache_key = self._expected_column_model_cache_key()
+
+        if ws_base_val is not None:
+            base_rows = [
+                self._base_row_for_pair(idx, pair)
+                for idx, pair in enumerate(self.row_pairs)
+            ]
+            rows_base_val = _read_rows_into_shared_cache(
+                ws_base_val, base_rows, max_col,
+                cache_bundle=row_cache_bundle, cache_key="base_val",
+            )
+            rows_base_edit = (
+                _read_rows_into_shared_cache(
+                    ws_base_edit, base_rows, max_col,
+                    cache_bundle=row_cache_bundle, cache_key="base_edit",
+                )
+                if ws_base_edit is not None else {}
+            )
+            aligned_base_val = [
+                _row_from_cache(rows_base_val, base_row, max_col)
+                for base_row in base_rows
+            ]
+            aligned_base_edit = [
+                _row_from_cache(rows_base_edit, base_row, max_col)
+                for base_row in base_rows
+            ]
+            cache = build_logical_column_comparison_cache_3way(
+                cache_key,
+                aligned_a_val,
+                aligned_base_val,
+                aligned_b_val,
+                aligned_a_edit,
+                aligned_base_edit,
+                aligned_b_edit,
+                mine_max_col=max(1, int(self.col_max_a or 1)),
+                base_max_col=base_width,
+                theirs_max_col=max(1, int(self.col_max_b or 1)),
+            )
+            self.column_alignment_3way = cache.three_way_alignment
+            self.column_alignment_2way = None
+        else:
+            cache = build_logical_column_comparison_cache_2way(
+                cache_key,
+                aligned_a_val,
+                aligned_b_val,
+                aligned_a_edit,
+                aligned_b_edit,
+                mine_max_col=max(1, int(self.col_max_a or 1)),
+                theirs_max_col=max(1, int(self.col_max_b or 1)),
+            )
+            self.column_alignment_2way = cache.two_way_alignment
+            self.column_alignment_3way = None
+        self._install_column_projection(cache)
+        return cache
+
+    def _cache_base_line_from_row_values(self, pair_idx: int, row_vals) -> str:
+        line = self._render_line_from_raw_parts(
+            self._raw_parts_from_row_values(
+                row_vals, max(self.max_col, int(getattr(self, "col_max_base", 1) or 1))
+            ),
+            "BASE",
+        )
+        self.pair_text_base[int(pair_idx)] = line
+        return line
+
+    def _quick_diff_cols_from_value_rows(
+        self,
+        row_left_vals,
+        row_right_vals,
+        *,
+        right_side: str = "theirs",
+    ) -> tuple[set[int], bool]:
+        column_cache = self._active_column_comparison_cache()
+        result = compare_logical_row_sides(
+            column_cache,
+            row_left_vals,
+            row_right_vals,
+            left_side="mine",
+            right_side=right_side,
+            values_only=True,
+        )
         need_exact = False
-        for offset in range(self.max_col):
-            vl = row_left_vals[offset]
-            vr = row_right_vals[offset]
-            if _merge_cmp_value(vl) != _merge_cmp_value(vr):
-                cols.add(offset + 1)
-                if (vl is None) != (vr is None):
-                    need_exact = True
-        return cols, need_exact
+        for slot in column_cache.model.slots:
+            if slot.logical_idx + 1 not in result.diff_cols:
+                continue
+            vl = _logical_row_value(row_left_vals, slot.mine_col)
+            right_col = _logical_model_side_col(slot, right_side)
+            vr = _logical_row_value(row_right_vals, right_col)
+            if slot.mine_col is not None and right_col is not None and ((vl is None) != (vr is None)):
+                need_exact = True
+                break
+        return set(result.diff_cols), need_exact
 
     def _edit_row_values_cached(self, ws_edit, row_idx: int | None, cache: dict[int, tuple]) -> tuple:
         if row_idx is None or ws_edit is None:
@@ -8647,7 +16316,11 @@ class SheetView:
             row_a_edit_vals=row_a_edit_vals,
             row_b_edit_vals=row_b_edit_vals,
         )
-        return self._render_line_from_raw_parts(raw_a), self._render_line_from_raw_parts(raw_b), cols
+        return (
+            self._render_line_from_raw_parts(raw_a, "A"),
+            self._render_line_from_raw_parts(raw_b, "B"),
+            cols,
+        )
 
     def _build_row_parts_and_diff_pair_from_values(
         self,
@@ -8676,26 +16349,27 @@ class SheetView:
 
         raw_a: list[str] = []
         raw_b: list[str] = []
-        cols: set[int] = set()
         for offset in range(self.max_col):
-            col_idx = offset + 1
-            edit_b = row_b_edit_vals[offset]
-            if ra is not None and rb is not None and ra != rb:
-                edit_b = _translate_normal_formula_for_compare(
-                    row_b_vals[offset], edit_b, rb, col_idx, ra, col_idx
-                )
-            da, db, eq = _cell_display_and_equal_from_values(
-                row_a_vals[offset],
-                row_b_vals[offset],
-                row_a_edit_vals[offset],
-                edit_b,
+            da = _cell_display_from_values(
+                row_a_vals[offset], row_a_edit_vals[offset]
+            )
+            db = _cell_display_from_values(
+                row_b_vals[offset], row_b_edit_vals[offset]
             )
             raw_a.append(_val_to_str(da))
             raw_b.append(_val_to_str(db))
-            if not eq:
-                cols.add(offset + 1)
-        if (ra is None) != (rb is None):
-            cols = {-1}
+        comparison = compare_logical_row_2way(
+            self._active_column_comparison_cache(),
+            row_a_vals,
+            row_b_vals,
+            row_a_edit_vals,
+            row_b_edit_vals,
+            mine_row=ra,
+            theirs_row=rb,
+            mine_present=ra is not None,
+            theirs_present=rb is not None,
+        )
+        cols = set(comparison.diff_cols)
         return raw_a, raw_b, cols
 
     def _compute_base_diff_cols_from_values(
@@ -8726,23 +16400,18 @@ class SheetView:
             row_base_edit_vals = self._edit_row_values_cached(ws_base_edit, base_row, edit_cache_base if edit_cache_base is not None else {}) if ws_base_edit is not None else (None,) * self.max_col
         else:
             row_base_edit_vals = _pad_row_values(row_base_edit_vals, self.max_col)
-        cols: set[int] = set()
-        for offset in range(self.max_col):
-            col_idx = offset + 1
-            edit_base = row_base_edit_vals[offset]
-            if ra != base_row:
-                edit_base = _translate_normal_formula_for_compare(
-                    row_base_vals[offset], edit_base, base_row, col_idx, ra, col_idx
-                )
-            _va, _vb, eq = _cell_display_and_equal_from_values(
-                row_a_vals[offset],
-                row_base_vals[offset],
-                row_a_edit_vals[offset],
-                edit_base,
-            )
-            if not eq:
-                cols.add(offset + 1)
-        return cols
+        comparison = compare_logical_row_sides(
+            self._active_column_comparison_cache(),
+            row_a_vals,
+            row_base_vals,
+            row_a_edit_vals,
+            row_base_edit_vals,
+            left_side="mine",
+            right_side="base",
+            left_row=ra,
+            right_row=base_row,
+        )
+        return set(comparison.diff_cols)
 
     def _compute_base_diff_cols_for_pair(
         self,
@@ -8792,20 +16461,18 @@ class SheetView:
             ws_a_edit.max_column or 1,
             ws_base_edit.max_column or 1,
         )
-        cols: set[int] = set()
-        for c in range(1, full_max_col + 1):
-            _va, _vb, eq = _cell_display_and_equal_by_row(
-                ws_a_val,
-                ws_base_val,
-                ws_a_edit,
-                ws_base_edit,
-                ra,
-                base_row,
-                c,
-            )
-            if not eq:
-                cols.add(c)
-        return cols
+        rows_a_val = _read_rows_into_cache(ws_a_val, (ra,), full_max_col)
+        rows_base_val = _read_rows_into_cache(ws_base_val, (base_row,), full_max_col)
+        rows_a_edit = _read_rows_into_cache(ws_a_edit, (ra,), full_max_col)
+        rows_base_edit = _read_rows_into_cache(ws_base_edit, (base_row,), full_max_col)
+        return self._compute_base_diff_cols_from_values(
+            _row_from_cache(rows_a_val, ra, full_max_col),
+            _row_from_cache(rows_base_val, base_row, full_max_col),
+            ra=ra,
+            base_row=base_row,
+            row_a_edit_vals=_row_from_cache(rows_a_edit, ra, full_max_col),
+            row_base_edit_vals=_row_from_cache(rows_base_edit, base_row, full_max_col),
+        )
 
     def _ensure_base_diff_cache(
         self,
@@ -8816,6 +16483,7 @@ class SheetView:
         ws_a_edit=None,
         ws_base_val=None,
         ws_base_edit=None,
+        row_cache_bundle: dict | None = None,
     ):
         if not self._is_three_way_enabled():
             self.pair_base_diff_cols = {}
@@ -8841,26 +16509,151 @@ class SheetView:
             except Exception:
                 ws_base_edit = ws_base_val
         if pair_indices is None:
-            targets = range(len(self.row_pairs))
+            targets = list(range(len(self.row_pairs)))
         else:
             targets = [int(idx) for idx in pair_indices if 0 <= int(idx) < len(self.row_pairs)]
+        targets = [idx for idx in targets if idx not in self.pair_base_diff_cols]
+        if not targets:
+            return False
+        full_max_col = max(
+            int(max_col or 1),
+            int(getattr(ws_a_val, "max_column", 1) or 1),
+            int(getattr(ws_base_val, "max_column", 1) or 1),
+            int(getattr(ws_a_edit, "max_column", 1) or 1),
+            int(getattr(ws_base_edit, "max_column", 1) or 1),
+        )
+        rows_a_needed = [self.row_pairs[idx][0] for idx in targets]
+        base_rows_needed = [
+            self._base_row_for_pair(idx, self.row_pairs[idx])
+            for idx in targets
+        ]
+        rows_a_val = _read_rows_into_shared_cache(
+            ws_a_val, rows_a_needed, full_max_col,
+            cache_bundle=row_cache_bundle, cache_key="a_val",
+        )
+        rows_a_edit = _read_rows_into_shared_cache(
+            ws_a_edit, rows_a_needed, full_max_col,
+            cache_bundle=row_cache_bundle, cache_key="a_edit",
+        )
+        rows_base_val = _read_rows_into_shared_cache(
+            ws_base_val, base_rows_needed, full_max_col,
+            cache_bundle=row_cache_bundle, cache_key="base_val",
+        )
+        rows_base_edit = _read_rows_into_shared_cache(
+            ws_base_edit, base_rows_needed, full_max_col,
+            cache_bundle=row_cache_bundle, cache_key="base_edit",
+        )
         added_any = False
         for idx in targets:
-            if idx in self.pair_base_diff_cols:
-                continue
-            self.pair_base_diff_cols[idx] = self._compute_base_diff_cols_for_pair(
-                idx,
-                self.row_pairs[idx],
-                max_col=max_col,
-                ws_a_val=ws_a_val,
-                ws_a_edit=ws_a_edit,
-                ws_base_val=ws_base_val,
-                ws_base_edit=ws_base_edit,
+            pair = self.row_pairs[idx]
+            ra, _rb = pair
+            base_row = self._base_row_for_pair(idx, pair)
+            self.pair_base_diff_cols[idx] = self._compute_base_diff_cols_from_values(
+                _row_from_cache(rows_a_val, ra, full_max_col),
+                _row_from_cache(rows_base_val, base_row, full_max_col),
+                ra=ra,
+                base_row=base_row,
+                row_a_edit_vals=_row_from_cache(rows_a_edit, ra, full_max_col),
+                row_base_edit_vals=_row_from_cache(rows_base_edit, base_row, full_max_col),
             )
             added_any = True
         return added_any
 
-    def _visual_diff_cols_for_pair(self, pair_idx: int) -> set[int]:
+    def _refresh_pair_indices_exact(self, pair_indices) -> int:
+        """Batch-refresh exact row diff/text channels for selected aligned pairs.
+
+        Region adoption suppresses per-row UI refresh.  The final lazy render may
+        materialize only the first 200 rows of a large block, so its remaining
+        pair entries must be updated explicitly without expanding the visible
+        navigation window or rescanning unrelated rows.
+        """
+        targets = list(dict.fromkeys(
+            int(idx)
+            for idx in pair_indices
+            if 0 <= int(idx) < len(self.row_pairs)
+        ))
+        if not targets:
+            return 0
+        ws_a_val = self.app.ws_a_val(self.sheet)
+        ws_b_val = self.app.ws_b_val(self.sheet)
+        try:
+            ws_a_edit = self.app.ws_a_edit(self.sheet)
+        except Exception:
+            ws_a_edit = ws_a_val
+        try:
+            ws_b_edit = self.app.ws_b_edit(self.sheet)
+        except Exception:
+            ws_b_edit = ws_b_val
+        rows_a_needed = [self.row_pairs[idx][0] for idx in targets]
+        rows_b_needed = [self.row_pairs[idx][1] for idx in targets]
+        row_cache_bundle: dict = {}
+        rows_a_val = _read_rows_into_shared_cache(
+            ws_a_val, rows_a_needed, self.max_col,
+            cache_bundle=row_cache_bundle, cache_key="a_val",
+        )
+        rows_b_val = _read_rows_into_shared_cache(
+            ws_b_val, rows_b_needed, self.max_col,
+            cache_bundle=row_cache_bundle, cache_key="b_val",
+        )
+        rows_a_edit = _read_rows_into_shared_cache(
+            ws_a_edit, rows_a_needed, self.max_col,
+            cache_bundle=row_cache_bundle, cache_key="a_edit",
+        )
+        rows_b_edit = _read_rows_into_shared_cache(
+            ws_b_edit, rows_b_needed, self.max_col,
+            cache_bundle=row_cache_bundle, cache_key="b_edit",
+        )
+        for pair_idx in targets:
+            ra, rb = self.row_pairs[pair_idx]
+            line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+                _row_from_cache(rows_a_val, ra, self.max_col),
+                _row_from_cache(rows_b_val, rb, self.max_col),
+                ra=ra,
+                rb=rb,
+                row_a_edit_vals=_row_from_cache(rows_a_edit, ra, self.max_col),
+                row_b_edit_vals=_row_from_cache(rows_b_edit, rb, self.max_col),
+            )
+            self.pair_diff_cols[pair_idx] = cols
+            self.pair_text_a[pair_idx] = line_a
+            self.pair_text_b[pair_idx] = line_b
+
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            for pair_idx in targets:
+                self.pair_base_diff_cols.pop(pair_idx, None)
+            ws_base_val = self.app.ws_base_val(self.sheet)
+            try:
+                ws_base_edit = self.app.ws_base_edit(self.sheet)
+            except Exception:
+                ws_base_edit = ws_base_val
+            self._ensure_base_diff_cache(
+                pair_indices=targets,
+                max_col=self.max_col,
+                ws_a_val=ws_a_val,
+                ws_a_edit=ws_a_edit,
+                ws_base_val=ws_base_val,
+                ws_base_edit=ws_base_edit,
+                row_cache_bundle=row_cache_bundle,
+            )
+            base_rows_needed = [
+                self._base_row_for_pair(idx, self.row_pairs[idx])
+                for idx in targets
+            ]
+            rows_base_val = _read_rows_into_shared_cache(
+                ws_base_val, base_rows_needed, self.max_col,
+                cache_bundle=row_cache_bundle, cache_key="base_val",
+            )
+            for pair_idx, base_row in zip(targets, base_rows_needed):
+                if base_row is None:
+                    self.pair_text_base[pair_idx] = ""
+                else:
+                    self._cache_base_line_from_row_values(
+                        pair_idx,
+                        _row_from_cache(rows_base_val, base_row, self.max_col),
+                    )
+        return len(targets)
+
+    def _all_logical_diff_cols_for_pair(self, pair_idx: int) -> set[int]:
+        """Return the raw logical diff channel, including structural slots."""
         cols = set(self.pair_diff_cols.get(pair_idx, set()))
         base_cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
         if base_cols:
@@ -8869,48 +16662,150 @@ class SheetView:
             cols.update(c for c in base_cols if c > 0)
         return cols
 
+    def _visual_diff_cols_for_pair(self, pair_idx: int) -> set[int]:
+        """Return row-content diffs only; column structure has its own markers.
+
+        A missing logical slot can contain values on its owning side in every
+        row.  Treating those values as row diffs floods only-diff with the whole
+        sheet.  Only genuinely missing-side slots are removed here.  An
+        unresolved slot that still maps a physical column on both sides can
+        contain a real cell edit, so it remains in the row channel (merge
+        actions can still reject that ambiguous mapping independently).
+        """
+        pair_cols = set(self.pair_diff_cols.get(pair_idx, set()))
+        cols = self._all_logical_diff_cols_for_pair(pair_idx)
+        try:
+            cache = self._active_column_comparison_cache()
+            structural = set(cache.structural_diff_cols)
+            cols.difference_update(c for c in structural if c > 0)
+            # A resolved insertion owned identically by Mine and Theirs has no
+            # Base physical column by definition.  Base-relative comparison
+            # therefore marks that logical slot on every populated row even
+            # though the two current sides agree.  Remove only that Base-only
+            # contribution: a real Mine/Theirs cell disagreement, an
+            # unresolved mapping, or any one-sided slot remains visible.
+            resolved_common_insertions = {
+                slot.logical_idx + 1
+                for slot in cache.model.slots
+                if (
+                    slot.base_col is None
+                    and slot.mine_col is not None
+                    and slot.theirs_col is not None
+                    and slot.state != "unresolved"
+                    and not slot.confidence.ambiguous
+                )
+            }
+            cols.difference_update(
+                logical_col
+                for logical_col in resolved_common_insertions
+                if logical_col not in pair_cols
+            )
+        except Exception:
+            pass
+        return cols
+
     def _pair_has_visual_diff(self, pair_idx: int) -> bool:
         return bool(self._visual_diff_cols_for_pair(pair_idx))
 
-    def _prescan_col_widths(self, ws_a_val, ws_b_val, ws_base_val=None, max_pairs: int = 0):
+    def _prescan_col_widths(
+        self,
+        ws_a_val,
+        ws_b_val,
+        ws_base_val=None,
+        max_pairs: int = 0,
+        *,
+        row_cache_bundle: dict | None = None,
+    ):
         """Quick first-pass scan to populate col_char_widths before building formatted lines.
         max_pairs>0 limits scanning to first N pairs (for large sheets)."""
         self.col_char_widths = {}
         self._rownum_display_width = 0
         pairs = self.row_pairs[:max_pairs] if max_pairs > 0 else self.row_pairs
-        rows_a_cache = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in pairs if ra is not None], self.max_col)
-        rows_b_cache = _read_rows_into_cache(ws_b_val, [rb for _ra, rb in pairs if rb is not None], self.max_col)
+        rows_a_cache = _read_rows_into_shared_cache(
+            ws_a_val,
+            [ra for ra, _rb in pairs if ra is not None],
+            self.max_col,
+            cache_bundle=row_cache_bundle,
+            cache_key="a_val",
+        )
+        rows_b_cache = _read_rows_into_shared_cache(
+            ws_b_val,
+            [rb for _ra, rb in pairs if rb is not None],
+            self.max_col,
+            cache_bundle=row_cache_bundle,
+            cache_key="b_val",
+        )
         base_rows_needed = []
         if ws_base_val is not None:
             for idx, (ra, rb) in enumerate(pairs):
                 r_base = self._base_row_for_pair(idx, (ra, rb))
                 if r_base is not None:
                     base_rows_needed.append(r_base)
-        rows_base_cache = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if ws_base_val is not None else {}
+        rows_base_cache = _read_rows_into_shared_cache(
+            ws_base_val,
+            base_rows_needed,
+            self.max_col,
+            cache_bundle=row_cache_bundle,
+            cache_key="base_val",
+        ) if ws_base_val is not None else {}
 
+        projection = self._active_column_projection()
         for idx, (ra, rb) in enumerate(pairs):
             row_a = _row_from_cache(rows_a_cache, ra, self.max_col)
             row_b = _row_from_cache(rows_b_cache, rb, self.max_col)
             r_base = self._base_row_for_pair(idx, (ra, rb))
             row_base = _row_from_cache(rows_base_cache, r_base, self.max_col) if ws_base_val is not None else None
-            for c in range(1, self.max_col + 1):
-                sa = _val_to_str(row_a[c - 1])
-                sb = _val_to_str(row_b[c - 1])
+            for c in range(1, projection.slot_count + 1):
+                col_a = projection.physical_col("A", c)
+                col_b = projection.physical_col("B", c)
+                col_base = projection.physical_col("BASE", c)
+                sa = (
+                    _val_to_str(_logical_row_value(row_a, col_a))
+                    if col_a is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                )
+                sb = (
+                    _val_to_str(_logical_row_value(row_b, col_b))
+                    if col_b is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                )
                 w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
-                if row_base is not None and r_base is not None:
-                    sv = _val_to_str(row_base[c - 1])
+                if row_base is not None and r_base is not None and col_base is not None:
+                    sv = _val_to_str(_logical_row_value(row_base, col_base))
                     w = min(max(w, len(sv)), _COL_MAX_DISPLAY_WIDTH)
+                header_width = max(
+                    len(projection.header_label(side, c))
+                    for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B"))
+                )
+                w = max(w, header_width)
                 if w > self.col_char_widths.get(c, 0):
                     self.col_char_widths[c] = w
         # Avoid ultra-narrow columns (which render as repeated "...").
         # Keep a readable lower bound after grid on/off toggles.
-        for c in range(1, self.max_col + 1):
+        for c in range(1, projection.slot_count + 1):
             self.col_char_widths[c] = max(4, int(self.col_char_widths.get(c, 1)))
         # Invalidate cached base spans: column widths just changed.
         self._col_widths_version = int(getattr(self, "_col_widths_version", 0)) + 1
 
-    def _build_row_pairs(self, ws_a_val, ws_b_val, force: bool = False):
-        return _compute_row_pairs_generic(ws_a_val, ws_b_val, self.max_col, force=force)
+    def _build_row_pairs(
+        self,
+        ws_a_val,
+        ws_b_val,
+        force: bool = False,
+        *,
+        max_row_a: int | None = None,
+        max_row_b: int | None = None,
+        ws_a_edit=None,
+        ws_b_edit=None,
+    ):
+        return _compute_row_pairs_generic(
+            ws_a_val,
+            ws_b_val,
+            self.max_col,
+            force=force,
+            max_row_a=max_row_a,
+            max_row_b=max_row_b,
+            ws_a_edit=ws_a_edit,
+            ws_b_edit=ws_b_edit,
+        )
 
     @staticmethod
     def _build_row_pairs_direct(max_row_a: int, max_row_b: int):
@@ -8940,6 +16835,17 @@ class SheetView:
         edit_cache_base: dict[int, tuple] = {}
         has_base = bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False) and ws_base_val is not None)
 
+        def _cache_base_pair(pair_idx: int, base_row: int | None, rows_base: dict):
+            if not has_base:
+                return
+            if base_row is None:
+                self.pair_text_base[pair_idx] = ""
+                return
+            self._cache_base_line_from_row_values(
+                pair_idx,
+                _row_from_cache(rows_base, base_row, self.max_col),
+            )
+
         if self._align_rows_enabled and self.row_pairs:
             pair_count = len(self.row_pairs)
             block = _LARGE_SHEET_BLOCK_ROWS
@@ -8949,6 +16855,16 @@ class SheetView:
 
                 rows_a = _read_rows_into_cache(ws_a_val, [ra for ra, _rb in block_pairs if ra is not None], self.max_col)
                 rows_b = _read_rows_into_cache(ws_b_val, [rb for _ra, rb in block_pairs if rb is not None], self.max_col)
+                rows_a_edit_block = _read_rows_into_cache(
+                    ws_a_edit,
+                    [ra for ra, _rb in block_pairs if ra is not None],
+                    self.max_col,
+                ) if ws_a_edit is not None else {}
+                rows_b_edit_block = _read_rows_into_cache(
+                    ws_b_edit,
+                    [rb for _ra, rb in block_pairs if rb is not None],
+                    self.max_col,
+                ) if ws_b_edit is not None else {}
                 base_rows_needed = []
                 if has_base:
                     for off, pair in enumerate(block_pairs):
@@ -8957,6 +16873,9 @@ class SheetView:
                         if base_row is not None:
                             base_rows_needed.append(base_row)
                 rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if has_base else {}
+                rows_base_edit_block = _read_rows_into_cache(
+                    ws_base_edit, base_rows_needed, self.max_col
+                ) if (has_base and ws_base_edit is not None) else {}
                 exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
 
                 for off in range(len(block_pairs) - 1, -1, -1):
@@ -8966,21 +16885,43 @@ class SheetView:
                     ra, rb = self.row_pairs[pair_idx]
                     row_a = _row_from_cache(rows_a, ra, self.max_col)
                     row_b = _row_from_cache(rows_b, rb, self.max_col)
-                    if (ra is None) != (rb is None):
-                        cols = {-1}
-                        need_exact_ab = False
-                    else:
-                        cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                    row_a_edit_block = _row_from_cache(rows_a_edit_block, ra, self.max_col)
+                    row_b_edit_block = _row_from_cache(rows_b_edit_block, rb, self.max_col)
+                    comparison = compare_logical_row_2way(
+                        self._active_column_comparison_cache(),
+                        row_a,
+                        row_b,
+                        row_a_edit_block,
+                        row_b_edit_block,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        mine_present=ra is not None,
+                        theirs_present=rb is not None,
+                    )
+                    cols = set(comparison.diff_cols)
+                    need_exact_ab = False
                     base_cols = set()
                     need_exact_base = False
                     base_row = None
-                    if has_base and ra is not None:
+                    if has_base:
                         base_row = self._base_row_for_pair(pair_idx, (ra, rb))
-                        if base_row is None:
+                        if ra is not None and base_row is None:
                             base_cols = {-1}
-                        else:
+                        elif ra is not None:
                             row_base = _row_from_cache(rows_base, base_row, self.max_col)
-                            base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                            base_comparison = compare_logical_row_sides(
+                                self._active_column_comparison_cache(),
+                                row_a,
+                                row_base,
+                                row_a_edit_block,
+                                _row_from_cache(rows_base_edit_block, base_row, self.max_col),
+                                left_side="mine",
+                                right_side="base",
+                                left_row=ra,
+                                right_row=base_row,
+                            )
+                            base_cols = set(base_comparison.diff_cols)
+                            need_exact_base = False
                     if (not cols) and (not base_cols):
                         continue
                     if need_exact_ab or need_exact_base:
@@ -8989,8 +16930,9 @@ class SheetView:
                     self.pair_diff_cols[pair_idx] = cols
                     if has_base:
                         self.pair_base_diff_cols[pair_idx] = base_cols
-                    self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
-                    self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                    self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a), "A")
+                    self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b), "B")
+                    _cache_base_pair(pair_idx, base_row, rows_base)
 
                 if exact_rows:
                     exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
@@ -9018,8 +16960,8 @@ class SheetView:
                                 row_b_edit_vals=row_b_edit,
                             )
                         else:
-                            line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
-                            line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                            line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a), "A")
+                            line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b), "B")
                         if need_exact_base and has_base and ra is not None:
                             row_base = _row_from_cache(rows_base, base_row, self.max_col)
                             row_base_edit = _row_from_cache(rows_base_edit, base_row, self.max_col)
@@ -9042,6 +16984,7 @@ class SheetView:
                             self.pair_base_diff_cols[pair_idx] = base_cols
                         self.pair_text_a[pair_idx] = line_a
                         self.pair_text_b[pair_idx] = line_b
+                        _cache_base_pair(pair_idx, base_row, rows_base)
             return
 
         max_row = max(max_row_a, max_row_b)
@@ -9060,6 +17003,16 @@ class SheetView:
                 range(block_start, min(block_end, max_row_b) + 1),
                 self.max_col,
             )
+            rows_a_edit_block = _read_rows_into_cache(
+                ws_a_edit,
+                range(block_start, min(block_end, max_row_a) + 1),
+                self.max_col,
+            ) if ws_a_edit is not None else {}
+            rows_b_edit_block = _read_rows_into_cache(
+                ws_b_edit,
+                range(block_start, min(block_end, max_row_b) + 1),
+                self.max_col,
+            ) if ws_b_edit is not None else {}
             base_rows_needed = []
             if has_base:
                 for r in range(block_start, block_end + 1):
@@ -9072,6 +17025,9 @@ class SheetView:
                     if base_row is not None:
                         base_rows_needed.append(base_row)
             rows_base = _read_rows_into_cache(ws_base_val, base_rows_needed, self.max_col) if has_base else {}
+            rows_base_edit_block = _read_rows_into_cache(
+                ws_base_edit, base_rows_needed, self.max_col
+            ) if (has_base and ws_base_edit is not None) else {}
             exact_rows: list[tuple[int, int | None, int | None, int | None, set[int], bool, set[int], bool]] = []
 
             # Tail-first within changed block (newer rows first).
@@ -9087,21 +17043,43 @@ class SheetView:
                 ra, rb = self.row_pairs[pair_idx]
                 row_a = _row_from_cache(rows_a, ra, self.max_col)
                 row_b = _row_from_cache(rows_b, rb, self.max_col)
-                if (ra is None) != (rb is None):
-                    cols = {-1}
-                    need_exact_ab = False
-                else:
-                    cols, need_exact_ab = self._quick_diff_cols_from_value_rows(row_a, row_b)
+                row_a_edit_block = _row_from_cache(rows_a_edit_block, ra, self.max_col)
+                row_b_edit_block = _row_from_cache(rows_b_edit_block, rb, self.max_col)
+                comparison = compare_logical_row_2way(
+                    self._active_column_comparison_cache(),
+                    row_a,
+                    row_b,
+                    row_a_edit_block,
+                    row_b_edit_block,
+                    mine_row=ra,
+                    theirs_row=rb,
+                    mine_present=ra is not None,
+                    theirs_present=rb is not None,
+                )
+                cols = set(comparison.diff_cols)
+                need_exact_ab = False
                 base_cols = set()
                 need_exact_base = False
                 base_row = None
-                if has_base and ra is not None:
+                if has_base:
                     base_row = self._base_row_for_pair(pair_idx, (ra, rb))
-                    if base_row is None:
+                    if ra is not None and base_row is None:
                         base_cols = {-1}
-                    else:
+                    elif ra is not None:
                         row_base = _row_from_cache(rows_base, base_row, self.max_col)
-                        base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                        base_comparison = compare_logical_row_sides(
+                            self._active_column_comparison_cache(),
+                            row_a,
+                            row_base,
+                            row_a_edit_block,
+                            _row_from_cache(rows_base_edit_block, base_row, self.max_col),
+                            left_side="mine",
+                            right_side="base",
+                            left_row=ra,
+                            right_row=base_row,
+                        )
+                        base_cols = set(base_comparison.diff_cols)
+                        need_exact_base = False
                 if (not cols) and (not base_cols):
                     continue
                 if need_exact_ab or need_exact_base:
@@ -9110,8 +17088,9 @@ class SheetView:
                 self.pair_diff_cols[pair_idx] = cols
                 if has_base:
                     self.pair_base_diff_cols[pair_idx] = base_cols
-                self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
-                self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a), "A")
+                self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b), "B")
+                _cache_base_pair(pair_idx, base_row, rows_base)
 
             if exact_rows:
                 exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
@@ -9139,8 +17118,8 @@ class SheetView:
                             row_b_edit_vals=row_b_edit,
                         )
                     else:
-                        line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a))
-                        line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b))
+                        line_a = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_a), "A")
+                        line_b = self._render_line_from_raw_parts(self._raw_parts_from_row_values(row_b), "B")
                     if need_exact_base and has_base and ra is not None:
                         row_base = _row_from_cache(rows_base, base_row, self.max_col)
                         row_base_edit = _row_from_cache(rows_base_edit, base_row, self.max_col)
@@ -9163,6 +17142,7 @@ class SheetView:
                         self.pair_base_diff_cols[pair_idx] = base_cols
                     self.pair_text_a[pair_idx] = line_a
                     self.pair_text_b[pair_idx] = line_b
+                    _cache_base_pair(pair_idx, base_row, rows_base)
 
     def _build_row_and_diff(self, ws_a_val, ws_b_val, ws_a_edit, ws_b_edit, r: int):
         parts_a = []
@@ -9196,18 +17176,24 @@ class SheetView:
         so it is recomputed only when those change (``_col_widths_version`` bump),
         not once per rendered line in the tag phase."""
         grid = self._is_grid_overlay_enabled()
-        key = (int(self.max_col or 0), bool(grid), int(getattr(self, "_col_widths_version", 0)))
+        slot_count = self._logical_slot_count()
+        key = (
+            int(slot_count),
+            bool(grid),
+            int(getattr(self, "_col_widths_version", 0)),
+            int(getattr(self, "_column_projection_generation", 0)),
+        )
         if getattr(self, "_base_spans_cache", None) is not None \
                 and getattr(self, "_base_spans_cache_key", None) == key:
             return self._base_spans_cache
         sep_len = len(_COL_SEP) if grid else 3
         pos = 0
         spans = {}
-        for c in range(1, self.max_col + 1):
+        for c in range(1, slot_count + 1):
             w = max(1, self.col_char_widths.get(c, 1))
             spans[c] = (pos, pos + w)
             pos += w
-            if c < self.max_col:
+            if c < slot_count:
                 pos += sep_len
         self._base_spans_cache = spans
         self._base_spans_cache_key = key
@@ -9254,22 +17240,37 @@ class SheetView:
         for c in cols:
             if c <= 0:
                 continue
-            if ra is not None and c in spans_a:
+            if ra is not None and c in spans_a and self._slot_exists_on_side("A", c):
                 s, e = spans_a[c]
                 if s < e:
                     left_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
                     left_ranges.append((s, e))
-            if base_r is not None and c in spans_base:
+            if base_r is not None and c in spans_base and self._slot_exists_on_side("BASE", c):
                 s, e = spans_base[c]
                 if s < e:
                     base_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
                     base_ranges.append((s, e))
-            if rb is not None and c in spans_b:
+            if rb is not None and c in spans_b and self._slot_exists_on_side("B", c):
                 s, e = spans_b[c]
                 if s < e:
                     right_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
                     right_ranges.append((s, e))
         return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+
+    def _padding_column_tag_args(self, side: str, line_count: int) -> list[str]:
+        """Return exact placeholder ranges for a pane in shared slot geometry."""
+        if line_count <= 0:
+            return []
+        projection = self._active_column_projection()
+        spans = self._spans_for_line()
+        args = []
+        for logical_col in range(1, projection.slot_count + 1):
+            if not projection.is_missing(side, logical_col) or logical_col not in spans:
+                continue
+            start, end = spans[logical_col]
+            for line_no in range(1, int(line_count) + 1):
+                args.extend([f"{line_no}.{start}", f"{line_no}.{end}"])
+        return args
 
     def _clear_diffrow_under_diffcells(self, left_args=None, base_args=None, right_args=None):
         try:
@@ -9309,7 +17310,8 @@ class SheetView:
             self.sheet,
             int(self._only_diff_source_version),
             int(len(self.row_pairs)),
-            int(self.max_col or 0),
+            int(self._logical_slot_count()),
+            int(getattr(self, "_column_projection_generation", 0)),
             int(bool(self._align_rows_enabled)),
             int(bool(self._force_sequence_align)),
             int(bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False))),
@@ -9327,6 +17329,33 @@ class SheetView:
         self._only_diff_rows_cache_key = self._current_only_diff_cache_key()
         return list(normalized)
 
+    def _cache_only_diff_rows_from_exact_pair_maps(self) -> bool:
+        """Publish a synchronous snapshot when current in-memory maps are exact.
+
+        Disk-backed only-diff workers intentionally refuse to run after a user
+        edit because their source files are stale.  Column actions already
+        rebuild the full Mine/Theirs map and, on ordinary three-way sheets, the
+        full Base-relative map in memory.  Reusing those proved maps prevents a
+        toggle from waiting forever for an async result that must be rejected.
+        """
+        if not bool(getattr(self, "_data_ready", False)):
+            return False
+        pair_diff_map = getattr(self, "pair_diff_cols", {}) or {}
+        pair_map_complete = len(pair_diff_map) >= len(self.row_pairs) and all(
+            pair_idx in pair_diff_map for pair_idx in range(len(self.row_pairs))
+        )
+        if not bool(getattr(self, "_pair_diff_full_exact", False)) and not pair_map_complete:
+            return False
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            if len(getattr(self, "pair_base_diff_cols", {}) or {}) < len(self.row_pairs):
+                return False
+        self._cache_only_diff_rows_snapshot(
+            pair_idx
+            for pair_idx in range(len(self.row_pairs))
+            if self._pair_has_visual_diff(pair_idx)
+        )
+        return True
+
     def _only_diff_rows_with_touched(self, rows):
         rows_set = set(int(idx) for idx in (rows or []) if 0 <= int(idx) < len(self.row_pairs))
         for r in self.touched_rows:
@@ -9341,7 +17370,7 @@ class SheetView:
         try:
             total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
             self.info.configure(
-                text=f"只看差异 | 正在后台生成精确差异行...   Rows: {total_rows}   Cols: {self.max_col}"
+                text=f"只看差异 | 正在后台生成精确差异行...   Rows: {total_rows}   {self._info_column_text()}"
             )
             self._set_diff_block_indicator_visible(True)
             self.diff_block_status_var.set("差异块 计算中...")
@@ -9404,6 +17433,12 @@ class SheetView:
         missing_base_row_map = dict(getattr(self, "_missing_base_row_map", {}) or {})
         has_base = bool(self._is_three_way_enabled() and getattr(self.app, "has_base", False))
         align_enabled = bool(self._align_rows_enabled)
+        structural_cols_snapshot = set(
+            self._active_column_comparison_cache().structural_diff_cols
+        )
+
+        def _has_row_content_diff(cols) -> bool:
+            return any(int(col) == -1 or int(col) not in structural_cols_snapshot for col in (cols or ()))
 
         def _base_row_for_snapshot(pair_idx: int, pair: tuple[int | None, int | None]) -> int | None:
             if not has_base:
@@ -9457,6 +17492,7 @@ class SheetView:
                         return
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    self._refresh_diff_block_ui()
 
                 try:
                     self.app._queue_ui_task(_apply_open_fail)
@@ -9473,6 +17509,7 @@ class SheetView:
                 "pair_base_diff_cols": {},
                 "pair_parts_a": {},
                 "pair_parts_b": {},
+                "pair_parts_base": {},
             }
             try:
                 ws_a_val = wb_a_val[sheet_name]
@@ -9484,6 +17521,17 @@ class SheetView:
                 edit_cache_a: dict[int, tuple] = {}
                 edit_cache_b: dict[int, tuple] = {}
                 edit_cache_base: dict[int, tuple] = {}
+
+                def _store_base_parts(pair_idx: int, pair, rows_base: dict):
+                    if not has_base:
+                        return
+                    base_row = _base_row_for_snapshot(pair_idx, pair)
+                    if base_row is None or ws_base_val is None:
+                        result["pair_parts_base"][pair_idx] = []
+                        return
+                    result["pair_parts_base"][pair_idx] = self._raw_parts_from_row_values(
+                        _row_from_cache(rows_base, base_row, max_col)
+                    )
 
                 def _formula_rows(ws_edit):
                     rows = {}
@@ -9565,13 +17613,15 @@ class SheetView:
                             base_cols = set()
                             need_exact_base = False
                             base_row = None
-                            if has_base and ws_base_val is not None and ra is not None:
+                            if has_base and ws_base_val is not None:
                                 base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
-                                if base_row is None:
+                                if ra is not None and base_row is None:
                                     base_cols = {-1}
-                                else:
+                                elif ra is not None:
                                     row_base = _row_from_cache(rows_base, base_row, max_col)
-                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(
+                                        row_a, row_base, right_side="base"
+                                    )
                                     if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
                                         need_exact_base = _needs_formula_exact(
                                             row_a,
@@ -9584,12 +17634,15 @@ class SheetView:
                             if need_exact_ab or need_exact_base:
                                 exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
                                 continue
+                            if not (_has_row_content_diff(cols) or _has_row_content_diff(base_cols)):
+                                continue
                             result["diff_pair_indices"].append(pair_idx)
                             result["pair_diff_cols"][pair_idx] = cols
-                            if has_base and base_cols:
+                            if has_base:
                                 result["pair_base_diff_cols"][pair_idx] = base_cols
                             result["pair_parts_a"][pair_idx] = self._raw_parts_from_row_values(row_a)
                             result["pair_parts_b"][pair_idx] = self._raw_parts_from_row_values(row_b)
+                            _store_base_parts(pair_idx, (ra, rb), rows_base)
 
                         if exact_rows:
                             exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
@@ -9636,12 +17689,15 @@ class SheetView:
                                     )
                                 if (not cols) and (not base_cols):
                                     continue
+                                if not (_has_row_content_diff(cols) or _has_row_content_diff(base_cols)):
+                                    continue
                                 result["diff_pair_indices"].append(pair_idx)
                                 result["pair_diff_cols"][pair_idx] = cols
-                                if has_base and base_cols:
+                                if has_base:
                                     result["pair_base_diff_cols"][pair_idx] = base_cols
                                 result["pair_parts_a"][pair_idx] = raw_a
                                 result["pair_parts_b"][pair_idx] = raw_b
+                                _store_base_parts(pair_idx, (ra, rb), rows_base)
                 else:
                     max_row_a = ws_a_val.max_row or 1
                     max_row_b = ws_b_val.max_row or 1
@@ -9699,13 +17755,15 @@ class SheetView:
                             base_cols = set()
                             need_exact_base = False
                             base_row = None
-                            if has_base and ws_base_val is not None and ra is not None:
+                            if has_base and ws_base_val is not None:
                                 base_row = _base_row_for_snapshot(pair_idx, (ra, rb))
-                                if base_row is None:
+                                if ra is not None and base_row is None:
                                     base_cols = {-1}
-                                else:
+                                elif ra is not None:
                                     row_base = _row_from_cache(rows_base, base_row, max_col)
-                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(row_a, row_base)
+                                    base_cols, need_exact_base = self._quick_diff_cols_from_value_rows(
+                                        row_a, row_base, right_side="base"
+                                    )
                                     if not need_exact_base and (ra in formula_rows_a or base_row in formula_rows_base):
                                         need_exact_base = _needs_formula_exact(
                                             row_a,
@@ -9718,12 +17776,15 @@ class SheetView:
                             if need_exact_ab or need_exact_base:
                                 exact_rows.append((pair_idx, ra, rb, base_row, cols, need_exact_ab, base_cols, need_exact_base))
                                 continue
+                            if not (_has_row_content_diff(cols) or _has_row_content_diff(base_cols)):
+                                continue
                             result["diff_pair_indices"].append(pair_idx)
                             result["pair_diff_cols"][pair_idx] = cols
-                            if has_base and base_cols:
+                            if has_base:
                                 result["pair_base_diff_cols"][pair_idx] = base_cols
                             result["pair_parts_a"][pair_idx] = self._raw_parts_from_row_values(row_a)
                             result["pair_parts_b"][pair_idx] = self._raw_parts_from_row_values(row_b)
+                            _store_base_parts(pair_idx, (ra, rb), rows_base)
 
                         if exact_rows:
                             exact_rows_a = [ra for _pair_idx, ra, _rb, _base_row, _cols, need_ab, _bcols, need_base in exact_rows if ra is not None and (need_ab or need_base)]
@@ -9770,12 +17831,15 @@ class SheetView:
                                     )
                                 if (not cols) and (not base_cols):
                                     continue
+                                if not (_has_row_content_diff(cols) or _has_row_content_diff(base_cols)):
+                                    continue
                                 result["diff_pair_indices"].append(pair_idx)
                                 result["pair_diff_cols"][pair_idx] = cols
-                                if has_base and base_cols:
+                                if has_base:
                                     result["pair_base_diff_cols"][pair_idx] = base_cols
                                 result["pair_parts_a"][pair_idx] = raw_a
                                 result["pair_parts_b"][pair_idx] = raw_b
+                                _store_base_parts(pair_idx, (ra, rb), rows_base)
 
                 result["diff_pair_indices"] = sorted(set(result["diff_pair_indices"]))
             except Exception as e:
@@ -9790,28 +17854,50 @@ class SheetView:
                 if res.get("build_key") != self._current_only_diff_cache_key():
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
+                    # A foreground rescan may already have produced the exact
+                    # row set while this older worker was running.  Dropping
+                    # the stale payload must still publish that now-ready
+                    # block model to the widgets.
+                    self._refresh_diff_block_ui()
                     return
                 if self._has_user_edits_for_current_sheet():
                     self._only_diff_async_building = False
                     self._only_diff_async_build_key = None
                     _dlog(f"only-diff async result dropped after user edits: sheet={self.sheet}")
+                    self._refresh_diff_block_ui()
                     return
                 self._only_diff_async_building = False
                 self._only_diff_async_build_key = None
                 if res.get("error"):
+                    self._refresh_diff_block_ui()
                     return
-                for pair_idx, cols in (res.get("pair_diff_cols") or {}).items():
-                    self.pair_diff_cols[int(pair_idx)] = set(cols)
+                self.pair_diff_cols = {
+                    int(pair_idx): set(cols)
+                    for pair_idx, cols in (res.get("pair_diff_cols") or {}).items()
+                    if cols
+                }
+                self._pair_diff_full_exact = True
                 for pair_idx, cols in (res.get("pair_base_diff_cols") or {}).items():
                     self.pair_base_diff_cols[int(pair_idx)] = set(cols)
                 for pair_idx, parts in (res.get("pair_parts_a") or {}).items():
-                    self.pair_text_a[int(pair_idx)] = self._render_line_from_raw_parts(list(parts))
+                    self.pair_text_a[int(pair_idx)] = self._render_line_from_raw_parts(list(parts), "A")
                 for pair_idx, parts in (res.get("pair_parts_b") or {}).items():
-                    self.pair_text_b[int(pair_idx)] = self._render_line_from_raw_parts(list(parts))
+                    self.pair_text_b[int(pair_idx)] = self._render_line_from_raw_parts(list(parts), "B")
+                for pair_idx, parts in (res.get("pair_parts_base") or {}).items():
+                    base_parts = list(parts)
+                    self.pair_text_base[int(pair_idx)] = (
+                        self._render_line_from_raw_parts(base_parts, "BASE") if base_parts else ""
+                    )
                 self._cache_only_diff_rows_snapshot(res.get("diff_pair_indices") or [])
                 self._invalidate_render_cache()
                 if bool(self.only_diff_var.get()):
                     self._refresh_mode_switch_preserving_selection(rescan=False)
+                    # The first presentation pass can run while the async model
+                    # is still marked as building, in which case it correctly
+                    # clears/omits block tags.  Re-apply after the result has
+                    # been materialized and the ready flag is false so every
+                    # pane receives the final block boundaries.
+                    self._refresh_diff_block_ui()
                 else:
                     self._update_diff_nav_state()
 
@@ -9836,6 +17922,7 @@ class SheetView:
             self.app._end_priority_diff_compute()
             self._only_diff_async_building = False
             self._only_diff_async_build_key = None
+            self._refresh_diff_block_ui()
             return False
         return True
 
@@ -9891,7 +17978,8 @@ class SheetView:
             self._persist_only_diff_setting_debounced()
             return
         if bool(cur) and not self._has_valid_only_diff_snapshot_cache():
-            if self._start_async_large_only_diff_build():
+            cached_synchronously = self._cache_only_diff_rows_from_exact_pair_maps()
+            if (not cached_synchronously) and self._start_async_large_only_diff_build():
                 self._update_diff_nav_state()
                 self._persist_only_diff_setting_debounced()
                 return
@@ -10105,8 +18193,24 @@ class SheetView:
                     break
             if c is None:
                 return
-            if c > self.max_col:
-                c = self.max_col
+            if c > self._logical_slot_count():
+                c = self._logical_slot_count()
+
+            pair_idx = self.display_rows[line - 1]
+            # The click column is a logical slot.  Keep-mine only resolves the
+            # logical conflict; all write directions resolve distinct physical
+            # source/destination columns through the shared projection.
+            if direction == "MINE2A":
+                if getattr(self.app, "merge_conflict_mode", False):
+                    self.app.user_touched_conflicts = True
+                    self._resolve_conflict_cell(dst_r, c)
+                return
+            if getattr(self.app, "merge_conflict_mode", False) and direction == "A2B":
+                self.app.user_touched_conflicts = True
+                self._resolve_conflict_cell(dst_r, c)
+                return
+            self._copy_single_cell_by_pair(pair_idx, direction, c)
+            return
 
             # Merge conflict mode:
             # - "A2B" means keep mine, just mark resolved.
@@ -10465,6 +18569,15 @@ class SheetView:
                 old_pair=old_pair,
                 base_inserted=base_inserted,
             )
+            self._ensure_column_projection_current(
+                "插入行后刷新",
+                ws_a_val=ws_a_val,
+                ws_b_val=ws_b_val,
+                ws_a_edit=ws_a_edit,
+                ws_b_edit=ws_b_edit,
+                ws_base_val=(self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None),
+                ws_base_edit=(self.app.ws_base_edit(self.sheet) if getattr(self.app, "has_base", False) else None),
+            )
             self._prime_pair_cache_after_insert(
                 pair_idx=pair_idx,
                 ws_a_val=ws_a_val,
@@ -10530,6 +18643,7 @@ class SheetView:
         cache_maps = (
             self.pair_text_a,
             self.pair_text_b,
+            self.pair_text_base,
             self.pair_diff_cols,
             self.pair_base_diff_cols,
         )
@@ -10793,6 +18907,12 @@ class SheetView:
                     ws_b_edit=ws_b_edit,
                 )
 
+            self._mark_column_mapping_stale(
+                "batch-row-insert",
+                row_structure=True,
+                edited_sides=("A", "BASE") if direction == "B2A" and base_inserted
+                else (("A",) if direction == "B2A" else ("B",)),
+            )
             committed = True
 
             if not suppress_refresh:
@@ -11044,6 +19164,12 @@ class SheetView:
                 "count": 1,
                 "base_inserted": base_inserted,
             })
+            self._mark_column_mapping_stale(
+                "row-insert",
+                row_structure=True,
+                edited_sides=("A", "BASE") if direction == "B2A" and base_inserted
+                else (("A",) if direction == "B2A" else ("B",)),
+            )
             committed = True
 
             if not suppress_refresh:
@@ -11215,14 +19341,17 @@ class SheetView:
                 (ws_base_edit.max_column or 1) if ws_base_edit is not None else 1,
             )
             action_direction = direction
-            cols = set(range(1, full_max_col + 1)) if override_cols is None else set(override_cols)
+            cols = (
+                set(range(1, self._logical_slot_count() + 1))
+                if override_cols is None else set(override_cols)
+            )
 
             # 3-way row-header behavior:
             # - Base row number: apply only diff cells to mine
             # - Theirs row number: apply full row to mine
             if row_header and self._is_three_way_enabled() and direction == "BASE2A":
                 # Use base-vs-mine diffs for base-row action (not mine-vs-theirs).
-                cols = self._base_to_mine_diff_cols(ra, rb, full_max_col)
+                cols = set(self.pair_base_diff_cols.get(pair_idx, set()))
 
             # Recompute src/dst based on final action direction.
             if action_direction == "A2B":
@@ -11285,24 +19414,34 @@ class SheetView:
                     for c in cols:
                         if int(c) <= 0:
                             continue
+                        physical_cols = self._action_physical_columns(action_direction, c)
+                        if physical_cols is None:
+                            continue
+                        src_col, dst_col = physical_cols
                         _copy_edit_value_for_destination(
-                            src_val_ws.cell(row=src_r, column=c).value if src_val_ws is not None else None,
-                            src_edit_ws.cell(row=src_r, column=c).value,
-                            dst_edit_ws.cell(row=dst_r, column=c).value,
-                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                            src_val_ws.cell(row=src_r, column=src_col).value if src_val_ws is not None else None,
+                            src_edit_ws.cell(row=src_r, column=src_col).value,
+                            dst_edit_ws.cell(row=dst_r, column=dst_col).value,
+                            src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                         )
 
             if action_direction == "A2B":
                 if not resolved_only:
                     undo_cells = []
                     for c in cols:
-                        old_edit = ws_b_edit.cell(row=dst_r, column=c).value
-                        old_val = ws_b_val.cell(row=dst_r, column=c).value
-                        v_edit = ws_a_edit.cell(row=src_r, column=c).value
-                        v_val = ws_a_val.cell(row=src_r, column=c).value
+                        if int(c) <= 0:
+                            continue
+                        physical_cols = self._action_physical_columns(action_direction, c)
+                        if physical_cols is None:
+                            continue
+                        src_col, dst_col = physical_cols
+                        old_edit = ws_b_edit.cell(row=dst_r, column=dst_col).value
+                        old_val = ws_b_val.cell(row=dst_r, column=dst_col).value
+                        v_edit = ws_a_edit.cell(row=src_r, column=src_col).value
+                        v_val = ws_a_val.cell(row=src_r, column=src_col).value
                         new_edit = _copy_edit_value_for_destination(
                             v_val, v_edit, old_edit,
-                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                            src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                         )
                         formula_mode = self._same_formula_copy_mode(
                             new_edit, old_edit, v_val, old_val
@@ -11310,18 +19449,18 @@ class SheetView:
                         if formula_mode == "noop":
                             continue
                         if formula_mode == "cache":
-                            ws_b_val.cell(row=dst_r, column=c).value = v_val
-                            self.app.record_manual_b_formula_cache(self.sheet, dst_r, c, v_val)
-                            undo_cells.append((dst_r, c, old_edit, old_val))
+                            ws_b_val.cell(row=dst_r, column=dst_col).value = v_val
+                            self.app.record_manual_b_formula_cache(self.sheet, dst_r, dst_col, v_val)
+                            undo_cells.append((dst_r, dst_col, old_edit, old_val))
                             continue
-                        self.app.clear_manual_b_formula_cache(self.sheet, dst_r, c)
+                        self.app.clear_manual_b_formula_cache(self.sheet, dst_r, dst_col)
                         _assign_edit_cell_value(
-                            ws_b_edit.cell(row=dst_r, column=c),
+                            ws_b_edit.cell(row=dst_r, column=dst_col),
                             new_edit,
                         )
-                        self.app.record_manual_b_cell(self.sheet, dst_r, c, new_edit)
-                        ws_b_val.cell(row=dst_r, column=c).value = v_val
-                        undo_cells.append((dst_r, c, old_edit, old_val))
+                        self.app.record_manual_b_cell(self.sheet, dst_r, dst_col, new_edit)
+                        ws_b_val.cell(row=dst_r, column=dst_col).value = v_val
+                        undo_cells.append((dst_r, dst_col, old_edit, old_val))
                     self.app.modified_b = True
                     self.app.modified_sheets_b.add(self.sheet)
                     if undo_cells:
@@ -11338,13 +19477,19 @@ class SheetView:
                 undo_cells = []
                 applied_cols = set()
                 for c in cols:
-                    old_edit = ws_a_edit.cell(row=dst_r, column=c).value
-                    old_val = ws_a_val.cell(row=dst_r, column=c).value
-                    v_edit = ws_b_edit.cell(row=src_r, column=c).value
-                    v_val = ws_b_val.cell(row=src_r, column=c).value
+                    if int(c) <= 0:
+                        continue
+                    physical_cols = self._action_physical_columns(action_direction, c)
+                    if physical_cols is None:
+                        continue
+                    src_col, dst_col = physical_cols
+                    old_edit = ws_a_edit.cell(row=dst_r, column=dst_col).value
+                    old_val = ws_a_val.cell(row=dst_r, column=dst_col).value
+                    v_edit = ws_b_edit.cell(row=src_r, column=src_col).value
+                    v_val = ws_b_val.cell(row=src_r, column=src_col).value
                     new_edit = _copy_edit_value_for_destination(
                         v_val, v_edit, old_edit,
-                        src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                        src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                     )
                     formula_mode = self._same_formula_copy_mode(
                         new_edit, old_edit, v_val, old_val
@@ -11352,15 +19497,15 @@ class SheetView:
                     if formula_mode == "noop":
                         continue
                     if formula_mode == "cache":
-                        ws_a_val.cell(row=dst_r, column=c).value = v_val
-                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
-                        undo_cells.append((dst_r, c, old_edit, old_val))
+                        ws_a_val.cell(row=dst_r, column=dst_col).value = v_val
+                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, dst_col, v_val)
+                        undo_cells.append((dst_r, dst_col, old_edit, old_val))
                         applied_cols.add(c)
                         continue
-                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=c), new_edit)
-                    ws_a_val.cell(row=dst_r, column=c).value = v_val
-                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                    undo_cells.append((dst_r, c, old_edit, old_val))
+                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=dst_col), new_edit)
+                    ws_a_val.cell(row=dst_r, column=dst_col).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, dst_col, new_edit)
+                    undo_cells.append((dst_r, dst_col, old_edit, old_val))
                     applied_cols.add(c)
                 if undo_cells:
                     self.app.modified_a = True
@@ -11382,18 +19527,24 @@ class SheetView:
                 if ws_base_edit is None or ws_base_val is None:
                     return False
                 for c in cols:
-                    old_edit = ws_a_edit.cell(row=dst_r, column=c).value
-                    old_val = ws_a_val.cell(row=dst_r, column=c).value
+                    if int(c) <= 0:
+                        continue
+                    physical_cols = self._action_physical_columns(action_direction, c)
+                    if physical_cols is None:
+                        continue
+                    src_col, dst_col = physical_cols
+                    old_edit = ws_a_edit.cell(row=dst_r, column=dst_col).value
+                    old_val = ws_a_val.cell(row=dst_r, column=dst_col).value
                     if src_r is None:
                         v_edit = None
                         v_val = None
                     else:
-                        v_edit = ws_base_edit.cell(row=src_r, column=c).value
-                        v_val = ws_base_val.cell(row=src_r, column=c).value
+                        v_edit = ws_base_edit.cell(row=src_r, column=src_col).value
+                        v_val = ws_base_val.cell(row=src_r, column=src_col).value
                     new_edit = (
                         _copy_edit_value_for_destination(
                             v_val, v_edit, old_edit,
-                            src_row=src_r, src_col=c, dst_row=dst_r, dst_col=c,
+                            src_row=src_r, src_col=src_col, dst_row=dst_r, dst_col=dst_col,
                         )
                         if src_r is not None else None
                     )
@@ -11403,15 +19554,15 @@ class SheetView:
                     if formula_mode == "noop":
                         continue
                     if formula_mode == "cache":
-                        ws_a_val.cell(row=dst_r, column=c).value = v_val
-                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, c, v_val)
-                        undo_cells.append((dst_r, c, old_edit, old_val))
+                        ws_a_val.cell(row=dst_r, column=dst_col).value = v_val
+                        self.app.record_manual_a_formula_cache(self.sheet, dst_r, dst_col, v_val)
+                        undo_cells.append((dst_r, dst_col, old_edit, old_val))
                         applied_cols.add(c)
                         continue
-                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=c), new_edit)
-                    ws_a_val.cell(row=dst_r, column=c).value = v_val
-                    self.app.record_manual_a_cell(self.sheet, dst_r, c, new_edit)
-                    undo_cells.append((dst_r, c, old_edit, old_val))
+                    _assign_edit_cell_value(ws_a_edit.cell(row=dst_r, column=dst_col), new_edit)
+                    ws_a_val.cell(row=dst_r, column=dst_col).value = v_val
+                    self.app.record_manual_a_cell(self.sheet, dst_r, dst_col, new_edit)
+                    undo_cells.append((dst_r, dst_col, old_edit, old_val))
                     applied_cols.add(c)
                 if undo_cells:
                     self.app.modified_a = True
@@ -11438,6 +19589,10 @@ class SheetView:
             if touched_r is not None:
                 self.touched_rows.add(touched_r)
             if not suppress_refresh:
+                self._mark_column_mapping_stale(
+                    "row-overwrite",
+                    edited_sides=("B",) if action_direction == "A2B" else ("A",),
+                )
                 self._invalidate_only_diff_snapshot_cache()
                 self._invalidate_render_cache()
                 # Minimize flicker: use row-only incremental refresh after overwrite.
@@ -11470,11 +19625,50 @@ class SheetView:
 
     def _undo_last_action(self):
         try:
+            self._ensure_column_projection_current("撤销操作")
+            pending = self.app.undo_stack[-1] if getattr(self.app, "undo_stack", None) else None
+            column_undo_view = self
+            if pending and pending.get("kind") == "column_action":
+                action_sheet = pending.get("sheet")
+                column_undo_view = (
+                    self
+                    if action_sheet == self.sheet
+                    else getattr(self.app, "sheet_views", {}).get(action_sheet)
+                )
+                if column_undo_view is None:
+                    raise RuntimeError(f"撤销所需的 Sheet 视图尚未加载：{action_sheet}")
+                column_undo_view._ensure_column_projection_current("撤销列结构操作")
             action = self.app.pop_undo()
             if not action:
                 return
+            if action.get("kind") == "column_action":
+                column_undo_view._undo_column_action(action)
+                return
             sheet = action.get("sheet")
             target = action.get("target")
+            if sheet == self.sheet:
+                row_structure = target in (
+                    "A_APPEND",
+                    "A_INSERT_ROW",
+                    "B_INSERT_ROW",
+                )
+                if str(target or "").startswith("A"):
+                    edited_sides = ("A", "BASE") if action.get("base_inserted") else ("A",)
+                elif str(target or "").startswith("B"):
+                    edited_sides = ("B",)
+                else:
+                    edited_sides = ()
+                if row_structure:
+                    self._mark_column_mapping_stale(
+                        "undo",
+                        row_structure=True,
+                        edited_sides=edited_sides,
+                    )
+                elif target in ("A", "B"):
+                    self._mark_nonstructural_cell_edit(
+                        "undo-cell-overwrite",
+                        edited_sides=edited_sides,
+                    )
             if target == "A_APPEND":
                 start_row = action.get("start_row")
                 count = action.get("count")
@@ -11616,14 +19810,31 @@ class SheetView:
                 for r in rows:
                     self.touched_rows.add(r)
                 self._invalidate_only_diff_snapshot_cache()
-                if self._align_rows_enabled:
-                    # Full refresh supersedes per-row work; avoid N redundant partial renders.
-                    self.refresh(row_only=None, rescan=True)
+                self._invalidate_render_cache()
+                side_lookup = (
+                    self.row_a_to_pair_idx if target == "A"
+                    else self.row_b_to_pair_idx
+                )
+                affected_pair_indices = list(dict.fromkeys(
+                    int(side_lookup[r])
+                    for r in sorted(rows)
+                    if r in side_lookup
+                ))
+                self._refresh_pair_indices_exact(affected_pair_indices)
+                if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
+                    self._cache_only_diff_rows_from_exact_pair_maps()
+                if len(affected_pair_indices) <= _CELL_UNDO_INCREMENTAL_ROW_LIMIT:
+                    # ``refresh(row_only=...)`` accepts a worksheet row rather
+                    # than a pair index. Prefer Mine's row because refresh
+                    # resolves that lookup first, then fall back to Theirs for
+                    # a one-sided aligned pair.
+                    for pair_idx in affected_pair_indices:
+                        ra, rb = self.row_pairs[pair_idx]
+                        display_row = ra if ra is not None else rb
+                        if display_row is not None:
+                            self.refresh(row_only=int(display_row), rescan=False)
                 else:
-                    for r in rows:
-                        if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
-                            self._recalc_row_diff_and_update(r)
-                        self.refresh(row_only=r, rescan=False)
+                    self.refresh(row_only=None, rescan=False)
                 self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("撤销失败", f"撤销操作失败，数据可能未恢复：\n{e}")
@@ -11770,30 +19981,31 @@ class SheetView:
             return ""
         if not getattr(self.app, "has_base", False):
             return ""
-        if pair_idx >= len(self.row_pairs):
+        pair_idx = int(pair_idx)
+        if pair_idx in self.pair_text_base:
+            return self.pair_text_base[pair_idx]
+        if not (0 <= pair_idx < len(self.row_pairs)):
             return ""
         pair = self.row_pairs[pair_idx]
         if not pair:
             return ""
         r = self._base_row_for_pair(pair_idx, pair)
         if r is None:
+            self.pair_text_base[pair_idx] = ""
             return ""
         try:
             ws_base = self._display_ws("BASE", edit=False)
         except Exception:
             return ""
-        raw = []
-        for c in range(1, self.max_col + 1):
-            try:
-                v = ws_base.cell(row=r, column=c).value
-            except Exception:
-                v = None
-            raw.append(_val_to_str(v))
-        grid_on = self._is_grid_overlay_enabled()
-        sep = _COL_SEP if grid_on else "   "
-        trail = " \u2502" if grid_on else ""
-        cells = sep.join(_format_cell(raw[i], self.col_char_widths.get(i + 1, 1)) for i in range(len(raw))) + trail
-        return cells
+        base_width = max(self.max_col, int(getattr(self, "col_max_base", 1) or 1))
+        rows_base = _read_rows_into_cache(ws_base, (r,), base_width)
+        raw = [
+            _val_to_str(value)
+            for value in _row_from_cache(rows_base, r, base_width)
+        ]
+        line = self._render_line_from_raw_parts(raw, "BASE")
+        self.pair_text_base[pair_idx] = line
+        return line
 
     def _render_base_full(self):
         if not self._is_three_way_enabled():
@@ -11809,18 +20021,24 @@ class SheetView:
                 ws_base = self._display_ws("BASE", edit=False)
                 base_rows_needed = []
                 for pair_idx in self.display_rows:
+                    if pair_idx in self.pair_text_base:
+                        continue
                     base_row = self._base_row_for_pair(pair_idx)
                     if base_row is not None:
                         base_rows_needed.append(base_row)
-                rows_base = _read_rows_into_cache(ws_base, base_rows_needed, self.max_col)
+                base_width = max(self.max_col, int(getattr(self, "col_max_base", 1) or 1))
+                rows_base = _read_rows_into_cache(ws_base, base_rows_needed, base_width)
                 for pair_idx in self.display_rows:
+                    if pair_idx in self.pair_text_base:
+                        lines.append(self.pair_text_base[pair_idx])
+                        continue
                     base_row = self._base_row_for_pair(pair_idx)
                     if base_row is None:
+                        self.pair_text_base[pair_idx] = ""
                         lines.append("")
                         continue
-                    row_base = _row_from_cache(rows_base, base_row, self.max_col)
-                    raw = [_val_to_str(v) for v in row_base]
-                    lines.append(self._render_line_from_raw_parts(raw))
+                    row_base = _row_from_cache(rows_base, base_row, base_width)
+                    lines.append(self._cache_base_line_from_row_values(pair_idx, row_base))
             except Exception:
                 lines = [self._build_base_line(pair_idx) for pair_idx in self.display_rows]
         else:
@@ -11943,19 +20161,133 @@ class SheetView:
             except Exception:
                 pass
 
-    def _build_col_header_line(self) -> str:
-        if self.max_col <= 0:
+    def _append_row_header_lines(self, pair_indices: list[int]):
+        """Append materialized row headers without clamping beyond the Text end."""
+        if not pair_indices:
+            return
+        rn_w = self._sync_row_header_width_widgets()
+        for w, side in (
+            (self.left_ln, "A"),
+            (self.base_ln, "BASE"),
+            (self.right_ln, "B"),
+        ):
+            lines = [self._format_main_row_header(pair_idx, side, rn_w) for pair_idx in pair_indices]
+            try:
+                w.configure(state="normal")
+                w.insert("end", "\n".join(lines) + "\n")
+            except Exception:
+                pass
+            finally:
+                try:
+                    w.configure(state="disabled")
+                except Exception:
+                    pass
+
+    def _build_col_header_line(self, side: str = "LOGICAL") -> str:
+        projection = self._active_column_projection()
+        if projection.slot_count <= 0:
             return ""
         sep = _COL_SEP if self._is_grid_overlay_enabled() else "   "
         trail = " │" if self._is_grid_overlay_enabled() else ""
         parts = []
-        for c in range(1, self.max_col + 1):
-            label = get_column_letter(c)
+        for c in range(1, projection.slot_count + 1):
+            label = projection.header_label(side, c)
             parts.append(_format_cell(label, self.col_char_widths.get(c, 1)))
         return sep.join(parts) + (trail if parts else "")
 
+    def _column_structure_summary(self) -> str:
+        projection = self._active_column_projection()
+        cache = self._active_column_comparison_cache()
+        special_cols = set(cache.structural_diff_cols)
+        special_cols.update(cache.unresolved_cols)
+        items = []
+        state_labels = {
+            "inserted": "新增列",
+            "deleted": "删除列",
+            "mine-deleted": "Mine删除",
+            "theirs-deleted": "Theirs删除",
+            "both-deleted": "双方删除",
+            "unresolved": "待确认",
+        }
+        cause_labels = {
+            COLUMN_MAPPING_CAUSE_BLANK_COLUMN: "空白列无法唯一识别",
+            COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE: "重复列特征",
+            COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH: "公式结构不一致",
+            COLUMN_MAPPING_CAUSE_INCOMPATIBLE_CACHE: "缓存版本不兼容",
+            COLUMN_MAPPING_CAUSE_IMPLICIT_BOUNDARY: "列边界不明确",
+            COLUMN_MAPPING_CAUSE_COLUMN_LIMIT: "超过列对齐上限",
+            COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE: "匹配置信度不足",
+        }
+        for block in projection.model.blocks:
+            logical_cols = [int(idx) + 1 for idx in block.slot_indices]
+            if not any(col in special_cols for col in logical_cols):
+                continue
+            start_col = logical_cols[0]
+            end_col = logical_cols[-1]
+            range_label = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
+            slots = [projection.slot(col) for col in logical_cols]
+            slots = [slot for slot in slots if slot is not None]
+            unresolved = any(
+                slot.state == "unresolved" or slot.confidence.ambiguous
+                for slot in slots
+            )
+            state_text = "待确认" if unresolved else state_labels.get(block.state, "结构变化")
+            missing_sides = []
+            for side, label in (("A", "Mine"), ("BASE", "Base"), ("B", "Theirs")):
+                if side == "BASE" and not self._is_three_way_enabled():
+                    continue
+                if all(projection.is_missing(side, col) for col in logical_cols):
+                    missing_sides.append(f"{label}缺列")
+            causes = []
+            for slot in slots:
+                for cause in slot.confidence.cause_codes:
+                    translated = cause_labels.get(cause)
+                    if translated:
+                        causes.append(translated)
+            details = missing_sides + list(dict.fromkeys(causes))
+            detail_text = f"（{'；'.join(details)}）" if details else ""
+            marker = "?" if unresolved else _LOGICAL_COLUMN_STATE_MARKERS.get(block.state, "!")
+            items.append(f"{marker}{range_label} {state_text}{detail_text}")
+        if not items:
+            return ""
+        preview = "，".join(items[:4])
+        if len(items) > 4:
+            preview += f"，…（另{len(items) - 4}块）"
+        return preview
+
+    def _info_column_text(self) -> str:
+        text = f"Cols: {self._logical_slot_count()}"
+        summary = self._column_structure_summary()
+        if summary:
+            text += f"   ColumnStructure: {summary}"
+        return text
+
+    def _apply_column_header_structure_tags(self, widget: tk.Text, side: str):
+        try:
+            widget.tag_configure("colstruct", background="#FFF1B8", foreground="#7A4B00")
+            widget.tag_configure("colmissing", background="#B0B0B0", foreground="#3A3A3A")
+            widget.tag_configure("colunresolved", background="#FFD1D1", foreground="#8B0000")
+            projection = self._active_column_projection()
+            spans = self._spans_for_line(self._build_col_header_line(side))
+            for logical_col in range(1, projection.slot_count + 1):
+                slot = projection.slot(logical_col)
+                if slot is None or logical_col not in spans:
+                    continue
+                if slot.state == "retained" and not slot.confidence.ambiguous:
+                    continue
+                start, end = spans[logical_col]
+                tag = (
+                    "colunresolved"
+                    if slot.state == "unresolved" or slot.confidence.ambiguous
+                    else "colmissing"
+                    if side != "LOGICAL" and projection.is_missing(side, logical_col)
+                    else "colstruct"
+                )
+                widget.tag_add(tag, f"1.{start}", f"1.{end}")
+        except Exception:
+            pass
+
     def _render_col_headers(self):
-        hdr = self._build_col_header_line()
         rn_w = self._sync_row_header_width_widgets()
         corner = "".rjust(rn_w + self._diff_block_marker_width())
         for w in (self.left_corner_hdr, self.base_corner_hdr, self.right_corner_hdr, self.cursor_cmp_corner):
@@ -11966,14 +20298,23 @@ class SheetView:
                 w.configure(state="disabled")
             except Exception:
                 pass
-        for w in (self.left_colhdr, self.base_colhdr, self.right_colhdr, self.cursor_cmp_colhdr):
+        header_widgets = (
+            (self.left_colhdr, "A"),
+            (self.base_colhdr, "BASE"),
+            (self.right_colhdr, "B"),
+            (self.cursor_cmp_colhdr, "LOGICAL"),
+        )
+        for w, side in header_widgets:
             try:
+                hdr = self._build_col_header_line(side)
                 w.configure(state="normal")
                 w.delete("1.0", "end")
                 w.insert("1.0", hdr)
+                self._apply_column_header_structure_tags(w, side)
                 w.configure(state="disabled")
             except Exception:
                 pass
+        self._apply_column_block_selection_tags()
 
     def _render_cursor_row_headers(self, pair, is_three: bool):
         if not hasattr(self, "cursor_cmp_ln"):
@@ -12005,7 +20346,7 @@ class SheetView:
         self._full_render = True
         self.refresh(row_only=None, rescan=False)
 
-    def _append_rows(self, new_rows: list[int]):
+    def _append_rows(self, new_rows: list[int], *, refresh_block_ui: bool = True):
         if not new_rows:
             return
         ws_a = self.app.ws_a_val(self.sheet)
@@ -12025,6 +20366,17 @@ class SheetView:
             ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
         except Exception:
             ws_base_edit_ready = None
+
+        if getattr(self, "_data_ready", False) and not self._column_mapping_is_current():
+            self._ensure_column_projection_current(
+                "增量加载行",
+                ws_a_val=ws_a,
+                ws_b_val=ws_b,
+                ws_a_edit=ws_a_edit,
+                ws_b_edit=ws_b_edit,
+                ws_base_val=(self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None),
+                ws_base_edit=ws_base_edit_ready,
+            )
 
         missing_pair_text = any(
             pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b
@@ -12058,6 +20410,7 @@ class SheetView:
                 ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
             )
 
+        row_header_diffrow_args = []
         for idx, pair_idx in enumerate(new_rows, start=0):
             if pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b:
                 ra, rb = self.row_pairs[pair_idx]
@@ -12075,10 +20428,10 @@ class SheetView:
             if self._is_three_way_enabled():
                 self.base.insert("end", self._build_base_line(pair_idx) + "\n")
             self.right.insert("end", line_b + "\n")
-            self._render_row_header_line(line_no, pair_idx)
 
             if visual_cols:
                 self._display_diff_row_count += 1
+                row_header_diffrow_args.extend([f"{line_no}.0", f"{line_no}.end"])
                 self.left.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.base.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.right.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
@@ -12097,6 +20450,11 @@ class SheetView:
                 if right_args:
                     self.right.tag_add("diffcell", *right_args)
 
+        self._append_row_header_lines(new_rows)
+        if row_header_diffrow_args:
+            for w in (self.left_ln, self.base_ln, self.right_ln):
+                w.tag_add("diffrow", *row_header_diffrow_args)
+
         self.display_rows.extend(new_rows)
         for i, pair_idx in enumerate(new_rows, start=start_line):
             self.row_to_line[pair_idx] = i
@@ -12105,7 +20463,7 @@ class SheetView:
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
         total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {self._display_diff_row_count}")
+        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {self._display_diff_row_count}")
 
         if first is not None:
             try:
@@ -12117,7 +20475,8 @@ class SheetView:
                 pass
 
         self._invalidate_render_cache()
-        self._refresh_diff_block_ui()
+        if refresh_block_ui:
+            self._refresh_diff_block_ui()
 
     def _maybe_load_more_rows(self, last_fraction: float):
         if not _FAST_OPEN_ENABLED:
@@ -12163,6 +20522,8 @@ class SheetView:
         self.max_col = max(1, a_c, b_c, base_c)
         self.col_max_a = max(1, a_c)
         self.col_max_b = max(1, b_c)
+        self.col_max_base = max(1, base_c)
+        self._base_bounds_checked = bool(ws_base is not None and meta.get("has_base"))
         self._bounds_checked = True
         self._is_large_sheet = False
         self._align_rows_enabled = False
@@ -12178,6 +20539,7 @@ class SheetView:
         self.row_b_to_pair_idx = {}
         self.pair_text_a = {}
         self.pair_text_b = {}
+        self.pair_text_base = {}
         self.pair_diff_cols = {}
         self.pair_base_diff_cols = {}
 
@@ -12249,9 +20611,13 @@ class SheetView:
 
         self._refresh_diff_block_ui()
         diff_count = len(self.display_rows)
-        self.info.configure(text=f"缺失Sheet对照 | RowsShown: {len(self.display_rows)} / {len(self.row_pairs)}   Cols: {self.max_col}   DiffRows: {diff_count}")
+        self.info.configure(text=f"缺失Sheet对照 | RowsShown: {len(self.display_rows)} / {len(self.row_pairs)}   {self._info_column_text()}   DiffRows: {diff_count}")
         self._display_diff_row_count = diff_count
-        self.app.set_sheet_has_diff(self.sheet, diff_count > 0, confirmed=True)
+        self.app.set_sheet_has_diff(
+            self.sheet,
+            diff_count > 0 or bool(self._active_column_comparison_cache().structural_diff_cols),
+            confirmed=True,
+        )
         self.app.refresh_sheet_nav()
         self._update_diff_nav_state()
         try:
@@ -12260,8 +20626,26 @@ class SheetView:
             pass
         return
 
-    def refresh(self, row_only: int | None, rescan: bool):
+    def refresh(self, row_only: int | None, rescan: bool, *, column_only: bool = False):
         _dlog(f"REFRESH sheet={self.sheet} row_only={row_only} rescan={rescan} only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()}")
+        column_diff_seed_request = None
+        if bool(column_only and rescan):
+            column_diff_seed_request = getattr(self, "_pending_column_only_diff_seed", None)
+        self._pending_column_only_diff_seed = None
+        used_column_diff_seed = False
+        # One rescan owns one cache bundle.  Mapping, width pre-scan, row diff,
+        # and Base diff may all need the same sequential worksheet rows; keeping
+        # them local avoids stale cross-refresh data while eliminating duplicate
+        # openpyxl iteration and tuple allocation.
+        row_cache_bundle: dict = {}
+        if rescan and bool(getattr(self, "_only_diff_async_building", False)):
+            # A foreground rescan is authoritative and computes the exact row
+            # set itself.  Retire any older disk-backed snapshot so its
+            # in-flight flag cannot keep the freshly built block model in the
+            # "计算中" state or suppress presentation tags.
+            self._only_diff_async_build_seq += 1
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
         if rescan and (not self._full_render):
             self._render_limit = _FAST_RENDER_ROW_LIMIT
         if self._is_missing_sheet_view():
@@ -12289,10 +20673,37 @@ class SheetView:
             ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
         except Exception:
             ws_base_edit_ready = None
+        reuse_row_alignment = bool(column_only and rescan and getattr(self, "row_pairs", None))
+        preserved_row_pairs = list(self.row_pairs) if reuse_row_alignment else []
+        preserved_mine_to_base = dict(getattr(self, "mine_to_base_row", {}) or {})
+        preserved_theirs_to_base = dict(getattr(self, "theirs_to_base_row", {}) or {})
+        preserved_base_overrides = dict(getattr(self, "pair_base_row_override", {}) or {})
+        preserved_align_enabled = bool(getattr(self, "_align_rows_enabled", False))
 
-        if rescan or (not self._bounds_checked):
+        if (
+            not rescan
+            and getattr(self, "_data_ready", False)
+            and not self._column_mapping_is_current()
+        ):
+            self._ensure_column_projection_current(
+                "刷新显示",
+                ws_a_val=ws_a,
+                ws_b_val=ws_b,
+                ws_a_edit=ws_a_edit,
+                ws_b_edit=ws_b_edit,
+                ws_base_val=(self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None),
+                ws_base_edit=ws_base_edit_ready,
+            )
+
+        used_column_bounds_seed = bool(
+            column_diff_seed_request is not None
+            and self._try_apply_column_action_bounds_seed(column_diff_seed_request)
+        )
+        if (rescan or (not self._bounds_checked)) and not used_column_bounds_seed:
             a_r, a_c = _effective_bounds_with_edit(ws_a, ws_a_edit)
             b_r, b_c = _effective_bounds_with_edit(ws_b, ws_b_edit)
+            self._effective_max_row_a = a_r
+            self._effective_max_row_b = b_r
             self.max_row = max(a_r, b_r)
             self.max_col = max(a_c, b_c)
             self.col_max_a = a_c
@@ -12310,16 +20721,31 @@ class SheetView:
                 # Data not yet ready (background computation still running).
                 # Skip this call; _apply_sheet_cache will call refresh() when done.
                 return
+            if not reuse_row_alignment:
+                self._row_model_version = int(getattr(self, "_row_model_version", 0)) + 1
+                self._column_mapping_stale_reason = "row-model-rebuilt"
             self.pair_diff_cols = {}
             self.pair_base_diff_cols = {}
             self.pair_text_a = {}
             self.pair_text_b = {}
+            self.pair_text_base = {}
             self.row_a_to_pair_idx = {}
             self.row_b_to_pair_idx = {}
             self.pair_base_row_override = {}
+            self.column_comparison_cache = None
+            self.column_projection = None
+            self.column_alignment_2way = None
+            self.column_alignment_3way = None
+            self.logical_column_states = ()
+            self.logical_column_structural_conflicts = ()
             self._diff_partial = False
+            self._pair_diff_full_exact = False
 
-            if conflict_cells_by_row is not None:
+            if (
+                conflict_cells_by_row is not None
+                and not reuse_row_alignment
+                and not bool(getattr(self.app, "has_base", False))
+            ):
                 # Conflict-only fast path: avoid full-sheet diff scan.
                 self._align_rows_enabled = False
                 conflict_rows = sorted(conflict_cells_by_row.keys())
@@ -12329,13 +20755,25 @@ class SheetView:
                         self.row_a_to_pair_idx[ra] = idx
                     if rb is not None:
                         self.row_b_to_pair_idx[rb] = idx
-                # Pre-scan column widths before formatting
+                # Build the same shared logical projection before formatting.
                 ws_base_val_opt = None
                 if getattr(self.app, "has_base", False):
                     try:
                         ws_base_val_opt = self.app.ws_base_val(self.sheet)
                     except Exception:
                         pass
+                try:
+                    self._rebuild_column_comparison_cache_from_worksheets(
+                        ws_a,
+                        ws_b,
+                        ws_a_edit,
+                        ws_b_edit,
+                        ws_base_val=ws_base_val_opt,
+                        ws_base_edit=ws_base_edit_ready or ws_base_val_opt,
+                    )
+                except Exception as exc:
+                    _dlog(f"conflict column projection fallback: sheet={self.sheet} err={exc}")
+                    self._install_column_projection(self._identity_column_comparison_cache())
                 self._prescan_col_widths(ws_a, ws_b, ws_base_val_opt)
                 for idx, (ra, rb) in enumerate(self.row_pairs):
                     line_a, line_b, _cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
@@ -12346,8 +20784,18 @@ class SheetView:
                     self.pair_text_a[idx] = line_a
                     self.pair_text_b[idx] = line_b
             else:
-                max_row_a = ws_a.max_row or 1
-                max_row_b = ws_b.max_row or 1
+                # Once edit/formula workbooks are available, use the same
+                # value-aware effective horizons as the background cache.  A
+                # physical horizon remains the conservative fallback while edit
+                # data is still loading, so uncached formulas cannot disappear.
+                max_row_a = (
+                    int(getattr(self, "_effective_max_row_a", ws_a.max_row or 1))
+                    if ws_a_edit is not None else int(ws_a.max_row or 1)
+                )
+                max_row_b = (
+                    int(getattr(self, "_effective_max_row_b", ws_b.max_row or 1))
+                    if ws_b_edit is not None else int(ws_b.max_row or 1)
+                )
 
                 force_align = bool(getattr(self, "_force_sequence_align", False))
                 should_align = (
@@ -12355,25 +20803,94 @@ class SheetView:
                     and _should_auto_row_align(max_row_a, max_row_b, force=force_align)
                 )
 
-                self._align_rows_enabled = should_align
-                if self._align_rows_enabled:
-                    self.row_pairs = self._build_row_pairs(ws_a, ws_b, force=force_align)
+                if reuse_row_alignment:
+                    self._align_rows_enabled = preserved_align_enabled
+                    self.row_pairs = preserved_row_pairs
+                    self.mine_to_base_row = preserved_mine_to_base
+                    self.theirs_to_base_row = preserved_theirs_to_base
+                    self.pair_base_row_override = preserved_base_overrides
                 else:
-                    self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
-                self.mine_to_base_row = {}
-                self.theirs_to_base_row = {}
-                if getattr(self.app, "has_base", False):
+                    self._align_rows_enabled = should_align
+                    if self._align_rows_enabled:
+                        self.row_pairs = self._build_row_pairs(
+                            ws_a,
+                            ws_b,
+                            force=force_align,
+                            max_row_a=max_row_a,
+                            max_row_b=max_row_b,
+                            ws_a_edit=ws_a_edit,
+                            ws_b_edit=ws_b_edit,
+                        )
+                    else:
+                        self.row_pairs = self._build_row_pairs_direct(max_row_a, max_row_b)
+                    self.row_pairs = _collapse_one_sided_blank_tail_padding(
+                        self.row_pairs,
+                        ws_a,
+                        ws_b,
+                        ws_a_edit,
+                        ws_b_edit,
+                        max_row_a,
+                        max_row_b,
+                        self.max_col,
+                    )
+                    self.mine_to_base_row = {}
+                    self.theirs_to_base_row = {}
+                if getattr(self.app, "has_base", False) and not reuse_row_alignment:
                     try:
                         ws_base_map = self.app.ws_base_val(self.sheet)
                     except Exception:
                         ws_base_map = None
                     if ws_base_map is not None:
+                        if ws_base_edit_ready is not None:
+                            base_r, _base_c = _effective_bounds_with_edit(ws_base_map, ws_base_edit_ready)
+                        else:
+                            base_r = int(ws_base_map.max_row or 1)
                         try:
-                            self.mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_generic(ws_a, ws_base_map, self.max_col, force=force_align))
+                            mine_base_pairs = _compute_row_pairs_generic(
+                                ws_a,
+                                ws_base_map,
+                                self.max_col,
+                                force=force_align,
+                                max_row_a=max_row_a,
+                                max_row_b=base_r,
+                                ws_a_edit=ws_a_edit,
+                                ws_b_edit=ws_base_edit_ready,
+                            )
+                            mine_base_pairs = _collapse_one_sided_blank_tail_padding(
+                                mine_base_pairs,
+                                ws_a,
+                                ws_base_map,
+                                ws_a_edit,
+                                ws_base_edit_ready,
+                                max_row_a,
+                                base_r,
+                                self.max_col,
+                            )
+                            self.mine_to_base_row = _row_map_from_pairs(mine_base_pairs)
                         except Exception:
                             self.mine_to_base_row = {}
                         try:
-                            self.theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_generic(ws_b, ws_base_map, self.max_col, force=force_align))
+                            theirs_base_pairs = _compute_row_pairs_generic(
+                                ws_b,
+                                ws_base_map,
+                                self.max_col,
+                                force=force_align,
+                                max_row_a=max_row_b,
+                                max_row_b=base_r,
+                                ws_a_edit=ws_b_edit,
+                                ws_b_edit=ws_base_edit_ready,
+                            )
+                            theirs_base_pairs = _collapse_one_sided_blank_tail_padding(
+                                theirs_base_pairs,
+                                ws_b,
+                                ws_base_map,
+                                ws_b_edit,
+                                ws_base_edit_ready,
+                                max_row_b,
+                                base_r,
+                                self.max_col,
+                            )
+                            self.theirs_to_base_row = _row_map_from_pairs(theirs_base_pairs)
                         except Exception:
                             self.theirs_to_base_row = {}
                         self.row_pairs = _split_tail_independent_append_pairs(
@@ -12418,13 +20935,54 @@ class SheetView:
                     except Exception:
                         pass
                     ws_base_edit_opt = ws_base_edit_ready if ws_base_edit_ready is not None else ws_base_val_opt
-                _prescan_limit = _FAST_RENDER_ROW_LIMIT if self._is_large_sheet else 0
-                self._prescan_col_widths(ws_a, ws_b, ws_base_val_opt, max_pairs=_prescan_limit)
+                used_projection_seed = bool(
+                    column_diff_seed_request is not None
+                    and self._try_install_column_action_projection_seed(
+                        column_diff_seed_request
+                    )
+                )
+                if not used_projection_seed:
+                    try:
+                        self._rebuild_column_comparison_cache_from_worksheets(
+                            ws_a,
+                            ws_b,
+                            ws_a_edit,
+                            ws_b_edit,
+                            ws_base_val=ws_base_val_opt,
+                            ws_base_edit=ws_base_edit_opt,
+                            row_cache_bundle=row_cache_bundle,
+                        )
+                    except Exception as exc:
+                        _dlog(f"column comparison cache fallback: sheet={self.sheet} err={exc}")
+                        self._install_column_projection(self._identity_column_comparison_cache())
+                if column_diff_seed_request is not None:
+                    used_column_diff_seed = self._try_apply_column_action_diff_seed(
+                        column_diff_seed_request,
+                        ws_a_val=ws_a,
+                        ws_b_val=ws_b,
+                        ws_a_edit=ws_a_edit,
+                        ws_b_edit=ws_b_edit,
+                    )
+                widths_restored = bool(
+                    used_column_diff_seed
+                    and getattr(self, "_column_diff_seed_last", {}).get(
+                        "widths_restored", False
+                    )
+                )
+                if not widths_restored:
+                    _prescan_limit = _FAST_RENDER_ROW_LIMIT if self._is_large_sheet else 0
+                    self._prescan_col_widths(
+                        ws_a,
+                        ws_b,
+                        ws_base_val_opt,
+                        max_pairs=_prescan_limit,
+                        row_cache_bundle=row_cache_bundle,
+                    )
 
                 # Large-sheet strategy:
                 # - full mode: lazy row compute (first 200 visible rows only)
                 # - only-diff mode: block scan from tail to head (1000 rows/block)
-                if self._is_large_sheet and bool(self.only_diff_var.get()):
+                if self._is_large_sheet and bool(self.only_diff_var.get()) and not used_column_diff_seed:
                     self._precompute_large_diff_by_blocks(
                         ws_a,
                         ws_b,
@@ -12435,12 +20993,49 @@ class SheetView:
                         ws_base_val=ws_base_val_opt,
                         ws_base_edit=ws_base_edit_opt,
                     )
+                    self._pair_diff_full_exact = True
                 elif not self._is_large_sheet:
+                    # Read each worksheet once for the foreground rescan.  The
+                    # old per-row helper performed four iter_rows calls for
+                    # every pair; even with a cached physical horizon that was
+                    # the dominant latency of column-action refresh/undo.
+                    rows_a_needed = [ra for ra, _rb in self.row_pairs if ra is not None]
+                    rows_b_needed = [rb for _ra, rb in self.row_pairs if rb is not None]
+                    rows_a_val_all = _read_rows_into_shared_cache(
+                        ws_a, rows_a_needed, self.max_col,
+                        cache_bundle=row_cache_bundle, cache_key="a_val",
+                    )
+                    rows_b_val_all = _read_rows_into_shared_cache(
+                        ws_b, rows_b_needed, self.max_col,
+                        cache_bundle=row_cache_bundle, cache_key="b_val",
+                    )
+                    rows_a_edit_all = (
+                        _read_rows_into_shared_cache(
+                            ws_a_edit, rows_a_needed, self.max_col,
+                            cache_bundle=row_cache_bundle, cache_key="a_edit",
+                        )
+                        if ws_a_edit is not None else {}
+                    )
+                    rows_b_edit_all = (
+                        _read_rows_into_shared_cache(
+                            ws_b_edit, rows_b_needed, self.max_col,
+                            cache_bundle=row_cache_bundle, cache_key="b_edit",
+                        )
+                        if ws_b_edit is not None else {}
+                    )
                     for idx, (ra, rb) in enumerate(self.row_pairs):
-                        line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
+                        line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+                            _row_from_cache(rows_a_val_all, ra, self.max_col),
+                            _row_from_cache(rows_b_val_all, rb, self.max_col),
+                            ra=ra,
+                            rb=rb,
+                            row_a_edit_vals=_row_from_cache(rows_a_edit_all, ra, self.max_col),
+                            row_b_edit_vals=_row_from_cache(rows_b_edit_all, rb, self.max_col),
+                        )
                         self.pair_diff_cols[idx] = cols
                         self.pair_text_a[idx] = line_a
                         self.pair_text_b[idx] = line_b
+                    self._pair_diff_full_exact = True
 
             self._data_ready = True
 
@@ -12453,9 +21048,18 @@ class SheetView:
                     ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                     ws_base_val=self.app.ws_base_val(self.sheet),
                     ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
+                    row_cache_bundle=row_cache_bundle,
                 )
                 if added_base_diff:
                     self._invalidate_render_cache()
+
+        if (
+            isinstance(column_diff_seed_request, dict)
+            and str(column_diff_seed_request.get("mode") or "") == "restore"
+        ):
+            self._restore_column_action_comparison_state(
+                column_diff_seed_request.get("comparison_state")
+            )
 
         # Build display rows list (pair indices)
         if conflict_cells_by_row is not None:
@@ -12528,7 +21132,10 @@ class SheetView:
                         rows = [idx for idx in range(len(self.row_pairs)) if self._pair_has_visual_diff(idx)]
                         # If recovery found no diffs, the sheet_diff_state was stale.
                         # Clear it so subsequent refreshes do not re-trigger recovery.
-                        if not rows:
+                        if (
+                            not rows
+                            and not self._active_column_comparison_cache().structural_diff_cols
+                        ):
                             try:
                                 if hasattr(self.app, "sheet_diff_state"):
                                     self.app.sheet_diff_state[self.sheet] = 0
@@ -12563,7 +21170,14 @@ class SheetView:
             ):
                 self._render_limit = _FAST_RENDER_ROW_LIMIT
             if self._is_large_sheet and rescan:
-                self._render_limit = min(_LARGE_SHEET_INITIAL_ROWS, len(self._full_display_rows)) if self._full_display_rows else _LARGE_SHEET_INITIAL_ROWS
+                action_preview = (
+                    _LARGE_DIFF_NAV_PREVIEW_ROWS
+                    if (
+                        used_column_diff_seed
+                        and bool(self.only_diff_var.get())
+                    ) else _LARGE_SHEET_INITIAL_ROWS
+                )
+                self._render_limit = min(action_preview, len(self._full_display_rows)) if self._full_display_rows else action_preview
             self.display_rows = self._full_display_rows[:self._render_limit]
         _dlog(f"  build display_rows: {len(self.display_rows)} / {self.max_row} (only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()})")
 
@@ -12575,6 +21189,7 @@ class SheetView:
                 ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                 ws_base_val=self.app.ws_base_val(self.sheet),
                 ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
+                row_cache_bundle=row_cache_bundle,
             )
             if added_base_diff:
                 self._invalidate_render_cache()
@@ -12583,14 +21198,55 @@ class SheetView:
         if self.display_rows:
             missing = [idx for idx in self.display_rows if idx not in self.pair_text_a or idx not in self.pair_text_b]
             if missing:
+                missing_pairs = [
+                    self.row_pairs[idx]
+                    for idx in missing
+                    if 0 <= idx < len(self.row_pairs)
+                ]
+                missing_rows_a = [ra for ra, _rb in missing_pairs if ra is not None]
+                missing_rows_b = [rb for _ra, rb in missing_pairs if rb is not None]
+                rows_a_val_missing = _read_rows_into_shared_cache(
+                    ws_a, missing_rows_a, self.max_col,
+                    cache_bundle=row_cache_bundle, cache_key="a_val",
+                )
+                rows_b_val_missing = _read_rows_into_shared_cache(
+                    ws_b, missing_rows_b, self.max_col,
+                    cache_bundle=row_cache_bundle, cache_key="b_val",
+                )
+                rows_a_edit_missing = _read_rows_into_shared_cache(
+                    ws_a_edit, missing_rows_a, self.max_col,
+                    cache_bundle=row_cache_bundle, cache_key="a_edit",
+                ) if ws_a_edit is not None else {}
+                rows_b_edit_missing = _read_rows_into_shared_cache(
+                    ws_b_edit, missing_rows_b, self.max_col,
+                    cache_bundle=row_cache_bundle, cache_key="b_edit",
+                ) if ws_b_edit is not None else {}
                 for idx in missing:
                     if idx >= len(self.row_pairs):
                         continue
                     ra, rb = self.row_pairs[idx]
-                    line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
+                    line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+                        _row_from_cache(rows_a_val_missing, ra, self.max_col),
+                        _row_from_cache(rows_b_val_missing, rb, self.max_col),
+                        ra=ra,
+                        rb=rb,
+                        row_a_edit_vals=_row_from_cache(rows_a_edit_missing, ra, self.max_col),
+                        row_b_edit_vals=_row_from_cache(rows_b_edit_missing, rb, self.max_col),
+                    )
                     self.pair_diff_cols[idx] = cols
                     self.pair_text_a[idx] = line_a
                     self.pair_text_b[idx] = line_b
+
+        # Lazy text reconstruction may also compute temporary row diffs. For a
+        # proved 3-way undo, reapply the compact pre-action channels before any
+        # row/cell tags or navigation models consume them.
+        if (
+            isinstance(column_diff_seed_request, dict)
+            and str(column_diff_seed_request.get("mode") or "") == "restore"
+        ):
+            self._restore_column_action_comparison_state(
+                column_diff_seed_request.get("comparison_state")
+            )
 
         self.row_to_line = {r: i + 1 for i, r in enumerate(self.display_rows)}
 
@@ -12716,7 +21372,7 @@ class SheetView:
                 self._display_diff_row_count = sum(1 for idx in self.display_rows if self._pair_has_visual_diff(idx))
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {self._display_diff_row_count}")
+                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {self._display_diff_row_count}")
             except Exception:
                 pass
             try:
@@ -12751,6 +21407,9 @@ class SheetView:
                 self.left.tag_remove("paddingrow", "1.0", "end")
                 self.base.tag_remove("paddingrow", "1.0", "end")
                 self.right.tag_remove("paddingrow", "1.0", "end")
+                self.left.tag_remove("paddingcol", "1.0", "end")
+                self.base.tag_remove("paddingcol", "1.0", "end")
+                self.right.tag_remove("paddingcol", "1.0", "end")
                 # apply cached tags in bulk (one Tcl call per tag per widget)
                 if tag_rows:
                     cached_diffrow_args = []
@@ -12796,34 +21455,30 @@ class SheetView:
                     self.left.tag_add("paddingrow", *_padding_left)
                 if _padding_right:
                     self.right.tag_add("paddingrow", *_padding_right)
-                # paddingcol: grey out column positions that don't exist on one side (新增列).
-                _col_max_a = getattr(self, "col_max_a", self.max_col)
-                _col_max_b = getattr(self, "col_max_b", self.max_col)
-                if _col_max_a < self.max_col or _col_max_b < self.max_col:
-                    _cspans = self._spans_for_line()
-                    _n_lines = len(self.display_rows)
-                    _pcol_left = []
-                    _pcol_right = []
-                    if _col_max_a < self.max_col and _col_max_a in _cspans:
-                        _gs = _cspans[_col_max_a][1]
-                        for _ln in range(1, _n_lines + 1):
-                            _pcol_left.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
-                    if _col_max_b < self.max_col and _col_max_b in _cspans:
-                        _gs = _cspans[_col_max_b][1]
-                        for _ln in range(1, _n_lines + 1):
-                            _pcol_right.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
-                    if _pcol_left:
-                        self.left.tag_add("paddingcol", *_pcol_left)
-                    if _pcol_right:
-                        self.right.tag_add("paddingcol", *_pcol_right)
+                # Placeholder styling follows exact logical slots, including
+                # middle insertions/deletions (not only a physical tail).
+                _n_lines = len(self.display_rows)
+                _pcol_left = self._padding_column_tag_args("A", _n_lines)
+                _pcol_base = self._padding_column_tag_args("BASE", _n_lines)
+                _pcol_right = self._padding_column_tag_args("B", _n_lines)
+                if _pcol_left:
+                    self.left.tag_add("paddingcol", *_pcol_left)
+                if _pcol_base and self._is_three_way_enabled():
+                    self.base.tag_add("paddingcol", *_pcol_base)
+                if _pcol_right:
+                    self.right.tag_add("paddingcol", *_pcol_right)
                 # rownum gutter tags are unused when row headers are separate
                 self._refresh_diff_block_ui()
 
                 mode = "只看差异" if self.only_diff_var.get() else "全量"
                 total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {diff_row_count}")
+                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {diff_row_count}")
                 self._display_diff_row_count = diff_row_count
-                self.app.set_sheet_has_diff(self.sheet, diff_row_count > 0, confirmed=True)
+                self.app.set_sheet_has_diff(
+                    self.sheet,
+                    diff_row_count > 0 or bool(self._active_column_comparison_cache().structural_diff_cols),
+                    confirmed=True,
+                )
                 self.app.refresh_sheet_nav()
                 self._update_diff_nav_state()
                 try:
@@ -12845,6 +21500,9 @@ class SheetView:
         self.left.tag_remove("paddingrow", "1.0", "end")
         self.base.tag_remove("paddingrow", "1.0", "end")
         self.right.tag_remove("paddingrow", "1.0", "end")
+        self.left.tag_remove("paddingcol", "1.0", "end")
+        self.base.tag_remove("paddingcol", "1.0", "end")
+        self.right.tag_remove("paddingcol", "1.0", "end")
 
         # Build full text in memory and insert once (faster)
         lines_a = []
@@ -12884,6 +21542,7 @@ class SheetView:
                 ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
                 ws_base_val=self.app.ws_base_val(self.sheet),
                 ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
+                row_cache_bundle=row_cache_bundle,
             )
             if added_base_diff:
                 self._invalidate_render_cache()
@@ -12962,35 +21621,30 @@ class SheetView:
             self.left.tag_add("paddingrow", *_padding_left)
         if _padding_right:
             self.right.tag_add("paddingrow", *_padding_right)
-        # paddingcol: grey out column positions that don't exist on one side (新增列).
-        _col_max_a = getattr(self, "col_max_a", self.max_col)
-        _col_max_b = getattr(self, "col_max_b", self.max_col)
-        if _col_max_a < self.max_col or _col_max_b < self.max_col:
-            _cspans = self._spans_for_line()
-            _n_lines = len(self.display_rows)
-            _pcol_left = []
-            _pcol_right = []
-            if _col_max_a < self.max_col and _col_max_a in _cspans:
-                _gs = _cspans[_col_max_a][1]
-                for _ln in range(1, _n_lines + 1):
-                    _pcol_left.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
-            if _col_max_b < self.max_col and _col_max_b in _cspans:
-                _gs = _cspans[_col_max_b][1]
-                for _ln in range(1, _n_lines + 1):
-                    _pcol_right.extend([f"{_ln}.{_gs}", f"{_ln}.end"])
-            if _pcol_left:
-                self.left.tag_add("paddingcol", *_pcol_left)
-            if _pcol_right:
-                self.right.tag_add("paddingcol", *_pcol_right)
+        # paddingcol: exact missing-side slots in shared logical geometry.
+        _n_lines = len(self.display_rows)
+        _pcol_left = self._padding_column_tag_args("A", _n_lines)
+        _pcol_base = self._padding_column_tag_args("BASE", _n_lines)
+        _pcol_right = self._padding_column_tag_args("B", _n_lines)
+        if _pcol_left:
+            self.left.tag_add("paddingcol", *_pcol_left)
+        if _pcol_base and self._is_three_way_enabled():
+            self.base.tag_add("paddingcol", *_pcol_base)
+        if _pcol_right:
+            self.right.tag_add("paddingcol", *_pcol_right)
         # row-number styling handled by dedicated row-header widgets
         self._refresh_diff_block_ui()
 
         mode = "只看差异" if self.only_diff_var.get() else "全量"
         total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   Cols: {self.max_col}   DiffRows: {diff_row_count}")
+        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {diff_row_count}")
         self._display_diff_row_count = diff_row_count
 
-        self.app.set_sheet_has_diff(self.sheet, diff_row_count > 0, confirmed=True)
+        self.app.set_sheet_has_diff(
+            self.sheet,
+            diff_row_count > 0 or bool(self._active_column_comparison_cache().structural_diff_cols),
+            confirmed=True,
+        )
         self.app.refresh_sheet_nav()
         self._update_diff_nav_state()
         try:
@@ -13051,6 +21705,11 @@ class SowMergeApp:
         self.manual_b_formula_cache_ops: dict[tuple[str, int, int], object] = {}
         self.manual_a_row_ops: list[dict[str, object]] = []
         self.manual_b_row_ops: list[dict[str, object]] = []
+        self.manual_a_column_ops: list[dict[str, object]] = []
+        self.manual_b_column_ops: list[dict[str, object]] = []
+        self._manual_column_action_seq = 0
+        self._manual_column_op_seq = 0
+        self._manual_structural_op_seq = 0
         self.manual_sheet_ops: list[dict[str, object]] = []
         self.auto_sheet_ops: list[dict[str, object]] = []
         self.sheet_level_conflicts: list[dict[str, object]] = []
@@ -13087,6 +21746,7 @@ class SowMergeApp:
         self._wb_base_edit = None
         self._edit_loaded_event = threading.Event()
         self._initial_sheet_ready_event = threading.Event()
+        self._edit_preload_active_event = threading.Event()
         self._edit_loading_started = False
         self._edit_fallback_lock = threading.Lock()
         self._wb_a_val = None
@@ -13097,37 +21757,21 @@ class SowMergeApp:
         # Always run regardless of _FAST_OPEN_ENABLED: fast-open defers value loading
         # but edit workbooks must still be ready before the user's first row override.
         def _preload_edit():
-            a_edit = None
-            b_edit = None
-            base_edit = None
+            loaded_ok = False
             try:
                 _dlog("preload edit workbooks waiting for initial Sheet")
                 while not self._initial_sheet_ready_event.wait(timeout=0.05):
                     if self._is_closing:
                         return
                 _dlog("preload edit workbooks (background) start")
-                t1 = datetime.now()
-                a_edit = load_workbook(self.file_a, data_only=False)
-                _dlog(f"preload wb_a_edit: {(datetime.now()-t1).total_seconds():.3f}s")
-                t2 = datetime.now()
-                b_edit = load_workbook(self.file_b, data_only=False)
-                _dlog(f"preload wb_b_edit: {(datetime.now()-t2).total_seconds():.3f}s")
-                base_edit = None
-                if self.has_base:
-                    t3 = datetime.now()
-                    base_edit = load_workbook(self.base_path, data_only=False)
-                    _dlog(f"preload wb_base_edit: {(datetime.now()-t3).total_seconds():.3f}s")
-                with self._edit_fallback_lock:
-                    if self._is_closing:
-                        _wbs_close(a_edit, b_edit, base_edit)
-                    else:
-                        self._wb_a_edit = a_edit
-                        self._wb_b_edit = b_edit
-                        self._wb_base_edit = base_edit
+                loaded_ok = self._load_edit_workbooks_owned()
             except Exception as e:
-                _wbs_close(a_edit, b_edit, base_edit)
                 _dlog(f"preload edit failed: {e}")
             finally:
+                if loaded_ok:
+                    queue_ui = getattr(self, "_queue_ui_task", None)
+                    if callable(queue_ui):
+                        queue_ui(self._refresh_loaded_views_after_edit_ready)
                 self._edit_loaded_event.set()
                 _dlog("preload edit workbooks (background) done")
 
@@ -13667,36 +22311,104 @@ class SowMergeApp:
         except Exception:
             pass
 
+    def _edit_workbooks_ready(self) -> bool:
+        return bool(
+            self._wb_a_edit is not None
+            and self._wb_b_edit is not None
+            and (not self.has_base or self._wb_base_edit is not None)
+        )
+
+    def _request_edit_preload(self):
+        """Release the existing preload worker without starting a second parser."""
+        try:
+            self._initial_sheet_ready_event.set()
+        except Exception:
+            pass
+
+    def _refresh_loaded_views_after_edit_ready(self):
+        """Replace value-only provisional row diffs with formula-aware results."""
+        if self._is_closing or not self._edit_workbooks_ready():
+            return
+        for sheet, view in list(getattr(self, "sheet_views", {}).items()):
+            if view is None or not bool(getattr(view, "_data_ready", False)):
+                continue
+            if (
+                sheet in getattr(self, "modified_sheets_a", set())
+                or sheet in getattr(self, "modified_sheets_b", set())
+            ):
+                continue
+            try:
+                # This formula-aware foreground result is authoritative for the
+                # loaded tab. Do not let a late provisional background cache
+                # overwrite it afterward.
+                view._suppress_bg_apply = True
+                view.refresh(row_only=None, rescan=True)
+            except Exception as exc:
+                _dlog(
+                    f"edit-ready formula refresh failed: sheet={sheet} "
+                    f"err={type(exc).__name__}:{exc}"
+                )
+
+    def _load_edit_workbooks_owned(self) -> bool:
+        """Load each editable workbook once under a single ownership lock.
+
+        Both the background preloader and foreground fallback use this method.
+        Holding ownership across XML parsing prevents two complete openpyxl loads
+        from racing, and compare-and-set installation prevents a late pristine
+        preload from replacing a workbook that already contains user changes.
+        """
+        loaded_here = []
+        self._edit_preload_active_event.set()
+        try:
+            with self._edit_fallback_lock:
+                if self._edit_workbooks_ready():
+                    return True
+                if self._wb_a_edit is None:
+                    t0 = datetime.now()
+                    candidate = load_workbook(self.file_a, data_only=False)
+                    if self._wb_a_edit is None and not self._is_closing:
+                        self._wb_a_edit = candidate
+                    else:
+                        loaded_here.append(candidate)
+                    _dlog(f"load wb_a_edit owned: {(datetime.now()-t0).total_seconds():.3f}s")
+                if self._wb_b_edit is None:
+                    t0 = datetime.now()
+                    candidate = load_workbook(self.file_b, data_only=False)
+                    if self._wb_b_edit is None and not self._is_closing:
+                        self._wb_b_edit = candidate
+                    else:
+                        loaded_here.append(candidate)
+                    _dlog(f"load wb_b_edit owned: {(datetime.now()-t0).total_seconds():.3f}s")
+                if self.has_base and self._wb_base_edit is None:
+                    t0 = datetime.now()
+                    candidate = load_workbook(self.base_path, data_only=False)
+                    if self._wb_base_edit is None and not self._is_closing:
+                        self._wb_base_edit = candidate
+                    else:
+                        loaded_here.append(candidate)
+                    _dlog(f"load wb_base_edit owned: {(datetime.now()-t0).total_seconds():.3f}s")
+                return self._edit_workbooks_ready()
+        finally:
+            self._edit_preload_active_event.clear()
+            _wbs_close(*loaded_here)
+
     def _ensure_edit_loaded(self):
-        if self._wb_a_edit is not None and self._wb_b_edit is not None and (not self.has_base or self._wb_base_edit is not None):
+        if self._edit_workbooks_ready():
             return
 
-        # If background preload is running, wait briefly.
         if getattr(self, "_edit_loading_started", False):
-            try:
-                self._initial_sheet_ready_event.set()
-            except Exception:
-                pass
-            _dlog("waiting for background edit preload")
-            self._edit_loaded_event.wait(timeout=10)
-            if self._wb_a_edit is not None and self._wb_b_edit is not None and (not self.has_base or self._wb_base_edit is not None):
+            self._request_edit_preload()
+            _dlog("waiting for single-owner background edit preload")
+            while not self._edit_loaded_event.wait(timeout=0.1):
+                if self._is_closing:
+                    raise RuntimeError("应用正在关闭，已取消可编辑工作簿加载。")
+            if self._edit_workbooks_ready():
                 return
 
-        _dlog("loading edit workbooks (fallback)")
-        with self._edit_fallback_lock:
-            # Re-check under lock: background thread may have just finished.
-            if self._wb_a_edit is not None and self._wb_b_edit is not None and (not self.has_base or self._wb_base_edit is not None):
-                return
-            t0 = datetime.now()
-            self._wb_a_edit = load_workbook(self.file_a, data_only=False)
-            _dlog(f"load wb_a_edit: {(datetime.now()-t0).total_seconds():.3f}s")
-            t0 = datetime.now()
-            self._wb_b_edit = load_workbook(self.file_b, data_only=False)
-            _dlog(f"load wb_b_edit: {(datetime.now()-t0).total_seconds():.3f}s")
-            if self.has_base:
-                t0 = datetime.now()
-                self._wb_base_edit = load_workbook(self.base_path, data_only=False)
-                _dlog(f"load wb_base_edit: {(datetime.now()-t0).total_seconds():.3f}s")
+        _dlog("loading edit workbooks (single-owner fallback)")
+        if not self._load_edit_workbooks_owned():
+            raise RuntimeError("可编辑工作簿加载失败。")
+        self._edit_loaded_event.set()
 
     def ws_a_edit(self, sheet: str):
         self._ensure_edit_loaded()
@@ -13766,6 +22478,137 @@ class SowMergeApp:
         except Exception:
             pass
 
+    def next_manual_column_action_id(self) -> str:
+        self._manual_column_action_seq += 1
+        return f"column-action-{self._manual_column_action_seq:06d}"
+
+    def _next_manual_structural_operation_order(self) -> int:
+        """Allocate one order shared by row and column structural actions."""
+        current = max(
+            int(getattr(self, "_manual_structural_op_seq", 0) or 0),
+            int(getattr(self, "_manual_column_op_seq", 0) or 0),
+        ) + 1
+        self._manual_structural_op_seq = current
+        # Keep the former counter synchronized for old tests/helpers that still
+        # initialize or inspect it directly.
+        self._manual_column_op_seq = current
+        return current
+
+    def remap_manual_cell_operations_for_column_action(
+        self,
+        target_side: str,
+        plan: ColumnBlockActionPlan,
+    ):
+        """Keep explicit cell/cache records in final physical coordinates.
+
+        Existing edits move with an inserted/deleted column in the live
+        workbook.  Their replay keys must move identically; edits made after
+        this action are already recorded in the new coordinates.  A direct
+        copy overwrites any earlier explicit edits inside the adopted block.
+        """
+        target_side = str(target_side or "").upper()
+        if target_side == "A":
+            op_maps = (self.manual_a_cell_ops, self.manual_a_formula_cache_ops)
+        elif target_side == "B":
+            op_maps = (self.manual_b_cell_ops, self.manual_b_formula_cache_ops)
+        else:
+            raise ValueError("column action target_side must be A or B")
+        anchor = int(plan.target_physical_anchor)
+        count = int(plan.count)
+        deleted_end = anchor + count - 1
+        for op_map_index, op_map in enumerate(op_maps):
+            remapped = {}
+            for (sheet, row_idx, col_idx), value in op_map.items():
+                col_idx = int(col_idx)
+                key = (sheet, int(row_idx), col_idx)
+                remapped_value = value
+                if (
+                    op_map_index == 0
+                    and plan.action_kind in ("insert_copy", "delete")
+                ):
+                    remapped_value = _transform_formula_for_column_structure(
+                        value,
+                        formula_sheet=str(sheet),
+                        target_sheet=str(plan.sheet),
+                        anchor=anchor,
+                        count=count,
+                        insert=plan.action_kind == "insert_copy",
+                    )
+                if sheet != plan.sheet:
+                    remapped[key] = remapped_value
+                    continue
+                if plan.action_kind == "insert_copy":
+                    new_col = col_idx + count if col_idx >= anchor else col_idx
+                elif plan.action_kind == "delete":
+                    if anchor <= col_idx <= deleted_end:
+                        continue
+                    new_col = col_idx - count if col_idx > deleted_end else col_idx
+                elif plan.action_kind == "copy":
+                    if anchor <= col_idx <= deleted_end:
+                        continue
+                    new_col = col_idx
+                else:
+                    new_col = col_idx
+                remapped[(sheet, int(row_idx), int(new_col))] = remapped_value
+            op_map.clear()
+            op_map.update(remapped)
+
+    def record_manual_column_operations(self, target_side: str, operations) -> list[dict[str, object]]:
+        """Append a validated action batch to the ordered target-side log."""
+        target_side = str(target_side or "").upper()
+        if target_side == "A":
+            destination = self.manual_a_column_ops
+        elif target_side == "B":
+            destination = self.manual_b_column_ops
+        else:
+            raise ValueError("column operation target_side must be A or B")
+        normalized = []
+        action_id = None
+        next_order = max(
+            int(getattr(self, "_manual_structural_op_seq", 0) or 0),
+            int(getattr(self, "_manual_column_op_seq", 0) or 0),
+        )
+        for operation in operations or ():
+            op = dict(operation or {})
+            if op.get("kind") not in ("insert_cols", "delete_cols", "copy_cols"):
+                raise ValueError("unsupported manual column operation")
+            if str(op.get("target_side") or "").upper() != target_side:
+                raise ValueError("manual column operation target mismatch")
+            op_action_id = str(op.get("action_id") or "")
+            if not op_action_id or str(op.get("batch_id") or "") != op_action_id:
+                raise ValueError("manual column operation requires one action/batch id")
+            if action_id is None:
+                action_id = op_action_id
+            elif op_action_id != action_id:
+                raise ValueError("manual column operation batch must share one action id")
+            count = int(op.get("count", 0) or 0)
+            anchor = int(op.get("target_physical_anchor", 0) or 0)
+            logical_slot = int(op.get("target_logical_slot", 0) or 0)
+            if count <= 0 or anchor <= 0 or logical_slot <= 0:
+                raise ValueError("manual column operation range is invalid")
+            source_side = str(op.get("source_side") or "").upper()
+            if source_side not in ("A", "BASE", "B"):
+                raise ValueError("manual column operation source is invalid")
+            source_cols = [int(value) for value in (op.get("source_physical_cols") or [])]
+            if op["kind"] == "copy_cols" and len(source_cols) != count:
+                raise ValueError("copy_cols source range must match count")
+            next_order += 1
+            op.update({
+                "target_side": target_side,
+                "count": count,
+                "target_physical_anchor": anchor,
+                "target_logical_slot": logical_slot,
+                "source_side": source_side,
+                "source_physical_cols": source_cols,
+                "metadata_scope": list(op.get("metadata_scope") or _COLUMN_ACTION_METADATA_SCOPE),
+                "order": next_order,
+            })
+            normalized.append(op)
+        self._manual_column_op_seq = next_order
+        self._manual_structural_op_seq = next_order
+        destination.extend(normalized)
+        return normalized
+
     def record_manual_a_row_insert(
         self,
         sheet: str,
@@ -13780,6 +22623,7 @@ class SowMergeApp:
                 "kind": "insert_rows",
                 "row": int(row),
                 "count": max(1, int(count)),
+                "order": self._next_manual_structural_operation_order(),
             }
             if source_side:
                 op["source_side"] = str(source_side).upper()
@@ -13802,6 +22646,7 @@ class SowMergeApp:
             "kind": "insert_rows",
             "row": int(row),
             "count": max(1, int(count)),
+            "order": self._next_manual_structural_operation_order(),
         }
         if source_side:
             op["source_side"] = str(source_side).upper()
@@ -13937,17 +22782,41 @@ class SowMergeApp:
             if str(op.get("target_side") or "A").upper() != target_side
         ]
 
+    def _ensure_live_column_mappings_current(self, operation: str):
+        """Synchronously validate/rebuild every materialized view before output."""
+        for view in tuple(getattr(self, "sheet_views", {}).values()):
+            if view is None or not getattr(view, "_data_ready", False):
+                continue
+            view._ensure_column_projection_current(operation)
+
+    def _ensure_column_replay_available(self, target_side: str):
+        """Validate that pending column operations can use native replay."""
+        target_side = str(target_side or "").upper()
+        operations = self.manual_a_column_ops if target_side == "A" else self.manual_b_column_ops
+        if operations and not _EXCEL_NATIVE_SAVE_ON_MERGE:
+            raise RuntimeError(
+                f"{target_side} 侧还有 {len(operations)} 条列结构操作待保存。"
+                "Excel 原生列回放已禁用；操作与撤销状态已保留，"
+                "为避免 openpyxl 结构回退损坏文件，本次保存已停止。"
+            )
+        if operations:
+            _validated_column_replay_operations(operations)
+
     def build_manual_merge_output_file(self):
         """Build merge output by XML-level patching from pristine mine snapshot."""
+        self._ensure_live_column_mappings_current("构建合并输出")
+        self._ensure_column_replay_available("A")
         src = self._merge_mine_snapshot if (self._merge_mine_snapshot and os.path.exists(self._merge_mine_snapshot)) else self.file_a
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_merged_output_{os.getpid()}_{ts}{_workbook_ext(src)}")
         sheet_ops = self._sheet_ops_for_target("A", include_auto=True)
+        column_ops = list(getattr(self, "manual_a_column_ops", []) or [])
         manual_ops = _prepare_manual_ops_for_save(
             src,
             self.manual_a_cell_ops,
             row_ops=self.manual_a_row_ops,
             sheet_ops=sheet_ops,
+            column_ops=column_ops,
         )
         formula_cache_values = dict(getattr(self, "manual_a_formula_cache_ops", {}) or {})
         literal_text_values = {
@@ -13973,16 +22842,26 @@ class SowMergeApp:
                     zip_ops[key] = formula
             except Exception:
                 pass
-        source_paths = {"B": self.file_b}
-        if getattr(self, "base_path", None):
+        required_sources = {
+            str(op.get("source_side") or "").upper()
+            for op in (
+                list(self.manual_a_row_ops)
+                + list(sheet_ops)
+                + list(column_ops)
+            )
+        }
+        source_paths = {}
+        if required_sources & {"B", "THEIRS"}:
+            source_paths["B"] = self.file_b
+        if "BASE" in required_sources and getattr(self, "base_path", None):
             source_paths["BASE"] = self.base_path
-        if not zip_ops and not self.manual_a_row_ops and not sheet_ops:
+        if not zip_ops and not self.manual_a_row_ops and not sheet_ops and not column_ops:
             shutil.copy2(src, out)
             return out
 
         # Cell-only replay is safer at OOXML level: untouched formula caches and
         # shared-formula metadata stay intact, and text values keep their type.
-        if not self.manual_a_row_ops and not sheet_ops:
+        if not self.manual_a_row_ops and not sheet_ops and not column_ops:
             try:
                 _build_manual_merge_xlsx_via_zip(
                     src,
@@ -14003,6 +22882,7 @@ class SowMergeApp:
                 self.manual_a_row_ops,
                 sheet_ops=sheet_ops,
                 source_paths=source_paths,
+                column_ops=column_ops,
             )
             if ok:
                 if formula_cache_values or literal_text_values:
@@ -14020,7 +22900,21 @@ class SowMergeApp:
                         cache_only_keys=set(formula_cache_values),
                     )
                     os.replace(cache_out, out)
+                    if column_ops and not _excel_reopen_validate(out):
+                        try:
+                            os.remove(out)
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "列结构输出的公式缓存补丁未通过 Excel 重开校验；"
+                            "目标文件未被替换。"
+                        )
                 return out
+            if column_ops:
+                raise RuntimeError(
+                    "Excel 原生列结构回放失败。为保护公式、宏和高级元数据，"
+                    "已停止保存且未替换目标文件；请关闭占用文件的 Excel 后重试。"
+                )
             _dlog("WARNING: excel native save failed, trying openpyxl replay fallback")
         if self.manual_a_row_ops or sheet_ops:
             unsafe_sources = [
@@ -14056,6 +22950,8 @@ class SowMergeApp:
 
     def build_manual_b_output_file(self):
         """Build a 2-way B-side result by replaying structural operations safely."""
+        self._ensure_live_column_mappings_current("构建B输出")
+        self._ensure_column_replay_available("B")
         src = self.file_b
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(
@@ -14063,12 +22959,14 @@ class SowMergeApp:
             f"{APP_NAME}_b_output_{os.getpid()}_{ts}{_workbook_ext(src)}",
         )
         row_ops = list(getattr(self, "manual_b_row_ops", []) or [])
+        column_ops = list(getattr(self, "manual_b_column_ops", []) or [])
         sheet_ops = self._sheet_ops_for_target("B")
         manual_ops = _prepare_manual_ops_for_save(
             src,
             self.manual_b_cell_ops,
             row_ops=row_ops,
             sheet_ops=sheet_ops,
+            column_ops=column_ops,
         )
         formula_cache_values = dict(getattr(self, "manual_b_formula_cache_ops", {}) or {})
         literal_text_values = {
@@ -14094,10 +22992,10 @@ class SowMergeApp:
                     zip_ops[key] = formula
             except Exception:
                 pass
-        if not zip_ops and not row_ops and not sheet_ops:
+        if not zip_ops and not row_ops and not sheet_ops and not column_ops:
             shutil.copy2(src, out)
             return out
-        if not row_ops and not sheet_ops:
+        if not row_ops and not sheet_ops and not column_ops:
             _build_manual_merge_xlsx_via_zip(
                 src,
                 out,
@@ -14107,7 +23005,11 @@ class SowMergeApp:
             )
             return out
 
-        source_paths = {"A": self.file_a}
+        required_sources = {
+            str(op.get("source_side") or "").upper()
+            for op in (list(row_ops) + list(sheet_ops) + list(column_ops))
+        }
+        source_paths = {"A": self.file_a} if "A" in required_sources else {}
         if _EXCEL_NATIVE_SAVE_ON_MERGE and _build_manual_merge_output_with_excel(
             src,
             out,
@@ -14115,6 +23017,7 @@ class SowMergeApp:
             row_ops,
             sheet_ops=sheet_ops,
             source_paths=source_paths,
+            column_ops=column_ops,
         ):
             if formula_cache_values or literal_text_values:
                 cache_out = out + ".formula-cache.xlsx"
@@ -14131,7 +23034,22 @@ class SowMergeApp:
                     cache_only_keys=set(formula_cache_values),
                 )
                 os.replace(cache_out, out)
+                if column_ops and not _excel_reopen_validate(out):
+                    try:
+                        os.remove(out)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "列结构输出的公式缓存补丁未通过 Excel 重开校验；"
+                        "目标文件未被替换。"
+                    )
             return out
+
+        if column_ops:
+            raise RuntimeError(
+                "Excel 原生列结构回放失败。为保护公式、宏和高级元数据，"
+                "已停止保存且未替换目标文件；请关闭占用文件的 Excel 后重试。"
+            )
 
         unsafe_sources = [
             path for path in _replay_formula_source_paths(
@@ -14456,7 +23374,11 @@ class SowMergeApp:
             # Openpyxl XML parsing is CPU/GIL heavy. Yield while a user-triggered
             # overwrite/insert or active-Sheet exact diff is running so button
             # feedback and the selected Sheet always win over unopened tabs.
-            while self._interactive_action_event.is_set() or self._priority_diff_event.is_set():
+            while (
+                self._interactive_action_event.is_set()
+                or self._priority_diff_event.is_set()
+                or self._edit_preload_active_event.is_set()
+            ):
                 if self._is_closing:
                     raise InterruptedError("background compute cancelled during shutdown")
                 time.sleep(0.01)
@@ -14546,8 +23468,18 @@ class SowMergeApp:
             max_col: int,
             signature_cache=None,
             rows_cache=None,
+            ws_a_edit=None,
+            ws_b_edit=None,
         ):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
+            max_row_a, max_row_b = _shared_physical_row_horizon(
+                ws_a,
+                ws_b,
+                max_row_a,
+                max_row_b,
+                ws_a_edit,
+                ws_b_edit,
+            )
             if not _should_auto_row_align(max_row_a, max_row_b, force=False):
                 max_row = max(max_row_a, max_row_b)
                 pairs = []
@@ -14557,39 +23489,76 @@ class SowMergeApp:
                     pairs.append((ra, rb))
                 return pairs
 
-            def _bulk_sig_list(ws, max_row_local: int):
-                cache_key = (id(ws), int(max_row_local), int(max_col))
-                if signature_cache is not None and cache_key in signature_cache:
-                    return signature_cache[cache_key]
-                cached_rows = rows_cache.get(id(ws)) if rows_cache is not None else None
-                if cached_rows is not None and len(cached_rows) >= max_row_local:
-                    sigs = []
-                    for row_idx, row in enumerate(cached_rows[:max_row_local], start=1):
+            source_width_a = max(
+                int(ws_a.max_column or 1),
+                int(ws_a_edit.max_column or 1) if ws_a_edit is not None else 1,
+            )
+            source_width_b = max(
+                int(ws_b.max_column or 1),
+                int(ws_b_edit.max_column or 1) if ws_b_edit is not None else 1,
+            )
+            width_a = max(1, min(int(max_col or 1), source_width_a))
+            width_b = max(1, min(int(max_col or 1), source_width_b))
+            pair_cache_key = (
+                "typed-row-pair",
+                id(ws_a),
+                id(ws_a_edit),
+                int(max_row_a),
+                width_a,
+                id(ws_b),
+                id(ws_b_edit),
+                int(max_row_b),
+                width_b,
+            )
+            if signature_cache is not None and pair_cache_key in signature_cache:
+                sig_a, sig_b = signature_cache[pair_cache_key]
+                return _compute_row_pairs_from_signatures(sig_a, sig_b)
+
+            def _bulk_rows(ws, max_row_local: int, width: int):
+                cached = rows_cache.get(id(ws)) if isinstance(rows_cache, dict) else None
+                if isinstance(cached, (list, tuple)) and len(cached) >= max_row_local:
+                    return [
+                        _pad_row_values(row, width)
+                        for row in cached[:max_row_local]
+                    ]
+                rows = []
+                try:
+                    for row_idx, row in enumerate(ws.iter_rows(
+                        min_row=1,
+                        max_row=max_row_local,
+                        min_col=1,
+                        max_col=width,
+                        values_only=True,
+                    ), start=1):
                         if (row_idx & 127) == 0:
                             _check_bg_cancel()
-                        sigs.append(_row_signature(_pad_row_values(row, max_col)))
-                else:
-                    sigs = []
-                    try:
-                        for row_idx, row in enumerate(ws.iter_rows(
-                            min_row=1,
-                            max_row=max_row_local,
-                            min_col=1,
-                            max_col=max_col,
-                            values_only=True,
-                        ), start=1):
-                            if (row_idx & 127) == 0:
-                                _check_bg_cancel()
-                            sigs.append(_row_signature(row or ()))
-                    except InterruptedError:
-                        raise
-                    except Exception:
-                        return []
-                if signature_cache is not None:
-                    signature_cache[cache_key] = sigs
-                return sigs
-            sig_a = _bulk_sig_list(ws_a, max_row_a)
-            sig_b = _bulk_sig_list(ws_b, max_row_b)
+                        rows.append(_pad_row_values(row, width))
+                except InterruptedError:
+                    raise
+                except Exception:
+                    return []
+                return rows
+
+            rows_a = _bulk_rows(ws_a, max_row_a, width_a)
+            rows_b = _bulk_rows(ws_b, max_row_b, width_b)
+            edit_rows_a = (
+                _bulk_rows(ws_a_edit, max_row_a, width_a)
+                if ws_a_edit is not None else None
+            )
+            edit_rows_b = (
+                _bulk_rows(ws_b_edit, max_row_b, width_b)
+                if ws_b_edit is not None else None
+            )
+            sig_a, sig_b = _row_signatures_from_unique_column_anchors(
+                rows_a,
+                rows_b,
+                width_a,
+                width_b,
+                edit_rows_a,
+                edit_rows_b,
+            )
+            if signature_cache is not None:
+                signature_cache[pair_cache_key] = (sig_a, sig_b)
             return _compute_row_pairs_from_signatures(sig_a, sig_b)
 
         def _complete_trimmed_rows(ws, rows_cache):
@@ -14810,8 +23779,8 @@ class SowMergeApp:
             _check_bg_cancel()
             ws_a_edit = wb_a_edit[sheet]
             ws_b_edit = wb_b_edit[sheet]
-            edit_r_a, edit_c_a = _compute_trim_bounds(ws_a_edit)
-            edit_r_b, edit_c_b = _compute_trim_bounds(ws_b_edit)
+            edit_r_a, edit_c_a = _compute_trim_bounds(ws_a_edit, trimmed_rows_cache)
+            edit_r_b, edit_c_b = _compute_trim_bounds(ws_b_edit, trimmed_rows_cache)
             max_r_a, max_c_a = max(max_r_a, edit_r_a), max(max_c_a, edit_c_a)
             max_r_b, max_c_b = max(max_r_b, edit_r_b), max(max_c_b, edit_c_b)
             ws_base = None
@@ -14823,9 +23792,14 @@ class SowMergeApp:
                 max_r_base, max_c_base = _compute_trim_bounds(ws_base, trimmed_rows_cache)
                 if wb_base_edit is not None and sheet in wb_base_edit.sheetnames:
                     ws_base_edit = wb_base_edit[sheet]
-                    edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit)
+                    edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit, trimmed_rows_cache)
                     max_r_base = max(max_r_base, edit_r_base)
                     max_c_base = max(max_c_base, edit_c_base)
+            common_sheet_added_vs_base = bool(
+                getattr(self, "has_base", False)
+                and wb_base_val is not None
+                and ws_base is None
+            )
             _check_bg_cancel()
             max_row = max(max_r_a, max_r_b, max_r_base)
             max_col = max(max_c_a, max_c_b, max_c_base)
@@ -14833,7 +23807,26 @@ class SowMergeApp:
 
             # Compute row-aligned pairs (same algorithm as SheetView._build_row_pairs)
             row_pairs = _compute_row_pairs_bg(
-                ws_a, ws_b, max_r_a, max_r_b, max_col, signature_cache, trimmed_rows_cache
+                ws_a,
+                ws_b,
+                max_r_a,
+                max_r_b,
+                max_col,
+                signature_cache,
+                trimmed_rows_cache,
+                ws_a_edit,
+                ws_b_edit,
+            )
+            row_pairs = _collapse_one_sided_blank_tail_padding(
+                row_pairs,
+                ws_a,
+                ws_b,
+                ws_a_edit,
+                ws_b_edit,
+                max_r_a,
+                max_r_b,
+                max_col,
+                cancel_check=_check_bg_cancel,
             )
             _check_bg_cancel()
 
@@ -14842,6 +23835,7 @@ class SowMergeApp:
             # Keep raw per-cell display parts in cache; render with current grid mode on UI thread.
             pair_parts_a: dict[int, list[str]] = {}
             pair_parts_b: dict[int, list[str]] = {}
+            pair_parts_base: dict[int, list[str]] = {}
             col_char_widths: dict[int, int] = {}
             row_a_to_pair_idx: dict[int, int] = {}
             row_b_to_pair_idx: dict[int, int] = {}
@@ -14851,15 +23845,55 @@ class SowMergeApp:
 
             if ws_base is not None:
                 try:
-                    mine_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(
-                        ws_a, ws_base, max_r_a, max_r_base, max_col, signature_cache, trimmed_rows_cache
-                    ))
+                    mine_base_pairs = _compute_row_pairs_bg(
+                        ws_a,
+                        ws_base,
+                        max_r_a,
+                        max_r_base,
+                        max_col,
+                        signature_cache,
+                        trimmed_rows_cache,
+                        ws_a_edit,
+                        ws_base_edit,
+                    )
+                    mine_base_pairs = _collapse_one_sided_blank_tail_padding(
+                        mine_base_pairs,
+                        ws_a,
+                        ws_base,
+                        ws_a_edit,
+                        ws_base_edit,
+                        max_r_a,
+                        max_r_base,
+                        max_col,
+                        cancel_check=_check_bg_cancel,
+                    )
+                    mine_to_base_row = _row_map_from_pairs(mine_base_pairs)
                 except Exception:
                     mine_to_base_row = {}
                 try:
-                    theirs_to_base_row = _row_map_from_pairs(_compute_row_pairs_bg(
-                        ws_b, ws_base, max_r_b, max_r_base, max_col, signature_cache, trimmed_rows_cache
-                    ))
+                    theirs_base_pairs = _compute_row_pairs_bg(
+                        ws_b,
+                        ws_base,
+                        max_r_b,
+                        max_r_base,
+                        max_col,
+                        signature_cache,
+                        trimmed_rows_cache,
+                        ws_b_edit,
+                        ws_base_edit,
+                    )
+                    theirs_base_pairs = _collapse_one_sided_blank_tail_padding(
+                        theirs_base_pairs,
+                        ws_b,
+                        ws_base,
+                        ws_b_edit,
+                        ws_base_edit,
+                        max_r_b,
+                        max_r_base,
+                        max_col,
+                        cancel_check=_check_bg_cancel,
+                    )
+                    theirs_to_base_row = _row_map_from_pairs(theirs_base_pairs)
                 except Exception:
                     theirs_to_base_row = {}
                 row_pairs = _split_tail_independent_append_pairs(
@@ -14891,29 +23925,148 @@ class SowMergeApp:
                 if rb is not None:
                     row_b_to_pair_idx[rb] = idx
 
+            def _rows_from_existing_sequential_cache(ws, row_indices):
+                needed = sorted({int(r) for r in row_indices if r is not None and int(r) > 0})
+                complete = _complete_trimmed_rows(ws, trimmed_rows_cache)
+                if complete is not None:
+                    return {
+                        row_idx: _pad_row_values(complete[row_idx - 1], max_col)
+                        for row_idx in needed
+                        if row_idx <= len(complete)
+                    }
+                return _read_rows_into_cache(
+                    ws,
+                    needed,
+                    max_col,
+                    cancel_check=_check_bg_cancel,
+                )
+
+            rows_needed_a = [ra for ra, _rb in row_pairs if ra is not None]
+            rows_needed_b = [rb for _ra, rb in row_pairs if rb is not None]
+            rows_a_val_all = _rows_from_existing_sequential_cache(ws_a, rows_needed_a)
+            rows_b_val_all = _rows_from_existing_sequential_cache(ws_b, rows_needed_b)
+            # Edit worksheets were already consumed into ``trimmed_rows_cache``
+            # by the effective-bound pass. Reuse that exact sequential cache;
+            # reparsing a consumed ReadOnlyWorksheet can yield empty formula
+            # rows and turn cache asymmetry into thousands of false diffs.
+            rows_a_edit_all = _rows_from_existing_sequential_cache(
+                ws_a_edit, rows_needed_a
+            )
+            rows_b_edit_all = _rows_from_existing_sequential_cache(
+                ws_b_edit, rows_needed_b
+            )
+
+            base_row_by_pair: dict[int, int | None] = {}
+            if ws_base is not None:
+                for idx, (ra, rb) in enumerate(row_pairs):
+                    if idx in pair_base_row_override:
+                        base_row = pair_base_row_override.get(idx)
+                    elif ra is not None and ra in mine_to_base_row:
+                        base_row = mine_to_base_row.get(ra)
+                    elif rb is not None and rb in theirs_to_base_row:
+                        base_row = theirs_to_base_row.get(rb)
+                    else:
+                        base_row = None
+                    base_row_by_pair[idx] = base_row
+                base_rows_needed = [r for r in base_row_by_pair.values() if r is not None]
+                rows_base_val_all = _rows_from_existing_sequential_cache(ws_base, base_rows_needed)
+                rows_base_edit_all = (
+                    _rows_from_existing_sequential_cache(
+                        ws_base_edit, base_rows_needed
+                    ) if ws_base_edit is not None else {}
+                )
+            else:
+                rows_base_val_all = {}
+                rows_base_edit_all = {}
+
+            aligned_a_val = [
+                _row_from_cache(rows_a_val_all, ra, max_col) for ra, _rb in row_pairs
+            ]
+            aligned_b_val = [
+                _row_from_cache(rows_b_val_all, rb, max_col) for _ra, rb in row_pairs
+            ]
+            aligned_a_edit = [
+                _row_from_cache(rows_a_edit_all, ra, max_col) for ra, _rb in row_pairs
+            ]
+            aligned_b_edit = [
+                _row_from_cache(rows_b_edit_all, rb, max_col) for _ra, rb in row_pairs
+            ]
+            column_cache_key = ColumnModelCacheKey(sheet, 1, 1)
+            if ws_base is not None:
+                aligned_base_val = [
+                    _row_from_cache(rows_base_val_all, base_row_by_pair.get(idx), max_col)
+                    for idx in range(len(row_pairs))
+                ]
+                aligned_base_edit = [
+                    _row_from_cache(rows_base_edit_all, base_row_by_pair.get(idx), max_col)
+                    for idx in range(len(row_pairs))
+                ]
+                column_comparison_cache = build_logical_column_comparison_cache_3way(
+                    column_cache_key,
+                    aligned_a_val,
+                    aligned_base_val,
+                    aligned_b_val,
+                    aligned_a_edit,
+                    aligned_base_edit,
+                    aligned_b_edit,
+                    mine_max_col=max_c_a,
+                    base_max_col=max_c_base,
+                    theirs_max_col=max_c_b,
+                )
+            else:
+                column_comparison_cache = build_logical_column_comparison_cache_2way(
+                    column_cache_key,
+                    aligned_a_val,
+                    aligned_b_val,
+                    aligned_a_edit,
+                    aligned_b_edit,
+                    mine_max_col=max_c_a,
+                    theirs_max_col=max_c_b,
+                )
+
             # Large-sheet fast open: avoid full cell-by-cell precompute.
             # Still estimate display widths from head + tail samples to prevent 4-char collapse.
             if max_row >= _LARGE_SHEET_ROW_THRESHOLD:
-                has_diff = _has_diff_by_blocks_bg(
-                    ws_a,
-                    ws_b,
-                    max_r_a,
-                    max_r_b,
-                    max_col,
-                    trimmed_rows_cache,
-                )
-                if (not has_diff) and getattr(self, "has_base", False):
-                    has_diff = _sheet_has_base_diff_bg(
-                        ws_a,
-                        ws_b,
-                        ws_base,
-                        max_r_a,
-                        max_r_b,
-                        max_r_base,
-                        max_col,
-                        signature_cache,
-                        trimmed_rows_cache,
+                has_diff = bool(column_comparison_cache.structural_diff_cols)
+                for idx in range(len(row_pairs) - 1, -1, -1):
+                    if has_diff:
+                        break
+                    if (idx & 127) == 0:
+                        _check_bg_cancel()
+                    ra, rb = row_pairs[idx]
+                    comparison = compare_logical_row_2way(
+                        column_comparison_cache,
+                        _row_from_cache(rows_a_val_all, ra, max_col),
+                        _row_from_cache(rows_b_val_all, rb, max_col),
+                        _row_from_cache(rows_a_edit_all, ra, max_col),
+                        _row_from_cache(rows_b_edit_all, rb, max_col),
+                        mine_row=ra,
+                        theirs_row=rb,
+                        mine_present=ra is not None,
+                        theirs_present=rb is not None,
                     )
+                    if comparison.has_diff:
+                        has_diff = True
+                        break
+                    if ws_base is not None and ra is not None:
+                        base_row = base_row_by_pair.get(idx)
+                        if base_row is None:
+                            has_diff = True
+                            break
+                        base_comparison = compare_logical_row_sides(
+                            column_comparison_cache,
+                            _row_from_cache(rows_a_val_all, ra, max_col),
+                            _row_from_cache(rows_base_val_all, base_row, max_col),
+                            _row_from_cache(rows_a_edit_all, ra, max_col),
+                            _row_from_cache(rows_base_edit_all, base_row, max_col),
+                            left_side="mine",
+                            right_side="base",
+                            left_row=ra,
+                            right_row=base_row,
+                        )
+                        if base_comparison.has_diff:
+                            has_diff = True
+                            break
 
                 sample_head = min(_LARGE_SHEET_INITIAL_ROWS, len(row_pairs))
                 sample_indices = list(range(sample_head))
@@ -14922,18 +24075,8 @@ class SowMergeApp:
                 if tail_start < len(row_pairs):
                     sample_indices.extend(range(tail_start, len(row_pairs)))
 
-                sample_rows_a = _read_rows_into_cache(
-                    ws_a,
-                    [row_pairs[idx][0] for idx in sample_indices],
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
-                sample_rows_b = _read_rows_into_cache(
-                    ws_b,
-                    [row_pairs[idx][1] for idx in sample_indices],
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
+                sample_rows_a = rows_a_val_all
+                sample_rows_b = rows_b_val_all
 
                 for idx in sample_indices:
                     if (idx & 31) == 0:
@@ -14951,85 +24094,39 @@ class SowMergeApp:
                         if w > col_char_widths.get(col_idx, 0):
                             col_char_widths[col_idx] = w
             else:
-                rows_needed_a = [ra for ra, _rb in row_pairs if ra is not None]
-                rows_needed_b = [rb for _ra, rb in row_pairs if rb is not None]
-                rows_a_val = _read_rows_into_cache(
-                    ws_a,
-                    rows_needed_a,
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
-                rows_b_val = _read_rows_into_cache(
-                    ws_b,
-                    rows_needed_b,
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
-                rows_a_edit = _read_rows_into_cache(
-                    ws_a_edit,
-                    rows_needed_a,
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
-                rows_b_edit = _read_rows_into_cache(
-                    ws_b_edit,
-                    rows_needed_b,
-                    max_col,
-                    cancel_check=_check_bg_cancel,
-                )
-                base_row_by_pair: dict[int, int | None] = {}
-                if ws_base is not None:
-                    for idx, (ra, rb) in enumerate(row_pairs):
-                        if idx in pair_base_row_override:
-                            base_row = pair_base_row_override.get(idx)
-                        elif ra is not None and ra in mine_to_base_row:
-                            base_row = mine_to_base_row.get(ra)
-                        elif rb is not None and rb in theirs_to_base_row:
-                            base_row = theirs_to_base_row.get(rb)
-                        else:
-                            base_row = None
-                        base_row_by_pair[idx] = base_row
-                    base_rows_needed = [r for r in base_row_by_pair.values() if r is not None]
-                    rows_base_val = _read_rows_into_cache(
-                        ws_base,
-                        base_rows_needed,
-                        max_col,
-                        cancel_check=_check_bg_cancel,
-                    )
-                    rows_base_edit = _read_rows_into_cache(
-                        ws_base_edit,
-                        base_rows_needed,
-                        max_col,
-                        cancel_check=_check_bg_cancel,
-                    ) if ws_base_edit is not None else {}
-                else:
-                    rows_base_val = {}
-                    rows_base_edit = {}
+                rows_a_val = rows_a_val_all
+                rows_b_val = rows_b_val_all
+                rows_a_edit = rows_a_edit_all
+                rows_b_edit = rows_b_edit_all
+                rows_base_val = rows_base_val_all
+                rows_base_edit = rows_base_edit_all
                 for idx, (ra, rb) in enumerate(row_pairs):
                     if (idx & 127) == 0:
                         _check_bg_cancel()
-                    cols = set()
                     parts_a = []
                     parts_b = []
                     row_a_val = _row_from_cache(rows_a_val, ra, max_col)
                     row_b_val = _row_from_cache(rows_b_val, rb, max_col)
                     row_a_edit = _row_from_cache(rows_a_edit, ra, max_col)
                     row_b_edit = _row_from_cache(rows_b_edit, rb, max_col)
+                    comparison = compare_logical_row_2way(
+                        column_comparison_cache,
+                        row_a_val,
+                        row_b_val,
+                        row_a_edit,
+                        row_b_edit,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        mine_present=ra is not None,
+                        theirs_present=rb is not None,
+                    )
+                    cols = set(comparison.diff_cols)
                     for c in range(1, max_col + 1):
                         offset = c - 1
                         va_val = row_a_val[offset]
                         vb_val = row_b_val[offset]
                         va_edit = row_a_edit[offset]
                         vb_edit = row_b_edit[offset]
-                        if ra is not None and rb is not None and ra != rb:
-                            vb_edit = _translate_normal_formula_for_compare(
-                                vb_val,
-                                vb_edit,
-                                rb,
-                                c,
-                                ra,
-                                c,
-                            )
                         da, db, eq = _cell_display_and_equal_from_values(
                             va_val,
                             vb_val,
@@ -15043,55 +24140,48 @@ class SowMergeApp:
                         w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
                         if w > col_char_widths.get(c, 0):
                             col_char_widths[c] = w
-                        if not eq:
-                            cols.add(c)
-                    if (ra is None) != (rb is None):
-                        cols = {-1}
                     pair_parts_a[idx] = parts_a
                     pair_parts_b[idx] = parts_b
                     pair_diff_cols[idx] = cols
-                    if ws_base is not None and ra is not None:
+                    if ws_base is not None:
                         base_row = base_row_by_pair.get(idx)
                         if base_row is None:
-                            pair_base_diff_cols[idx] = {-1}
+                            pair_parts_base[idx] = []
                         else:
                             row_base_val = _row_from_cache(rows_base_val, base_row, max_col)
+                            parts_base = [_val_to_str(value) for value in row_base_val]
+                            pair_parts_base[idx] = parts_base
+                            for c, base_text in enumerate(parts_base, start=1):
+                                width = min(len(base_text), _COL_MAX_DISPLAY_WIDTH)
+                                if width > col_char_widths.get(c, 0):
+                                    col_char_widths[c] = width
+                        if ra is not None and base_row is None:
+                            pair_base_diff_cols[idx] = {-1}
+                        elif ra is not None:
                             row_base_edit = _row_from_cache(rows_base_edit, base_row, max_col)
-                            base_cols = set()
-                            for c in range(1, max_col + 1):
-                                offset = c - 1
-                                base_edit = row_base_edit[offset]
-                                if ra != base_row:
-                                    base_edit = _translate_normal_formula_for_compare(
-                                        row_base_val[offset],
-                                        base_edit,
-                                        base_row,
-                                        c,
-                                        ra,
-                                        c,
-                                    )
-                                _mine_display, _base_display, equal = _cell_display_and_equal_from_values(
-                                    row_a_val[offset],
-                                    row_base_val[offset],
-                                    row_a_edit[offset],
-                                    base_edit,
-                                )
-                                if not equal:
-                                    base_cols.add(c)
-                            pair_base_diff_cols[idx] = base_cols
-                has_diff = any(bool(v) for v in pair_diff_cols.values())
+                            base_comparison = compare_logical_row_sides(
+                                column_comparison_cache,
+                                row_a_val,
+                                row_base_val,
+                                row_a_edit,
+                                row_base_edit,
+                                left_side="mine",
+                                right_side="base",
+                                left_row=ra,
+                                right_row=base_row,
+                            )
+                            pair_base_diff_cols[idx] = set(base_comparison.diff_cols)
+                has_diff = (
+                    bool(column_comparison_cache.structural_diff_cols)
+                    or any(bool(v) for v in pair_diff_cols.values())
+                )
                 if (not has_diff) and getattr(self, "has_base", False):
-                    has_diff = _sheet_has_base_diff_bg(
-                        ws_a,
-                        ws_b,
-                        ws_base,
-                        max_r_a,
-                        max_r_b,
-                        max_r_base,
-                        max_col,
-                        signature_cache,
-                        trimmed_rows_cache,
-                    )
+                    has_diff = any(bool(v) for v in pair_base_diff_cols.values())
+
+            # A sheet present on both mine and theirs but absent from Base is a
+            # confirmed three-way structural change even when both new copies
+            # have identical content (the A/B comparison alone is then clean).
+            has_diff = bool(has_diff or common_sheet_added_vs_base)
 
             # Keep a readable lower bound and normalize missing columns.
             for c in range(1, max_col + 1):
@@ -15100,20 +24190,26 @@ class SowMergeApp:
             return {
                 "sheet": sheet,
                 "max_row": max_row,
+                "max_row_a": max_r_a,
+                "max_row_b": max_r_b,
+                "max_row_base": max_r_base,
                 "max_col": max_col,
                 "col_max_a": max_c_a,
+                "col_max_base": max_c_base,
                 "col_max_b": max_c_b,
                 "row_pairs": row_pairs,
                 "pair_diff_cols": pair_diff_cols,
                 "pair_base_diff_cols": pair_base_diff_cols,
                 "pair_parts_a": pair_parts_a,
                 "pair_parts_b": pair_parts_b,
+                "pair_parts_base": pair_parts_base,
                 "col_char_widths": col_char_widths,
                 "row_a_to_pair_idx": row_a_to_pair_idx,
                 "row_b_to_pair_idx": row_b_to_pair_idx,
                 "mine_to_base_row": mine_to_base_row,
                 "theirs_to_base_row": theirs_to_base_row,
                 "pair_base_row_override": pair_base_row_override,
+                "column_comparison_cache": column_comparison_cache,
                 "has_diff": has_diff,
             }
 
@@ -15131,6 +24227,16 @@ class SowMergeApp:
                 _dlog(f"skip bg cache apply by user action: sheet={sheet}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
+                self._initial_sheet_ready_event.set()
+                return
+            if getattr(view, "_column_mapping_stale_reason", ""):
+                _dlog(
+                    f"skip bg cache apply by stale column mapping: sheet={sheet} "
+                    f"reason={view._column_mapping_stale_reason}"
+                )
+                view._hide_loading()
+                self.refresh_sheet_nav()
+                self._initial_sheet_ready_event.set()
                 return
             # Skip if the user has made edits in this view; background data (from read-only copies)
             # would be stale relative to the user's in-memory changes.
@@ -15141,6 +24247,7 @@ class SowMergeApp:
                 _dlog(f"skip stale bg cache after user action: sheet={sheet}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
+                self._initial_sheet_ready_event.set()
                 return
             # Guard against late background cache downgrading an already rendered sheet to no-diff.
             # This has been observed as a delayed "DiffRows -> 0 / rows disappear" regression.
@@ -15156,14 +24263,21 @@ class SowMergeApp:
                 _dlog(f"skip stale cache downgrade: sheet={sheet} old_diff={old_diff_count} new_diff={new_diff_count}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
+                self._initial_sheet_ready_event.set()
                 return
             # From this point we will apply this cache to the visible view.
             self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
             view._invalidate_only_diff_snapshot_cache()
             view.max_row = cache["max_row"]
+            view._effective_max_row_a = int(cache.get("max_row_a", view.max_row))
+            view._effective_max_row_b = int(cache.get("max_row_b", view.max_row))
             view.max_col = cache["max_col"]
             view.col_max_a = max(1, int(cache.get("col_max_a", view.max_col)))
             view.col_max_b = max(1, int(cache.get("col_max_b", view.max_col)))
+            view.col_max_base = max(1, int(cache.get("col_max_base", view.max_col)))
+            view._base_bounds_checked = bool(
+                getattr(self, "has_base", False) and "col_max_base" in cache
+            )
             view._is_large_sheet = view.max_row >= _LARGE_SHEET_ROW_THRESHOLD
             view._bounds_checked = True
 
@@ -15174,46 +24288,56 @@ class SowMergeApp:
                 int(idx): set(cols)
                 for idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items()
             }
-            view.col_char_widths = cache.get("col_char_widths", {}) or {c: 4 for c in range(1, view.max_col + 1)}
-            # Invalidate cached base spans: column widths replaced by background result.
-            view._col_widths_version = int(getattr(view, "_col_widths_version", 0)) + 1
+            view.column_comparison_cache = cache.get("column_comparison_cache")
+            if isinstance(view.column_comparison_cache, LogicalColumnComparisonCache):
+                view._install_column_projection(view.column_comparison_cache)
+                view.column_alignment_2way = view.column_comparison_cache.two_way_alignment
+                view.column_alignment_3way = view.column_comparison_cache.three_way_alignment
+            else:
+                view.column_alignment_2way = None
+                view.column_alignment_3way = None
             view.mine_to_base_row = cache.get("mine_to_base_row", {}) or {}
             view.theirs_to_base_row = cache.get("theirs_to_base_row", {}) or {}
             view.pair_base_row_override = cache.get("pair_base_row_override", {}) or {}
 
             pair_parts_a = cache.get("pair_parts_a", {}) or {}
             pair_parts_b = cache.get("pair_parts_b", {}) or {}
-            grid_on = view._is_grid_overlay_enabled()
-            sep = _COL_SEP if grid_on else "   "
-            trail = " │" if grid_on else ""
+            pair_parts_base = cache.get("pair_parts_base", {}) or {}
+            view._projected_widths_from_cached_parts(
+                pair_parts_a,
+                pair_parts_b,
+                pair_parts_base,
+                cache.get("col_char_widths", {}),
+            )
             if pair_parts_a or pair_parts_b:
                 view.pair_text_a = {}
                 view.pair_text_b = {}
                 for idx, parts in pair_parts_a.items():
-                    view.pair_text_a[idx] = sep.join(
-                        _format_cell(parts[i], view.col_char_widths.get(i + 1, 1))
-                        for i in range(len(parts))
-                    ) + (trail if parts else "")
+                    view.pair_text_a[idx] = view._render_line_from_raw_parts(list(parts), "A")
                 for idx, parts in pair_parts_b.items():
-                    view.pair_text_b[idx] = sep.join(
-                        _format_cell(parts[i], view.col_char_widths.get(i + 1, 1))
-                        for i in range(len(parts))
-                    ) + (trail if parts else "")
+                    view.pair_text_b[idx] = view._render_line_from_raw_parts(list(parts), "B")
             else:
                 # Backward-compatible fallback for older cache shape.
                 view.pair_text_a = cache.get("pair_text_a", {})
                 view.pair_text_b = cache.get("pair_text_b", {})
+            view.pair_text_base = {}
+            for idx, parts in pair_parts_base.items():
+                base_parts = list(parts)
+                view.pair_text_base[int(idx)] = (
+                    view._render_line_from_raw_parts(base_parts, "BASE") if base_parts else ""
+                )
 
             view.row_a_to_pair_idx = cache["row_a_to_pair_idx"]
             view.row_b_to_pair_idx = cache["row_b_to_pair_idx"]
             view._align_rows_enabled = True
             view._diff_partial = False
+            view._pair_diff_full_exact = True
             # Mark data as ready so refresh(rescan=False) uses it without rescanning
             view._data_ready = True
             view._invalidate_render_cache()
             if not view._is_three_way_enabled() and not view._is_large_sheet:
                 view._cache_only_diff_rows_snapshot(
-                    idx for idx, cols in view.pair_diff_cols.items() if cols
+                    idx for idx in view.pair_diff_cols if view._pair_has_visual_diff(idx)
                 )
 
             requested_only_diff = (
@@ -15290,6 +24414,10 @@ class SowMergeApp:
                 view.only_diff_var.set(requested_only_diff)
                 view._start_async_large_only_diff_build()
             self.refresh_sheet_nav()
+            # The first useful Sheet is now visible.  Let editable-workbook
+            # preload begin while unopened-tab scans yield via
+            # _edit_preload_active_event.
+            self._initial_sheet_ready_event.set()
 
         def _compute_worker():
             wb_a_ro = None
@@ -16864,6 +25992,12 @@ class SowMergeApp:
 
     def save_b_inplace(self):
         self._ensure_edit_loaded()
+        try:
+            self._ensure_live_column_mappings_current("保存B")
+            self._ensure_column_replay_available("B")
+        except Exception as exc:
+            messagebox.showerror("保存已停止", str(exc))
+            return
         path = self.file_b
         if not self._confirm_overwrite("B", path):
             return
@@ -16874,7 +26008,7 @@ class SowMergeApp:
                 nonlocal warning
                 replay_out = None
                 try:
-                    if self.manual_b_row_ops or self._sheet_ops_for_target("B"):
+                    if self.manual_b_row_ops or self.manual_b_column_ops or self._sheet_ops_for_target("B"):
                         replay_out = self.build_manual_b_output_file()
                         self._atomic_replace_file_with_retry(replay_out, path)
                     else:
@@ -16891,6 +26025,7 @@ class SowMergeApp:
             self.modified_b = False
             self.manual_b_cell_ops.clear()
             self.manual_b_row_ops.clear()
+            self.manual_b_column_ops.clear()
             self.manual_b_formula_cache_ops.clear()
             self._clear_sheet_ops_for_target("B")
             if warning:
@@ -16909,6 +26044,12 @@ class SowMergeApp:
 
     def save_a_inplace(self):
         self._ensure_edit_loaded()
+        try:
+            self._ensure_live_column_mappings_current("保存A")
+            self._ensure_column_replay_available("A")
+        except Exception as exc:
+            messagebox.showerror("保存已停止", str(exc))
+            return
         path = self.file_a
         if not self._confirm_overwrite("A", path):
             return
@@ -16919,7 +26060,7 @@ class SowMergeApp:
                 nonlocal warning
                 replay_out = None
                 try:
-                    if self.manual_a_row_ops or self._sheet_ops_for_target("A"):
+                    if self.manual_a_row_ops or self.manual_a_column_ops or self._sheet_ops_for_target("A"):
                         replay_out = self.build_manual_merge_output_file()
                         self._atomic_replace_file_with_retry(replay_out, path)
                     else:
@@ -16936,6 +26077,7 @@ class SowMergeApp:
             self.modified_a = False
             self.manual_a_cell_ops.clear()
             self.manual_a_row_ops.clear()
+            self.manual_a_column_ops.clear()
             self.manual_a_formula_cache_ops.clear()
             self._clear_sheet_ops_for_target("A")
             if warning:
@@ -16954,6 +26096,12 @@ class SowMergeApp:
 
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:
+            return
+        try:
+            self._ensure_live_column_mappings_current("保存Merged")
+            self._ensure_column_replay_available("A")
+        except Exception as exc:
+            messagebox.showerror("保存已停止", str(exc))
             return
         if not auto:
             if self.merge_mode and self.initial_conflict_cell_count > 0:

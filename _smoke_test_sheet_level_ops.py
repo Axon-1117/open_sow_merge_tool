@@ -114,6 +114,12 @@ def main():
         assert base_only_view._is_missing_sheet_view()
         base_only_view._copy_missing_sheet("BASE2A")
         out = app.build_manual_merge_output_file()
+        assert base_only_view._column_mapping_is_current()
+        base_only_projection = base_only_view._active_column_projection()
+        assert all(
+            base_only_projection.physical_col("B", logical_col) is None
+            for logical_col in range(1, base_only_projection.slot_count + 1)
+        )
         wb = load_workbook(out, data_only=False)
         try:
             assert "BaseOnly" in wb.sheetnames, wb.sheetnames

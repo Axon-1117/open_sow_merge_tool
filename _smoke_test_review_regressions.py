@@ -632,6 +632,16 @@ def _test_excel_row_replay_uses_full_paste():
     captured = {}
     original_run = mod.subprocess.run
     original_validate = mod._validate_xlsx_package
+    fixture_root = make_temp_dir("sow_review_native_row_replay_")
+    source_path = os.path.join(fixture_root, "source.xlsx")
+    theirs_path = os.path.join(fixture_root, "theirs.xlsx")
+    output_path = os.path.join(fixture_root, "output.xlsx")
+    for path in (source_path, theirs_path):
+        workbook = Workbook()
+        workbook.active.title = "S1"
+        workbook.active["A1"] = "fixture"
+        workbook.save(path)
+        workbook.close()
     try:
         def _fake_run(command, **_kwargs):
             captured["command"] = command
@@ -647,8 +657,8 @@ def _test_excel_row_replay_uses_full_paste():
         mod.subprocess.run = _fake_run
         mod._validate_xlsx_package = lambda _path: (True, "")
         ok = mod._build_manual_merge_output_with_excel(
-            "source.xlsx",
-            "output.xlsx",
+            source_path,
+            output_path,
             {
                 ("S1", 2, 2): None,
                 ("S1", 2, 3): "",
@@ -663,7 +673,7 @@ def _test_excel_row_replay_uses_full_paste():
                 "source_side": "B",
                 "source_rows": [2],
             }],
-            source_paths={"B": "theirs.xlsx"},
+            source_paths={"B": theirs_path},
         )
         assert ok
         script = captured["command"][-1]

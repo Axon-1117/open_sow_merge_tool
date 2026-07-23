@@ -123,7 +123,10 @@ def _case_base_only_insert_large():
         for idx in view.display_rows:
             ra, rb = view.row_pairs[idx]
             if (ra is not None and 748 <= ra <= 756) or (rb is not None and 748 <= rb <= 756):
-                targets.append((idx, ra, rb, view._base_row_for_pair(idx, (ra, rb)), view.pair_diff_cols.get(idx), view.pair_base_diff_cols.get(idx), view._visual_diff_cols_for_pair(idx)))
+                # Large-sheet async results intentionally keep the exact A/B
+                # map sparse: a missing key and an explicit empty set both
+                # mean that Mine and Theirs have no row-content difference.
+                targets.append((idx, ra, rb, view._base_row_for_pair(idx, (ra, rb)), view.pair_diff_cols.get(idx, set()), view.pair_base_diff_cols.get(idx), view._visual_diff_cols_for_pair(idx)))
         assert (752, 753, 753, None, set(), {-1}, {-1}) in targets, targets
     finally:
         try:

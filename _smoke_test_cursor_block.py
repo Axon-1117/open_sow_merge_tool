@@ -3,7 +3,7 @@
 Validates:
 - cursor block always shows 2 lines
 - line1 mirrors left pane cursor row text
-- line2 mirrors right pane cursor row text
+- line2 mirrors the right-side row paired with the active inspection row
 
 Run with: D:\\Tools\\sow_merge_tool\\.venv\\Scripts\\python.exe _smoke_test_cursor_block.py
 """
@@ -44,7 +44,8 @@ if view is None:
 
 view.refresh(row_only=None, rescan=True)
 
-# Put left cursor on line 2, right cursor on line 1
+# Put the active left cursor on line 2.  A stale independent right cursor must
+# not make C-area compare unrelated rows; both lines use one resolved pair.
 view.left.mark_set('insert', '2.0')
 view.right.mark_set('insert', '1.0')
 view._update_cursor_lines()
@@ -54,10 +55,10 @@ line2 = view.cursor_cmp.get('2.0', '2.end')
 
 # Cursor compare area no longer prefixes row numbers; validate by cell content.
 assert 'left2' in line1, (line1, line2)
-assert 'x' in line2 and 'Y' in line2, (line1, line2)
+assert 'right2' in line2 and 'right2b' in line2, (line1, line2)
 
 # Ensure correct order: A on top, B on bottom
-assert 'left2' in line1 and 'Y' in line2
+assert 'left2' in line1 and 'right2' in line2
 
 app.root.destroy()
 print('SMOKE_CURSOR_BLOCK_OK')

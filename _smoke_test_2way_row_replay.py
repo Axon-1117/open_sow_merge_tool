@@ -47,9 +47,18 @@ def main():
         assert app.manual_b_row_ops[0]["source_side"] == "A"
         assert app.manual_b_cell_ops[("S1", 3, 2)] == "=A3"
 
-        def _fake_excel(src, out, manual_ops, row_ops, sheet_ops=None, source_paths=None):
+        def _fake_excel(
+            src,
+            out,
+            manual_ops,
+            row_ops,
+            sheet_ops=None,
+            source_paths=None,
+            column_ops=None,
+        ):
             captured["src"] = src
             captured["row_ops"] = list(row_ops or [])
+            captured["column_ops"] = list(column_ops or [])
             captured["source_paths"] = dict(source_paths or {})
             return mod._build_manual_merge_output_with_openpyxl(
                 src,
@@ -63,6 +72,7 @@ def main():
         mod._build_manual_merge_output_with_excel = _fake_excel
         out = app.build_manual_b_output_file()
         assert captured["src"] == theirs
+        assert captured["column_ops"] == []
         assert captured["source_paths"]["A"] == mine
         assert captured["row_ops"][0]["source_side"] == "A"
 
