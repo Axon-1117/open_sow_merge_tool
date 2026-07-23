@@ -69,6 +69,7 @@ def _base_view():
     )
     view._active_column_projection = lambda: _Projection()
     view._base_row_for_pair = lambda pair_idx, _pair: pair_idx + 1
+    view._guard_mutation_ready = lambda _action: True
     return view
 
 
@@ -87,18 +88,18 @@ def test_nearest_first_and_direction_filtering_are_deterministic():
     block, relocated = view._resolve_region_action_target("B2A", None)
     assert (block.start_pair_idx, relocated) == (1, True)
 
-    # Direction-specific source rows prevent landing on a one-sided block that
-    # the clicked button cannot apply.
+    # A missing source row is itself an applicable structural deletion. Each
+    # direction therefore stays on the explicitly selected one-sided block.
     view.pair_diff_cols = {1: {-1}, 7: {-1}}
     view.row_pairs[1] = (2, None)
     view.row_pairs[7] = (None, 8)
     left_target = view._resolve_region_action_target("A2B", 7)
     right_target = view._resolve_region_action_target("B2A", 1)
-    assert left_target is not None and left_target[0].start_pair_idx == 1
-    assert right_target is not None and right_target[0].start_pair_idx == 7
+    assert left_target is not None and left_target[0].start_pair_idx == 7
+    assert right_target is not None and right_target[0].start_pair_idx == 1
 
     base_target = view._resolve_region_action_target("BASE2A", 1)
-    assert base_target is None  # pair 7 has no Mine destination row
+    assert base_target is not None and base_target[0].start_pair_idx == 7
 
 
 def test_locator_reuses_navigation_and_selects_block_start():
@@ -137,6 +138,8 @@ def test_region_button_fallback_locates_then_requires_second_click_headlessly():
         _begin_interactive_action=None,
         _end_interactive_action=None,
         push_undo=lambda _action: None,
+        begin_undo_group=lambda *_args, **_kwargs: None,
+        finish_undo_group=lambda **_kwargs: None,
     )
     view._current_line = lambda: 5
     view.has_explicit_cell_selection = lambda: True
@@ -209,6 +212,7 @@ def test_no_applicable_region_has_visible_non_modal_feedback():
 def test_explicit_wrong_direction_block_does_not_jump_or_write():
     view = _base_view()
     view.pair_diff_cols = {1: {-1}, 7: {-1}}
+    view.pair_base_diff_cols = {7: {1}}
     view.row_pairs[1] = (2, None)  # left-only: A2B applies, B2A cannot
     view.row_pairs[7] = (None, 8)  # right-only: B2A applies
     view._suppress_bg_apply = False
@@ -231,11 +235,11 @@ def test_explicit_wrong_direction_block_does_not_jump_or_write():
         block.start_pair_idx
     ) or True
 
-    view._copy_selected_region("B2A")
+    view._copy_selected_region("BASE2A")
     assert located == []
     assert view.selected_pair_idx == 1
     assert view.info.texts[-1] == (
-        "当前差异区域不能使用右侧内容，请选择另一侧或其他差异区域。"
+        "当前差异区域不能使用Base内容，请选择另一侧或其他差异区域。"
     )
     assert view.root.bells == 0
 

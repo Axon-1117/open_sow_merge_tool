@@ -57,7 +57,7 @@ def main():
                 break
         assert insert_pair is not None, view.row_pairs
         base_line = view._build_base_line(insert_pair).strip()
-        assert base_line == "", repr(base_line)
+        assert "此侧" in base_line, repr(base_line)
 
         # The C-area cell action must use mine->base row mapping. Mine row 4
         # corresponds to base row 3 after the inserted B row.
@@ -67,13 +67,13 @@ def main():
         view._copy_single_cell_by_pair(mapped_pair, "BASE2A", 1)
         assert app.ws_a_val("S1").cell(row=4, column=1).value == "C"
 
-        assert view._copy_selected_row("BASE2A", override_pair_idx=insert_pair), "BASE2A clear failed"
+        assert view._copy_selected_row("BASE2A", override_pair_idx=insert_pair), "BASE2A delete failed"
         out = app.build_manual_merge_output_file()
         wb = load_workbook(out, data_only=False)
         try:
             ws = wb["S1"]
             values = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
-            assert values == ["id", "A", None, "C"], values
+            assert values == ["id", "A", "C"], values
         finally:
             wb.close()
     finally:

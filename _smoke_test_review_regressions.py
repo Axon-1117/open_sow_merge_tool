@@ -252,12 +252,19 @@ def _test_shared_formula_is_not_destroyed():
     assert member_f.text in (None, "")
     assert member_v is not None and member_v.text == "11"
 
-    try:
-        mod._sheet_xml_set_cell(root, 1, 1, "=SUM(B1:D1)", 4)
-    except RuntimeError as exc:
-        assert "special formula" in str(exc)
-    else:
-        raise AssertionError("unsafe shared-formula replacement was not rejected")
+    # A value/formula replacement may safely detach one member by expanding
+    # the shared group into ordinary formulas first.
+    mod._sheet_xml_set_cell(root, 1, 1, "=SUM(B1:D1)", 4)
+    master_f = root.find(f".//{{{ns}}}c[@r='A1']/{{{ns}}}f")
+    member_f = root.find(f".//{{{ns}}}c[@r='A2']/{{{ns}}}f")
+    master_v = root.find(f".//{{{ns}}}c[@r='A1']/{{{ns}}}v")
+    member_v = root.find(f".//{{{ns}}}c[@r='A2']/{{{ns}}}v")
+    assert master_f is not None and master_f.attrib == {}
+    assert master_f.text == "SUM(B1:D1)"
+    assert member_f is not None and member_f.attrib == {}
+    assert member_f.text == "SUM(B2:C2)"
+    assert master_v is not None and master_v.text == "4"
+    assert member_v is not None and member_v.text == "11"
 
     array_root = ET.fromstring(
         f'<worksheet xmlns="{ns}"><sheetData><row r="1">'

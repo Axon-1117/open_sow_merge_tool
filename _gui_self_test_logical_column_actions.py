@@ -1648,6 +1648,236 @@ def test_three_way_mine_base_theirs_plans_and_same_anchor_confirmation():
     assert confirmed.count == 1
 
 
+def test_first_direct_row_apply_revalidates_false_pending_mapping():
+    root_dir = make_temp_dir("sow_first_row_mapping_revalidate_")
+    mine = os.path.join(root_dir, "mine.xlsx")
+    theirs = os.path.join(root_dir, "theirs.xlsx")
+    _write_action_book(mine, ("A", "B", "C"))
+    _write_action_book(theirs, ("A", "B", "C"))
+    workbook = load_workbook(theirs)
+    workbook["Sheet1"]["C2"] = "theirs-diff"
+    workbook.save(theirs)
+    workbook.close()
+
+    app = smt.SowMergeApp(mine, theirs)
+    try:
+        view = _force_full_view(_wait_for_view(app))
+        deadline = time.time() + 12.0
+        while time.time() < deadline and view._derive_lifecycle_state() != "READY":
+            _pump(app.root, 0.03)
+        assert view._derive_lifecycle_state() == "READY"
+        natural = view._active_column_comparison_cache()
+        assert not natural.unresolved_cols
+
+        pending = smt.ColumnMappingConfidence(
+            0.2,
+            True,
+            "low-confidence-physical-fallback",
+            ("provisional-background-cache",),
+            (smt.COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE,),
+        )
+        slots = list(natural.model.slots)
+        first = slots[0]
+        slots[0] = smt.ColumnSlot(
+            logical_idx=first.logical_idx,
+            mine_col=first.mine_col,
+            base_col=first.base_col,
+            theirs_col=first.theirs_col,
+            state="unresolved",
+            confidence=pending,
+            base_boundary=first.base_boundary,
+            origin_side=first.origin_side,
+        )
+        false_model = smt.ColumnModel.from_slots(
+            view._expected_column_model_cache_key(),
+            tuple(slots),
+            blocks=smt._build_column_blocks(tuple(slots)),
+            confidence=pending,
+        )
+        view._install_column_projection(smt.LogicalColumnComparisonCache(
+            model=false_model,
+            two_way_alignment=natural.two_way_alignment,
+            structural_diff_cols=natural.structural_diff_cols,
+            unresolved_cols=frozenset({1}),
+        ))
+        assert view._column_mapping_is_current()
+        assert view._active_column_projection().slot(1).state == "unresolved"
+
+        revalidation_calls = []
+        original_revalidate = view._authoritative_revalidate_column_projection_for_action
+
+        def counted_revalidate(*args, **kwargs):
+            revalidation_calls.append(1)
+            return original_revalidate(*args, **kwargs)
+
+        view._authoritative_revalidate_column_projection_for_action = counted_revalidate
+        errors = []
+        original_showerror = smt.messagebox.showerror
+        smt.messagebox.showerror = lambda *args, **kwargs: errors.append((args, kwargs))
+        try:
+            pair_idx = view.row_a_to_pair_idx[2]
+            assert view._copy_selected_row("B2A", override_pair_idx=pair_idx)
+        finally:
+            smt.messagebox.showerror = original_showerror
+            view._authoritative_revalidate_column_projection_for_action = original_revalidate
+
+        assert errors == []
+        assert revalidation_calls == [1]
+        assert app.ws_a_edit("Sheet1")["C2"].value == "theirs-diff"
+        assert view._active_column_projection().slot(1).state != "unresolved"
+        assert 1 not in view._active_column_comparison_cache().unresolved_cols
+    finally:
+        app._shutdown_root()
+
+
+def test_consecutive_row_apply_ignores_style_only_blank_tail_columns():
+    root_dir = make_temp_dir("sow_row_style_tail_mapping_")
+    mine = os.path.join(root_dir, "mine.xlsx")
+    theirs = os.path.join(root_dir, "theirs.xlsx")
+
+    for path, side in ((mine, "mine"), (theirs, "theirs")):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Sheet1"
+        for col in range(1, 14):
+            worksheet.cell(1, col).value = f"H{col}"
+            worksheet.cell(2, col).value = (
+                f"{side}-row-2-diff" if col == 5 else f"row-2-value-{col}"
+            )
+            worksheet.cell(3, col).value = (
+                f"{side}-row-3-diff" if col == 5 else f"row-3-value-{col}"
+            )
+        # Match Link@design's misleading physical dimension: columns 14-18
+        # contain styles only and are not part of the logical data structure.
+        for col in range(14, 19):
+            worksheet.cell(474, col).fill = PatternFill(
+                "solid", fgColor="FF0000"
+            )
+        workbook.save(path)
+        workbook.close()
+
+    app = smt.SowMergeApp(mine, theirs)
+    try:
+        view = _wait_for_view(app)
+        _wait_for_stable_projection(view)
+        deadline = time.time() + 12.0
+        while time.time() < deadline and view._derive_lifecycle_state() != "READY":
+            _pump(app.root, 0.03)
+        assert view._derive_lifecycle_state() == "READY"
+        assert (view.col_max_a, view.col_max_b, view.max_col) == (13, 13, 13)
+        assert view._logical_slot_count() == 13
+        assert not view._active_column_comparison_cache().unresolved_cols
+
+        errors = []
+        original_showerror = smt.messagebox.showerror
+        smt.messagebox.showerror = lambda *args, **kwargs: errors.append(
+            (args, kwargs)
+        )
+        try:
+            first_pair_idx = view.row_a_to_pair_idx[2]
+            assert view._copy_selected_row(
+                "B2A", override_pair_idx=first_pair_idx
+            )
+            assert (view.col_max_a, view.col_max_b, view.max_col) == (13, 13, 13)
+            assert view._logical_slot_count() == 13
+            assert not view._active_column_comparison_cache().unresolved_cols
+
+            # Exercise the opposite direction on the next still-different row.
+            second_pair_idx = view.row_a_to_pair_idx[3]
+            assert view._copy_selected_row(
+                "A2B", override_pair_idx=second_pair_idx
+            )
+        finally:
+            smt.messagebox.showerror = original_showerror
+
+        assert errors == []
+        assert (
+            app.ws_b_edit("Sheet1").cell(3, 5).value
+            == "mine-row-3-diff"
+        )
+        assert (view.col_max_a, view.col_max_b, view.max_col) == (13, 13, 13)
+        assert view._logical_slot_count() == 13
+        assert not view._active_column_comparison_cache().unresolved_cols
+        # The style-only cells remain physically intact without entering the
+        # logical action range.
+        assert app.ws_a_edit("Sheet1").max_column == 18
+        assert app.ws_b_edit("Sheet1").max_column == 18
+    finally:
+        app._shutdown_root()
+
+
+def test_full_row_apply_skips_unresolved_blank_gap_before_real_formula_column():
+    root_dir = make_temp_dir("sow_row_blank_gap_formula_")
+    mine = os.path.join(root_dir, "mine.xlsx")
+    theirs = os.path.join(root_dir, "theirs.xlsx")
+
+    for path, side in ((mine, "mine"), (theirs, "theirs")):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Sheet1"
+        for col in range(1, 14):
+            worksheet.cell(1, col).value = f"H{col}"
+            worksheet.cell(2, col).value = (
+                f"{side}-row-2-diff" if col == 5 else f"row-2-value-{col}"
+            )
+            worksheet.cell(3, col).value = (
+                f"{side}-row-3-diff" if col == 5 else f"row-3-value-{col}"
+            )
+        # L14-L17 are intentionally empty on both sides. L18 is a real
+        # formula-bearing column, so the semantic width must remain 18.
+        worksheet.cell(1, 18).value = "formula-tail"
+        if side == "mine":
+            worksheet.cell(2, 18).value = "=A2"
+            worksheet.cell(3, 18).value = "=C3"
+        else:
+            worksheet.cell(2, 18).value = "=B2"
+            worksheet.cell(3, 18).value = "=D3"
+        workbook.save(path)
+        workbook.close()
+
+    app = smt.SowMergeApp(mine, theirs)
+    try:
+        view = _wait_for_view(app)
+        _wait_for_stable_projection(view)
+        deadline = time.time() + 12.0
+        while time.time() < deadline and view._derive_lifecycle_state() != "READY":
+            _pump(app.root, 0.03)
+        assert view._derive_lifecycle_state() == "READY"
+        assert (view.col_max_a, view.col_max_b, view.max_col) == (18, 18, 18)
+        assert view._logical_slot_count() == 18
+        assert view._active_column_projection().slot(18).state == "retained"
+        assert view._active_column_comparison_cache().unresolved_cols == frozenset(
+            {14, 15, 16, 17}
+        )
+
+        errors = []
+        original_showerror = smt.messagebox.showerror
+        smt.messagebox.showerror = lambda *args, **kwargs: errors.append(
+            (args, kwargs)
+        )
+        try:
+            assert view._copy_selected_row(
+                "B2A", override_pair_idx=view.row_a_to_pair_idx[2]
+            )
+            assert view._copy_selected_row(
+                "A2B", override_pair_idx=view.row_a_to_pair_idx[3]
+            )
+        finally:
+            smt.messagebox.showerror = original_showerror
+
+        assert errors == []
+        assert app.ws_a_edit("Sheet1").cell(2, 18).value == "=B2"
+        assert app.ws_b_edit("Sheet1").cell(3, 18).value == "=C3"
+        assert (view.col_max_a, view.col_max_b, view.max_col) == (18, 18, 18)
+        # Blank-gap ambiguity remains visible to structural column operations;
+        # only the row-specific no-op writes are skipped.
+        assert view._active_column_comparison_cache().unresolved_cols == frozenset(
+            {14, 15, 16, 17}
+        )
+    finally:
+        app._shutdown_root()
+
+
 def test_ordinary_cell_action_rejects_missing_or_unresolved_slot():
     cache = _cache_2way(
         "Sheet1",
@@ -2449,6 +2679,9 @@ def main():
         test_manual_formula_ops_follow_excel_column_reference_semantics,
         test_formula_capture_prefilter_keeps_target_and_qualified_references_only,
         test_three_way_mine_base_theirs_plans_and_same_anchor_confirmation,
+        test_first_direct_row_apply_revalidates_false_pending_mapping,
+        test_consecutive_row_apply_ignores_style_only_blank_tail_columns,
+        test_full_row_apply_skips_unresolved_blank_gap_before_real_formula_column,
         test_ordinary_cell_action_rejects_missing_or_unresolved_slot,
         test_real_gui_insert_block_and_one_step_undo_full_fidelity,
         test_real_gui_delete_block_preserves_adjacent_columns_and_undo,

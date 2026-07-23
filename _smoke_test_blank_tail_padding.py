@@ -200,6 +200,65 @@ def _test_internal_blank_insert_is_preserved():
     wb_b.close()
 
 
+def _test_deleted_blank_separator_does_not_steal_content_alignment():
+    """A later blank row must not anchor before identical shifted records."""
+    wb_a = Workbook()
+    ws_a = wb_a.active
+    ws_a.title = SHEET
+    wb_b = Workbook()
+    ws_b = wb_b.active
+    ws_b.title = SHEET
+
+    left_rows = (
+        "before-1",
+        "before-2",
+        None,
+        "same-1",
+        "same-2",
+        "same-3",
+        None,
+        "after",
+    )
+    right_rows = (
+        "before-1",
+        "before-2",
+        "same-1",
+        "same-2",
+        "same-3",
+        None,
+        "after",
+    )
+    for row_idx, value in enumerate(left_rows, start=1):
+        ws_a.cell(row_idx, 1).value = value
+        ws_a.cell(row_idx, 2).value = f"=ROW()+{row_idx}"
+    for row_idx, value in enumerate(right_rows, start=1):
+        ws_b.cell(row_idx, 1).value = value
+        ws_b.cell(row_idx, 2).value = f"=ROW()+{row_idx}"
+
+    pairs = mod._compute_row_pairs_generic(
+        ws_a,
+        ws_b,
+        2,
+        force=True,
+        max_row_a=len(left_rows),
+        max_row_b=len(right_rows),
+        ws_a_edit=ws_a,
+        ws_b_edit=ws_b,
+    )
+    assert pairs == [
+        (1, 1),
+        (2, 2),
+        (3, None),
+        (4, 3),
+        (5, 4),
+        (6, 5),
+        (7, 6),
+        (8, 7),
+    ], pairs
+    wb_a.close()
+    wb_b.close()
+
+
 def _test_uncached_empty_formula_is_not_padding(root_dir: str):
     mine_path = os.path.join(root_dir, "formula-mine.xlsx")
     theirs_path = os.path.join(root_dir, "formula-theirs.xlsx")
@@ -226,6 +285,7 @@ def main():
     root_dir = make_temp_dir("sow_blank_tail_padding_")
     _test_guide_shape_two_way_and_three_way(root_dir)
     _test_internal_blank_insert_is_preserved()
+    _test_deleted_blank_separator_does_not_steal_content_alignment()
     _test_uncached_empty_formula_is_not_padding(root_dir)
     print("SMOKE_TEST_BLANK_TAIL_PADDING_OK")
 
