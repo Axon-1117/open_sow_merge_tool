@@ -261,6 +261,84 @@ def _test_two_way_mixed_insert_delete_keeps_later_anchors():
     assert (tail.mine_col, tail.theirs_col, tail.state) == (6, 7, "retained")
 
 
+def _test_unique_header_prefix_anchors_delete_before_replaced_payload():
+    base_rows = (
+        ("id@id", "part", "part_move", "model", "quality"),
+        ("uint32", "map<int,string>", "int32", "string", "int32"),
+        ("ID", "部件", "镜头移动", "旧模型描述", "品质"),
+        (1, "head", 4, "old-model-a", 1),
+        (2, "tail", 2, "old-model-b", 2),
+        (3, "wing", 1, "old-model-c", 3),
+    )
+    theirs_rows = (
+        ("id@id", "part", "model", "quality"),
+        ("uint32", "map<int,string>", "string", "int32"),
+        ("ID", "车辆部件", "新模型描述", "品质"),
+        (1, "weapon", "new-model-x", 1),
+        (2, "wheel", "new-model-y", 2),
+        (3, "trunk", "new-model-z", 3),
+    )
+    base_formula_rows = tuple(
+        row
+        if row_idx < 3
+        else row[:3] + (f'=A{row_idx + 1}&"-old"',) + row[4:]
+        for row_idx, row in enumerate(base_rows)
+    )
+    theirs_formula_rows = tuple(
+        row
+        if row_idx < 3
+        else row[:2] + (f'=A{row_idx + 1}&"-new"',) + row[3:]
+        for row_idx, row in enumerate(theirs_rows)
+    )
+
+    for label, base_edits, theirs_edits in (
+        ("value-payload", None, None),
+        ("uncached-formula-payload", base_formula_rows, theirs_formula_rows),
+    ):
+        base = _snapshot(
+            base_rows,
+            base_edits,
+            column_version=4,
+        )
+        theirs = _snapshot(
+            theirs_rows,
+            theirs_edits,
+            column_version=4,
+        )
+
+        two_way = _align_2way(base, theirs)
+        assert [
+            (slot.mine_col, slot.theirs_col, slot.state)
+            for slot in two_way.model.slots
+        ] == [
+            (1, 1, "retained"),
+            (2, 2, "retained"),
+            (3, None, "deleted"),
+            (4, 3, "retained"),
+            (5, 4, "retained"),
+        ], label
+        assert not two_way.has_unresolved, label
+        model_slot = two_way.model.slots[3]
+        assert model_slot.confidence.reason == "unique-header-prefix-anchor", (
+            label,
+            model_slot.confidence,
+        )
+        assert "schema-header" in model_slot.confidence.evidence, label
+
+        three_way = _align_3way(base, base, theirs)
+        assert [
+            (slot.mine_col, slot.base_col, slot.theirs_col, slot.state)
+            for slot in three_way.model.slots
+        ] == [
+            (1, 1, 1, "retained"),
+            (2, 2, 2, "retained"),
+            (3, 3, None, "theirs-deleted"),
+            (4, 4, 3, "retained"),
+            (5, 5, 4, "retained"),
+        ], label
+        assert not three_way.has_unresolved, label
+
+
 def _test_duplicate_and_blank_ranges_are_bounded():
     cases = (
         (
@@ -710,6 +788,7 @@ def main():
     try:
         _test_two_way_edge_insertions_and_deletions()
         _test_two_way_mixed_insert_delete_keeps_later_anchors()
+        _test_unique_header_prefix_anchors_delete_before_replaced_payload()
         _test_duplicate_and_blank_ranges_are_bounded()
         _test_formula_shift_and_literal_edit_are_conservative()
         _test_three_way_independent_and_edge_insertions()

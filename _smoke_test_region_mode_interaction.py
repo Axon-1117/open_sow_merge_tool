@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from openpyxl import Workbook
+
 import sow_merge_tool as smt
 
 
@@ -68,6 +70,7 @@ def _base_view():
         view.pair_diff_cols.get(pair_idx) or view.pair_base_diff_cols.get(pair_idx)
     )
     view._active_column_projection = lambda: _Projection()
+    view._ensure_column_projection_current = lambda _operation: _Projection()
     view._base_row_for_pair = lambda pair_idx, _pair: pair_idx + 1
     view._guard_mutation_ready = lambda _action: True
     return view
@@ -298,6 +301,94 @@ def test_empty_direction_map_short_circuits_without_block_scan():
     assert view._resolve_region_action_target("BASE2A", None) is None
 
 
+def test_unresolved_two_sided_column_is_a_region_preflight_blocker():
+    view = _base_view()
+    view.pair_diff_cols = {1: {14}}
+
+    class _UnresolvedProjection:
+        def slot(self, logical_col):
+            return SimpleNamespace(
+                logical_idx=int(logical_col) - 1,
+                state="unresolved",
+                confidence=SimpleNamespace(ambiguous=True),
+            )
+
+        def physical_col(self, _side, logical_col):
+            return int(logical_col)
+
+    view._ensure_column_projection_current = lambda _operation: _UnresolvedProjection()
+    assert view._region_column_structure_blockers("B2A", (1,)) == (14,)
+    target = view._resolve_region_action_target("B2A", 1)
+    assert target is not None and target[0].start_pair_idx == 1
+
+
+def test_region_formula_preflight_uses_projected_physical_columns():
+    view = object.__new__(smt.SheetView)
+    view.sheet = "Data"
+    view.row_pairs = [(1, 1)]
+    view.pair_diff_cols = {0: {15}}
+    view.pair_base_diff_cols = {}
+    mine_edit_book = Workbook()
+    mine_value_book = Workbook()
+    theirs_edit_book = Workbook()
+    theirs_value_book = Workbook()
+    for workbook in (
+        mine_edit_book,
+        mine_value_book,
+        theirs_edit_book,
+        theirs_value_book,
+    ):
+        workbook.active.title = "Data"
+    mine_edit_book["Data"].cell(1, 15).value = "=B1"
+    mine_value_book["Data"].cell(1, 15).value = 3
+    theirs_edit_book["Data"].cell(1, 14).value = "=A1"
+    theirs_value_book["Data"].cell(1, 14).value = 5
+    view.app = SimpleNamespace(
+        has_base=False,
+        merge_conflict_mode=False,
+        ws_a_edit=lambda _sheet: mine_edit_book["Data"],
+        ws_a_val=lambda _sheet: mine_value_book["Data"],
+        ws_b_edit=lambda _sheet: theirs_edit_book["Data"],
+        ws_b_val=lambda _sheet: theirs_value_book["Data"],
+        ws_base_edit=lambda _sheet: None,
+        ws_base_val=lambda _sheet: None,
+    )
+    view._action_physical_columns = lambda direction, logical_col: (
+        (14, 15) if (direction, logical_col) == ("B2A", 15) else None
+    )
+    captured = []
+    original_copy = smt._copy_edit_value_for_destination
+    try:
+        def _capture(src_val, src_edit, dst_edit, **coordinates):
+            captured.append((src_val, src_edit, dst_edit, coordinates))
+            return src_edit
+
+        smt._copy_edit_value_for_destination = _capture
+        view._preflight_region_formula_copy("B2A", [0])
+    finally:
+        smt._copy_edit_value_for_destination = original_copy
+        for workbook in (
+            mine_edit_book,
+            mine_value_book,
+            theirs_edit_book,
+            theirs_value_book,
+        ):
+            workbook.close()
+    assert captured == [
+        (
+            5,
+            "=A1",
+            "=B1",
+            {
+                "src_row": 1,
+                "src_col": 14,
+                "dst_row": 1,
+                "dst_col": 15,
+            },
+        )
+    ]
+
+
 def main():
     tests = (
         test_nearest_first_and_direction_filtering_are_deterministic,
@@ -307,6 +398,8 @@ def main():
         test_explicit_wrong_direction_block_does_not_jump_or_write,
         test_processed_snapshot_block_falls_back_to_next_pending_block,
         test_empty_direction_map_short_circuits_without_block_scan,
+        test_unresolved_two_sided_column_is_a_region_preflight_blocker,
+        test_region_formula_preflight_uses_projected_physical_columns,
     )
     for test in tests:
         test()

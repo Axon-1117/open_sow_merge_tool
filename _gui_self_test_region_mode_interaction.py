@@ -440,6 +440,104 @@ def test_mixed_structural_and_cell_region_is_one_atomic_undo():
         app._shutdown_root()
 
 
+def test_region_column_delete_is_guided_before_any_cell_write():
+    base = [
+        ("id@id", "part", "part_move", "model", "quality"),
+        ("uint32", "map<int,string>", "int32", "string", "int32"),
+        ("ID", "部件", "镜头移动", "旧模型描述", "品质"),
+        (1, "head", 4, "old-model-a", 1),
+        (2, "tail", 2, "old-model-b", 2),
+        (3, "wing", 1, "old-model-c", 3),
+    ]
+    mine = list(base)
+    theirs = [
+        ("id@id", "part", "model", "quality"),
+        ("uint32", "map<int,string>", "string", "int32"),
+        ("ID", "车辆部件", "新模型描述", "品质"),
+        (1, "weapon", "new-model-x", 1),
+        (2, "wheel", "new-model-y", 2),
+        (3, "trunk", "new-model-z", 3),
+    ]
+    app, view = _open_three_way_view(mine, base, theirs)
+    original_showwarning = smt.messagebox.showwarning
+    original_showerror = smt.messagebox.showerror
+    warnings = []
+    errors = []
+    try:
+        projection = view._active_column_projection()
+        assert (
+            projection.slot(3).mine_col,
+            projection.slot(3).base_col,
+            projection.slot(3).theirs_col,
+            projection.slot(3).state,
+        ) == (3, 3, None, "theirs-deleted")
+        assert (
+            projection.slot(4).mine_col,
+            projection.slot(4).base_col,
+            projection.slot(4).theirs_col,
+            projection.slot(4).state,
+        ) == (4, 4, 3, "retained")
+
+        structural_pair = next(
+            pair_idx
+            for pair_idx, cols in view.pair_diff_cols.items()
+            if 3 in cols
+        )
+        before_rows = [
+            tuple(
+                app.ws_a_edit("Data").cell(row=row, column=col).value
+                for col in range(1, 6)
+            )
+            for row in range(1, 7)
+        ]
+        undo_before = list(app.undo_stack)
+        manual_cells_before = dict(app.manual_a_cell_ops)
+        manual_rows_before = list(app.manual_a_row_ops)
+        smt.messagebox.showwarning = lambda *args, **kwargs: warnings.append(
+            (args, kwargs)
+        )
+        smt.messagebox.showerror = lambda *args, **kwargs: errors.append(
+            (args, kwargs)
+        )
+
+        view._set_copy_scope_mode("region")
+        view._select_line(view.row_to_line[structural_pair])
+        view._run_copy_action_by_mode("B2A")
+        _pump(app.root)
+        # A toolbar command without a retained explicit cell selection first
+        # locates the applicable visual block by design.  Its second click is
+        # the mutating attempt and must be intercepted by the structure gate.
+        if not warnings:
+            view._run_copy_action_by_mode("B2A")
+            _pump(app.root)
+
+        after_rows = [
+            tuple(
+                app.ws_a_edit("Data").cell(row=row, column=col).value
+                for col in range(1, 6)
+            )
+            for row in range(1, 7)
+        ]
+        assert after_rows == before_rows
+        assert app.undo_stack == undo_before
+        assert app.manual_a_cell_ops == manual_cells_before
+        assert app.manual_a_row_ops == manual_rows_before
+        assert errors == [], errors
+        assert warnings, "structure guidance must be visible"
+        warning_text = str(warnings[-1][0])
+        assert "L3" in warning_text and "part_move" in warning_text, warning_text
+        assert "采用Theirs列" in warning_text, warning_text
+        assert "本次未写入任何内容" in warning_text, warning_text
+        assert view.selected_column_logical_range is not None
+        start_col, end_col = view.selected_column_logical_range
+        assert int(start_col) <= 3 <= int(end_col)
+        assert "本次未写入" in str(view.info.cget("text"))
+    finally:
+        smt.messagebox.showwarning = original_showwarning
+        smt.messagebox.showerror = original_showerror
+        app._shutdown_root()
+
+
 def test_base_row_actions_physically_restore_and_delete_with_undo():
     base = [
         ("ID", "值"),
@@ -716,6 +814,97 @@ def test_region_failure_after_structural_commit_rolls_back_atomically():
         app._shutdown_root()
 
 
+def test_conflict_dialog_has_location_and_goto_button():
+    base = [
+        ("ID", "值"),
+        ("id-1", "base"),
+    ]
+    mine = [
+        ("ID", "值"),
+        ("id-1", "mine"),
+    ]
+    theirs = [
+        ("ID", "值"),
+        ("id-1", "theirs"),
+    ]
+    app, _view = _open_three_way_view(mine, base, theirs)
+    captured_text = []
+    try:
+        app.initial_conflict_cell_count = 3
+
+        def _descendants(widget):
+            result = []
+            for child in widget.winfo_children():
+                result.append(child)
+                result.extend(_descendants(child))
+            return result
+
+        def _invoke_goto():
+            for widget in _descendants(app.root):
+                try:
+                    text = str(widget.cget("text"))
+                except Exception:
+                    continue
+                if text:
+                    captured_text.append(text)
+                if text == "前往首个冲突":
+                    widget.invoke()
+                    return
+            app.root.after(25, _invoke_goto)
+
+        app.root.after(50, _invoke_goto)
+        action = app._show_unresolved_conflict_save_dialog(
+            3,
+            ("Data", 2, 2),
+        )
+        assert action == "goto"
+        all_text = "\n".join(captured_text)
+        assert "前往首个冲突" in all_text
+        assert "Sheet：Data" in all_text
+        assert "位置：B2" in all_text
+        assert "行号：2" in all_text and "列号：2" in all_text
+    finally:
+        app._shutdown_root()
+
+
+def test_focus_logical_conflict_cell_selects_row_column_and_c_area():
+    base = [
+        ("ID", "值", "尾列"),
+        ("id-1", "base", "same"),
+        ("id-2", "same", "same"),
+    ]
+    mine = [
+        ("ID", "值", "尾列"),
+        ("id-1", "mine", "same"),
+        ("id-2", "same", "same"),
+    ]
+    theirs = [
+        ("ID", "值", "尾列"),
+        ("id-1", "theirs", "same"),
+        ("id-2", "same", "same"),
+    ]
+    app, view = _open_three_way_view(mine, base, theirs)
+    try:
+        assert view.focus_logical_cell(2, 2)
+        _pump(app.root)
+        pair_idx = view.row_a_to_pair_idx[2]
+        line = int(view.row_to_line[pair_idx])
+        assert view.selected_pair_idx == pair_idx
+        assert view._main_sel_line == line
+        assert view._main_sel_col == 2
+        assert view._cursor_cmp_sel_col == 2
+        assert view._cursor_cmp_sel_line == 2
+        assert view.left.tag_ranges("selcell")
+        assert view.base.tag_ranges("selcell")
+        assert view.right.tag_ranges("selcell")
+        assert view.cursor_cmp.tag_ranges("cselcell")
+        assert str(view.left.index("insert")).startswith(f"{line}.")
+        info = str(view.info.cget("text"))
+        assert "B2" in info and "第 2 行" in info and "第 2 列" in info
+    finally:
+        app._shutdown_root()
+
+
 def main():
     tests = (
         test_region_target_resolver_uses_nearest_block_and_earlier_tie_break,
@@ -726,11 +915,14 @@ def main():
         test_region_fallback_first_click_only_locates_second_click_applies_and_undo_reapplies,
         test_region_action_with_no_applicable_diff_is_nonmodal_silent_noop,
         test_mixed_structural_and_cell_region_is_one_atomic_undo,
+        test_region_column_delete_is_guided_before_any_cell_write,
         test_base_row_actions_physically_restore_and_delete_with_undo,
         test_initial_missing_marker_and_row_header_clicks_are_safe,
         test_visible_row_header_arrow_applies_blank_source_row,
         test_row_delete_transforms_recorded_formula_and_native_output,
         test_region_failure_after_structural_commit_rolls_back_atomically,
+        test_conflict_dialog_has_location_and_goto_button,
+        test_focus_logical_conflict_cell_selects_row_column_and_c_area,
     )
     for test in tests:
         test()

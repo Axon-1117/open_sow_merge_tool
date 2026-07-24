@@ -40,8 +40,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-23.update60"
-APP_BUILD_TAG = "new137-row-style-tail-mapping-safety"
+APP_VERSION = "2026-07-24.update62"
+APP_BUILD_TAG = "new139-conflict-cell-navigation"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -1924,6 +1924,72 @@ def _column_signature_similarity(left: ColumnSignature, right: ColumnSignature) 
     )
 
 
+def _column_unique_header_prefix_identity(
+    signature: ColumnSignature,
+) -> tuple[str, str] | None:
+    """Return a strong schema identity from physical header rows 1 and 2.
+
+    Configuration workbooks normally place the field name and type in rows 1
+    and 2.  Payload and formula edits can make the complete column signature
+    intentionally dissimilar even though those two schema tokens still prove
+    that a shifted column retained its identity.  Requiring both tokens, and
+    later requiring the pair to be unique on each side, avoids treating a lone
+    first-row data value or a repeated generic type as a structural anchor.
+    """
+    signals = tuple(signature.header_signals or ())
+    if len(signals) < 2 or signals[0] in (None, "") or signals[1] in (None, ""):
+        return None
+    type_signal = str(signals[1])
+    text_prefix = "('VALUE', 'TEXT:"
+    if not (type_signal.startswith(text_prefix) and type_signal.endswith("')")):
+        return None
+    type_name = type_signal[len(text_prefix):-2].strip().lower().replace(" ", "")
+    primitive_types = {
+        "any",
+        "bool",
+        "boolean",
+        "byte",
+        "bytes",
+        "date",
+        "datetime",
+        "decimal",
+        "double",
+        "duration",
+        "fixed32",
+        "fixed64",
+        "float",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "long",
+        "object",
+        "sfixed32",
+        "sfixed64",
+        "short",
+        "sint32",
+        "sint64",
+        "string",
+        "time",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+    }
+    is_container_type = (
+        type_name.endswith("[]")
+        or any(
+            type_name.startswith(prefix) and type_name.endswith(">")
+            for prefix in ("array<", "list<", "map<", "repeated<", "set<")
+        )
+    )
+    if type_name not in primitive_types and not is_container_type:
+        return None
+    return str(signals[0]), str(signals[1])
+
+
 def _column_alignment_input(value):
     if isinstance(value, ColumnSignatureSnapshot):
         return tuple(value.signatures), value
@@ -2225,8 +2291,49 @@ def align_column_signatures_2way(
                 exact_pairs.add((left_idx, right_idx))
                 candidates.append((left_idx, right_idx, 1.0, "exact"))
 
-        exact_left_indices = {left_idx for left_idx, _right_idx in exact_pairs}
-        exact_right_indices = {right_idx for _left_idx, right_idx in exact_pairs}
+        # A branch can replace most payload values or formulas in a column
+        # while retaining its field-name/type schema.  The bounded similarity
+        # score then drops below the automatic threshold and a real deletion
+        # immediately before that column is misread as a physical-order
+        # fallback.  Add unique two-row schema identities as ordered anchors;
+        # duplicate/blank identities remain conservative.
+        left_header_counts: dict[tuple[str, str], int] = {}
+        right_header_counts: dict[tuple[str, str], int] = {}
+        right_by_header: dict[tuple[str, str], int] = {}
+        for signature in left:
+            identity = _column_unique_header_prefix_identity(signature)
+            if identity is not None:
+                left_header_counts[identity] = (
+                    left_header_counts.get(identity, 0) + 1
+                )
+        for right_idx, signature in enumerate(right):
+            identity = _column_unique_header_prefix_identity(signature)
+            if identity is not None:
+                right_header_counts[identity] = (
+                    right_header_counts.get(identity, 0) + 1
+                )
+                right_by_header[identity] = right_idx
+        unique_header_pairs = set()
+        for left_idx, signature in enumerate(left):
+            identity = _column_unique_header_prefix_identity(signature)
+            if (
+                identity is None
+                or signature.ambiguous
+                or left_header_counts.get(identity) != 1
+                or right_header_counts.get(identity) != 1
+            ):
+                continue
+            right_idx = right_by_header[identity]
+            if right[right_idx].ambiguous or (left_idx, right_idx) in exact_pairs:
+                continue
+            unique_header_pairs.add((left_idx, right_idx))
+            candidates.append(
+                (left_idx, right_idx, 0.995, "unique-header-prefix")
+            )
+
+        proven_pairs = exact_pairs | unique_header_pairs
+        proven_left_indices = {left_idx for left_idx, _right_idx in proven_pairs}
+        proven_right_indices = {right_idx for _left_idx, right_idx in proven_pairs}
         left_profiles = tuple(
             _prepare_column_similarity_profile(signature) for signature in left
         )
@@ -2239,12 +2346,12 @@ def align_column_signatures_2way(
         right_second: list[tuple[float, int] | None] = [None] * len(right)
 
         for left_idx, left_signature in enumerate(left):
-            if left_signature.ambiguous or left_idx in exact_left_indices:
+            if left_signature.ambiguous or left_idx in proven_left_indices:
                 continue
             for right_idx, right_signature in enumerate(right):
                 if (
                     right_signature.ambiguous
-                    or right_idx in exact_right_indices
+                    or right_idx in proven_right_indices
                 ):
                     continue
                 if (
@@ -2319,6 +2426,19 @@ def align_column_signatures_2way(
             score
             for candidate_left, candidate_right, score, _kind in candidates
             if candidate_left == left_idx and candidate_right == right_idx
+        )
+        for left_idx, right_idx in anchors
+    }
+    anchor_kinds = {
+        (left_idx, right_idx): next(
+            kind
+            for preferred_kind in ("exact", "unique-header-prefix", "approximate")
+            for candidate_left, candidate_right, _score, kind in candidates
+            if (
+                candidate_left == left_idx
+                and candidate_right == right_idx
+                and kind == preferred_kind
+            )
         )
         for left_idx, right_idx in anchors
     }
@@ -2419,6 +2539,16 @@ def align_column_signatures_2way(
         _append_gap(previous_left, left_idx, previous_right, right_idx)
         score = anchor_scores[(left_idx, right_idx)]
         exact = left[left_idx].intrinsic_key == right[right_idx].intrinsic_key
+        anchor_kind = anchor_kinds[(left_idx, right_idx)]
+        if exact:
+            confidence_reason = "exact-anchor"
+            confidence_evidence = ("intrinsic",)
+        elif anchor_kind == "unique-header-prefix":
+            confidence_reason = "unique-header-prefix-anchor"
+            confidence_evidence = ("schema-header",)
+        else:
+            confidence_reason = "high-confidence-anchor"
+            confidence_evidence = ("multi-signal",)
         _append_slot(
             left_idx,
             right_idx,
@@ -2426,8 +2556,8 @@ def align_column_signatures_2way(
             ColumnMappingConfidence(
                 score,
                 False,
-                "exact-anchor" if exact else "high-confidence-anchor",
-                ("intrinsic" if exact else "multi-signal",),
+                confidence_reason,
+                confidence_evidence,
             ),
         )
         previous_left = left_idx + 1
@@ -16605,6 +16735,146 @@ class SheetView:
                 return True
         return False
 
+    def _region_column_structure_blockers(
+        self,
+        direction: str,
+        pair_indices,
+        *,
+        first_only: bool = False,
+    ) -> tuple[int, ...]:
+        """Return logical columns that require an explicit structure action.
+
+        A region command owns rows and cells, not the whole worksheet column
+        geometry.  Missing source/destination columns and unresolved mappings
+        therefore have to be resolved through the column-structure buttons
+        before a region is allowed to write anything.
+        """
+        side_pair = {
+            "A2B": ("A", "B"),
+            "B2A": ("B", "A"),
+            "BASE2A": ("BASE", "A"),
+        }.get(str(direction or ""))
+        if side_pair is None:
+            return ()
+        diff_map = (
+            self.pair_base_diff_cols
+            if direction == "BASE2A"
+            else self.pair_diff_cols
+        )
+        normalized_pairs = tuple(
+            normalized
+            for normalized in (
+                self._normalize_pair_idx(pair_idx) for pair_idx in pair_indices
+            )
+            if normalized is not None
+        )
+        if not any(
+            int(col) > 0
+            for pair_idx in normalized_pairs
+            for col in diff_map.get(pair_idx, set())
+        ):
+            return ()
+        projection = self._ensure_column_projection_current("检查区域列结构")
+        blockers: list[int] = []
+        seen: set[int] = set()
+        source_side, destination_side = side_pair
+        for normalized_pair_idx in normalized_pairs:
+            for logical_col in sorted(
+                int(col)
+                for col in diff_map.get(normalized_pair_idx, set())
+                if int(col) > 0
+            ):
+                if logical_col in seen:
+                    continue
+                slot = projection.slot(logical_col)
+                if (
+                    slot is None
+                    or slot.state == "unresolved"
+                    or slot.confidence.ambiguous
+                    or projection.physical_col(source_side, logical_col) is None
+                    or projection.physical_col(destination_side, logical_col) is None
+                ):
+                    blockers.append(logical_col)
+                    seen.add(logical_col)
+                    if first_only:
+                        return tuple(blockers)
+        return tuple(blockers)
+
+    def _logical_column_display_name(self, logical_col: int) -> str:
+        """Best-effort schema name for one projected logical column."""
+        try:
+            projection = self._ensure_column_projection_current("显示区域列结构")
+        except Exception:
+            return ""
+        side_order = ("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B")
+        for side in side_order:
+            physical_col = projection.physical_col(side, int(logical_col))
+            if physical_col is None:
+                continue
+            try:
+                ws = self.app.ws_for_side(side, self.sheet, edit=False)
+                value = ws.cell(row=1, column=int(physical_col)).value if ws is not None else None
+            except Exception:
+                value = None
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _guide_region_column_structure(
+        self,
+        direction: str,
+        blocker_cols: tuple[int, ...],
+    ):
+        """Select the first blocked column and explain the explicit next step."""
+        if not blocker_cols:
+            return
+        source_side = {
+            "A2B": "A",
+            "B2A": "B",
+            "BASE2A": "BASE",
+        }.get(str(direction or ""), "LOGICAL")
+        action_text = {
+            "A2B": "采用左侧(A)列",
+            "B2A": "采用Theirs列" if self._is_three_way_enabled() else "采用右侧(B)列",
+            "BASE2A": "采用Base列",
+        }.get(str(direction or ""), "对应列结构按钮")
+        first_col = int(blocker_cols[0])
+        block = self._select_column_block_by_logical_col(first_col, source_side)
+        if block is not None:
+            start_col = int(block.start_slot_idx) + 1
+            end_col = int(block.end_slot_idx) + 1
+        else:
+            start_col = end_col = first_col
+        range_text = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
+        column_name = self._logical_column_display_name(first_col)
+        named_range = f"{range_text}（{column_name}）" if column_name else range_text
+        extra_count = len(blocker_cols) - 1
+        extra_text = f"，另有 {extra_count} 个结构列" if extra_count > 0 else ""
+        text = (
+            f"该区域包含列结构差异：{named_range}{extra_text}。\n\n"
+            "“使用区域”只覆盖所选行中的单元格，不会自动新增或删除整张 Sheet 的列。"
+            f"已为你选中对应列块，请先点击“{action_text}”，"
+            "完成列结构处理后再使用区域。\n\n本次未写入任何内容。"
+        )
+        try:
+            self.info.configure(
+                text=f"区域包含列结构差异 {named_range}；请先点击“{action_text}”（本次未写入）"
+            )
+        except Exception:
+            pass
+        try:
+            self.column_action_status_var.set(
+                f"区域操作已暂停｜{named_range}｜请点击“{action_text}”｜本次未写入"
+            )
+        except Exception:
+            pass
+        _dlog(
+            f"OVERWRITE_REGION_COLUMN_STRUCTURE_BLOCKED sheet={self.sheet} "
+            f"dir={direction} cols={blocker_cols} first={named_range}"
+        )
+        messagebox.showwarning("请先处理列结构差异", text)
+
     def _region_action_visual_blocks(self) -> list[_DiffBlock]:
         """Return safe-to-navigate visual blocks for the current display mode."""
         if self._diff_block_model_ready():
@@ -16650,13 +16920,21 @@ class SheetView:
         # the first safe block; a preferred pair still keeps deterministic
         # nearest/earlier tie-breaking.
         for block in self._region_action_visual_blocks():
-            if not any(
+            has_writable_diff = any(
                 self._region_pair_has_applicable_diff(
                     direction,
                     pair_idx,
                     writable_col_cache,
                 )
                 for pair_idx in block.pair_indices
+            )
+            if (
+                not has_writable_diff
+                and not self._region_column_structure_blockers(
+                    direction,
+                    block.pair_indices,
+                    first_only=True,
+                )
             ):
                 continue
             if preferred is None:
@@ -16775,14 +17053,22 @@ class SheetView:
                         break
             if selected_visual_block is not None:
                 writable_col_cache: dict[tuple[str, int], bool] = {}
-                if not any(
+                has_writable_diff = any(
                     self._region_pair_has_applicable_diff(
                         direction,
                         pair_idx,
                         writable_col_cache,
                     )
                     for pair_idx in selected_visual_block.pair_indices
-                ):
+                )
+                has_structure_diff = bool(
+                    self._region_column_structure_blockers(
+                        direction,
+                        selected_visual_block.pair_indices,
+                        first_only=True,
+                    )
+                )
+                if not has_writable_diff and not has_structure_diff:
                     self._show_region_action_feedback(direction, "direction-unavailable")
                     return
                 target = (selected_visual_block, False)
@@ -16831,6 +17117,13 @@ class SheetView:
                 f"anchor={anchor_pair_idx} pairs={region_pair_indices[0]}-"
                 f"{region_pair_indices[-1]} rows={total_region_rows}"
             )
+            structure_blockers = self._region_column_structure_blockers(
+                direction,
+                region_pair_indices,
+            )
+            if structure_blockers:
+                self._guide_region_column_structure(direction, structure_blockers)
+                return False
             try:
                 self.info.configure(text=f"正在采用{direction_text}：0/{total_region_rows} 行...")
                 self.root.configure(cursor="watch")
@@ -17450,6 +17743,110 @@ class SheetView:
         except Exception:
             pass
         self._update_diff_nav_state()
+
+    def focus_logical_cell(self, excel_row: int, logical_col: int) -> bool:
+        """Materialize and visibly select one logical cell by Excel row/column."""
+        try:
+            excel_row = max(1, int(excel_row))
+            logical_col = max(1, int(logical_col))
+        except Exception:
+            return False
+
+        pair_idx = self._normalize_pair_idx(
+            self.row_a_to_pair_idx.get(excel_row)
+        )
+        if pair_idx is None:
+            pair_idx = self._normalize_pair_idx(
+                self.row_b_to_pair_idx.get(excel_row)
+            )
+        if pair_idx is None:
+            pair_idx = next(
+                (
+                    idx
+                    for idx, pair in enumerate(self.row_pairs)
+                    if excel_row in tuple(value for value in pair if value is not None)
+                ),
+                None,
+            )
+            pair_idx = self._normalize_pair_idx(pair_idx)
+        if pair_idx is None or not self._materialize_pair_for_navigation(pair_idx):
+            return False
+        line = self.row_to_line.get(pair_idx)
+        if line is None:
+            return False
+        line = int(line)
+        self._goto_block_start(line)
+        self._set_main_selected_cell(line, logical_col)
+        self.selected_pair_idx = pair_idx
+        pair = self.row_pairs[pair_idx]
+        row_a = self._row_for_side(pair, "A")
+        row_b = self._row_for_side(pair, "B")
+        self.selected_excel_row_a = row_a
+        self.selected_excel_row_b = row_b
+        self.selected_excel_row = row_a or row_b
+        self.hover_pair_idx = pair_idx
+        self.hover_col_idx = logical_col
+        self.hover_side = "A" if row_a is not None else "B"
+
+        if self._is_three_way_enabled():
+            if row_a is not None and self._slot_exists_on_side("A", logical_col):
+                cursor_line = 2
+            elif row_b is not None and self._slot_exists_on_side("B", logical_col):
+                cursor_line = 3
+            else:
+                cursor_line = 1
+        else:
+            cursor_line = (
+                1
+                if row_a is not None and self._slot_exists_on_side("A", logical_col)
+                else 2
+            )
+        self._cursor_cmp_sel_col = logical_col
+        self._cursor_cmp_sel_line = cursor_line
+        self._last_cursor_cmp_pair_idx = pair_idx
+        self._update_cursor_lines()
+
+        try:
+            spans = self._spans_for_line()
+            start_char = int(spans.get(logical_col, (0, 0))[0])
+            cell_index = f"{line}.{max(0, start_char)}"
+            nav_widgets = [self.left, self.right]
+            if self._is_three_way_enabled():
+                nav_widgets.insert(1, self.base)
+            for widget in nav_widgets:
+                widget.mark_set("insert", cell_index)
+                widget.see(cell_index)
+            try:
+                fraction = float((self.left.xview() or (0.0, 1.0))[0])
+                self._sync_main_x_to_frac(fraction)
+                self._sync_c_x_to_frac(fraction)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        focus_widget = self.left
+        if row_a is None or not self._slot_exists_on_side("A", logical_col):
+            focus_widget = self.right
+        try:
+            focus_widget.focus_set()
+        except Exception:
+            pass
+        try:
+            excel_coordinate = f"{get_column_letter(logical_col)}{excel_row}"
+            self.info.configure(
+                text=(
+                    f"已定位首个冲突：{self.sheet}｜{excel_coordinate}｜"
+                    f"第 {excel_row} 行，第 {logical_col} 列（逻辑列 L{logical_col}）"
+                )
+            )
+        except Exception:
+            pass
+        _dlog(
+            f"CONFLICT_CELL_FOCUSED sheet={self.sheet} row={excel_row} "
+            f"logical_col={logical_col} pair={pair_idx} line={line}"
+        )
+        return True
 
     def _goto_next_diff_block(self):
         try:
@@ -20371,19 +20768,37 @@ class SheetView:
                 dst_row = ra
             if src_ws is None or src_row is None:
                 continue
-            cols = set(self.pair_diff_cols.get(int(pair_idx), set()))
+            cols = set(
+                (
+                    self.pair_base_diff_cols
+                    if direction == "BASE2A"
+                    else self.pair_diff_cols
+                ).get(int(pair_idx), set())
+            )
             if dst_row is None or cols == {-1}:
-                cols = set(range(1, max(1, int(src_ws.max_column or 1)) + 1))
-            for col_idx in cols:
-                if int(col_idx) <= 0:
+                physical_col_pairs = tuple(
+                    (physical_col, physical_col)
+                    for physical_col in range(
+                        1,
+                        max(1, int(src_ws.max_column or 1)) + 1,
+                    )
+                )
+            else:
+                physical_col_pairs = []
+                for logical_col in sorted(int(col) for col in cols if int(col) > 0):
+                    physical_cols = self._action_physical_columns(direction, logical_col)
+                    if physical_cols is not None:
+                        physical_col_pairs.append(physical_cols)
+            for src_col, dst_col in physical_col_pairs:
+                if int(src_col) <= 0 or int(dst_col) <= 0:
                     continue
-                src_edit = src_ws.cell(row=int(src_row), column=int(col_idx)).value
+                src_edit = src_ws.cell(row=int(src_row), column=int(src_col)).value
                 dst_edit = (
-                    dst_ws.cell(row=int(dst_row), column=int(col_idx)).value
+                    dst_ws.cell(row=int(dst_row), column=int(dst_col)).value
                     if dst_ws is not None and dst_row is not None else None
                 )
                 src_val = (
-                    src_val_ws.cell(row=int(src_row), column=int(col_idx)).value
+                    src_val_ws.cell(row=int(src_row), column=int(src_col)).value
                     if src_val_ws is not None else None
                 )
                 _copy_edit_value_for_destination(
@@ -20391,9 +20806,9 @@ class SheetView:
                     src_edit,
                     dst_edit,
                     src_row=int(src_row),
-                    src_col=int(col_idx),
+                    src_col=int(src_col),
                     dst_row=int(dst_row) if dst_row is not None else int(src_row),
-                    dst_col=int(col_idx),
+                    dst_col=int(dst_col),
                 )
 
     def _show_formula_copy_skip_notice(self, count: int):
@@ -30007,6 +30422,219 @@ class SowMergeApp:
             messagebox.showerror("保存失败", f"保存 A 失败：\n{e}")
 
 
+    def _first_unresolved_conflict_cell(self) -> tuple[str, int, int] | None:
+        """Return the first marked conflict in visible Sheet/row/column order."""
+        rows_by_sheet = getattr(self, "merge_conflict_cells_by_sheet", None) or {}
+        if not rows_by_sheet:
+            return None
+        ordered_sheets = []
+        for sheet in tuple(getattr(self, "display_sheets", ()) or ()):
+            if sheet in rows_by_sheet and sheet not in ordered_sheets:
+                ordered_sheets.append(sheet)
+        for sheet in sorted(str(name) for name in rows_by_sheet):
+            if sheet not in ordered_sheets:
+                ordered_sheets.append(sheet)
+        for sheet in ordered_sheets:
+            rows = rows_by_sheet.get(sheet) or {}
+            for row in sorted(int(value) for value in rows):
+                cols = rows.get(row) or set()
+                positive_cols = sorted(int(value) for value in cols if int(value) > 0)
+                if positive_cols:
+                    return str(sheet), int(row), int(positive_cols[0])
+        return None
+
+    @staticmethod
+    def _conflict_cell_location_text(
+        conflict_cell: tuple[str, int, int] | None,
+    ) -> str:
+        if not conflict_cell:
+            return ""
+        sheet, row, logical_col = conflict_cell
+        coordinate = f"{get_column_letter(int(logical_col))}{int(row)}"
+        return (
+            f"Sheet：{sheet}\n"
+            f"位置：{coordinate}\n"
+            f"行号：{int(row)}　列号：{int(logical_col)}　逻辑列：L{int(logical_col)}"
+        )
+
+    def _show_unresolved_conflict_save_dialog(
+        self,
+        unresolved: int,
+        first_conflict: tuple[str, int, int],
+    ) -> str:
+        """Return ``save``, ``goto``, or ``cancel`` from a three-action dialog."""
+        dialog = None
+        try:
+            result = {"action": "cancel"}
+            dialog = tk.Toplevel(self.root)
+            dialog.withdraw()
+            dialog.title("确认冲突处理")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+
+            def _finish(action: str):
+                result["action"] = str(action)
+                try:
+                    dialog.grab_release()
+                except Exception:
+                    pass
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", lambda: _finish("cancel"))
+            outer = ttk.Frame(dialog, padding=(22, 18, 22, 16))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(
+                outer,
+                text=f"当前仍有 {int(unresolved)} 个未处理的冲突单元格",
+                font=("Microsoft YaHei UI", 11, "bold"),
+            ).pack(anchor="w")
+            ttk.Label(
+                outer,
+                text=(
+                    f"三方扫描共检测到 {int(self.initial_conflict_cell_count)} 个冲突单元格。"
+                    "\n继续保存会保留当前合并结果；也可以先前往首个冲突处理。"
+                ),
+                justify="left",
+            ).pack(anchor="w", pady=(8, 12))
+
+            location_frame = ttk.LabelFrame(
+                outer,
+                text="首个未处理冲突",
+                padding=(12, 9),
+            )
+            location_frame.pack(fill="x")
+            ttk.Label(
+                location_frame,
+                text=self._conflict_cell_location_text(first_conflict),
+                justify="left",
+                font=("Consolas", 10),
+            ).pack(anchor="w")
+            if int(unresolved) > 1:
+                ttk.Label(
+                    outer,
+                    text="存在多个冲突时，“前往首个冲突”始终定位当前排序中的第一个。",
+                    foreground="#6A5A00",
+                ).pack(anchor="w", pady=(10, 0))
+
+            buttons = ttk.Frame(outer)
+            buttons.pack(fill="x", pady=(18, 0))
+            ttk.Button(
+                buttons,
+                text="继续保存",
+                command=lambda: _finish("save"),
+                width=12,
+            ).pack(side="left")
+            ttk.Button(
+                buttons,
+                text="取消",
+                command=lambda: _finish("cancel"),
+                width=10,
+            ).pack(side="right")
+            goto_button = ttk.Button(
+                buttons,
+                text="前往首个冲突",
+                command=lambda: _finish("goto"),
+                width=16,
+            )
+            goto_button.pack(side="right", padx=(0, 8))
+
+            dialog.bind("<Escape>", lambda _event: _finish("cancel"))
+            dialog.bind("<Return>", lambda _event: _finish("goto"))
+            dialog.update_idletasks()
+            width = max(470, int(dialog.winfo_reqwidth()))
+            height = max(250, int(dialog.winfo_reqheight()))
+            try:
+                parent_x = int(self.root.winfo_rootx())
+                parent_y = int(self.root.winfo_rooty())
+                parent_width = max(1, int(self.root.winfo_width()))
+                parent_height = max(1, int(self.root.winfo_height()))
+                x = parent_x + max(0, (parent_width - width) // 2)
+                y = parent_y + max(0, (parent_height - height) // 2)
+                dialog.geometry(f"{width}x{height}+{x}+{y}")
+            except Exception:
+                dialog.geometry(f"{width}x{height}")
+            dialog.deiconify()
+            dialog.grab_set()
+            goto_button.focus_set()
+            dialog.wait_window()
+            return str(result["action"])
+        except Exception as exc:
+            _dlog(f"CONFLICT_SAVE_DIALOG_FALLBACK err={type(exc).__name__}:{exc}")
+            if dialog is not None:
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+            should_save = messagebox.askyesno(
+                "确认冲突处理",
+                f"当前仍有 {int(unresolved)} 个未处理的冲突单元格。\n\n"
+                f"{self._conflict_cell_location_text(first_conflict)}"
+                "\n\n是否继续保存？",
+            )
+            return "save" if should_save else "cancel"
+
+    def _navigate_to_conflict_cell(self, sheet: str, row: int, logical_col: int) -> bool:
+        """Switch Sheet and focus a marked conflict without modifying data."""
+        sheet = str(sheet)
+        try:
+            row = max(1, int(row))
+            logical_col = max(1, int(logical_col))
+        except Exception:
+            return False
+        container = getattr(self, "_sheet_containers", {}).get(sheet)
+        if container is None:
+            messagebox.showwarning("无法前往冲突", f"未找到 Sheet：{sheet}")
+            return False
+        try:
+            self.nb.select(container)
+        except Exception as exc:
+            messagebox.showwarning("无法前往冲突", f"无法切换到 Sheet {sheet}：\n{exc}")
+            return False
+
+        attempt_state = {"remaining": 80, "finished": False}
+
+        def _attempt_focus():
+            if attempt_state["finished"] or bool(getattr(self, "_is_closing", False)):
+                return
+            view = getattr(self, "sheet_views", {}).get(sheet)
+            if view is not None and bool(getattr(view, "_data_ready", False)):
+                if view.focus_logical_cell(row, logical_col):
+                    attempt_state["finished"] = True
+                    self._set_task_status(
+                        f"已定位首个冲突：{sheet}!{get_column_letter(logical_col)}{row}",
+                        active=False,
+                    )
+                    _dlog(
+                        f"CONFLICT_NAVIGATION_OK sheet={sheet} row={row} "
+                        f"logical_col={logical_col}"
+                    )
+                    return
+            attempt_state["remaining"] -= 1
+            if attempt_state["remaining"] <= 0:
+                attempt_state["finished"] = True
+                self._set_task_status("冲突定位失败", active=False)
+                messagebox.showwarning(
+                    "无法前往冲突",
+                    f"已切换到 Sheet {sheet}，但暂时无法定位"
+                    f"第 {row} 行、第 {logical_col} 列。\n请等待当前 Sheet 加载完成后重试。",
+                )
+                _dlog(
+                    f"CONFLICT_NAVIGATION_FAILED sheet={sheet} row={row} "
+                    f"logical_col={logical_col}"
+                )
+                return
+            self._set_task_status(
+                f"正在加载并定位：{sheet}!{get_column_letter(logical_col)}{row}",
+                active=True,
+            )
+            self.root.after(100, _attempt_focus)
+
+        try:
+            self.root.after(0, _attempt_focus)
+        except Exception:
+            return False
+        return True
+
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:
             return
@@ -30025,10 +30653,21 @@ class SowMergeApp:
                     for rows in self.merge_conflict_cells_by_sheet.values()
                     for cols in rows.values()
                 )
-                if not messagebox.askyesno(
+                first_conflict = self._first_unresolved_conflict_cell()
+                if unresolved > 0 and first_conflict is not None:
+                    conflict_action = self._show_unresolved_conflict_save_dialog(
+                        unresolved,
+                        first_conflict,
+                    )
+                    if conflict_action == "goto":
+                        self._navigate_to_conflict_cell(*first_conflict)
+                        return
+                    if conflict_action != "save":
+                        return
+                elif not messagebox.askyesno(
                     "确认冲突处理",
                     f"三方扫描检测到 {self.initial_conflict_cell_count} 个冲突单元格。"
-                    f"\n当前仍标记 {unresolved} 个（手动模式下不会自动清零）。"
+                    f"\n当前仍标记 {unresolved} 个。"
                     "\n\n请确认你已完成需要处理的冲突数据。是否继续保存？",
                 ):
                     return
