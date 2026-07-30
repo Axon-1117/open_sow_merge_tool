@@ -80,7 +80,14 @@ def _has_tag(view, tag_name: str) -> bool:
 
 
 def _motion_event_for_cell(text_widget, line_no: int, char_pos: int):
-    box = text_widget.bbox(f"{line_no}.{max(0, int(char_pos))}")
+    index = f"{line_no}.{max(0, int(char_pos))}"
+    # The Sheet-wide fixed-width model can place later logical columns outside
+    # the initial viewport. Drive the same visibility step a user would get
+    # from horizontal navigation before asking Tk for viewport coordinates.
+    text_widget.see(index)
+    text_widget.update_idletasks()
+    text_widget.update()
+    box = text_widget.bbox(index)
     assert box is not None, f"bbox is None for line={line_no}, char={char_pos}"
     x, y, w, h = box
     px = int(x + max(1, w // 2))
@@ -155,7 +162,10 @@ def _run_2way():
     panel = _panel_text(view)
     assert "base[" in panel and "mine[" in panel, panel
     assert long_a in panel and long_b in panel, panel
-    assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+    assert (
+        "Col: E(5)" in _panel_title(view)
+        or "列 E(5)" in _panel_title(view)
+    ), _panel_title(view)
     assert _has_tag(view, "hover_side_base"), "expected BASE-like row background in 2-way hover panel"
     assert _has_tag(view, "hover_side_mine"), "expected MINE-like row background in 2-way hover panel"
     assert _has_tag(view, "hover_diffchar"), "expected diff-char highlight in hover panel"
@@ -271,7 +281,10 @@ def _run_3way():
     panel = _panel_text(view)
     assert "base[" in panel and "mine[" in panel and "theirs[" in panel, panel
     assert long_base in panel and long_mine in panel and long_theirs in panel, panel
-    assert "Col: E(5)" in _panel_title(view), _panel_title(view)
+    assert (
+        "Col: E(5)" in _panel_title(view)
+        or "列 E(5)" in _panel_title(view)
+    ), _panel_title(view)
     assert _has_tag(view, "hover_side_base"), "expected BASE row background in 3-way hover panel"
     assert _has_tag(view, "hover_side_mine"), "expected MINE row background in 3-way hover panel"
     assert _has_tag(view, "hover_side_theirs"), "expected THEIRS row background in 3-way hover panel"

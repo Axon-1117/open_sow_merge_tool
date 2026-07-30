@@ -8,7 +8,7 @@ import time
 from openpyxl import Workbook, load_workbook
 
 import sow_merge_tool as smt
-from _test_temp_utils import make_temp_dir
+from _test_temp_utils import make_temp_dir, visible_render_text
 
 
 def _make_book(path: str, rows) -> None:
@@ -118,10 +118,20 @@ def _clear_region_anchor(view, *, insertion_pair_idx=None) -> None:
 
 def _assert_region_buttons_enabled(view) -> None:
     view._set_copy_scope_mode("region")
+    assert view._copy_scope_mode == "region"
+    assert view._copy_scope_var.get() == "region"
     assert str(view.use_left_btn.cget("state")) == "normal"
     assert str(view.use_right_btn.cget("state")) == "normal"
-    assert "区域" in str(view.use_left_btn.cget("text"))
-    assert "区域" in str(view.use_right_btn.cget("text"))
+    assert "区" in str(view.use_left_btn.cget("text"))
+    assert "区" in str(view.use_right_btn.cget("text"))
+    for menu in (view._use_left_menu, view._use_right_menu):
+        end = menu.index("end")
+        labels = [
+            str(menu.entrycget(index, "label"))
+            for index in range(int(end) + 1)
+        ]
+        assert any("区域" in label for label in labels), labels
+        assert any("全局" in label for label in labels), labels
 
 
 def _column_values(worksheet, column=1):
@@ -220,7 +230,10 @@ def test_explicit_theirs_deleted_region_deletes_mine_rows_and_undo_reapplies():
         assert len(mine_only_pairs) == 2, (view.row_pairs, mine_only_pairs)
         assert view._logical_diff_pair_block_for_pair(mine_only_pairs[0]) == mine_only_pairs
         assert view._row_label_for_pair_idx(mine_only_pairs[0], "B") == "缺行"
-        assert "此侧缺行" in view.pair_text_b[mine_only_pairs[0]]
+        assert "此侧缺行" in visible_render_text(
+            view.pair_text_b[mine_only_pairs[0]],
+            placeholder=smt._TK_INDEX_PLACEHOLDER,
+        )
         undo_before = len(app.undo_stack)
 
         view._select_line(view.row_to_line[mine_only_pairs[0]])
@@ -278,7 +291,10 @@ def test_explicit_mine_deleted_region_symmetrically_deletes_theirs_rows():
         ]
         assert len(theirs_only_pairs) == 2
         assert view._row_label_for_pair_idx(theirs_only_pairs[0], "A") == "缺行"
-        assert "此侧缺行" in view.pair_text_a[theirs_only_pairs[0]]
+        assert "此侧缺行" in visible_render_text(
+            view.pair_text_a[theirs_only_pairs[0]],
+            placeholder=smt._TK_INDEX_PLACEHOLDER,
+        )
         view._select_line(view.row_to_line[theirs_only_pairs[0]])
         undo_before = len(app.undo_stack)
 
@@ -525,7 +541,7 @@ def test_region_column_delete_is_guided_before_any_cell_write():
         assert errors == [], errors
         assert warnings, "structure guidance must be visible"
         warning_text = str(warnings[-1][0])
-        assert "L3" in warning_text and "part_move" in warning_text, warning_text
+        assert "C" in warning_text and "part_move" in warning_text, warning_text
         assert "采用Theirs列" in warning_text, warning_text
         assert "本次未写入任何内容" in warning_text, warning_text
         assert view.selected_column_logical_range is not None
@@ -617,7 +633,10 @@ def test_initial_missing_marker_and_row_header_clicks_are_safe():
             for idx, (row_a, row_b) in enumerate(view.row_pairs)
             if row_a is not None and row_b is None
         )
-        assert "此侧" in view.pair_text_b[structural_pair]
+        assert "此侧" in visible_render_text(
+            view.pair_text_b[structural_pair],
+            placeholder=smt._TK_INDEX_PLACEHOLDER,
+        )
         line = int(view.row_to_line[structural_pair])
         before = _column_values(app.ws_a_edit("Data"), 1)
         undo_before = list(app.undo_stack)
@@ -862,7 +881,8 @@ def test_conflict_dialog_has_location_and_goto_button():
         assert "前往首个冲突" in all_text
         assert "Sheet：Data" in all_text
         assert "位置：B2" in all_text
-        assert "行号：2" in all_text and "列号：2" in all_text
+        assert "行号：2" in all_text
+        assert "列号：B" in all_text
     finally:
         app._shutdown_root()
 
@@ -900,7 +920,9 @@ def test_focus_logical_conflict_cell_selects_row_column_and_c_area():
         assert view.cursor_cmp.tag_ranges("cselcell")
         assert str(view.left.index("insert")).startswith(f"{line}.")
         info = str(view.info.cget("text"))
-        assert "B2" in info and "第 2 行" in info and "第 2 列" in info
+        assert "B2" in info
+        assert "第 2 行" in info
+        assert "Excel 列 B" in info
     finally:
         app._shutdown_root()
 

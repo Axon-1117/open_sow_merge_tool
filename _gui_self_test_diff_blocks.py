@@ -26,6 +26,35 @@ def _pump(root, seconds=0.2):
         time.sleep(0.01)
 
 
+def _widget_rect(widget):
+    left = int(widget.winfo_rootx())
+    top = int(widget.winfo_rooty())
+    return (
+        left,
+        top,
+        left + int(widget.winfo_width()),
+        top + int(widget.winfo_height()),
+    )
+
+
+def _nearest_common_ancestor(left_widget, right_widget):
+    left_ancestors = []
+    current = left_widget
+    while current is not None:
+        left_ancestors.append(current)
+        current = getattr(current, "master", None)
+    right_ancestors = set()
+    current = right_widget
+    while current is not None:
+        right_ancestors.add(current)
+        current = getattr(current, "master", None)
+    return next(
+        ancestor
+        for ancestor in left_ancestors
+        if ancestor in right_ancestors
+    )
+
+
 def _prepare_view(app, *, only_diff=True):
     app.root.deiconify()
     app.nb.select(app._sheet_containers["Data"])
@@ -134,6 +163,36 @@ def _test_two_way_block_presentation(root_dir):
         assert "1/2" in view.diff_block_status_var.get(), view.diff_block_status_var.get()
         assert "待处理 2" in view.diff_block_status_var.get(), view.diff_block_status_var.get()
         assert view.diff_block_status.winfo_manager() == "pack"
+        view.root.update_idletasks()
+        action_row_widget = _nearest_common_ancestor(
+            view.diff_nav_group,
+            view.column_action_button_group,
+        )
+        assert action_row_widget not in (view.frame, view.root)
+        action_row = _widget_rect(action_row_widget)
+        nav_group = _widget_rect(view.diff_nav_group)
+        column_group = _widget_rect(view.column_action_button_group)
+        assert action_row[0] <= nav_group[0] < nav_group[2] <= action_row[2], (
+            action_row,
+            nav_group,
+        )
+        assert (
+            action_row[0]
+            <= column_group[0]
+            < column_group[2]
+            <= action_row[2]
+        ), (
+            action_row,
+            column_group,
+        )
+        assert nav_group[3] >= column_group[1] and column_group[3] >= nav_group[1], (
+            nav_group,
+            column_group,
+        )
+        assert nav_group[2] + 6 <= column_group[0], (
+            nav_group,
+            column_group,
+        )
         assert view.left_ln.get("1.0", "1.end").lstrip().startswith("[1]")
         assert view.left_ln.get("3.0", "3.end").lstrip().startswith("[2]")
 

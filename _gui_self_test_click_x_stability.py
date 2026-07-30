@@ -72,6 +72,7 @@ def main():
         pass
 
     before = float((view.left.xview() or (0.0, 1.0))[0])
+    before_c = float((view.cursor_cmp.xview() or (0.0, 1.0))[0])
 
     # Simulate a click near the right side; avoid bbox dependency in headless Tk runs.
     click_x = max(10, int(view.left.winfo_width()) - 30)
@@ -109,8 +110,11 @@ def main():
     assert abs(after_right - after_left) < 0.02, (
         f"main panes out of sync: left={after_left:.6f} right={after_right:.6f}"
     )
-    assert abs(after_c - after_left) < 0.03, (
-        f"C pane out of sync: left={after_left:.6f} c={after_c:.6f}"
+    # C has a different viewport/content width and therefore a different
+    # fractional xview for the same pixel position.  A click must preserve its
+    # mapped position, not force its fraction to equal the main pane.
+    assert abs(after_c - before_c) < 0.03, (
+        f"C pane moved after click: before={before_c:.6f} after={after_c:.6f}"
     )
 
     try:

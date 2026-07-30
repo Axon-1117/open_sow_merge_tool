@@ -60,6 +60,16 @@ class _Var:
         return self.value
 
 
+class _ButtonState:
+    """Tiny Tk-button substitute for readiness/selection contract checks."""
+
+    def __init__(self):
+        self.options = {}
+
+    def configure(self, **kwargs):
+        self.options.update(kwargs)
+
+
 class _CountingCells(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1648,6 +1658,112 @@ def test_three_way_mine_base_theirs_plans_and_same_anchor_confirmation():
     assert confirmed.count == 1
 
 
+def test_ready_auto_selects_first_real_structural_block_only():
+    gunships_columns = tuple(f"column-{idx:02d}" for idx in range(1, 27))
+    gunships_mine_columns = tuple(
+        value for idx, value in enumerate(gunships_columns, start=1)
+        if idx not in (14, 20)
+    )
+    mine_deleted = _cache_3way(
+        "GunshipsModify@design",
+        _rows(gunships_mine_columns),
+        _rows(gunships_columns),
+        _rows(gunships_columns),
+    )
+    view = _fake_action_view(mine_deleted, three_way=True)
+    view._lifecycle_state = "READY"
+    view.use_mine_col_btn = _ButtonState()
+    view.use_base_col_btn = _ButtonState()
+    view.use_theirs_col_btn = _ButtonState()
+
+    view._refresh_column_action_buttons()
+
+    assert view.selected_column_logical_range == (14, 14)
+    assert view.selected_column_source_side == "LOGICAL"
+    assert view._selected_column_block().state == "mine-deleted"
+    assert all(
+        button.options.get("state") == "normal"
+        for button in (
+            view.use_mine_col_btn,
+            view.use_base_col_btn,
+            view.use_theirs_col_btn,
+        )
+    )
+
+    # Applying L14 rebuilds the projection. The next generation must select
+    # L20 automatically, instead of leaving all three column-action buttons
+    # disabled while a structural block remains.
+    after_first_apply = _cache_3way(
+        "GunshipsModify@design",
+        _rows(
+            tuple(
+                value for idx, value in enumerate(gunships_columns, start=1)
+                if idx != 20
+            )
+        ),
+        _rows(gunships_columns),
+        _rows(gunships_columns),
+    )
+    view._install_column_projection(after_first_apply)
+    view.selected_column_block_ordinal = None
+    view.selected_column_logical_range = None
+    view.selected_column_source_side = None
+    view._selected_column_projection_generation = None
+    view._refresh_column_action_buttons()
+
+    assert view.selected_column_logical_range == (20, 20)
+    assert view._selected_column_block().state == "mine-deleted"
+    assert all(
+        button.options.get("state") == "normal"
+        for button in (
+            view.use_mine_col_btn,
+            view.use_base_col_btn,
+            view.use_theirs_col_btn,
+        )
+    )
+
+    # A deliberate click on a regular column clears the current projection's
+    # selection and must not immediately select L20 again.
+    assert view._select_column_block_by_logical_col(1) is None
+    assert view.selected_column_block_ordinal is None
+    assert all(
+        button.options.get("state") == "disabled"
+        for button in (
+            view.use_mine_col_btn,
+            view.use_base_col_btn,
+            view.use_theirs_col_btn,
+        )
+    )
+
+    regular_base = _rows(("field", "type", "comment", "default", "data"))
+    regular_mine = [list(row) for row in regular_base]
+    regular_mine[1][4] = "target-only-cell-difference"
+    regular = _cache_3way(
+        "GunshipsConfig@column",
+        regular_mine,
+        regular_base,
+        regular_base,
+    )
+    assert not regular.structural_diff_cols and not regular.unresolved_cols
+    regular_view = _fake_action_view(regular, three_way=True)
+    regular_view._lifecycle_state = "READY"
+    regular_view.use_mine_col_btn = _ButtonState()
+    regular_view.use_base_col_btn = _ButtonState()
+    regular_view.use_theirs_col_btn = _ButtonState()
+
+    regular_view._refresh_column_action_buttons()
+
+    assert regular_view.selected_column_block_ordinal is None
+    assert all(
+        button.options.get("state") == "disabled"
+        for button in (
+            regular_view.use_mine_col_btn,
+            regular_view.use_base_col_btn,
+            regular_view.use_theirs_col_btn,
+        )
+    )
+
+
 def test_first_direct_row_apply_revalidates_false_pending_mapping():
     root_dir = make_temp_dir("sow_first_row_mapping_revalidate_")
     mine = os.path.join(root_dir, "mine.xlsx")
@@ -1947,7 +2063,15 @@ def test_real_gui_insert_block_and_one_step_undo_full_fidelity():
         assert len(app.undo_stack) == before_undo_count + 1
         assert app.undo_stack[-1]["kind"] == "column_action"
         assert app.undo_stack[-1]["plan"] == plan
-        assert _selection_snapshot(view)[:3] == (None, None, None)
+        remaining_special = (
+            view.column_comparison_cache.structural_diff_cols
+            or view.column_comparison_cache.unresolved_cols
+        )
+        selected_after_action = view._selected_column_block()
+        if selected_after_action is not None:
+            assert view._column_block_is_structural(selected_after_action)
+        elif not remaining_special:
+            assert _selection_snapshot(view)[:3] == (None, None, None)
 
         after_model = _model_snapshot(view)
         assert len(after_model[0]) == 8
@@ -2679,6 +2803,7 @@ def main():
         test_manual_formula_ops_follow_excel_column_reference_semantics,
         test_formula_capture_prefilter_keeps_target_and_qualified_references_only,
         test_three_way_mine_base_theirs_plans_and_same_anchor_confirmation,
+        test_ready_auto_selects_first_real_structural_block_only,
         test_first_direct_row_apply_revalidates_false_pending_mapping,
         test_consecutive_row_apply_ignores_style_only_blank_tail_columns,
         test_full_row_apply_skips_unresolved_blank_gap_before_real_formula_column,

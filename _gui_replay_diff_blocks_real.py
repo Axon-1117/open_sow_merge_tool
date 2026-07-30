@@ -30,6 +30,23 @@ def _pump(root, seconds=0.15):
         time.sleep(0.01)
 
 
+def _wait_mutation_ready(app, view, timeout=180.0):
+    """Wait for the production mutation gate, not just a rendered diff block."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _pump(app.root, 0.05)
+        view._refresh_interaction_gate()
+        if (
+            getattr(view, "_lifecycle_state", "") == "READY"
+            and app._edit_workbooks_ready()
+        ):
+            return
+    raise AssertionError(
+        "Timed out waiting for the real region-adoption mutation gate: "
+        f"state={getattr(view, '_lifecycle_state', None)!r}"
+    )
+
+
 def _cell_value(path, sheet, row, col):
     wb = load_workbook(path, read_only=True, data_only=False)
     try:
@@ -263,6 +280,12 @@ def main():
         assert max(float(v[0]) for v in yviews) - min(float(v[0]) for v in yviews) < 0.002, yviews
 
         view._goto_full_diff_block(target_idx)
+        # The synchronous refresh above is intentionally protected from the
+        # first lazy cache publication.  Before performing a real mutation,
+        # restore normal publication so the production lifecycle can leave
+        # LOADING/DIFFING and reach the same READY gate a user sees.
+        view._suppress_bg_apply = False
+        _wait_mutation_ready(app, view)
         view.hover_pair_idx = next_pair
         direct_before_next = set(view.pair_diff_cols.get(next_pair, set()))
         assert direct_before_next

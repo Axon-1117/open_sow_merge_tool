@@ -27,3 +27,8 @@ def make_temp_dir(prefix: str) -> str:
         except FileExistsError:
             continue
     raise RuntimeError(f"Failed to create temp dir under: {base}")
+
+
+def visible_render_text(rendered_text: object, *, placeholder: str = "\u200b") -> str:
+    """Return what a user sees after removing zero-width Tk index padding."""
+    return str(rendered_text).replace(str(placeholder), "")

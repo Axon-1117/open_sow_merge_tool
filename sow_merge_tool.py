@@ -11,6 +11,7 @@ import traceback
 import atexit
 import copy
 import gc
+import ctypes
 import math
 from itertools import zip_longest
 from functools import lru_cache
@@ -22,7 +23,11 @@ import zipfile
 import posixpath
 import platform
 import xml.etree.ElementTree as ET
+import unicodedata
+from urllib.parse import quote
 from dataclasses import dataclass, field
+from enum import Enum
+import sqlite3
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -40,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-24.update62"
-APP_BUILD_TAG = "new139-conflict-cell-navigation"
+APP_VERSION = "2026-07-30.update68"
+APP_BUILD_TAG = "new145-cjk-compact-layout"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -89,14 +94,265 @@ _FAST_TABMARK_PHASE2_ENABLED = False
 _SVN_EXPORT_TIMEOUT_SECS = 15
 # Grid display: max chars shown per cell before truncation, and column separator
 _COL_MAX_DISPLAY_WIDTH = 30
+# Logical sheet panes deliberately use one content-independent width. Keeping
+# the lower and upper bounds equal prevents a long cell from moving geometry.
+_LOGICAL_COLUMN_DISPLAY_WIDTH_MIN = 18
+_LOGICAL_COLUMN_DISPLAY_WIDTH_MAX = 18
 _COL_SEP = " \u2502 "    # 3-char separator between columns (U+2502 BOX DRAWINGS LIGHT VERTICAL)
 _COL_SEP_LEN = 3
+# Every wide display cell adds this non-rendering Tk character.  It keeps
+# fixed-width logical spans indexable by ``tk.Text`` character offsets even
+# when one East Asian glyph occupies two display cells.
+_TK_INDEX_PLACEHOLDER = "\u200b"
 
 # Unified pane colors (main 3-way panes and C-area rows)
 _MINE_BG = "#F6C16B"
 _BASE_BG = "#E3E3FF"
 _THEIRS_BG = "#FFF176"
 _DIFF_CELL_BG = "#FF2D2D"
+
+
+class MergeScenario(str, Enum):
+    """The SVN launch semantics inferred from the *raw* TortoiseSVN inputs."""
+
+    TWO_WAY = "two-way"
+    UPDATE_CONFLICT = "update-conflict"
+    CROSS_BRANCH_MERGE = "cross-branch-merge"
+    UNKNOWN_THREE_WAY = "unknown-three-way"
+
+
+# These colours deliberately apply to application chrome only.  The spreadsheet
+# ``Text`` widgets keep their own white/data-state colours below.
+WORKSPACE_CHROME_COLORS: dict[MergeScenario, str] = {
+    MergeScenario.TWO_WAY: "#E9E9E9",
+    MergeScenario.UPDATE_CONFLICT: "#F8DFE3",
+    MergeScenario.CROSS_BRANCH_MERGE: "#E0F0E3",
+    MergeScenario.UNKNOWN_THREE_WAY: "#E9E9E9",
+}
+
+
+@dataclass
+class VersionIdentity:
+    """One immutable-in-meaning SVN/workbook identity shown to the user.
+
+    ``path`` is always the input path supplied by SVN.  ``stable_path`` may be
+    a copied/read-only implementation detail, but never changes the identity's
+    role or the original path shown in diagnostics.
+    """
+
+    role: str
+    path: str | None
+    stable_path: str | None = None
+    revision: int | None = None
+    author: str = "未知"
+    author_source: str = "unknown"
+    author_status: str = "unavailable"
+    locally_modified: bool = False
+    repository_identity: str | None = None
+    availability_reason: str = ""
+
+    @property
+    def effective_path(self) -> str | None:
+        return self.stable_path or self.path
+
+    @property
+    def available(self) -> bool:
+        path = self.effective_path
+        return bool(path and os.path.isfile(path))
+
+
+@dataclass
+class MergeLaunchContext:
+    """Preserves the five launch paths without conflating Base and WC BASE."""
+
+    scenario: MergeScenario
+    source_base_path: str | None = None
+    mine_path: str | None = None
+    theirs_path: str | None = None
+    merged_path: str | None = None
+    target_pristine_path: str | None = None
+    classification_reason: str = ""
+    identities: dict[str, VersionIdentity] = field(default_factory=dict)
+
+    def identity_for(self, role: str) -> VersionIdentity | None:
+        return self.identities.get(str(role or "").lower())
+
+
+@dataclass(frozen=True)
+class PackageComparison:
+    """Fail-closed equality evidence for two complete OOXML packages."""
+
+    left_role: str
+    right_role: str
+    left_path: str | None
+    right_path: str | None
+    left_sha256: str | None
+    right_sha256: str | None
+    package_equal: bool | None
+    ready: bool
+    elapsed_seconds: float
+    reason: str
+
+    @property
+    def raw_hash_equal(self) -> bool | None:
+        if not self.left_sha256 or not self.right_sha256:
+            return None
+        return self.left_sha256 == self.right_sha256
+
+
+@dataclass
+class EquivalenceMatrix:
+    """Complete pairwise package evidence for every available identity."""
+
+    comparisons: dict[tuple[str, str], PackageComparison] = field(default_factory=dict)
+
+    def get(self, left_role: str, right_role: str) -> PackageComparison | None:
+        left = str(left_role or "").lower()
+        right = str(right_role or "").lower()
+        return self.comparisons.get((left, right)) or self.comparisons.get((right, left))
+
+    def are_equal(self, left_role: str, right_role: str) -> bool:
+        comparison = self.get(left_role, right_role)
+        return bool(comparison and comparison.ready and comparison.package_equal is True)
+
+
+@dataclass
+class StartupMergeOutcome:
+    """Single startup decision record used by both logs and the UI dialog."""
+
+    automatic_action: str = "manual-review"
+    source_role: str | None = None
+    folded_identity: str | None = None
+    merged_count: int = 0
+    incoming_count: int = 0
+    applied_count: int = 0
+    already_present_count: int = 0
+    target_retained_count: int = 0
+    unresolved_count: int = 0
+    fallback_reasons: list[str] = field(default_factory=list)
+    equality_evidence: list[str] = field(default_factory=list)
+    candidate_path: str | None = None
+
+
+@dataclass
+class StartupMergeAnalysis:
+    context: MergeLaunchContext
+    matrix: EquivalenceMatrix
+    outcome: StartupMergeOutcome
+    conflicts: list[tuple] = field(default_factory=list)
+    conflict_cells_by_sheet: dict = field(default_factory=dict)
+
+
+class _SemanticPremergeDeclined(RuntimeError):
+    """Carry an authoritative scan when legacy pre-merge must stop safely.
+
+    The logical scanner has already paid to build the conflict map before it
+    can prove that a column structure is unsafe for the legacy physical-column
+    writer.  Re-running that same scanner in the startup fallback cannot add
+    safety, because all three inputs are immutable stable snapshots; it only
+    delays entry into the manual three-way view.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        conflicts: list[tuple],
+        conflict_cells_by_sheet: dict,
+    ):
+        super().__init__(message)
+        self.conflicts = conflicts
+        self.conflict_cells_by_sheet = conflict_cells_by_sheet
+
+
+def _parse_svn_sidecar_revision(path: str | None) -> int | None:
+    """Return the raw revision suffix used by SVN conflict sidecar files."""
+    if not path:
+        return None
+    match = re.search(r"(?:\.merge-(?:left|right))?\.r(\d+)$", os.path.basename(str(path)), re.IGNORECASE)
+    try:
+        return int(match.group(1)) if match else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_merge_launch_with_reason(
+    base_path: str | None,
+    mine_path: str | None,
+    theirs_path: str | None,
+) -> tuple[MergeScenario, str]:
+    """Classify only from raw arguments; never inspect normalized/exported files."""
+    if not theirs_path:
+        return MergeScenario.TWO_WAY, "missing /theirs argument"
+    base_name = os.path.basename(str(base_path or "")).lower()
+    theirs_name = os.path.basename(str(theirs_path or "")).lower()
+    if ".merge-left" in base_name and ".merge-right" in theirs_name:
+        return MergeScenario.CROSS_BRANCH_MERGE, "raw base=.merge-left and theirs=.merge-right"
+    if base_name.endswith(".rold") and theirs_name.endswith(".rnew"):
+        return MergeScenario.UPDATE_CONFLICT, "raw legacy .rOLD/.rNEW update sidecars"
+    base_revision = _parse_svn_sidecar_revision(base_path)
+    theirs_revision = _parse_svn_sidecar_revision(theirs_path)
+    if (
+        base_revision is not None
+        and theirs_revision is not None
+        and ".merge-left" not in base_name
+        and ".merge-right" not in theirs_name
+    ):
+        return MergeScenario.UPDATE_CONFLICT, "raw ordinary .rOLDREV/.rNEWREV sidecars"
+    if base_path and mine_path and theirs_path:
+        return MergeScenario.UNKNOWN_THREE_WAY, "complete raw three-way inputs do not match known SVN sidecar evidence"
+    return MergeScenario.TWO_WAY, "incomplete three-way input; using two-way comparison"
+
+
+def classify_merge_launch(
+    base_path: str | None,
+    mine_path: str | None,
+    theirs_path: str | None,
+) -> MergeScenario:
+    """Return the public launch scenario classification.
+
+    The detailed evidence is retained by :func:`build_merge_launch_context`.
+    """
+    return _classify_merge_launch_with_reason(base_path, mine_path, theirs_path)[0]
+
+
+def build_merge_launch_context(
+    base_path: str | None,
+    mine_path: str | None,
+    theirs_path: str | None,
+    merged_path: str | None = None,
+    *,
+    target_pristine_path: str | None = None,
+) -> MergeLaunchContext:
+    """Create role identities before copies, scanning, or automatic merging."""
+    scenario, reason = _classify_merge_launch_with_reason(base_path, mine_path, theirs_path)
+    identities = {
+        "base": VersionIdentity("base", base_path, revision=_parse_svn_sidecar_revision(base_path)),
+        "mine": VersionIdentity("mine", mine_path, revision=_parse_svn_sidecar_revision(mine_path)),
+        "theirs": VersionIdentity("theirs", theirs_path, revision=_parse_svn_sidecar_revision(theirs_path)),
+        "target_pristine": VersionIdentity(
+            "target_pristine",
+            target_pristine_path,
+            revision=None,
+        ),
+    }
+    context = MergeLaunchContext(
+        scenario=scenario,
+        source_base_path=base_path,
+        mine_path=mine_path,
+        theirs_path=theirs_path,
+        merged_path=merged_path,
+        target_pristine_path=target_pristine_path,
+        classification_reason=reason,
+        identities=identities,
+    )
+    _dlog(
+        "MERGE_CONTEXT "
+        f"scenario={scenario.value} reason={reason} raw_base={base_path!r} "
+        f"raw_mine={mine_path!r} raw_theirs={theirs_path!r} merged={merged_path!r} "
+        f"target_pristine={target_pristine_path!r}"
+    )
+    return context
 
 # Unified row-header hover/action arrows (keep one visual family).
 _ROW_ARROW_RIGHT = "➡"
@@ -4037,10 +4293,101 @@ def _val_to_str(v):
 
 
 def _format_cell(val_str: str, width: int) -> str:
-    """Left-justify val_str in exactly `width` chars; truncate with ellipsis if too long."""
-    if len(val_str) > width:
-        return val_str[:width - 1] + "\u2026"  # … (single char)
-    return val_str.ljust(width)
+    """Render one grid cell at exactly ``width`` display cells and Tk indices.
+
+    Every two-cell glyph is followed by a zero-width placeholder.  Thus a CJK
+    glyph occupies two display cells *and* two Tk character indices, preserving
+    the fixed logical-column spans used by hit testing and highlights.  NFC
+    resolves common base-plus-combining input before formatting.  Remaining
+    combining marks and raw U+200B input become visible ASCII escapes: they
+    retain the original code point without adding a zero-width Tk index to the
+    grid.  The only actual U+200B characters in the output are generated by
+    this formatter after a two-cell glyph.
+    """
+    try:
+        width = max(0, int(width))
+    except (TypeError, ValueError):
+        width = 0
+    if width == 0:
+        return ""
+
+    normalized = unicodedata.normalize("NFC", str(val_str or ""))
+    tokens: list[tuple[str, int]] = []
+    used = 0
+    for char in normalized:
+        # Input U+200B is user data, not one of our output placeholders.
+        # Expose it rather than silently hiding a meaningful invisible diff.
+        if char == _TK_INDEX_PLACEHOLDER:
+            escaped = f"{chr(92)}u{ord(char):04X}"
+            tokens.append((escaped, len(escaped)))
+            used += len(escaped)
+            continue
+        char_width = _display_cell_width(char)
+        if char_width == 0:
+            if unicodedata.combining(char):
+                # NFC cannot compose every possible mark sequence.  A literal
+                # escape is visibly auditable and has one ASCII grid cell per
+                # Tk index, unlike silently retaining a zero-width character.
+                escaped = f"{chr(92)}u{ord(char):04X}"
+                tokens.append((escaped, len(escaped)))
+                used += len(escaped)
+            continue
+        token = char + (_TK_INDEX_PLACEHOLDER if char_width == 2 else "")
+        tokens.append((token, char_width))
+        used += char_width
+
+    if used > width:
+        # U+2026 is East-Asian ambiguous and therefore a two-cell glyph under
+        # this grid model.  A one-cell field still gets a visible truncation
+        # marker without violating its fixed Tk index length.
+        ellipsis = "." if width == 1 else "…" + _TK_INDEX_PLACEHOLDER
+        ellipsis_width = 1 if width == 1 else 2
+        content_width = width - ellipsis_width
+        parts: list[str] = []
+        used = 0
+        for token, token_width in tokens:
+            if used + token_width > content_width:
+                break
+            parts.append(token)
+            used += token_width
+        return "".join(parts) + ellipsis + (" " * (content_width - used))
+
+    return "".join(token for token, _ in tokens) + (" " * (width - used))
+
+
+def _display_cell_width(char: str) -> int:
+    """Return the fixed grid width for one Unicode code point."""
+    if not char or unicodedata.combining(char):
+        return 0
+    east_asian_width = unicodedata.east_asian_width(char)
+    if east_asian_width in ("F", "W"):
+        return 2
+    if east_asian_width != "A":
+        return 1
+
+    # 新宋体 11 renders accented Latin letters and these compact trademark
+    # symbols at the one-cell ASCII advance even though Unicode marks them
+    # ambiguous.  Keep all other A characters wide: in particular U+2026
+    # remains two cells, matching the truncation marker below.
+    name = unicodedata.name(char, "")
+    if "LATIN" in name or char in ("™", "®"):
+        return 1
+    return 2
+
+
+def _excel_column_display(logical_col: int) -> str:
+    """Return a user-facing logical column as an Excel label (A, Z, AA...)."""
+    try:
+        return get_column_letter(max(1, int(logical_col)))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _excel_column_range_display(start_col: int, end_col: int | None = None) -> str:
+    """Return an inclusive user-facing logical column range in Excel notation."""
+    start = _excel_column_display(start_col)
+    end = _excel_column_display(start_col if end_col is None else end_col)
+    return start if start == end else f"{start}:{end}"
 
 
 def _should_auto_row_align(max_row_a: int, max_row_b: int, force: bool = False) -> bool:
@@ -4839,7 +5186,10 @@ class LogicalColumnProjection:
         normalized = _normalize_logical_column_side(side)
         marker = self.structural_marker(normalized, logical_col)
         if normalized == "logical":
-            label = f"L{int(logical_col)}"
+            # Logical-pane headers follow Excel's A..Z/AA convention too.
+            # ``L<n>`` remains an internal/action identifier only; structural
+            # markers are retained so C still exposes uncertain geometry.
+            label = get_column_letter(int(logical_col))
         else:
             physical = self.physical_col(normalized, logical_col)
             label = get_column_letter(physical) if physical is not None else _LOGICAL_COLUMN_PLACEHOLDER
@@ -8034,6 +8384,1884 @@ def _workbook_package_ready(path: str) -> bool:
         return False
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+@dataclass
+class _PackageFingerprint:
+    path: str
+    sha256: str | None
+    members: dict[str, tuple[int, str]] = field(default_factory=dict)
+    payloads: dict[str, bytes] = field(default_factory=dict)
+    ready: bool = False
+    reason: str = ""
+    elapsed_seconds: float = 0.0
+
+
+_PACKAGE_FINGERPRINT_CACHE: dict[tuple[str, int, int], _PackageFingerprint] = {}
+
+
+def _ooxml_package_fingerprint(path: str | None) -> _PackageFingerprint:
+    """Read a stable package once for all matrix pair comparisons.
+
+    The manifest accelerates obvious inequality; retained uncompressed member
+    bytes are compared directly in the equality decision, including VBA blobs.
+    """
+    started = time.perf_counter()
+    if not path:
+        return _PackageFingerprint("", None, reason="missing input path", elapsed_seconds=time.perf_counter() - started)
+    signature = _workbook_sig(path)
+    cached = _PACKAGE_FINGERPRINT_CACHE.get(signature)
+    if cached is not None:
+        return cached
+    fingerprint = _PackageFingerprint(str(path), None)
+    try:
+        if not _workbook_package_ready(path):
+            fingerprint.reason = "input is not a complete OOXML package"
+            return fingerprint
+        fingerprint.sha256 = _sha256_file(path)
+        with zipfile.ZipFile(path, "r") as package:
+            raw_names = [name for name in package.namelist() if not name.endswith("/")]
+            if len(set(raw_names)) != len(raw_names):
+                fingerprint.reason = "duplicate OOXML package member names"
+                return fingerprint
+            for name in sorted(raw_names):
+                payload = package.read(name)
+                fingerprint.payloads[name] = payload
+                fingerprint.members[name] = (len(payload), hashlib.sha256(payload).hexdigest())
+        fingerprint.ready = True
+        fingerprint.reason = "complete package fingerprint"
+        return fingerprint
+    except (OSError, zipfile.BadZipFile, EOFError, RuntimeError) as exc:
+        fingerprint.reason = f"package fingerprint failed: {exc}"
+        return fingerprint
+    except Exception as exc:
+        fingerprint.reason = f"package fingerprint unexpected error: {exc}"
+        return fingerprint
+    finally:
+        fingerprint.elapsed_seconds = time.perf_counter() - started
+        _PACKAGE_FINGERPRINT_CACHE[signature] = fingerprint
+        _dlog(
+            f"PACKAGE_FINGERPRINT path={path} ready={fingerprint.ready} "
+            f"members={len(fingerprint.members)} elapsed_ms={fingerprint.elapsed_seconds * 1000.0:.1f} "
+            f"reason={fingerprint.reason}"
+        )
+
+
+def compare_ooxml_packages(
+    left_path: str | None,
+    right_path: str | None,
+    *,
+    left_role: str = "left",
+    right_role: str = "right",
+) -> PackageComparison:
+    """Compare complete OOXML packages by uncompressed member bytes.
+
+    ZIP entry timestamps, ordering, compression levels, and container comments
+    are intentionally ignored.  Every non-directory member (including
+    ``xl/vbaProject.bin``) must exist on both sides and have identical bytes.
+    Any read/package failure is ``None`` (unknown), never equality.
+    """
+    started = time.perf_counter()
+    left = _ooxml_package_fingerprint(left_path)
+    right = _ooxml_package_fingerprint(right_path)
+    if not left.ready or not right.ready:
+        reason = f"left: {left.reason}; right: {right.reason}"
+        return PackageComparison(
+            left_role, right_role, left_path, right_path, left.sha256, right.sha256,
+            None, False, time.perf_counter() - started, reason,
+        )
+    if tuple(left.members) != tuple(right.members):
+        return PackageComparison(
+            left_role, right_role, left_path, right_path, left.sha256, right.sha256,
+            False, True, time.perf_counter() - started, "OOXML member set differs",
+        )
+    for member, manifest in left.members.items():
+        if right.members.get(member) != manifest:
+            return PackageComparison(
+                left_role, right_role, left_path, right_path, left.sha256, right.sha256,
+                False, True, time.perf_counter() - started, f"OOXML member bytes differ: {member}",
+            )
+        # A member digest never alone proves equality.  Compare the actual
+        # uncompressed bytes retained by the one-pass package scan.
+        if left.payloads.get(member) != right.payloads.get(member):
+            return PackageComparison(
+                left_role, right_role, left_path, right_path, left.sha256, right.sha256,
+                False, True, time.perf_counter() - started, f"OOXML member bytes differ: {member}",
+            )
+    return PackageComparison(
+        left_role, right_role, left_path, right_path, left.sha256, right.sha256,
+        True, True, time.perf_counter() - started, "all OOXML member bytes are identical",
+    )
+
+
+_OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _canonical_ooxml_xml(element: ET.Element):
+    """Return a whitespace-insensitive, attribute-order-stable XML value."""
+    text = (element.text or "").strip()
+    return (
+        element.tag,
+        tuple(sorted((str(key), str(value)) for key, value in element.attrib.items())),
+        text,
+        tuple(_canonical_ooxml_xml(child) for child in list(element)),
+    )
+
+
+def _ooxml_sheet_part_map(payloads: dict[str, bytes]) -> dict[str, str]:
+    """Resolve workbook sheet names to their worksheet package member paths."""
+    try:
+        workbook = ET.fromstring(payloads["xl/workbook.xml"])
+        relationships = ET.fromstring(payloads["xl/_rels/workbook.xml.rels"])
+        targets = {
+            relation.attrib.get("Id"): relation.attrib.get("Target", "")
+            for relation in relationships.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+        }
+        result = {}
+        for sheet in workbook.findall(f".//{{{_OOXML_MAIN_NS}}}sheet"):
+            name = sheet.attrib.get("name")
+            relationship_id = sheet.attrib.get(f"{{{_OOXML_REL_NS}}}id")
+            target = targets.get(relationship_id)
+            if not name or not target:
+                continue
+            normalized = posixpath.normpath(posixpath.join("xl", target)).lstrip("/")
+            if normalized in payloads:
+                result[str(name)] = normalized
+        return result
+    except Exception:
+        return {}
+
+
+def _shared_string_semantic_tokens(payload: bytes | None) -> tuple[str, ...] | None:
+    """Decode shared-string table entries into stable semantic tokens."""
+    if payload is None:
+        return ()
+    try:
+        root = ET.fromstring(payload)
+        tokens = []
+        for item in root.findall(f"{{{_OOXML_MAIN_NS}}}si"):
+            canonical = repr(_canonical_ooxml_xml(item)).encode("utf-8", "surrogatepass")
+            tokens.append(hashlib.sha256(canonical).hexdigest())
+        return tuple(tokens)
+    except Exception:
+        return None
+
+
+def _normalized_worksheet_payload(
+    payload: bytes,
+    allowed_cells: set[str],
+    *,
+    shared_string_tokens: tuple[str, ...] | None = None,
+) -> object | None:
+    """Ignore only value/formula payloads for explicitly changed cells.
+
+    Cell style attributes, comments/metadata attributes, sheet properties,
+    merged ranges, dimensions and every other worksheet node deliberately stay
+    in the canonical representation.  A difference in any of them is not a
+    value/formula merge and therefore cannot be silently projected.
+    """
+    try:
+        root = ET.fromstring(payload)
+        cell_tag = f"{{{_OOXML_MAIN_NS}}}c"
+        row_tag = f"{{{_OOXML_MAIN_NS}}}row"
+        value_tags = {
+            f"{{{_OOXML_MAIN_NS}}}v",
+            f"{{{_OOXML_MAIN_NS}}}f",
+            f"{{{_OOXML_MAIN_NS}}}is",
+        }
+        # Excel persists the user's active selection and scroll origin in the
+        # worksheet view.  They are not workbook content.  Preserve split and
+        # frozen-pane structure while removing only selection/focus fields.
+        for sheet_view in root.findall(f".//{{{_OOXML_MAIN_NS}}}sheetView"):
+            sheet_view.attrib.pop("tabSelected", None)
+            for child in list(sheet_view):
+                local_name = child.tag.rsplit("}", 1)[-1]
+                if local_name == "selection":
+                    sheet_view.remove(child)
+                elif local_name == "pane":
+                    child.attrib.pop("topLeftCell", None)
+                    child.attrib.pop("activePane", None)
+        for row in root.findall(f".//{row_tag}"):
+            for cell in list(row):
+                if cell.tag != cell_tag:
+                    continue
+                reference = cell.attrib.get("r")
+                is_allowed = reference in allowed_cells
+                if cell.attrib.get("t") == "s" and not is_allowed:
+                    shared_index = cell.find(f"{{{_OOXML_MAIN_NS}}}v")
+                    try:
+                        index = int((shared_index.text or "").strip()) if shared_index is not None else -1
+                    except (TypeError, ValueError):
+                        return None
+                    if (
+                        shared_string_tokens is None
+                        or index < 0
+                        or index >= len(shared_string_tokens)
+                        or shared_index is None
+                    ):
+                        return None
+                    # Shared-string indexes are package-local and Excel can
+                    # reindex the entire table on one unrelated text edit.
+                    # Compare the resolved string semantics at every unchanged
+                    # coordinate, never the transient table index.
+                    shared_index.text = f"sow-shared:{shared_string_tokens[index]}"
+                has_formula = cell.find(f"{{{_OOXML_MAIN_NS}}}f") is not None
+                # Formula cache values are recalc artifacts, not source edits;
+                # retain and compare the formula itself unless it is an
+                # explicitly changed formula coordinate.
+                if has_formula and not is_allowed:
+                    for child in list(cell):
+                        if child.tag == f"{{{_OOXML_MAIN_NS}}}v":
+                            cell.remove(child)
+                    continue
+                if not is_allowed:
+                    continue
+                # Cell type is payload.  A default-style blank cell that was
+                # materialized only to hold a new value is semantically the
+                # same as a missing cell once its payload is removed.  Keep
+                # every non-default style/metadata attribute so it remains a
+                # visible unsupported representation change.
+                cell.attrib.pop("t", None)
+                if cell.attrib.get("s") == "0":
+                    cell.attrib.pop("s", None)
+                for child in list(cell):
+                    if child.tag in value_tags:
+                        cell.remove(child)
+                if set(cell.attrib) == {"r"} and not list(cell):
+                    row.remove(cell)
+            # A newly materialized default row for a blank-to-value change is
+            # likewise equivalent to no row.  Row height/style/hidden/etc.
+            # remain, and therefore still fail the representation audit.
+            if not list(row) and set(row.attrib) == {"r"}:
+                parent = next(
+                    (node for node in root.iter() if row in list(node)),
+                    None,
+                )
+                if parent is not None:
+                    parent.remove(row)
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _shared_string_references(
+    worksheet_payloads: dict[str, bytes],
+    allowed_cells_by_member: dict[str, set[str]],
+) -> tuple[set[int], bool]:
+    """Return shared-string entries referenced only by allowed changed cells."""
+    allowed_indexes: set[int] = set()
+    disallowed_indexes: set[int] = set()
+    try:
+        for member, payload in worksheet_payloads.items():
+            root = ET.fromstring(payload)
+            allowed_cells = allowed_cells_by_member.get(member, set())
+            for cell in root.findall(f".//{{{_OOXML_MAIN_NS}}}c"):
+                if cell.attrib.get("t") != "s":
+                    continue
+                value = cell.find(f"{{{_OOXML_MAIN_NS}}}v")
+                try:
+                    index = int((value.text or "").strip()) if value is not None else -1
+                except (TypeError, ValueError):
+                    return set(), False
+                if index < 0:
+                    return set(), False
+                if cell.attrib.get("r") in allowed_cells:
+                    allowed_indexes.add(index)
+                else:
+                    disallowed_indexes.add(index)
+    except Exception:
+        return set(), False
+    return allowed_indexes - disallowed_indexes, True
+
+
+def _normalized_shared_strings_payload(payload: bytes, allowed_indexes: set[int]) -> object | None:
+    try:
+        root = ET.fromstring(payload)
+        root.attrib.pop("count", None)
+        root.attrib.pop("uniqueCount", None)
+        for index, item in enumerate(root.findall(f"{{{_OOXML_MAIN_NS}}}si")):
+            if index not in allowed_indexes:
+                continue
+            for child in list(item):
+                item.remove(child)
+            item.text = None
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _normalized_content_types_payload(payload: bytes, *, allow_shared_strings: bool, allow_calc_chain: bool) -> object | None:
+    try:
+        root = ET.fromstring(payload)
+        for child in list(root):
+            part_name = str(child.attrib.get("PartName") or "")
+            if (
+                (allow_shared_strings and part_name == "/xl/sharedStrings.xml")
+                or (allow_calc_chain and part_name == "/xl/calcChain.xml")
+            ):
+                root.remove(child)
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _normalized_workbook_relationships_payload(payload: bytes, *, allow_shared_strings: bool, allow_calc_chain: bool) -> object | None:
+    try:
+        root = ET.fromstring(payload)
+        for child in list(root):
+            target = str(child.attrib.get("Target") or "").replace("\\", "/")
+            if (
+                (allow_shared_strings and target.endswith("sharedStrings.xml"))
+                or (allow_calc_chain and target.endswith("calcChain.xml"))
+            ):
+                root.remove(child)
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _normalized_workbook_payload(payload: bytes, *, allow_formula_delta: bool) -> object | None:
+    try:
+        root = ET.fromstring(payload)
+        if allow_formula_delta:
+            for calc_properties in root.findall(f"{{{_OOXML_MAIN_NS}}}calcPr"):
+                root.remove(calc_properties)
+        # Excel rewrites window placement and its revision-pointer GUID on a
+        # normal save.  They are UI/save-session metadata, unlike activeTab,
+        # sheets, definedNames and other workbook semantics which remain in
+        # the canonical comparison below.
+        for parent in root.iter():
+            for child in list(parent):
+                if child.tag.rsplit("}", 1)[-1] == "revisionPtr":
+                    parent.remove(child)
+            if parent.tag.rsplit("}", 1)[-1] == "workbookView":
+                parent.attrib.pop("xWindow", None)
+                parent.attrib.pop("yWindow", None)
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _normalized_core_properties_payload(payload: bytes) -> object | None:
+    """Ignore only save-volatile core properties, never user metadata."""
+    try:
+        root = ET.fromstring(payload)
+        volatile = {"{http://purl.org/dc/terms/}modified"}
+        for child in list(root):
+            if child.tag in volatile:
+                root.remove(child)
+        return _canonical_ooxml_xml(root)
+    except Exception:
+        return None
+
+
+def _cross_branch_ooxml_representation_audit(
+    source_before_path: str,
+    source_after_path: str,
+    changed_cells_by_sheet: dict[str, set[str]],
+    *,
+    has_formula_content: bool,
+    has_string_delta: bool,
+) -> str | None:
+    """Reject source package changes that cannot be represented as cell edits.
+
+    The cross-branch writer copies only values/formulas into Target Working.
+    This audit proves that the source package changed *only* at those explicit
+    cell payloads.  Any style, comment, sheet property, document property,
+    drawing, relation or other OOXML member is an additional incoming change
+    and must be shown as manual work instead of being silently discarded.
+    """
+    before = _ooxml_package_fingerprint(source_before_path)
+    after = _ooxml_package_fingerprint(source_after_path)
+    if not before.ready or not after.ready:
+        return f"Source OOXML representation audit unavailable: before={before.reason}; after={after.reason}"
+    if before.members == after.members and all(
+        before.payloads.get(member) == after.payloads.get(member)
+        for member in before.members
+    ):
+        return None
+
+    before_sheet_parts = _ooxml_sheet_part_map(before.payloads)
+    after_sheet_parts = _ooxml_sheet_part_map(after.payloads)
+    if set(before_sheet_parts) != set(after_sheet_parts):
+        return "Source workbook sheet-member mapping changed"
+    allowed_cells_by_member: dict[str, set[str]] = {}
+    for sheet, cells in changed_cells_by_sheet.items():
+        before_member = before_sheet_parts.get(sheet)
+        after_member = after_sheet_parts.get(sheet)
+        if not before_member or before_member != after_member:
+            return f"Source worksheet member is unavailable for {sheet}"
+        allowed_cells_by_member.setdefault(before_member, set()).update(cells)
+
+    before_shared_tokens = _shared_string_semantic_tokens(before.payloads.get("xl/sharedStrings.xml"))
+    after_shared_tokens = _shared_string_semantic_tokens(after.payloads.get("xl/sharedStrings.xml"))
+    if before_shared_tokens is None or after_shared_tokens is None:
+        return "Source sharedStrings representation could not be decoded"
+
+    # Shared strings are an encoding table, not a distinct workbook feature.
+    # All unlisted worksheet coordinates are proven unchanged by the cell
+    # classification above, so a string payload change may legitimately rebuild
+    # or reindex the whole table (including indices shared by unchanged cells).
+    # Once each worksheet is compared through its resolved string semantics,
+    # sharedStrings is only an encoding table.  Its member can reorder even
+    # when the source has no logical cell delta, so never treat its raw bytes
+    # as a separate incoming change.
+    allow_shared_strings = True
+
+    member_names = set(before.payloads) | set(after.payloads)
+    for member in sorted(member_names):
+        before_payload = before.payloads.get(member)
+        after_payload = after.payloads.get(member)
+        if before_payload == after_payload:
+            continue
+        if member.startswith("xl/worksheets/") and member.endswith(".xml"):
+            # A source text edit can rebuild sharedStrings and reindex cells
+            # on worksheets with no direct source delta.  Normalize every
+            # worksheet through resolved shared-string semantics; a real style
+            # or other non-payload change still survives and fails below.
+            allowed_cells = allowed_cells_by_member.get(member, set())
+            normalized_before = _normalized_worksheet_payload(
+                before_payload or b"",
+                allowed_cells,
+                shared_string_tokens=before_shared_tokens,
+            )
+            normalized_after = _normalized_worksheet_payload(
+                after_payload or b"",
+                allowed_cells,
+                shared_string_tokens=after_shared_tokens,
+            )
+        elif member == "xl/sharedStrings.xml" and allow_shared_strings:
+            continue
+        elif member == "xl/calcChain.xml" and has_formula_content:
+            # Formula recalculation bookkeeping is not a user-visible source
+            # edit.  Formula cell XML remains covered by its worksheet audit.
+            continue
+        elif member == "xl/workbook.xml":
+            normalized_before = _normalized_workbook_payload(
+                before_payload or b"", allow_formula_delta=has_formula_content
+            )
+            normalized_after = _normalized_workbook_payload(
+                after_payload or b"", allow_formula_delta=has_formula_content
+            )
+        elif member == "docProps/core.xml":
+            normalized_before = _normalized_core_properties_payload(before_payload or b"")
+            normalized_after = _normalized_core_properties_payload(after_payload or b"")
+        elif member == "[Content_Types].xml" and (allow_shared_strings or has_formula_content):
+            normalized_before = _normalized_content_types_payload(
+                before_payload or b"",
+                allow_shared_strings=allow_shared_strings,
+                allow_calc_chain=has_formula_content,
+            )
+            normalized_after = _normalized_content_types_payload(
+                after_payload or b"",
+                allow_shared_strings=allow_shared_strings,
+                allow_calc_chain=has_formula_content,
+            )
+        elif member == "xl/_rels/workbook.xml.rels" and (allow_shared_strings or has_formula_content):
+            normalized_before = _normalized_workbook_relationships_payload(
+                before_payload or b"",
+                allow_shared_strings=allow_shared_strings,
+                allow_calc_chain=has_formula_content,
+            )
+            normalized_after = _normalized_workbook_relationships_payload(
+                after_payload or b"",
+                allow_shared_strings=allow_shared_strings,
+                allow_calc_chain=has_formula_content,
+            )
+        else:
+            return f"Unsupported Source OOXML member change: {member}"
+        if normalized_before is None or normalized_after is None or normalized_before != normalized_after:
+            return f"Unsupported Source OOXML representation change: {member}"
+    return None
+
+
+def _available_identities(
+    identities: dict[str, VersionIdentity] | MergeLaunchContext,
+) -> dict[str, VersionIdentity]:
+    if isinstance(identities, MergeLaunchContext):
+        # A launch context has four declared semantic roles even when the
+        # local WC pristine cannot be materialized.  Keep unavailable roles in
+        # the matrix so all six pair decisions are logged as fail-closed
+        # evidence instead of silently disappearing.
+        return {
+            str(role).lower(): identity
+            for role, identity in (identities.identities or {}).items()
+            if isinstance(identity, VersionIdentity)
+        }
+    return {
+        str(role).lower(): identity
+        for role, identity in (identities or {}).items()
+        if isinstance(identity, VersionIdentity) and identity.available
+    }
+
+
+def build_equivalence_matrix(
+    identities: dict[str, VersionIdentity] | MergeLaunchContext,
+) -> EquivalenceMatrix:
+    """Build and log every available identity pair before any automatic action."""
+    available = _available_identities(identities)
+    matrix = EquivalenceMatrix()
+    roles = sorted(available)
+    for left_idx, left_role in enumerate(roles):
+        for right_role in roles[left_idx + 1:]:
+            left = available[left_role]
+            right = available[right_role]
+            result = compare_ooxml_packages(
+                left.effective_path,
+                right.effective_path,
+                left_role=left_role,
+                right_role=right_role,
+            )
+            matrix.comparisons[(left_role, right_role)] = result
+            _dlog(
+                "EQUIVALENCE "
+                f"{left_role}<->{right_role} ready={result.ready} raw_sha_equal={result.raw_hash_equal} "
+                f"package_equal={result.package_equal} elapsed_ms={result.elapsed_seconds * 1000.0:.1f} "
+                f"reason={result.reason}"
+            )
+    if not matrix.comparisons:
+        _dlog("EQUIVALENCE matrix has no comparable input pairs")
+    return matrix
+
+
+def decide_startup_merge_outcome(
+    context: MergeLaunchContext,
+    matrix: EquivalenceMatrix,
+) -> StartupMergeOutcome:
+    """Select only a proven whole-workbook convergence action and fold target."""
+    outcome = StartupMergeOutcome()
+    is_three_way = bool(context.source_base_path and context.mine_path and context.theirs_path)
+    if not is_three_way:
+        return outcome
+
+    mine_base = matrix.are_equal("mine", "base")
+    theirs_base = matrix.are_equal("theirs", "base")
+    mine_theirs = matrix.are_equal("mine", "theirs")
+    if mine_base:
+        outcome.equality_evidence.append("Mine ≡ Base")
+    if theirs_base:
+        outcome.equality_evidence.append("Theirs ≡ Base")
+    if mine_theirs:
+        outcome.equality_evidence.append("Mine ≡ Theirs")
+
+    # A non-empty branch merge must always reach source-delta classification,
+    # even when Target Working happens to equal Source Before or Source After.
+    # Whole-package convergence can initialize a file, but it cannot supply the
+    # required incoming/applied/already-present audit counters.  The only branch
+    # fast path is the proven empty source delta.
+    if context.scenario == MergeScenario.CROSS_BRANCH_MERGE:
+        if theirs_base:
+            outcome.automatic_action = "initialize-from-mine-empty-branch-delta"
+            outcome.source_role = "mine"
+            outcome.equality_evidence.append("source Base ≡ source-right/Theirs")
+        else:
+            outcome.fallback_reasons.append(
+                "non-empty source delta requires Source Before-to-Source After classification"
+            )
+    elif mine_theirs:
+        outcome.automatic_action = "initialize-from-common-mine-theirs"
+        outcome.source_role = "mine"
+        if "Mine ≡ Theirs" not in outcome.equality_evidence:
+            outcome.equality_evidence.append("Mine ≡ Theirs")
+    elif mine_base and not theirs_base:
+        outcome.automatic_action = "initialize-from-theirs"
+        outcome.source_role = "theirs"
+    elif theirs_base and not mine_base:
+        outcome.automatic_action = "initialize-from-mine"
+        outcome.source_role = "mine"
+    else:
+        outcome.fallback_reasons.append("no complete package equality proves whole-workbook convergence")
+
+    # The center pane shows the initialized Merged candidate, not a mutable
+    # alias of raw Mine.  Fold the pane that is redundant to what remains
+    # visible after candidate initialization.
+    if context.scenario == MergeScenario.CROSS_BRANCH_MERGE:
+        if theirs_base:
+            outcome.folded_identity = "base"
+    elif outcome.source_role == "theirs":
+        outcome.folded_identity = "theirs"
+    elif mine_theirs:
+        outcome.folded_identity = "theirs"
+    elif theirs_base:
+        outcome.folded_identity = "base"
+    elif mine_base:
+        outcome.folded_identity = "base"
+    _dlog(
+        "STARTUP_OUTCOME decision "
+        f"action={outcome.automatic_action} source={outcome.source_role} fold={outcome.folded_identity} "
+        f"evidence={outcome.equality_evidence} fallback={outcome.fallback_reasons}"
+    )
+    return outcome
+
+
+def _find_svn_wc_root_for_path(path: str | None) -> str | None:
+    probe = os.path.dirname(os.path.abspath(path)) if path else ""
+    while probe:
+        if os.path.isfile(os.path.join(probe, ".svn", "wc.db")):
+            return probe
+        parent = os.path.dirname(probe)
+        if not parent or parent == probe:
+            break
+        probe = parent
+    return None
+
+
+def _parse_svn_skel(conflict_data: bytes | str | None):
+    """Parse the small, s-expression-like subset used by SVN conflict skels.
+
+    Working-copy ``ACTUAL_NODE.conflict_data`` is a binary SVN *skel*, not a
+    public XML or JSON format.  In practice the merge-source records are
+    represented by nested lists and length-prefixed atoms.  We intentionally
+    parse just those stable primitives here rather than guessing a target
+    repository path from a sidecar filename.  Malformed input returns an empty
+    list so callers can retain the supplied sidecar identity as a safe fallback.
+    """
+    if conflict_data is None:
+        return []
+    # SVN skel atom lengths count bytes, not Python Unicode code points.  Keep
+    # the cursor on raw bytes and decode only complete atoms; a Chinese source
+    # path therefore cannot shift the following source node boundary.
+    raw_data = (
+        bytes(conflict_data)
+        if isinstance(conflict_data, bytes)
+        else str(conflict_data).encode("utf-8", errors="surrogatepass")
+    )
+    length = len(raw_data)
+    position = 0
+
+    def _skip_space():
+        nonlocal position
+        while position < length and raw_data[position] in b" \t\r\n":
+            position += 1
+
+    def _decode_atom(value: bytes) -> str:
+        return value.decode("utf-8", errors="replace")
+
+    def _read_node():
+        nonlocal position
+        _skip_space()
+        if position >= length:
+            return None
+        if raw_data[position] == ord("("):
+            position += 1
+            values = []
+            while True:
+                _skip_space()
+                if position >= length:
+                    # A truncated WC record is not evidence we can use.
+                    return None
+                if raw_data[position] == ord(")"):
+                    position += 1
+                    return values
+                item = _read_node()
+                if item is None:
+                    return None
+                values.append(item)
+        if raw_data[position] == ord(")"):
+            return None
+
+        start = position
+        while position < length and ord("0") <= raw_data[position] <= ord("9"):
+            position += 1
+        if position > start:
+            atom_length = int(raw_data[start:position])
+            delimiter = raw_data[position] if position < length else None
+            if delimiter == ord(":"):
+                position += 1
+                if position + atom_length <= length:
+                    atom = _decode_atom(raw_data[position:position + atom_length])
+                    position += atom_length
+                    return atom
+            elif delimiter in b" \t\r\n":
+                # SVN's canonical form is ``<length> <atom>``.  Only consume
+                # it when the declared atom fits, otherwise this was simply a
+                # numeric revision token such as ``37073``.
+                payload_start = position + 1
+                if payload_start + atom_length <= length:
+                    atom = _decode_atom(raw_data[payload_start:payload_start + atom_length])
+                    position = payload_start + atom_length
+                    return atom
+            position = start
+
+        start = position
+        while position < length and raw_data[position] not in b" \t\r\n()":
+            position += 1
+        return _decode_atom(raw_data[start:position]) if position > start else None
+
+    parsed = _read_node()
+    _skip_space()
+    return parsed if parsed is not None and position >= length else []
+
+
+def _svn_skel_atoms(node) -> list[str]:
+    """Flatten a parsed skel while preserving the order SVN wrote its atoms."""
+    if isinstance(node, str):
+        return [node]
+    if not isinstance(node, list):
+        return []
+    atoms: list[str] = []
+    for child in node:
+        atoms.extend(_svn_skel_atoms(child))
+    return atoms
+
+
+def _normalise_svn_repository_path(value: str) -> str | None:
+    cleaned = str(value or "").strip().strip("\"'")
+    match = re.search(r"((?:[^()\s/]+/)+[^()\s/]+\.(?:xlsx|xlsm))", cleaned, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).replace("\\", "/").lstrip("/")
+
+
+def _svn_source_node_from_atoms(atoms: list[str]) -> tuple[str, int] | None:
+    """Return one ``repository-relative path, revision`` pair from a skel node."""
+    for index, atom in enumerate(atoms):
+        repository_path = _normalise_svn_repository_path(atom)
+        if not repository_path:
+            continue
+        revision = None
+        # SVN's merge source node stores ``peg-rev`` followed by operative
+        # revision (for example ``... Building.xlsx 5 37073 file``).  Search
+        # backwards through the trailing fields so the operative revision wins.
+        for nearby in list(reversed(atoms[index + 1:])) + list(reversed(atoms[:index])):
+            match = re.fullmatch(r"r?(\d+)", str(nearby or "").strip(), re.IGNORECASE)
+            if match:
+                revision = int(match.group(1))
+                break
+        if revision is not None:
+            return repository_path, revision
+    return None
+
+
+def _extract_svn_conflict_source_nodes(conflict_data: bytes | str | None) -> list[tuple[str, int]]:
+    """Extract ordered merge-source nodes from a WC conflict skel.
+
+    Newer SVN clients store two ``subversion`` source nodes for a merge.  The
+    order is meaningful: first is Source Before and second is Source After.
+    Be deliberately strict about needing a workbook path and explicit revision;
+    incomplete records are not promoted over raw sidecar evidence.
+    """
+    parsed = _parse_svn_skel(conflict_data)
+    candidates: list[tuple[str, int]] = []
+
+    def _walk(node):
+        if not isinstance(node, list):
+            return
+        atoms = _svn_skel_atoms(node)
+        # Do not treat a wrapper containing two source nodes as a source node
+        # itself: flattening that wrapper would accidentally pair Source Before
+        # with Source After's final revision.
+        if node and isinstance(node[0], str) and node[0].strip().lower() == "subversion":
+            source = _svn_source_node_from_atoms(atoms[1:])
+            if source is not None:
+                candidates.append(source)
+        for child in node:
+            _walk(child)
+
+    _walk(parsed)
+    if not candidates:
+        # Some SVN builds wrap the same source information in an opaque atom.
+        # Preserve list order by pairing each workbook path with the first
+        # adjacent revision token after it, then before it if necessary.
+        atoms = _svn_skel_atoms(parsed)
+        candidates = [
+            source for source in (_svn_source_node_from_atoms(atoms),)
+            if source is not None
+        ]
+    return candidates
+
+
+def _read_cross_branch_sources_from_wc(
+    wc_root: str,
+    local_relpath: str,
+) -> tuple[list[tuple[str, int]], str]:
+    """Read exact Source Before/After identity evidence from ``ACTUAL_NODE``."""
+    db_path = os.path.join(wc_root, ".svn", "wc.db")
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                """
+                select conflict_data
+                from ACTUAL_NODE
+                where local_relpath = ? and conflict_data is not null
+                """,
+                (local_relpath.replace("\\", "/"),),
+            ).fetchall()
+        if len(rows) != 1:
+            return [], (
+                "ACTUAL_NODE conflict-data lookup is ambiguous"
+                if rows else "ACTUAL_NODE has no conflict-data row for target"
+            )
+        sources = _extract_svn_conflict_source_nodes(rows[0][0])
+        if len(sources) != 2:
+            return [], "ACTUAL_NODE has no exact two-node merge source record"
+        before, after = sources
+        if before[0] != after[0] or before[1] >= after[1]:
+            return [], "ACTUAL_NODE source nodes do not prove one increasing revision path"
+        return sources, "wc-conflict-data"
+    except Exception as exc:
+        return [], f"ACTUAL_NODE conflict-data lookup failed: {exc}"
+
+
+def resolve_cross_branch_source_metadata(context: MergeLaunchContext) -> None:
+    """Promote WC-recorded source paths/revisions over sidecar suffix guesses."""
+    if context.scenario != MergeScenario.CROSS_BRANCH_MERGE:
+        return
+    _dlog(
+        "MERGE_ROLE_SEMANTICS "
+        "scenario=cross-branch-merge base=Source Before theirs=Source After "
+        "mine=Target Working target_pristine=Target Pristine"
+    )
+    anchor = context.merged_path or context.mine_path
+    wc_root = _find_svn_wc_root_for_path(anchor)
+    if wc_root and anchor:
+        relpath = os.path.relpath(os.path.abspath(anchor), wc_root).replace("\\", "/")
+        sources, reason = _read_cross_branch_sources_from_wc(wc_root, relpath)
+        if len(sources) == 2:
+            for role, (repository_path, revision) in zip(("base", "theirs"), sources):
+                identity = context.identity_for(role)
+                if identity is None:
+                    continue
+                identity.repository_identity = repository_path
+                identity.revision = revision
+                _dlog(
+                    "SVN_CONFLICT_SOURCE "
+                    f"role={role} repository_path={repository_path} revision=r{revision} "
+                    "source=wc-conflict-data"
+                )
+            return
+    else:
+        reason = "target working-copy root unavailable"
+
+    for role in ("base", "theirs"):
+        identity = context.identity_for(role)
+        if identity is not None:
+            _dlog(
+                "SVN_CONFLICT_SOURCE_FALLBACK "
+                f"role={role} sidecar_path={identity.path!r} revision={identity.revision!r} reason={reason}"
+            )
+
+
+def _wc_node_metadata(wc_root: str, local_relpath: str) -> tuple[int | None, str | None, str]:
+    """Return current WC BASE last-change metadata, read-only and locally."""
+    db_path = os.path.join(wc_root, ".svn", "wc.db")
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                """
+                select changed_revision, changed_author
+                from NODES
+                where local_relpath = ? and op_depth = 0 and kind = 'file'
+                  and presence = 'normal'
+                limit 1
+                """,
+                (local_relpath.replace("\\", "/"),),
+            ).fetchone()
+        if row:
+            return (int(row[0]) if row[0] is not None else None, row[1], "wc-db-current-node")
+        return None, None, "wc.db has no normal file node"
+    except Exception as exc:
+        return None, None, f"wc.db current-node lookup failed: {exc}"
+
+
+def _wc_author_for_exact_sidecar_revision(
+    wc_root: str,
+    basename: str,
+    revision: int,
+    *,
+    repository_identity: str | None = None,
+) -> tuple[str | None, str]:
+    """Find an exact WC author record; never infer it from a revision alone.
+
+    Cross-branch conflict metadata supplies a repository-relative source path.
+    Once present, that path is authoritative: a missing exact row must remain
+    unknown rather than falling back to a same-basename file in Target Working
+    or another branch.
+    """
+    db_path = os.path.join(wc_root, ".svn", "wc.db")
+    source_path = str(repository_identity or "").replace("\\", "/").strip().lstrip("/")
+    if source_path:
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                rows = conn.execute(
+                    """
+                    select local_relpath, changed_author
+                    from NODES
+                    where local_relpath = ? and op_depth = 0 and kind = 'file'
+                      and presence = 'normal' and changed_revision = ?
+                    """,
+                    (source_path, int(revision)),
+                ).fetchall()
+            if len(rows) == 1 and rows[0][1]:
+                return str(rows[0][1]), f"wc-db-exact-source:{rows[0][0]}@r{revision}"
+            if len(rows) > 1:
+                return None, f"wc.db exact source author ambiguous for {source_path}@r{revision}"
+            return None, f"wc.db has no exact source path {source_path}@r{revision}"
+        except Exception as exc:
+            return None, f"wc.db exact source lookup failed: {exc}"
+
+    name = os.path.basename(str(basename or ""))
+    # The WC database stores the working filename, not SVN's temporary sidecar
+    # suffix (for example ``Book.xlsx``, not ``Book.xlsx.merge-right.r42``).
+    name = re.sub(r"\.merge-(?:left|right)(?:\.r\d+)?$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\.r\d+$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"-rev\d+\.svn\d+\.tmp\.(xlsx|xlsm)$", r".\1", name, flags=re.IGNORECASE)
+    name = name.lower()
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                """
+                select local_relpath, changed_author
+                from NODES
+                where op_depth = 0 and kind = 'file' and presence = 'normal'
+                  and changed_revision = ?
+                  and (lower(local_relpath) = ? or lower(local_relpath) like ?)
+                order by local_relpath
+                """,
+                (int(revision), name, "%/" + name),
+            ).fetchall()
+        if len(rows) == 1 and rows[0][1]:
+            return str(rows[0][1]), f"wc-db-exact-sidecar:{rows[0][0]}@r{revision}"
+        if len(rows) > 1:
+            return None, f"wc.db exact sidecar author ambiguous ({len(rows)} matching paths)"
+        return None, f"wc.db has no exact changed_revision={revision} basename={name} match"
+    except Exception as exc:
+        return None, f"wc.db sidecar lookup failed: {exc}"
+
+
+def _wc_repository_metadata_for_local_path(
+    wc_root: str, local_relpath: str
+) -> tuple[str | None, str | None, str]:
+    """Read one target-WC path's proven repository root and UUID, read-only."""
+    db_path = os.path.join(wc_root, ".svn", "wc.db")
+    relpath = str(local_relpath or "").replace("\\", "/").lstrip("/")
+    if not relpath:
+        return None, None, "target working-copy relative path unavailable"
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                """
+                select r.root, r.uuid
+                from NODES n
+                join REPOSITORY r on r.id = n.repos_id
+                where n.local_relpath = ? and n.op_depth = 0 and n.kind = 'file'
+                  and n.presence = 'normal'
+                limit 1
+                """,
+                (relpath,),
+            ).fetchone()
+        if row and row[0]:
+            return str(row[0]).rstrip("/"), str(row[1] or ""), "wc-db-repository-root"
+        return None, None, "wc.db has no repository root for target path"
+    except Exception as exc:
+        return None, None, f"wc.db repository-root lookup failed: {exc}"
+
+
+def _wc_repository_root_for_local_path(
+    wc_root: str, local_relpath: str
+) -> tuple[str | None, str]:
+    """Compatibility wrapper for callers that only require the repository root."""
+    root, _uuid, reason = _wc_repository_metadata_for_local_path(wc_root, local_relpath)
+    return root, reason
+
+
+def _svn_info_url_for_input_path(path: str | None) -> tuple[str | None, str]:
+    """Ask SVN for a local input file's canonical URL, with a short timeout."""
+    if not path or not os.path.exists(path):
+        return None, "input file unavailable for svn info"
+    svn_exe = _find_svn_cli_exe()
+    if not svn_exe:
+        return None, "svn CLI unavailable for input URL lookup"
+    try:
+        result = subprocess.run(
+            [svn_exe, "info", "--xml", "--non-interactive", path],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        return None, f"svn info input URL lookup failed: {exc}"
+    if int(getattr(result, "returncode", 1) or 0) != 0:
+        detail = str(getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+        return None, f"svn info input URL lookup failed: {detail or 'non-zero exit'}"
+    try:
+        root = ET.fromstring(str(getattr(result, "stdout", "") or ""))
+        url = str(root.findtext(".//url") or "").strip()
+    except Exception as exc:
+        return None, f"svn info input URL XML invalid: {exc}"
+    if not url:
+        return None, "svn info input URL missing"
+    return url, "svn-info-input-url"
+
+
+_SVN_AUTHOR_MEMORY_CACHE: dict[tuple[str, str, int], str] = {}
+
+
+class _SvnOptRevisionValue(ctypes.Union):
+    _fields_ = [("number", ctypes.c_longlong), ("date", ctypes.c_longlong)]
+
+
+class _SvnOptRevision(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_int), ("value", _SvnOptRevisionValue)]
+
+
+class _SvnString(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_char_p), ("len", ctypes.c_size_t)]
+
+
+def _find_tortoise_svn_bin_dir() -> str | None:
+    """Find TortoiseSVN's bundled Subversion runtime without loading it here."""
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "TortoiseSVN", "bin"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "TortoiseSVN", "bin"),
+    ]
+    proc = _find_tortoise_proc_exe()
+    if os.path.isabs(proc):
+        candidates.append(os.path.dirname(proc))
+    for candidate in dict.fromkeys(candidates):
+        if all(
+            os.path.isfile(os.path.join(candidate, filename))
+            for filename in ("libapr_tsvn.dll", "libsvn_tsvn.dll")
+        ):
+            return candidate
+    return None
+
+
+def _tortoise_probe_error(svn, error_ptr, operation: str) -> None:
+    if not error_ptr:
+        return
+    svn.svn_err_best_message.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    svn.svn_err_best_message.restype = ctypes.c_char_p
+    buffer = ctypes.create_string_buffer(2048)
+    message = svn.svn_err_best_message(error_ptr, buffer, len(buffer))
+    svn.svn_error_clear.argtypes = [ctypes.c_void_p]
+    svn.svn_error_clear(error_ptr)
+    # The probe protocol deliberately returns only the operation class.  SVN's
+    # native diagnostic can include server/authentication details and is not
+    # needed by the visible Author label.
+    _ = message or buffer
+    raise RuntimeError(operation)
+
+
+def _query_tortoise_svn_author_in_child(repo_url: str, revision: int) -> str:
+    """Load TortoiseSVN's client DLLs in a disposable process only.
+
+    This reads exactly ``svn:author`` at one URL/revision.  It never supplies,
+    reads, logs, or serializes credentials; TortoiseSVN's own non-interactive
+    authentication baton decides whether its existing secure configuration can
+    access the repository.
+    """
+    bin_dir = _find_tortoise_svn_bin_dir()
+    if not bin_dir or not hasattr(os, "add_dll_directory") or not hasattr(ctypes, "WinDLL"):
+        raise RuntimeError("tortoise-runtime-unavailable")
+    dll_cookie = os.add_dll_directory(bin_dir)
+    apr_ready = False
+    pool = ctypes.c_void_p()
+    try:
+        apr = ctypes.WinDLL(os.path.join(bin_dir, "libapr_tsvn.dll"))
+        svn = ctypes.WinDLL(os.path.join(bin_dir, "libsvn_tsvn.dll"))
+        apr.apr_initialize.argtypes = []
+        apr.apr_initialize.restype = ctypes.c_int
+        if int(apr.apr_initialize()):
+            raise RuntimeError("apr-initialize")
+        apr_ready = True
+        apr.apr_pool_create_ex.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        ]
+        apr.apr_pool_create_ex.restype = ctypes.c_int
+        if int(apr.apr_pool_create_ex(ctypes.byref(pool), None, None, None)):
+            raise RuntimeError("apr-pool-create")
+        svn.svn_dso_initialize2.argtypes = []
+        svn.svn_dso_initialize2.restype = ctypes.c_void_p
+        _tortoise_probe_error(svn, svn.svn_dso_initialize2(), "svn-dso-initialize")
+        svn.svn_ra_initialize.argtypes = [ctypes.c_void_p]
+        svn.svn_ra_initialize.restype = ctypes.c_void_p
+        _tortoise_probe_error(svn, svn.svn_ra_initialize(pool), "svn-ra-initialize")
+
+        auth_baton = ctypes.c_void_p()
+        svn.svn_cmdline_create_auth_baton2.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        svn.svn_cmdline_create_auth_baton2.restype = ctypes.c_void_p
+        _tortoise_probe_error(
+            svn,
+            svn.svn_cmdline_create_auth_baton2(
+                ctypes.byref(auth_baton), 1, None, None, None,
+                0, 0, 0, 0, 0, 0, None, None, None, pool,
+            ),
+            "svn-auth-create",
+        )
+
+        context = ctypes.c_void_p()
+        svn.svn_client_create_context2.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p
+        ]
+        svn.svn_client_create_context2.restype = ctypes.c_void_p
+        _tortoise_probe_error(
+            svn,
+            svn.svn_client_create_context2(ctypes.byref(context), None, pool),
+            "svn-client-context-create",
+        )
+        # svn_client_ctx_t starts with auth_baton in the bundled ABI. This is
+        # isolated in the child process so a third-party DLL/ABI fault cannot
+        # take down the merge UI.
+        ctypes.cast(context, ctypes.POINTER(ctypes.c_void_p))[0] = auth_baton
+
+        source_revision = _SvnOptRevision()
+        source_revision.kind = 1  # svn_opt_revision_number
+        source_revision.value.number = int(revision)
+        value = ctypes.POINTER(_SvnString)()
+        actual_revision = ctypes.c_longlong(-1)
+        svn.svn_client_revprop_get.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(ctypes.POINTER(_SvnString)), ctypes.c_char_p,
+            ctypes.POINTER(_SvnOptRevision), ctypes.POINTER(ctypes.c_longlong),
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        svn.svn_client_revprop_get.restype = ctypes.c_void_p
+        encoded_url = quote(repo_url, safe="/%:@").encode("utf-8")
+        _tortoise_probe_error(
+            svn,
+            svn.svn_client_revprop_get(
+                b"svn:author", ctypes.byref(value), encoded_url,
+                ctypes.byref(source_revision), ctypes.byref(actual_revision), context, pool,
+            ),
+            "svn-author-read",
+        )
+        if not value:
+            raise RuntimeError("svn-author-absent")
+        author = ctypes.string_at(value.contents.data, value.contents.len).decode("utf-8", errors="replace").strip()
+        if not author:
+            raise RuntimeError("svn-author-empty")
+        return author
+    finally:
+        if pool:
+            try:
+                apr.apr_pool_destroy.argtypes = [ctypes.c_void_p]
+                apr.apr_pool_destroy(pool)
+            except Exception:
+                pass
+        if apr_ready:
+            try:
+                apr.apr_terminate()
+            except Exception:
+                pass
+        dll_cookie.close()
+
+
+def _run_tortoise_svn_author_probe(repo_url: str, revision: int) -> tuple[str | None, str]:
+    """Run the native-DLL author lookup out of process with a hard timeout."""
+    if not _find_tortoise_svn_bin_dir():
+        return None, "TortoiseSVN runtime unavailable for URL+revision author query"
+    fd, result_path = tempfile.mkstemp(
+        prefix=f"{APP_NAME}_svn_author_{os.getpid()}_", suffix=".json"
+    )
+    os.close(fd)
+    command = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        command.append(os.path.abspath(__file__))
+    command.extend((
+        "--internal-svn-author-query",
+        str(int(revision)),
+        str(repo_url),
+        result_path,
+    ))
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+        return None, "TortoiseSVN author probe timed out"
+    except Exception as exc:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+        return None, f"TortoiseSVN author probe launch failed: {type(exc).__name__}"
+    payload: dict | None = None
+    try:
+        if int(getattr(result, "returncode", 1) or 0) == 0:
+            with open(result_path, "r", encoding="utf-8") as stream:
+                candidate = json.load(stream)
+            if isinstance(candidate, dict):
+                payload = candidate
+    except (OSError, ValueError, TypeError):
+        payload = None
+    finally:
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
+    if isinstance(payload, dict):
+        author = str(payload.get("author") or "").strip()
+        if author:
+            return author, "tortoise-svn-revprop-author"
+    return None, "TortoiseSVN author probe failed"
+
+
+def _run_tortoise_svn_author_probe_entrypoint(argv: list[str]) -> int:
+    """Minimal file-only child protocol; never emit native SVN diagnostics."""
+    result_path = ""
+    try:
+        if len(argv) != 3:
+            raise ValueError("invalid arguments")
+        result_path = os.path.abspath(argv[2])
+        temp_root = os.path.abspath(tempfile.gettempdir())
+        if (
+            os.path.commonpath((temp_root, result_path)) != temp_root
+            or not os.path.basename(result_path).startswith(f"{APP_NAME}_svn_author_")
+        ):
+            raise ValueError("invalid result path")
+        payload = {"author": _query_tortoise_svn_author_in_child(argv[1], int(argv[0]))}
+    except Exception as exc:
+        payload = {"error": type(exc).__name__}
+    if result_path:
+        try:
+            temp_path = result_path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False)
+            os.replace(temp_path, result_path)
+        except OSError:
+            return 2
+    return 0 if payload.get("author") else 2
+
+
+def _svn_author_cache_key(
+    repository_root: str | None, repository_uuid: str | None, revision: int
+) -> tuple[str, str, int] | None:
+    if not repository_root:
+        return None
+    return str(repository_root).rstrip("/"), str(repository_uuid or ""), int(revision)
+
+
+def _svn_author_for_url_peg(
+    repo_url: str,
+    revision: int,
+    *,
+    trusted_repository_root: str | None = None,
+    repository_uuid: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve an author from one exact repository URL and revision.
+
+    CLI remains the fast normal path.  When a TortoiseSVN-only installation has
+    no ``svn.exe``, a child process uses its bundled client runtime solely for
+    ``svn:author``—but only for a URL assembled from this WC's proven root.
+    """
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        return None, "invalid source revision for URL+peg author query"
+    request_url = f"{str(repo_url).rstrip('@')}@{revision}"
+    cache_key = _svn_author_cache_key(trusted_repository_root, repository_uuid, revision)
+    if cache_key and cache_key in _SVN_AUTHOR_MEMORY_CACHE:
+        return _SVN_AUTHOR_MEMORY_CACHE[cache_key], f"svn-author-memory-cache:{request_url}"
+
+    cli_reason = "svn CLI unavailable for URL+peg author query"
+    svn_exe = _find_svn_cli_exe()
+    if svn_exe:
+        try:
+            result = subprocess.run(
+                [svn_exe, "log", "--xml", "--non-interactive", "-r", f"{revision}:{revision}", request_url],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=12,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if int(getattr(result, "returncode", 1) or 0) == 0:
+                root = ET.fromstring(str(getattr(result, "stdout", "") or ""))
+                author = str(root.findtext(".//logentry/author") or "").strip()
+                if author:
+                    if cache_key:
+                        _SVN_AUTHOR_MEMORY_CACHE[cache_key] = author
+                    return author, f"svn-log-url-peg:{request_url}"
+                cli_reason = f"svn log URL+peg author missing for {request_url}"
+            else:
+                cli_reason = "svn log URL+peg author query failed"
+        except Exception as exc:
+            cli_reason = f"svn log URL+peg author query failed: {type(exc).__name__}"
+
+    trusted_prefix = str(trusted_repository_root or "").rstrip("/")
+    if trusted_prefix and (repo_url == trusted_prefix or repo_url.startswith(trusted_prefix + "/")):
+        author, reason = _run_tortoise_svn_author_probe(repo_url, revision)
+        if author:
+            if cache_key:
+                _SVN_AUTHOR_MEMORY_CACHE[cache_key] = author
+            return author, f"{reason}:{request_url}"
+        return None, f"{cli_reason}; {reason}"
+    return None, f"{cli_reason}; TortoiseSVN fallback requires WC-proven repository root"
+
+
+def _svn_author_for_source_identity(
+    wc_root: str | None,
+    anchor: str | None,
+    identity: VersionIdentity,
+) -> tuple[str | None, str]:
+    """Resolve Source Before/After author without requiring a current WC row.
+
+    Cross-branch merge metadata supplies a repository-relative identity.  Pair
+    it with the target input's repository root and ask SVN for exactly that
+    URL at exactly the sidecar/merge revision.  Plain sidecars retain a local
+    ``svn info`` fallback for their corresponding input path.
+    """
+    if identity.revision is None:
+        return None, "sidecar revision unavailable"
+    source_path = str(identity.repository_identity or "").replace("\\", "/").strip().lstrip("/")
+    if source_path:
+        if not wc_root or not anchor:
+            return None, "target working-copy root unavailable for source URL"
+        try:
+            anchor_relpath = os.path.relpath(os.path.abspath(anchor), wc_root).replace("\\", "/")
+        except Exception as exc:
+            return None, f"target working-copy relative path failed: {exc}"
+        repository_root, repository_uuid, root_reason = _wc_repository_metadata_for_local_path(
+            wc_root, anchor_relpath
+        )
+        if not repository_root:
+            return None, root_reason
+        encoded_source_path = quote(source_path, safe="/%:@")
+        return _svn_author_for_url_peg(
+            f"{repository_root.rstrip('/')}/{encoded_source_path}",
+            identity.revision,
+            trusted_repository_root=repository_root,
+            repository_uuid=repository_uuid,
+        )
+
+    candidates = []
+    for candidate in (identity.path, identity.effective_path):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in tuple(candidates):
+        name = os.path.basename(candidate)
+        normalized_name = re.sub(
+            r"\.merge-(?:left|right)(?:\.r\d+)?$|\.r\d+$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        )
+        normalized = os.path.join(os.path.dirname(candidate), normalized_name)
+        if normalized != candidate and normalized not in candidates:
+            candidates.append(normalized)
+    reasons = []
+    for candidate in candidates:
+        repo_url, reason = _svn_info_url_for_input_path(candidate)
+        if repo_url:
+            return _svn_author_for_url_peg(repo_url, identity.revision)
+        reasons.append(reason)
+    return None, "; ".join(dict.fromkeys(reasons)) or "source input URL unavailable"
+
+
+def _copy_wc_pristine_local(path: str | None) -> str | None:
+    """Copy the target WC pristine blob without SVN CLI/Tortoise GUI fallback."""
+    if not path or not os.path.isfile(path):
+        _dlog(f"target pristine unavailable: target path missing {path!r}")
+        return None
+    wc_root = _find_svn_wc_root_for_path(path)
+    if not wc_root:
+        _dlog(f"target pristine unavailable: wc.db not found for {path}")
+        return None
+    relpath = os.path.relpath(os.path.abspath(path), wc_root).replace("\\", "/")
+    db_path = os.path.join(wc_root, ".svn", "wc.db")
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                """
+                select checksum from NODES
+                where local_relpath = ? and op_depth = 0 and kind = 'file'
+                  and presence = 'normal'
+                limit 1
+                """,
+                (relpath,),
+            ).fetchone()
+        checksum = row[0] if row else None
+        match = re.match(r"^\$sha1\$([0-9a-fA-F]{40})$", str(checksum or ""))
+        if not match:
+            _dlog(f"target pristine unavailable: no checksum for {relpath}")
+            return None
+        sha1 = match.group(1).lower()
+        pristine = os.path.join(wc_root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
+        if not os.path.isfile(pristine):
+            _dlog(f"target pristine unavailable: pristine blob missing {pristine}")
+            return None
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = os.path.join(
+            tempfile.gettempdir(),
+            f"{APP_NAME}_target_pristine_{os.getpid()}_{ts}_{os.path.basename(path)}",
+        )
+        if not target.lower().endswith(_workbook_ext(path)):
+            target += _workbook_ext(path)
+        shutil.copyfile(pristine, target)
+        if _workbook_package_ready(target):
+            _dlog(f"target pristine copied from wc.db: {path} -> {target}")
+            return target
+        _dlog(f"target pristine copy invalid package: {target}")
+    except Exception as exc:
+        _dlog(f"target pristine copy failed: {exc}")
+    return None
+
+
+def resolve_svn_author_metadata(context: MergeLaunchContext) -> dict[str, VersionIdentity]:
+    """Populate author labels with an exact URL+peg lookup when available."""
+    anchor = context.merged_path or context.mine_path
+    wc_root = _find_svn_wc_root_for_path(anchor)
+    mine_revision = None
+    mine_author = None
+    mine_reason = "working-copy metadata unavailable"
+    if wc_root and anchor:
+        relpath = os.path.relpath(os.path.abspath(anchor), wc_root).replace("\\", "/")
+        mine_revision, mine_author, mine_reason = _wc_node_metadata(wc_root, relpath)
+    for role, identity in context.identities.items():
+        if identity is None or not identity.path:
+            continue
+        if role in ("mine", "target_pristine"):
+            identity.revision = mine_revision if mine_revision is not None else identity.revision
+            if mine_author:
+                identity.author = str(mine_author)
+                identity.author_source = mine_reason
+                identity.author_status = "resolved"
+                identity.availability_reason = ""
+                _dlog(f"AUTHOR role={role} resolved author={identity.author} source={mine_reason}")
+            else:
+                identity.author = "未知"
+                identity.author_source = "local-wc-db"
+                identity.author_status = "unavailable"
+                identity.availability_reason = mine_reason
+                _dlog(f"AUTHOR role={role} unavailable reason={mine_reason}")
+            continue
+        revision = identity.revision
+        author = None
+        reason = "sidecar revision unavailable"
+        if revision is not None:
+            author, reason = _svn_author_for_source_identity(wc_root, anchor, identity)
+        # An offline WC retains the old precise database lookup as a fallback.
+        # It must not become the primary cross-branch source because a merge
+        # source revision commonly has no current NODES row in the target WC.
+        if not author and wc_root and revision is not None:
+            wc_author, wc_reason = _wc_author_for_exact_sidecar_revision(
+                wc_root,
+                identity.path,
+                revision,
+                repository_identity=identity.repository_identity,
+            )
+            if wc_author:
+                author, reason = wc_author, wc_reason
+            else:
+                reason = f"{reason}; offline fallback: {wc_reason}"
+        if author:
+            identity.author = author
+            identity.author_source = reason
+            identity.author_status = "resolved"
+            identity.availability_reason = ""
+            _dlog(f"AUTHOR role={role} resolved author={author} source={reason}")
+        else:
+            identity.author = "未知"
+            identity.author_source = "local-wc-db"
+            identity.author_status = "unavailable"
+            identity.availability_reason = reason
+            _dlog(f"AUTHOR role={role} unavailable revision={revision} reason={reason}")
+    return context.identities
+
+
+def format_version_identity(identity: VersionIdentity | None, *, candidate: bool = False) -> str:
+    if identity is None:
+        return "-"
+    path = identity.path or identity.effective_path or "-"
+    name = os.path.basename(path)
+    rev = f" @r{identity.revision}" if identity.revision is not None else ""
+    local = "；本地未提交修改" if identity.locally_modified else ""
+    candidate_note = " → 合并候选" if candidate else ""
+    repository = f" · SVN路径 = {identity.repository_identity}" if identity.repository_identity else ""
+    return f"{name}{rev}{candidate_note}{repository} · Author = {identity.author or '未知'}{local}"
+
+
+def _compact_identity_basename(identity: VersionIdentity | None) -> str:
+    """Return the workbook name without SVN conflict-sidecar noise."""
+    if identity is None:
+        return "-"
+    path = identity.path or identity.effective_path or "-"
+    name = os.path.basename(path)
+    return re.sub(
+        r"(?i)(\.(?:xlsx|xlsm|xltx|xltm))"
+        r"(?:\.merge-(?:left|right)\.r\d+|\.r\d+)$",
+        r"\1",
+        name,
+    )
+
+
+def format_compact_version_identity(
+    identity: VersionIdentity | None,
+    *,
+    candidate: bool = False,
+) -> str:
+    """Format a pane identity with Author first so it survives clipping.
+
+    Repository and local paths intentionally stay out of this permanent label;
+    ``format_version_identity`` remains the complete diagnostic/hover format.
+    """
+    if identity is None:
+        return "-"
+    name = _compact_identity_basename(identity)
+    rev = f" @r{identity.revision}" if identity.revision is not None else ""
+    candidate_note = " → Merged" if candidate else ""
+    local = "；本地未提交修改" if identity.locally_modified else ""
+    return (
+        f"Author = {identity.author or '未知'}{local} · "
+        f"{name}{rev}{candidate_note}"
+    )
+
+
+def merge_role_label(context: MergeLaunchContext | None, role: str, *, candidate: bool = False) -> str:
+    """Return the user-facing semantic role name without changing raw roles."""
+    normalized = str(role or "").lower()
+    if context and context.scenario == MergeScenario.CROSS_BRANCH_MERGE:
+        labels = {
+            "base": "Source Before",
+            "theirs": "Source After",
+            "mine": "Target Working",
+            "target_pristine": "Target Pristine",
+        }
+        label = labels.get(normalized, normalized.title() or "Unknown")
+        return f"Merged Candidate ({label})" if candidate and normalized == "mine" else label
+    labels = {
+        "base": "Base",
+        "theirs": "Theirs",
+        "mine": "Mine",
+        "target_pristine": "Target Pristine",
+    }
+    label = labels.get(normalized, normalized.title() or "Unknown")
+    return f"Merged Candidate ({label})" if candidate and normalized == "mine" else label
+
+
+def merge_side_label(context: MergeLaunchContext | None, side: str, *, candidate: bool = False) -> str:
+    """Translate raw workspace sides into the scenario's visible role name."""
+    normalized = str(side or "").upper()
+    role = {
+        "A": "mine",
+        "MINE": "mine",
+        "BASE": "base",
+        "B": "theirs",
+        "THEIRS": "theirs",
+    }.get(normalized)
+    return merge_role_label(context, role or normalized.lower(), candidate=candidate)
+
+
+def _create_startup_candidate_copy(source_path: str, role: str) -> str:
+    ext = _workbook_ext(source_path)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = os.path.join(
+        tempfile.gettempdir(),
+        f"{APP_NAME}_startup_candidate_{role}_{os.getpid()}_{stamp}{ext}",
+    )
+    shutil.copy2(source_path, candidate)
+    if not _workbook_package_ready(candidate):
+        raise RuntimeError(f"candidate copy is not a complete workbook: {candidate}")
+    return candidate
+
+
+def _legacy_premerge_effective_width_mismatch(
+    base_path: str,
+    mine_path: str,
+    theirs_path: str,
+) -> tuple[str, int, int, int] | None:
+    """Find a conclusive physical-column blocker without row alignment.
+
+    Legacy pre-merge writes by physical column.  If a common worksheet has
+    different populated widths in Base, Mine, and Theirs, its physical column
+    coordinates cannot be proved interchangeable.  This is sufficient to
+    decline that writer before the much more expensive row/conflict scan.  A
+    failure to inspect the lightweight bounds deliberately returns ``None`` so
+    the exact scanner remains the conservative fallback.
+    """
+    started = time.perf_counter()
+
+    def _widths(path: str) -> dict[str, int] | None:
+        workbook = None
+        try:
+            # Normal worksheets expose sparse populated cells, allowing
+            # `_effective_bounds` to ignore style-only XML tails.  Process one
+            # input at a time to keep this preflight's memory bounded.
+            workbook = load_workbook(path, data_only=False, keep_links=False)
+            return {
+                str(sheet): int(_effective_bounds(workbook[sheet])[1])
+                for sheet in workbook.sheetnames
+            }
+        except Exception as exc:
+            _dlog(f"SEMANTIC_PREMERGE_WIDTH_PREFLIGHT unavailable path={path} error={exc}")
+            return None
+        finally:
+            _wbs_close(workbook)
+
+    base_widths = _widths(base_path)
+    mine_widths = _widths(mine_path)
+    theirs_widths = _widths(theirs_path)
+    if not (base_widths is not None and mine_widths is not None and theirs_widths is not None):
+        return None
+    for sheet in sorted(set(base_widths) & set(mine_widths) & set(theirs_widths)):
+        widths = (base_widths[sheet], mine_widths[sheet], theirs_widths[sheet])
+        if len(set(widths)) != 1:
+            _dlog(
+                "SEMANTIC_PREMERGE_WIDTH_PREFLIGHT_BLOCK "
+                f"sheet={sheet} base={widths[0]} mine={widths[1]} theirs={widths[2]} "
+                f"elapsed_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+            )
+            return (sheet, *widths)
+    _dlog(
+        "SEMANTIC_PREMERGE_WIDTH_PREFLIGHT_CLEAR "
+        f"sheets={len(set(base_widths) & set(mine_widths) & set(theirs_widths))} "
+        f"elapsed_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+    )
+    return None
+
+
+def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnalysis:
+    """Run the complete conservative pre-UI analysis without changing SVN state.
+
+    Raw roles remain in ``context``.  A separate candidate file is made only
+    after the full equality matrix has been captured.  Unsupported structural
+    changes leave a manual candidate and are reported as fallbacks.
+    """
+    for identity in context.identities.values():
+        if identity is None or not identity.path:
+            continue
+        try:
+            identity.stable_path = _ensure_xlsx_copy(identity.path)
+        except Exception as exc:
+            identity.stable_path = identity.path
+            identity.availability_reason = f"stable copy unavailable: {exc}"
+            _dlog(f"IDENTITY stable copy failed role={identity.role} path={identity.path}: {exc}")
+
+    if context.merged_path and not context.target_pristine_path:
+        # The helper is intentionally local-only; retaining this call seam also
+        # lets host integrations supply an already-read WC pristine identity.
+        pristine = _try_export_svn_base_from_working_copy(context.merged_path)
+        context.target_pristine_path = pristine
+        pristine_identity = context.identity_for("target_pristine")
+        if pristine_identity is not None:
+            pristine_identity.path = pristine
+            pristine_identity.stable_path = pristine
+    # Cross-branch sidecar names are only a fallback.  Resolve the merge's
+    # actual source branch identities from the target WC before author lookup
+    # and equality logging make those revisions visible to the user.
+    resolve_cross_branch_source_metadata(context)
+    resolve_svn_author_metadata(context)
+    matrix = build_equivalence_matrix(context)
+    mine_identity = context.identity_for("mine")
+    pristine_identity = context.identity_for("target_pristine")
+    if mine_identity is not None and pristine_identity is not None and pristine_identity.available:
+        mine_identity.locally_modified = not matrix.are_equal("mine", "target_pristine")
+        _dlog(
+            f"MINE_LOCAL_STATE mine_equals_target_pristine={not mine_identity.locally_modified} "
+            f"mine={mine_identity.path} pristine={pristine_identity.path}"
+        )
+
+    outcome = decide_startup_merge_outcome(context, matrix)
+    conflicts: list[tuple] = []
+    conflict_map: dict = {}
+    source_identity = context.identity_for(outcome.source_role or "")
+    if outcome.source_role and source_identity and source_identity.available:
+        try:
+            outcome.candidate_path = _create_startup_candidate_copy(
+                str(source_identity.effective_path), outcome.source_role
+            )
+            _dlog(
+                f"STARTUP_CONVERGENCE action={outcome.automatic_action} source={outcome.source_role} "
+                f"candidate={outcome.candidate_path}"
+            )
+        except Exception as exc:
+            outcome.automatic_action = "manual-review"
+            outcome.source_role = None
+            outcome.fallback_reasons.append(f"candidate initialization failed: {exc}")
+
+    if not outcome.source_role and context.scenario == MergeScenario.CROSS_BRANCH_MERGE:
+        base = context.identity_for("base")
+        mine = context.identity_for("mine")
+        theirs = context.identity_for("theirs")
+        if not (base and mine and theirs and base.available and mine.available and theirs.available):
+            outcome.automatic_action = "manual-review"
+            outcome.fallback_reasons.append(
+                "complete Source Before/Target Working/Source After packages are unavailable"
+            )
+        else:
+            (
+                conflicts,
+                candidate,
+                conflict_map,
+                branch_summary,
+                manual_reason,
+            ) = _cross_branch_source_delta_premerge(
+                str(base.effective_path),
+                str(mine.effective_path),
+                str(theirs.effective_path),
+            )
+            outcome.incoming_count = int(branch_summary.get("incoming_count", 0))
+            outcome.applied_count = int(branch_summary.get("applied_count", 0))
+            outcome.already_present_count = int(branch_summary.get("already_present_count", 0))
+            outcome.target_retained_count = int(branch_summary.get("target_retained_count", 0))
+            outcome.unresolved_count = int(branch_summary.get("unresolved_count", len(conflicts)))
+            outcome.merged_count = int(branch_summary.get("merged_count", outcome.applied_count))
+            if manual_reason:
+                outcome.automatic_action = "manual-review"
+                outcome.fallback_reasons.append(f"source-delta projection safely declined: {manual_reason}")
+                try:
+                    outcome.candidate_path = _create_startup_candidate_copy(
+                        str(mine.effective_path), "mine"
+                    )
+                    outcome.source_role = "mine"
+                except Exception as exc:
+                    outcome.fallback_reasons.append(
+                        f"manual Target Working candidate initialization failed: {exc}"
+                    )
+            else:
+                outcome.candidate_path = candidate
+                outcome.source_role = "mine"
+                if outcome.unresolved_count:
+                    outcome.automatic_action = "manual-review"
+                    outcome.fallback_reasons.append(
+                        "some Source Before-to-Source After changes require manual resolution"
+                    )
+                elif outcome.applied_count:
+                    outcome.automatic_action = "cross-branch-source-delta"
+                elif outcome.already_present_count:
+                    outcome.automatic_action = "incoming-already-present"
+                else:
+                    outcome.automatic_action = "manual-review"
+                    outcome.fallback_reasons.append(
+                        "source delta contained no supported incoming logical cells"
+                    )
+            _dlog(
+                "STARTUP_CROSS_BRANCH_SOURCE_DELTA "
+                f"incoming={outcome.incoming_count} applied={outcome.applied_count} "
+                f"already_present={outcome.already_present_count} "
+                f"target_retained={outcome.target_retained_count} "
+                f"unresolved={outcome.unresolved_count} candidate={outcome.candidate_path}"
+            )
+
+    if not outcome.source_role and context.scenario != MergeScenario.CROSS_BRANCH_MERGE:
+        base = context.identity_for("base")
+        mine = context.identity_for("mine")
+        theirs = context.identity_for("theirs")
+        if not (base and mine and theirs and base.available and mine.available and theirs.available):
+            outcome.fallback_reasons.append("complete Base/Mine/Theirs packages are unavailable for semantic pre-merge")
+        else:
+            base_path = str(base.effective_path)
+            mine_path = str(mine.effective_path)
+            theirs_path = str(theirs.effective_path)
+            width_mismatch = _legacy_premerge_effective_width_mismatch(
+                base_path, mine_path, theirs_path
+            )
+            if width_mismatch is not None:
+                sheet, base_width, mine_width, theirs_width = width_mismatch
+                # A manual candidate is byte-identical to Mine.  Do not invoke
+                # the exact startup scanner here: SheetView's normal background
+                # pipeline will build its complete row/column conflict model
+                # after the user opens the manual three-way workspace.
+                try:
+                    outcome.candidate_path = _create_startup_candidate_copy(mine_path, "mine")
+                except Exception as exc:
+                    outcome.fallback_reasons.append(f"manual Mine candidate initialization failed: {exc}")
+                outcome.automatic_action = "manual-review"
+                outcome.fallback_reasons.append(
+                    "legacy physical-column pre-merge skipped before exact conflict scan: "
+                    f"{sheet} has different effective populated widths "
+                    f"(Base={base_width}, Mine={mine_width}, Theirs={theirs_width}); "
+                    "manual three-way view will build the exact conflict model"
+                )
+            else:
+                try:
+                    # The existing logical engine refuses unsupported column structure
+                    # before writing.  It is therefore safe to use only as a preview.
+                    conflicts, preview, conflict_map = _merge_three_way(
+                        base_path,
+                        mine_path,
+                        theirs_path,
+                        context.merged_path or mine_path,
+                        save_merged=False,
+                    )
+                    outcome.candidate_path = preview or _create_startup_candidate_copy(
+                        mine_path, "mine"
+                    )
+                    merged_summary = globals().get("_LAST_SEMANTIC_PREMERGE_SUMMARY", {}) or {}
+                    outcome.merged_count = int(merged_summary.get("merged_count", 0))
+                    outcome.unresolved_count = len(conflicts)
+                    if outcome.merged_count:
+                        outcome.automatic_action = "semantic-premerge"
+                        outcome.source_role = "mine"
+                    else:
+                        outcome.automatic_action = "manual-review"
+                        outcome.fallback_reasons.append("no supported one-sided or identical logical changes were applied")
+                    _dlog(
+                        f"STARTUP_SEMANTIC_PREMERGE merged={outcome.merged_count} unresolved={outcome.unresolved_count} "
+                        f"candidate={outcome.candidate_path}"
+                    )
+                except _SemanticPremergeDeclined as exc:
+                    # `_merge_three_way` has already completed the exact logical
+                    # scan that proved legacy physical-column replay is unsafe.
+                    # The stable Base/Mine/Theirs inputs cannot change during this
+                    # startup transaction, so reuse that map verbatim instead of
+                    # paying for a second whole-workbook scan before manual review.
+                    outcome.automatic_action = "manual-review"
+                    outcome.fallback_reasons.append(f"semantic pre-merge safely declined: {exc}")
+                    conflicts = list(exc.conflicts)
+                    conflict_map = dict(exc.conflict_cells_by_sheet)
+                    outcome.unresolved_count = len(conflicts)
+                    _dlog(
+                        "STARTUP_SEMANTIC_PREMERGE_DECLINED_REUSED_SCAN "
+                        f"unresolved={outcome.unresolved_count}"
+                    )
+                except Exception as exc:
+                    outcome.automatic_action = "manual-review"
+                    outcome.fallback_reasons.append(f"semantic pre-merge safely declined: {exc}")
+                    try:
+                        conflicts, conflict_map = _scan_three_way_conflicts(
+                            base_path, mine_path, theirs_path
+                        )
+                        outcome.unresolved_count = len(conflicts)
+                    except Exception as scan_exc:
+                        outcome.fallback_reasons.append(f"manual conflict scan failed: {scan_exc}")
+    else:
+        if context.scenario == MergeScenario.CROSS_BRANCH_MERGE:
+            # Whole-workbook convergence and source-delta pre-merge both retain
+            # source-specific counts.  ``merged_count`` remains compatibility
+            # only and therefore equals actual writes, never retained content.
+            outcome.merged_count = outcome.applied_count
+        else:
+            outcome.unresolved_count = 0
+            outcome.merged_count = 1
+    _dlog(
+        "STARTUP_ANALYSIS_COMPLETE "
+        f"scenario={context.scenario.value} action={outcome.automatic_action} source={outcome.source_role} "
+        f"fold={outcome.folded_identity} merged={outcome.merged_count} "
+        f"incoming={outcome.incoming_count} applied={outcome.applied_count} "
+        f"already_present={outcome.already_present_count} target_retained={outcome.target_retained_count} "
+        f"unresolved={outcome.unresolved_count} "
+        f"fallback={outcome.fallback_reasons}"
+    )
+    return StartupMergeAnalysis(context, matrix, outcome, conflicts, conflict_map)
+
+
 def _wait_for_complete_workbook(path: str, timeout_seconds: float | None = None) -> bool:
     """Wait for asynchronous SVN exports to finish writing a valid OOXML ZIP."""
     timeout = float(_SVN_EXPORT_TIMEOUT_SECS if timeout_seconds is None else timeout_seconds)
@@ -8062,194 +10290,26 @@ def _wait_for_complete_workbook(path: str, timeout_seconds: float | None = None)
 
 
 def _try_export_svn_revision_from_merge_temp(path: str) -> str:
-    """If path looks like *.merge-left.r#### or *.merge-right.r####, export that revision from WC.
+    """Compatibility shim: SVN sidecar content is authoritative as supplied.
 
-    Returns replacement path if export succeeded; otherwise returns original path.
+    The old implementation guessed a target-branch repository path from a
+    ``.merge-left`` sidecar and re-exported it through TortoiseProc.  That is
+    invalid for cross-branch merges and can silently replace the source-left
+    delta.  Keep the raw sidecar instead.
     """
-    try:
-        if not path:
-            return path
-        p = os.path.abspath(path)
-        m = re.match(r"^(?P<base>.+)\.merge-(left|right)\.r(?P<rev>\d+)$", p, flags=re.IGNORECASE)
-        if not m:
-            return path
-        base_path = m.group("base")
-        rev = m.group("rev")
-        if not os.path.exists(base_path):
-            # Try same dir + original base filename
-            base_path = os.path.join(os.path.dirname(p), os.path.basename(m.group("base")))
-        if not os.path.exists(base_path):
-            _dlog(f"svn export skip: base not found for {path}")
-            return path
-
-        proc_exe = _find_tortoise_proc_exe()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = os.path.basename(base_path)
-        save_path = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svncat_r{rev}_{ts}_{base_name}")
-        ext = _workbook_ext(base_name)
-        if not save_path.lower().endswith(ext):
-            save_path += ext
-
-        try:
-            _dlog(f"svn export: {base_path} r{rev} -> {save_path}")
-        except Exception:
-            pass
-
-        # TortoiseProc may show UI; run and wait briefly for file to appear.
-        try:
-            subprocess.Popen([
-                proc_exe,
-                "/command:cat",
-                f"/path:{base_path}",
-                f"/revision:{rev}",
-                f"/savepath:{save_path}",
-                "/closeonend:1",
-            ])
-        except Exception as e:
-            _dlog(f"svn export failed launch: {e}")
-            return path
-
-        if _wait_for_complete_workbook(save_path):
-            return save_path
-
-        _dlog(f"svn export timeout or invalid workbook: {save_path}")
-        return path
-    except Exception as e:
-        _dlog(f"svn export error: {e}")
-        return path
+    if path and ".merge-" in os.path.basename(str(path)).lower():
+        _dlog(f"svn revision re-export intentionally skipped; preserving raw sidecar: {path}")
+    return path
 
 
 
 def _try_export_svn_base_from_working_copy(path: str) -> str | None:
-    """Export BASE revision for a working-copy file path.
+    """Return a local WC pristine copy without invoking SVN/Tortoise UI.
 
-    Returns exported temp .xlsx path when successful, otherwise None.
+    Retained for callers outside the launch path.  WC pristine is diagnostic
+    fourth input only; it is never a substitute for the raw source Base.
     """
-    try:
-        if not path:
-            return None
-        p = os.path.abspath(path)
-        if not os.path.exists(p):
-            return None
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = os.path.basename(p)
-        save_path = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svncat_BASE_{ts}_{base_name}")
-        ext = _workbook_ext(base_name)
-        if not save_path.lower().endswith(ext):
-            save_path += ext
-
-        # Prefer svn CLI (usually uses WC metadata for BASE).
-        svn_exe = shutil.which("svn")
-        if svn_exe:
-            try:
-                no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                with open(save_path, "wb") as f:
-                    r = subprocess.run(
-                        [svn_exe, "cat", "-r", "BASE", p],
-                        stdout=f,
-                        stderr=subprocess.PIPE,
-                        timeout=30,
-                        creationflags=no_window,
-                    )
-                if r.returncode == 0 and _workbook_package_ready(save_path):
-                    _dlog(f"svn base export(cli): {p} -> {save_path}")
-                    return save_path
-                try:
-                    if os.path.exists(save_path):
-                        os.remove(save_path)
-                except Exception:
-                    pass
-                _dlog(
-                    f"svn base export(cli) failed: rc={r.returncode} "
-                    f"err={(r.stderr or b'').decode('utf-8', errors='ignore')}"
-                )
-            except Exception as e:
-                _dlog(f"svn base export(cli) exception: {e}")
-
-        # Prefer the working-copy pristine blob over asynchronous TortoiseProc
-        # export. It is the exact WC BASE and copying it is synchronous.
-        try:
-            import sqlite3
-
-            p_dir = os.path.dirname(p)
-            wc_root = None
-            probe = p_dir
-            while probe:
-                wc_db = os.path.join(probe, ".svn", "wc.db")
-                if os.path.isfile(wc_db):
-                    wc_root = probe
-                    break
-                parent = os.path.dirname(probe)
-                if not parent or parent == probe:
-                    break
-                probe = parent
-            if wc_root is None:
-                raise FileNotFoundError(f"working-copy metadata not found for {p}")
-
-            rel_path = os.path.relpath(p, wc_root).replace("\\", "/")
-            wc_db = os.path.join(wc_root, ".svn", "wc.db")
-            conn = sqlite3.connect(wc_db)
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    select checksum
-                    from NODES
-                    where local_relpath = ?
-                      and op_depth = 0
-                      and kind = 'file'
-                      and presence = 'normal'
-                    limit 1
-                    """,
-                    (rel_path,),
-                )
-                row = cur.fetchone()
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            checksum = row[0] if row else None
-            m = re.match(r"^\$sha1\$([0-9a-fA-F]{40})$", str(checksum or ""))
-            if not m:
-                raise RuntimeError(f"working-copy pristine checksum not found for {p}")
-            sha1 = m.group(1).lower()
-            pristine_path = os.path.join(wc_root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
-            if not os.path.exists(pristine_path):
-                raise FileNotFoundError(f"working-copy pristine file not found: {pristine_path}")
-            part_path = save_path + ".part"
-            shutil.copyfile(pristine_path, part_path)
-            os.replace(part_path, save_path)
-            if _workbook_package_ready(save_path):
-                _dlog(f"svn base export(pristine): {p} -> {save_path}")
-                return save_path
-            _dlog(f"svn base export(pristine) invalid workbook: {pristine_path}")
-        except Exception as e:
-            _dlog(f"svn base export(pristine) exception: {e}")
-
-        # Last fallback: TortoiseProc cat BASE. TortoiseProc writes the output
-        # asynchronously, so file existence alone is not sufficient here.
-        try:
-            proc_exe = _find_tortoise_proc_exe()
-            subprocess.Popen([
-                proc_exe,
-                "/command:cat",
-                f"/path:{p}",
-                "/revision:BASE",
-                f"/savepath:{save_path}",
-                "/closeonend:1",
-            ])
-            if _wait_for_complete_workbook(save_path):
-                _dlog(f"svn base export(tortoise): {p} -> {save_path}")
-                return save_path
-            _dlog(f"svn base export(tortoise) incomplete: {save_path}")
-        except Exception as e:
-            _dlog(f"svn base export(tortoise) exception: {e}")
-    except Exception as e:
-        _dlog(f"svn base export error: {e}")
-        return None
-    return None
+    return _copy_wc_pristine_local(path)
 
 
 def _find_handle_exe():
@@ -8960,6 +11020,680 @@ def _wbs_close(*wbs):
                 pass
 
 
+def _cross_branch_source_delta_premerge(
+    source_before_path: str,
+    target_working_path: str,
+    source_after_path: str,
+) -> tuple[list[tuple], str | None, dict, dict[str, int], str | None]:
+    """Project only a source-branch delta onto a target-working candidate.
+
+    This intentionally does *not* reuse the generic Base/Mine/Theirs writer.
+    In a cross-branch merge Mine is the target branch, not a second change
+    relative to Source Before.  Starting from Target Working makes unrelated
+    target edits naturally persistent; a Source Before-to-After cell is the
+    only thing eligible to become incoming.
+    """
+    global _LAST_SEMANTIC_PREMERGE_SUMMARY
+    summary = {
+        "incoming_count": 0,
+        "applied_count": 0,
+        "already_present_count": 0,
+        "target_retained_count": 0,
+        "unresolved_count": 0,
+        # Backward-compatible generic count: only a value written to the
+        # candidate is a merge, never an already-present or retained value.
+        "merged_count": 0,
+        "unresolved_structural_count": 0,
+    }
+    conflicts: list[tuple] = []
+    conflict_cells_by_sheet: dict = {}
+    workbooks = []
+    prepared_paths: list[tuple[str, str]] = []
+
+    def _record_conflict(sheet: str, row: int, col: int, target_value, source_value):
+        conflicts.append((sheet, int(row), int(col), target_value, source_value))
+        conflict_cells_by_sheet.setdefault(sheet, {}).setdefault(int(row), set()).add(int(col))
+        summary["unresolved_count"] += 1
+
+    def _decline(reason: str, sheet: str = "<workbook>"):
+        # A declined source change is still one incoming change.  Keeping that
+        # accounting explicit is important to the startup dialog invariant:
+        # incoming == applied + already-present + unresolved.  In particular,
+        # package-only/style and sheet-structure changes have no cell delta to
+        # increment before reaching this conservative exit.
+        summary["incoming_count"] += 1
+        # Earlier sheets may already have contributed incoming source changes
+        # during the bounded preflight.  Once the projection as a whole is
+        # declined, classify every not-yet-classified incoming item as manual
+        # rather than leaving the audit counters internally inconsistent.
+        pending = max(
+            1,
+            summary["incoming_count"]
+            - summary["applied_count"]
+            - summary["already_present_count"]
+            - summary["unresolved_count"],
+        )
+        summary["unresolved_structural_count"] += pending
+        for index in range(pending):
+            _record_conflict(
+                sheet,
+                1 + index,
+                1,
+                "未支持的源结构变化",
+                reason,
+            )
+        summary["merged_count"] = summary["applied_count"]
+        _LAST_SEMANTIC_PREMERGE_SUMMARY = dict(summary)
+        _dlog(
+            "CROSS_BRANCH_SOURCE_DELTA_DECLINED "
+            f"reason={reason} incoming={summary['incoming_count']} "
+            f"applied={summary['applied_count']} unresolved={summary['unresolved_count']}"
+        )
+        # Preserve Target Working byte-for-byte even when a source change is
+        # unsupported; callers still need a safe candidate to inspect.
+        candidate = _create_startup_candidate_copy(target_working_path, "mine")
+        return conflicts, candidate, conflict_cells_by_sheet, dict(summary), reason
+
+    def _cell_value_key(ws_val, ws_edit, row: int, col: int):
+        value = ws_val.cell(row=row, column=col).value
+        edit_value = ws_edit.cell(row=row, column=col).value
+        # Cached formula results are recalculation artifacts.  A Source input
+        # edit may refresh many unchanged formula <v> nodes; classify formula
+        # identity from its edit text and let Target Working recalculate rather
+        # than treating cache churn as additional incoming cells.
+        special = _special_formula_signature(edit_value)
+        formula = _formula_text(edit_value)
+        if special is not None:
+            return value, edit_value, ("FORMULA", "SPECIAL", repr(special))
+        if formula is not None:
+            return value, edit_value, ("FORMULA", "TEXT", formula)
+        return value, edit_value, _merge_cell_compare_key(value, edit_value)
+
+    def _row_values(ws, rows: int, width: int):
+        if rows <= 0 or width <= 0:
+            return []
+        cache = _read_rows_into_cache(ws, range(1, rows + 1), width)
+        return [_row_from_cache(cache, row, width) for row in range(1, rows + 1)]
+
+    def _source_to_target_row_map(
+        source_val,
+        source_edit,
+        target_val,
+        target_edit,
+        source_rows: int,
+        target_rows: int,
+        source_width: int,
+        target_width: int,
+        source_to_target_cols: dict[int, int] | None = None,
+    ) -> dict[int, int]:
+        column_map = {
+            int(source_col): int(target_col)
+            for source_col, target_col in (source_to_target_cols or {}).items()
+            if int(source_col) > 0 and int(target_col) > 0
+        }
+        if not column_map and source_width == target_width:
+            column_map = {column: column for column in range(1, source_width + 1)}
+        if not column_map:
+            return {}
+        try:
+            source_columns = sorted(column_map)
+            target_columns = [column_map[column] for column in source_columns]
+
+            # Use the leftmost provably unique common column as a record key
+            # and map it in O(n).  We deliberately do not choose a later
+            # coincidentally-unique numeric payload: in ``[id, value]``, a
+            # replacement ``a -> x`` may keep the same value and must not
+            # receive Source After's change.  Missing/nonmatching keys simply
+            # remain unmapped and become manual incoming work.
+            def _looks_like_physical_ordinal(ws_val, ws_edit, rows: int, col: int) -> bool:
+                samples = []
+                for row in range(2, rows + 1):
+                    value = ws_val.cell(row=row, column=col).value
+                    if value is None:
+                        value = ws_edit.cell(row=row, column=col).value
+                    if isinstance(value, bool):
+                        continue
+                    try:
+                        numeric = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if numeric.is_integer():
+                        samples.append((row, int(numeric)))
+                if len(samples) < 4:
+                    return False
+                offsets = [numeric - row for row, numeric in samples]
+                dominant = max(set(offsets), key=offsets.count)
+                return offsets.count(dominant) / len(offsets) >= 0.90
+
+            for source_col in source_columns:
+                target_col = column_map[source_col]
+                if (
+                    _looks_like_physical_ordinal(source_val, source_edit, source_rows, source_col)
+                    and _looks_like_physical_ordinal(target_val, target_edit, target_rows, target_col)
+                ):
+                    continue
+                source_positions: dict[object, int] = {}
+                target_positions: dict[object, int] = {}
+                source_duplicates: set[object] = set()
+                target_duplicates: set[object] = set()
+                for row in range(2, source_rows + 1):
+                    key = _cell_value_key(source_val, source_edit, row, source_col)[2]
+                    if key == _merge_cell_compare_key(None, None):
+                        continue
+                    if key in source_positions:
+                        source_duplicates.add(key)
+                    else:
+                        source_positions[key] = row
+                for row in range(2, target_rows + 1):
+                    key = _cell_value_key(target_val, target_edit, row, target_col)[2]
+                    if key == _merge_cell_compare_key(None, None):
+                        continue
+                    if key in target_positions:
+                        target_duplicates.add(key)
+                    else:
+                        target_positions[key] = row
+                populated_source = len(source_positions) + len(source_duplicates)
+                populated_target = len(target_positions) + len(target_duplicates)
+                if min(populated_source, populated_target) < 2:
+                    continue
+                unique_source = len(source_positions) / populated_source if populated_source else 0.0
+                unique_target = len(target_positions) / populated_target if populated_target else 0.0
+                if unique_source < 0.80 or unique_target < 0.80:
+                    continue
+                mapping = {1: 1} if source_rows and target_rows else {}
+                for key, source_row in source_positions.items():
+                    target_row = target_positions.get(key)
+                    if (
+                        target_row is not None
+                        and key not in source_duplicates
+                        and key not in target_duplicates
+                    ):
+                        mapping[source_row] = target_row
+                shared_coverage = (len(mapping) - (1 if 1 in mapping else 0)) / min(
+                    populated_source, populated_target
+                )
+                # This is the leftmost plausible identity candidate.  If it
+                # does not explain most source/target records, a later unique
+                # amount/status column is not a safe substitute.  That
+                # preserves the a->x replacement guard while allowing
+                # high-coverage business IDs in real workbooks to retain O(n)
+                # mapping.
+                if shared_coverage >= 0.80:
+                    return mapping
+                # Low coverage is not permission to try a later payload
+                # column.  The exact shared keys are nevertheless proved
+                # records (for example Target already contains Source After's
+                # ``id=a`` while another target record was renamed), so retain
+                # only that partial map and leave every missing key manual.
+                return mapping
+
+            def _project_rows(ws, row_count: int, columns: list[int]):
+                return [
+                    tuple(ws.cell(row=row, column=column).value for column in columns)
+                    for row in range(1, row_count + 1)
+                ]
+
+            target_values = _project_rows(target_val, target_rows, target_columns)
+            source_values = _project_rows(source_val, source_rows, source_columns)
+            target_edits = _project_rows(target_edit, target_rows, target_columns)
+            source_edits = _project_rows(source_edit, source_rows, source_columns)
+            target_sigs, source_sigs = _row_signatures_from_unique_column_anchors(
+                target_values,
+                source_values,
+                len(target_columns),
+                len(source_columns),
+                target_edits,
+                source_edits,
+            )
+            target_to_source = _row_map_from_pairs(
+                _compute_row_pairs_from_signatures(target_sigs, source_sigs)
+            )
+            # Equal grid dimensions are not row identity evidence.  Without a
+            # semantic unique key above, require every mapped payload cell to
+            # remain exactly equal to Source Before.  That is conservative for
+            # target edits, but prevents an in-place record replacement from
+            # inheriting Source After's value at the same physical row.
+            def _proven_same_record(target_row: int, source_row: int) -> bool:
+                if not (target_sigs[target_row - 1] and source_sigs[source_row - 1]):
+                    return False
+                return all(
+                    _cell_value_key(source_val, source_edit, source_row, source_col)[2]
+                    == _cell_value_key(target_val, target_edit, target_row, column_map[source_col])[2]
+                    for source_col in source_columns
+                )
+
+            return {
+                int(source_row): int(target_row)
+                for target_row, source_row in target_to_source.items()
+                if target_row is not None and source_row is not None
+                and _proven_same_record(int(target_row), int(source_row))
+            }
+        except Exception as exc:
+            _dlog(f"CROSS_BRANCH_SOURCE_DELTA row mapping unavailable: {exc}")
+            return {}
+
+    def _source_to_target_column_map(
+        sheet: str,
+        source_val,
+        source_edit,
+        target_val,
+        target_edit,
+        source_rows: int,
+        target_rows: int,
+        source_width: int,
+        target_width: int,
+    ) -> tuple[dict[int, int], int]:
+        """Map Source-Before columns to Target Working logical columns.
+
+        Target-only inserted/deleted columns are retained branch structure, so
+        they contribute one diagnostic count each but are never treated as
+        incoming source changes.  Cells in an unmapped source column remain
+        safely unresolved only when Source After actually changes them.
+        """
+        try:
+            cache = build_logical_column_comparison_cache_2way(
+                ColumnModelCacheKey(sheet, 11, 1),
+                _row_values(source_val, source_rows, source_width),
+                _row_values(target_val, target_rows, target_width),
+                _row_values(source_edit, source_rows, source_width),
+                _row_values(target_edit, target_rows, target_width),
+                mine_max_col=source_width,
+                theirs_max_col=target_width,
+            )
+            mapping = {
+                int(slot.mine_col): int(slot.theirs_col)
+                for slot in cache.model.slots
+                if slot.mine_col is not None
+                and slot.theirs_col is not None
+                and slot.state != "unresolved"
+                and not slot.confidence.ambiguous
+            }
+            # Same ordinal dimensions with a normal header row are an explicit
+            # identity proof even when a target-only cell change alters a full
+            # column digest and weakens the signature cache.
+            if source_width == target_width:
+                for column in range(1, source_width + 1):
+                    if column in mapping:
+                        continue
+                    source_header = _cell_value_key(source_val, source_edit, 1, column)[2]
+                    target_header = _cell_value_key(target_val, target_edit, 1, column)[2]
+                    if source_header == target_header and source_header != _merge_cell_compare_key(None, None):
+                        mapping[column] = column
+            retained_structural = sum(
+                1
+                for slot in cache.model.slots
+                if (slot.mine_col is None) != (slot.theirs_col is None)
+            )
+            return mapping, retained_structural
+        except Exception as exc:
+            _dlog(f"CROSS_BRANCH_SOURCE_DELTA column mapping unavailable sheet={sheet}: {exc}")
+            return {}, max(0, abs(int(target_width) - int(source_width)))
+
+    try:
+        source_before_path = _ensure_xlsx_copy(source_before_path)
+        target_working_path = _ensure_xlsx_copy(target_working_path)
+        source_after_path = _ensure_xlsx_copy(source_after_path)
+        before_val_path = _prepare_val_path(source_before_path)
+        target_val_path = _prepare_val_path(target_working_path)
+        after_val_path = _prepare_val_path(source_after_path)
+        prepared_paths.extend(((source_before_path, before_val_path), (target_working_path, target_val_path), (source_after_path, after_val_path)))
+
+        wb_before_val = load_workbook(before_val_path, data_only=True, keep_links=False)
+        wb_target_val = load_workbook(target_val_path, data_only=True, keep_links=False)
+        wb_after_val = load_workbook(after_val_path, data_only=True, keep_links=False)
+        wb_before_edit = load_workbook(
+            source_before_path, data_only=False, keep_links=False,
+            keep_vba=_is_macro_enabled_workbook(source_before_path),
+        )
+        wb_target_edit = load_workbook(
+            target_working_path, data_only=False, keep_links=False,
+            keep_vba=_is_macro_enabled_workbook(target_working_path),
+        )
+        wb_after_edit = load_workbook(
+            source_after_path, data_only=False, keep_links=False,
+            keep_vba=_is_macro_enabled_workbook(source_after_path),
+        )
+        workbooks.extend((wb_before_val, wb_target_val, wb_after_val, wb_before_edit, wb_target_edit, wb_after_edit))
+
+        before_sheets = list(wb_before_val.sheetnames)
+        after_sheets = list(wb_after_val.sheetnames)
+        if before_sheets != after_sheets:
+            source_sheet_changes = sorted(set(before_sheets).symmetric_difference(after_sheets))
+            changed_sheet = source_sheet_changes[0] if source_sheet_changes else "<workbook>"
+            return _decline(
+                "Source Before/Source After sheet structure differs",
+                changed_sheet,
+            )
+
+        # A target-only sheet and a target-deleted source sheet are branch
+        # structure that must survive untouched.  They are not incoming source
+        # content, so record each only as target-retained.
+        target_sheet_names = set(wb_target_val.sheetnames)
+        source_sheet_names = set(before_sheets)
+        summary["target_retained_count"] += len(target_sheet_names - source_sheet_names)
+
+        sheet_state: dict[str, tuple[int, int, int, int, dict[int, int], dict[int, int]]] = {}
+        structurally_blocked_sheets: set[str] = set()
+        source_has_supported_delta = False
+        source_changed_cells_by_sheet: dict[str, set[str]] = {}
+        source_has_formula_content = False
+        source_has_string_delta = False
+        for sheet in before_sheets:
+            before_val = wb_before_val[sheet]
+            after_val = wb_after_val[sheet]
+            before_edit = wb_before_edit[sheet]
+            after_edit = wb_after_edit[sheet]
+            before_rows, before_width = _effective_bounds_with_edit(before_val, before_edit)
+            after_rows, after_width = _effective_bounds_with_edit(after_val, after_edit)
+            target_val = wb_target_val[sheet] if sheet in wb_target_val.sheetnames else None
+            target_edit = wb_target_edit[sheet] if sheet in wb_target_edit.sheetnames else None
+
+            # Derive row identities before touching either source projection or
+            # Target Working.  The helper is the same bounded, key-aware row
+            # alignment used by the manual three-way workspace.
+            row_pairs = _compute_row_pairs_generic(
+                before_val,
+                after_val,
+                max(1, max(before_width, after_width)),
+                force=True,
+                max_row_a=before_rows,
+                max_row_b=after_rows,
+                ws_a_edit=before_edit,
+                ws_b_edit=after_edit,
+            )
+            row_ops = [pair for pair in row_pairs if (pair[0] is None) != (pair[1] is None)]
+
+            before_value_rows = _row_values(before_val, before_rows, before_width)
+            after_value_rows = _row_values(after_val, after_rows, after_width)
+            before_edit_rows = _row_values(before_edit, before_rows, before_width)
+            after_edit_rows = _row_values(after_edit, after_rows, after_width)
+            column_cache = build_logical_column_comparison_cache_2way(
+                ColumnModelCacheKey(sheet, 1, 1),
+                before_value_rows,
+                after_value_rows,
+                before_edit_rows,
+                after_edit_rows,
+                mine_max_col=before_width,
+                theirs_max_col=after_width,
+            )
+            # Same-width source sheets retain a physical 1:1 column identity
+            # only when their ordered first-row identity tokens match.  A cell
+            # value change can weaken a full-column signature (notably on
+            # small enum sheets), so ``unresolved_cols`` alone is never source
+            # structure.  A header replacement/reorder is the conservative
+            # same-width structural signal.
+            if before_width == after_width:
+                column_ops = set()
+                for column in range(1, before_width + 1):
+                    before_header = _cell_value_key(before_val, before_edit, 1, column)[2]
+                    after_header = _cell_value_key(after_val, after_edit, 1, column)[2]
+                    if before_header != after_header:
+                        column_ops.add((column, column))
+            else:
+                if column_cache.unresolved_cols:
+                    return _decline(
+                        "Source Before/Source After column identity is ambiguous",
+                        sheet,
+                    )
+                column_ops = {
+                    (slot.mine_col, slot.theirs_col)
+                    for slot in column_cache.model.slots
+                    if (slot.mine_col is None) != (slot.theirs_col is None)
+                }
+            column_ops = sorted(
+                column_ops,
+                key=lambda pair: (int(pair[1] or pair[0] or 0), int(pair[0] or pair[1] or 0)),
+            )
+            if before_width != after_width and column_cache.structural_diff_cols and not column_ops:
+                return _decline(
+                    "Source Before/Source After column structure has no safe logical projection",
+                    sheet,
+                )
+
+            structural_count = len(row_ops) + len(column_ops)
+            if structural_count:
+                source_has_supported_delta = True
+                # Row/column replays can alter merged cells, named ranges,
+                # drawing anchors, formula references and VBA-bearing sheets.
+                # The startup writer cannot yet prove all of those transforms,
+                # so retain the source structural delta for manual resolution
+                # rather than performing a partial openpyxl rewrite.  This is
+                # intentionally one unresolved incoming item per aligned source
+                # row/column operation and leaves Target Working byte-for-byte
+                # untouched when nothing else is safely applicable.
+                for before_row, after_row in row_ops:
+                    summary["incoming_count"] += 1
+                    _record_conflict(
+                        sheet,
+                        int(after_row or before_row or 1),
+                        1,
+                        "Source 结构变化待人工处理",
+                        "Source Before → Source After 行插入/删除",
+                    )
+                for before_col, after_col in column_ops:
+                    summary["incoming_count"] += 1
+                    _record_conflict(
+                        sheet,
+                        1,
+                        int(after_col or before_col or 1),
+                        "Source 结构变化待人工处理",
+                        "Source Before → Source After 列插入/删除",
+                    )
+                structurally_blocked_sheets.add(sheet)
+            # No automatic structural rewrite occurs above.  Keep the original
+            # Source Before coordinates only for non-structural sheets.
+            before_rows, before_width = _effective_bounds_with_edit(before_val, before_edit)
+            if target_val is None or target_edit is None:
+                target_rows, target_width, source_to_target, source_to_target_cols = 0, 0, {}, {}
+                retained_target_structure = 0
+                # The target intentionally deleted an otherwise source-stable
+                # sheet.  Retain that target branch decision as one logical
+                # structural item; any source delta below will still become
+                # unresolved because no target sheet can receive it.
+                summary["target_retained_count"] += 1
+            else:
+                target_rows, target_width = _effective_bounds_with_edit(target_val, target_edit)
+                source_to_target_cols, retained_target_structure = _source_to_target_column_map(
+                    sheet,
+                    before_val,
+                    before_edit,
+                    target_val,
+                    target_edit,
+                    before_rows,
+                    target_rows,
+                    before_width,
+                    target_width,
+                )
+                source_to_target = _source_to_target_row_map(
+                    before_val, before_edit, target_val, target_edit,
+                    before_rows, target_rows, before_width, target_width,
+                    source_to_target_cols,
+                )
+            sheet_state[sheet] = (
+                before_rows,
+                before_width,
+                target_rows,
+                target_width,
+                source_to_target,
+                source_to_target_cols,
+            )
+            if not structural_count and target_val is not None and target_edit is not None:
+                # Target-only inserted/deleted rows are retained diagnostics,
+                # never incoming source changes.  Count only source-stable
+                # physical cells on proven same-ordinal columns; unmapped rows
+                # are a safety/write decision, not by themselves target branch
+                # structure (they may be ordinary blank/style padding).
+                summary["target_retained_count"] += retained_target_structure
+                if before_rows != target_rows:
+                    def _semantic_row_present(ws_val, ws_edit, row_number: int, width: int) -> bool:
+                        return any(
+                            _cell_value_key(ws_val, ws_edit, row_number, column_number)[2]
+                            != _merge_cell_compare_key(None, None)
+                            for column_number in range(1, max(1, int(width)) + 1)
+                        )
+
+                    mapped_source_rows = set(source_to_target)
+                    mapped_target_rows = set(source_to_target.values())
+                    summary["target_retained_count"] += sum(
+                        1
+                        for row_number in (set(range(1, before_rows + 1)) - mapped_source_rows)
+                        if _semantic_row_present(before_val, before_edit, row_number, before_width)
+                    )
+                    summary["target_retained_count"] += sum(
+                        1
+                        for row_number in (set(range(1, target_rows + 1)) - mapped_target_rows)
+                        if _semantic_row_present(target_val, target_edit, row_number, target_width)
+                    )
+                else:
+                    for row_number in range(1, before_rows + 1):
+                        for source_col, target_col in source_to_target_cols.items():
+                            if int(source_col) != int(target_col):
+                                continue
+                            _bv, _be, before_key = _cell_value_key(
+                                before_val, before_edit, row_number, source_col
+                            )
+                            _av, _ae, after_key = _cell_value_key(
+                                after_val, after_edit, row_number, source_col
+                            )
+                            _tv, _te, target_key = _cell_value_key(
+                                target_val, target_edit, row_number, target_col
+                            )
+                            if before_key == after_key and target_key != before_key:
+                                summary["target_retained_count"] += 1
+            if not structural_count:
+                for row in range(1, before_rows + 1):
+                    for col in range(1, before_width + 1):
+                        _, before_edit_value, before_key = _cell_value_key(before_val, before_edit, row, col)
+                        _, after_edit_value, after_key = _cell_value_key(after_val, after_edit, row, col)
+                        before_formula = _formula_text(before_edit_value)
+                        after_formula = _formula_text(after_edit_value)
+                        if before_formula is not None or after_formula is not None:
+                            source_has_formula_content = True
+                        if before_key != after_key:
+                            source_has_supported_delta = True
+                            summary["incoming_count"] += 1
+                            source_changed_cells_by_sheet.setdefault(sheet, set()).add(
+                                f"{get_column_letter(col)}{row}"
+                            )
+                            if (
+                                (before_formula is None and isinstance(before_edit_value, str))
+                                or (after_formula is None and isinstance(after_edit_value, str))
+                            ):
+                                source_has_string_delta = True
+
+        # A package-level audit is required even when we found supported cell
+        # deltas.  Without it a Source After tab color, document property,
+        # comment, drawing or VBA member could disappear while the value write
+        # looked successful.  Source row/column structure is already a manual
+        # unit and is intentionally not double-counted here.
+        if not structurally_blocked_sheets:
+            representation_problem = _cross_branch_ooxml_representation_audit(
+                source_before_path,
+                source_after_path,
+                source_changed_cells_by_sheet,
+                has_formula_content=source_has_formula_content,
+                has_string_delta=source_has_string_delta,
+            )
+            if representation_problem:
+                return _decline(representation_problem)
+
+        for sheet in before_sheets:
+            before_val = wb_before_val[sheet]
+            after_val = wb_after_val[sheet]
+            before_edit = wb_before_edit[sheet]
+            after_edit = wb_after_edit[sheet]
+            target_val = wb_target_val[sheet] if sheet in wb_target_val.sheetnames else None
+            target_edit = wb_target_edit[sheet] if sheet in wb_target_edit.sheetnames else None
+            before_rows, before_width, target_rows, target_width, source_to_target, source_to_target_cols = sheet_state[sheet]
+            if sheet in structurally_blocked_sheets:
+                # A source structural delta is one atomic manual unit.  Do not
+                # continue physical-cell projection on the same sheet, because
+                # its coordinates may already have shifted.
+                continue
+            for row in range(1, before_rows + 1):
+                target_row = source_to_target.get(row)
+                for col in range(1, before_width + 1):
+                    before_value, before_edit_value, before_key = _cell_value_key(before_val, before_edit, row, col)
+                    after_value, after_edit_value, after_key = _cell_value_key(after_val, after_edit, row, col)
+                    source_changed = before_key != after_key
+                    target_col = source_to_target_cols.get(col)
+                    if target_val is None or target_edit is None or not target_row or not target_col:
+                        if source_changed:
+                            _record_conflict(sheet, target_row or row, target_col or col, "目标行/列无法安全映射", after_value)
+                        continue
+                    target_value, target_edit_value, target_key = _cell_value_key(
+                        target_val, target_edit, target_row, target_col
+                    )
+                    if not source_changed:
+                        continue
+                    if target_key == before_key:
+                        try:
+                            copied = _copy_edit_value_for_destination(
+                                after_value,
+                                after_edit_value,
+                                target_edit_value,
+                                src_row=row,
+                                src_col=col,
+                                dst_row=target_row,
+                                dst_col=target_col,
+                            )
+                            if not _is_same_formula_copy_noop(copied, target_edit_value):
+                                _assign_edit_cell_value(
+                                    wb_target_edit[sheet].cell(row=target_row, column=target_col), copied
+                                )
+                            summary["applied_count"] += 1
+                        except RuntimeError as exc:
+                            _record_conflict(sheet, target_row, col, target_value, str(exc))
+                    elif target_key == after_key:
+                        summary["already_present_count"] += 1
+                    else:
+                        _record_conflict(sheet, target_row, col, target_value, after_value)
+
+        if not source_has_supported_delta:
+            source_equivalence = compare_ooxml_packages(
+                source_before_path,
+                source_after_path,
+                left_role="source-before",
+                right_role="source-after",
+            )
+            if not source_equivalence.package_equal:
+                return _decline("Source package changed without a supported logical cell delta")
+
+        summary["merged_count"] = summary["applied_count"]
+        candidate = None
+        if summary["applied_count"]:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate = os.path.join(
+                tempfile.gettempdir(),
+                f"{APP_NAME}_cross_branch_candidate_{os.getpid()}_{stamp}{_workbook_ext(target_working_path)}",
+            )
+            _atomic_save_wb(wb_target_edit, candidate)
+        else:
+            # Crucial for an all-already-present merge: openpyxl must not touch
+            # OOXML members just to make a preview.  A direct Target Working
+            # copy preserves raw/package equality for Building and audits.
+            candidate = _create_startup_candidate_copy(target_working_path, "mine")
+        _LAST_SEMANTIC_PREMERGE_SUMMARY = dict(summary)
+        _dlog(
+            "CROSS_BRANCH_SOURCE_DELTA "
+            f"incoming={summary['incoming_count']} applied={summary['applied_count']} "
+            f"already_present={summary['already_present_count']} "
+            f"target_retained={summary['target_retained_count']} "
+            f"unresolved={summary['unresolved_count']} candidate={candidate}"
+        )
+        return conflicts, candidate, conflict_cells_by_sheet, dict(summary), None
+    except Exception as exc:
+        return _decline(f"source-delta pre-merge failed safely: {exc}")
+    finally:
+        _wbs_close(*workbooks)
+        for original, prepared in prepared_paths:
+            if prepared != original:
+                try:
+                    os.remove(prepared)
+                except Exception:
+                    pass
+
+
 def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_path: str, save_merged: bool = True):
     """3-way merge using row-aligned diff (consistent with _scan_three_way_conflicts).
 
@@ -8974,12 +11708,27 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
 
     Returns (conflicts, merged_preview_path, conflict_cells_by_sheet).
     """
+    global _LAST_SEMANTIC_PREMERGE_SUMMARY
+    auto_merged_count = 0
+    unresolved_structural_count = 0
+    _LAST_SEMANTIC_PREMERGE_SUMMARY = {
+        "merged_count": 0,
+        "unresolved_structural_count": 0,
+    }
     # The legacy auto-merge loop below is intentionally physical-column based.
     # Reuse the authoritative logical scan first and refuse to auto-write any
     # sheet with column structure/unresolved mapping; this prevents row mapping
     # from diverging between conflict scan and automatic save until the logical
     # column write pipeline is implemented in the later merge phase.
-    _scan_three_way_conflicts(base_path, mine_path, theirs_path)
+    preflight_started = time.perf_counter()
+    preflight_conflicts, preflight_conflict_map = _scan_three_way_conflicts(
+        base_path, mine_path, theirs_path
+    )
+    _dlog(
+        "SEMANTIC_PREMERGE_PREFLIGHT "
+        f"elapsed_ms={(time.perf_counter() - preflight_started) * 1000.0:.1f} "
+        f"conflicts={len(preflight_conflicts)}"
+    )
     structural_sheets = []
     for sheet_name, analysis in _LAST_THREE_WAY_COLUMN_ANALYSIS.items():
         if analysis.structural_conflicts or any(
@@ -8991,9 +11740,11 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
         preview = "、".join(structural_sheets[:6])
         if len(structural_sheets) > 6:
             preview += f" 等{len(structural_sheets)}张Sheet"
-        raise RuntimeError(
+        raise _SemanticPremergeDeclined(
             "检测到列插入、删除或待确认映射，已停止旧版自动合并，"
-            f"避免按物理列写错数据。涉及：{preview}"
+            f"避免按物理列写错数据。涉及：{preview}",
+            conflicts=preflight_conflicts,
+            conflict_cells_by_sheet=preflight_conflict_map,
         )
 
     base_path = _ensure_xlsx_copy(base_path)
@@ -9024,6 +11775,7 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
         ws_t = wb_theirs_edit[name]  # data_only=False preserves formulas
         ws_m = wb_merged.create_sheet(title=name)
         _copy_sheet_basic(ws_t, ws_m)
+        auto_merged_count += 1
 
     conflicts = []
     conflict_cells_by_sheet = {}
@@ -9217,7 +11969,15 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
                         if vm_key != vt_key:
                             conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
                             conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
-                        # else: identical change on both sides; keep mine as-is.
+                        else:
+                            # Both changed identically relative to Base.  Mine
+                            # already contains the result, but it is still an
+                            # auditable automatic semantic merge decision.
+                            auto_merged_count += 1
+                    elif mine_changed and (not theirs_changed):
+                        # Mine's one-sided change is already present in the
+                        # candidate and is counted as an automatic keep.
+                        auto_merged_count += 1
                     elif (not mine_changed) and theirs_changed:
                         # Safe to apply theirs onto mine's aligned row (preserve formulas).
                         _t_edit_v = ws_t_edit.cell(row=rb, column=c).value if ws_t_edit is not None else None
@@ -9241,6 +12001,7 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
                                 ws_m_edit.cell(row=ra, column=c),
                                 _new_edit_v,
                             )
+                            auto_merged_count += 1
                     continue
 
                 # Both sides added the same logical row independently (no shared base):
@@ -9249,8 +12010,20 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
                     if vm_key != vt_key:
                         conflicts.append((name, conflict_row, c, vm_cmp, vt_cmp))
                         conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(c)
-                # ra is None (theirs-only row) or rb is None (mine-only row): structural
-                # insert/delete -> left for the manual 3-way UI, never written by physical row.
+                elif ra is None or rb is None:
+                    # A Mine-only inserted row has no Base identity and is
+                    # already safely retained in the Mine candidate.  Do not
+                    # turn that proven preservation into a false conflict: a
+                    # later aligned Theirs change can still be applied through
+                    # the normal Base mapping.  Theirs-only insertion or either
+                    # deletion case still lacks a safe write mapping here.
+                    safe_mine_only_insert = (
+                        ra is not None and rb is None and base_row_m is None
+                    )
+                    if c == 1 and not safe_mine_only_insert:
+                        conflicts.append((name, conflict_row, 1, "未支持的行结构变化", "未支持的行结构变化"))
+                        conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(1)
+                        unresolved_structural_count += 1
 
     _merge_result = None
     try:
@@ -9275,10 +12048,18 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
                     os.remove(_vp)
                 except Exception:
                     pass
+    _LAST_SEMANTIC_PREMERGE_SUMMARY = {
+        "merged_count": int(auto_merged_count),
+        "unresolved_structural_count": int(unresolved_structural_count),
+    }
     return _merge_result
 
 
 _LAST_THREE_WAY_COLUMN_ANALYSIS: dict[str, LogicalThreeWayColumnAnalysis] = {}
+_LAST_SEMANTIC_PREMERGE_SUMMARY: dict[str, int] = {
+    "merged_count": 0,
+    "unresolved_structural_count": 0,
+}
 
 
 def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
@@ -9704,7 +12485,13 @@ class SheetView:
         self.col_max_base = 1
         self._bounds_checked = False
         self._base_bounds_checked = False
-        # Per-column max display width (chars), computed during diff scan
+        # Every logical column in a Sheet intentionally shares this bounded
+        # display width.  Keeping the geometry independent from sampled cell
+        # content makes A/Base/B/C panes stable while scrolling or loading.
+        self._logical_column_display_width = _LOGICAL_COLUMN_DISPLAY_WIDTH_MIN
+        self._logical_column_widths: tuple[int, ...] = ()
+        self._logical_column_widths_key = None
+        # Compatibility map consumed by the existing formatter/hit testing.
         self.col_char_widths: dict[int, int] = {}
         self._rownum_display_width: int = 3  # right-justified row number gutter width
         self._row_header_width: int = 4
@@ -9741,6 +12528,10 @@ class SheetView:
         self._theirs_edit_version = 0
         self._column_projection_generation = 0
         self._column_mapping_stale_reason = ""
+        # A column-only mapping rebuild must not rerun row alignment against
+        # temporarily different physical column positions.  Callers that know
+        # rows changed set ``row_structure=True`` and clear this request.
+        self._row_alignment_reuse_requested = False
 
         # Render state
         # display_rows stores pair indices (into row_pairs)
@@ -9768,7 +12559,19 @@ class SheetView:
         self.selected_column_logical_range: tuple[int, int] | None = None
         self.selected_column_source_side: str | None = None
         self._selected_column_projection_generation: int | None = None
+        # Each column projection gets at most one automatic structural-block
+        # selection. A user clear in the same projection remains respected,
+        # while an accepted block may reveal the next pending block after the
+        # projection is rebuilt.
+        self._auto_structural_selection_generation: int | None = None
         self._retained_column_decisions: set[tuple[int, int, str]] = set()
+        # Logical common insertions explicitly accepted from the opposite
+        # current side.  Row alignment may pair different physical row
+        # numbers, so a freshly copied column can otherwise look changed on
+        # those shifted pairs.  The visual filter below suppresses that noise
+        # only while the source and target cells at the copied physical row
+        # remain formula/value equivalent.
+        self._accepted_common_insert_sources: dict[int, str] = {}
         self._applied_main_sel_col: int | None = None
         self._applied_main_sel_line: int | None = None
         self._cursor_cmp_sel_col: int | None = None
@@ -9839,29 +12642,37 @@ class SheetView:
         # Toolbar
         bar = ttk.Frame(self.frame)
         bar.pack(fill="x", padx=8, pady=(8, 6))
-        self.diff_nav_bar = ttk.Frame(self.frame)
-        self.diff_nav_bar.pack(fill="x", padx=8, pady=(0, 4))
-        self.diff_nav_group = ttk.Frame(self.diff_nav_bar)
-        self.diff_nav_group.pack(side="right")
+        self._toolbar = bar
+        # Difference navigation and structural-column decisions deliberately
+        # share one compact row.  The navigation group is absolutely centered
+        # until it would collide with the protected right-side action groups.
+        self.column_action_bar = ttk.Frame(self.frame)
+        self.column_action_bar.pack(fill="x", padx=8, pady=(0, 4))
+        # Reserve one fixed right-hand group before any dynamic text.  This
+        # keeps row/region, view-mode and diff-navigation controls visible on
+        # narrow Gunships sheets even while status text changes.
+        self.toolbar_action_group = ttk.Frame(bar)
+        self.toolbar_action_group.pack(side="right")
+        self.diff_nav_group = ttk.Frame(self.column_action_bar)
+        self._action_row_layout_after_id = None
 
         ttk.Label(bar, text=f"Sheet: {sheet_name}", font=("Segoe UI", 11, "bold")).pack(side="left")
-        self.info = ttk.Label(bar, text="", foreground="#444")
-        self.info.pack(side="left", padx=(10, 0))
+        self.info = None
         self.loading_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
-        # Difference navigation owns a separate, always-reserved row. Dynamic
-        # counts must never reflow the view-mode controls in the toolbar above.
+        # Dynamic counts must never reflow the view-mode controls in the
+        # toolbar above; their navigation group is placed independently.
         self.next_diff_btn = tk.Button(
             self.diff_nav_group,
-            text="下一处差异",
-            padx=10,
+            text="下一差异",
+            padx=5,
             pady=2,
             command=self._goto_next_diff_block,
         )
         self.prev_diff_btn = tk.Button(
             self.diff_nav_group,
-            text="上一处差异",
-            padx=10,
+            text="上一差异",
+            padx=5,
             pady=2,
             command=self._goto_prev_diff_block,
         )
@@ -9873,7 +12684,7 @@ class SheetView:
         self.diff_block_status = tk.Label(
             self.diff_nav_group,
             textvariable=self.diff_block_status_var,
-            width=28,
+            width=18,
             anchor="center",
             fg="#174A7E",
         )
@@ -9886,36 +12697,42 @@ class SheetView:
         self._last_only_diff_value = int(self.only_diff_var.get())
 
         self.only_diff_cb = tk.Checkbutton(
-            bar,
-            text="只看差异内容",
+            self.toolbar_action_group,
+            text="仅差异",
             variable=self.only_diff_var,
             onvalue=1,
             offvalue=0,
             command=self._toggle_only_diff,
             padx=6,
+            bg=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
+            activebackground=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
         )
         # Put on the right for a stable position
         self.only_diff_cb.pack(side="right", padx=(6, 0))
         self.force_align_var = tk.IntVar(value=0)
         self.force_align_cb = tk.Checkbutton(
-            bar,
-            text="强制行对齐(SM)",
+            self.toolbar_action_group,
+            text="行对齐",
             variable=self.force_align_var,
             onvalue=1,
             offvalue=0,
             command=self._toggle_force_align,
             padx=6,
+            bg=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
+            activebackground=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
         )
         self.force_align_cb.pack(side="right", padx=(6, 0))
         self.grid_overlay_var = tk.IntVar(value=1)
         self.grid_overlay_cb = tk.Checkbutton(
-            bar,
-            text="网格显示",
+            self.toolbar_action_group,
+            text="网格",
             variable=self.grid_overlay_var,
             onvalue=1,
             offvalue=0,
             command=self._toggle_grid_overlay,
             padx=6,
+            bg=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
+            activebackground=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
         )
         self.grid_overlay_cb.pack(side="right", padx=(6, 0))
         if getattr(self.app, "merge_conflict_mode", False):
@@ -9927,18 +12744,25 @@ class SheetView:
                 self.force_align_cb.configure(state="disabled")
             except Exception:
                 pass
-        self.three_way_var = tk.IntVar(value=1 if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False) else 0)
+        self._folded_identity = getattr(getattr(self.app, "startup_outcome", None), "folded_identity", None)
+        self.three_way_var = tk.IntVar(
+            value=(
+                0 if self._folded_identity else 1
+            ) if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False) else 0
+        )
         self._last_three_way_value = int(self.three_way_var.get())
         self.three_way_cb = None
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
             self.three_way_cb = tk.Checkbutton(
-                bar,
-                text="3视图",
+                self.toolbar_action_group,
+                text="展开三方" if self._folded_identity else "三方",
                 variable=self.three_way_var,
                 onvalue=1,
                 offvalue=0,
                 command=self._toggle_three_way_view,
                 padx=6,
+                bg=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
+                activebackground=getattr(self.app, "workspace_chrome_color", "#E9E9E9"),
             )
             self.three_way_cb.pack(side="right", padx=(6, 0))
 
@@ -9953,10 +12777,10 @@ class SheetView:
         self._last_only_diff_value = int(self.only_diff_var.get())
 
         # Debug: provide a force-toggle button to prove the filtering path works even if UI toggling fails.
-        if _DEBUG_ENABLED:
+        if _DEBUG_ENABLED and bool(getattr(self.app, "show_debug_controls", False)):
             tk.Button(
-                bar,
-                text="强制切换",
+                self.toolbar_action_group,
+                text="调试切换",
                 command=lambda: (self.only_diff_var.set(0 if self.only_diff_var.get() else 1), self._toggle_only_diff()),
                 padx=6,
                 pady=1,
@@ -10018,8 +12842,8 @@ class SheetView:
             return group, main_btn, menu_btn
 
         self.use_left_group, self.use_left_btn, self.use_left_menu_btn = _build_split_group(
-            bar,
-            "使用左侧行",
+            self.toolbar_action_group,
+            "采用左",
             "#eaf2ff",
             command=lambda: self._run_copy_action_by_mode(self._left_copy_direction),
         )
@@ -10036,11 +12860,17 @@ class SheetView:
             value="region",
             command=lambda: self._set_copy_scope_mode("region"),
         )
+        self._use_left_menu.add_radiobutton(
+            label="全局模式",
+            variable=self._copy_scope_var,
+            value="global",
+            command=lambda: self._set_copy_scope_mode("global"),
+        )
         self.use_left_menu_btn.configure(menu=self._use_left_menu)
 
         self.use_right_group, self.use_right_btn, self.use_right_menu_btn = _build_split_group(
-            bar,
-            "使用右侧行",
+            self.toolbar_action_group,
+            "采用右",
             "#ffecec",
             command=lambda: self._run_copy_action_by_mode(self._right_copy_direction),
         )
@@ -10057,22 +12887,28 @@ class SheetView:
             value="region",
             command=lambda: self._set_copy_scope_mode("region"),
         )
+        self._use_right_menu.add_radiobutton(
+            label="全局模式",
+            variable=self._copy_scope_var,
+            value="global",
+            command=lambda: self._set_copy_scope_mode("global"),
+        )
         self.use_right_menu_btn.configure(menu=self._use_right_menu)
         self._set_copy_scope_mode("row")
 
         self.use_base_btn = None
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
             self.use_base_btn = tk.Button(
-                bar,
-                text="保留Mine",
+                self.toolbar_action_group,
+                text=f"保留{merge_side_label(getattr(self.app, 'launch_context', None), 'A')}",
                 bg="#f3f3ff",
                 padx=10,
                 pady=2,
                 command=lambda: self._copy_selected_row("MINE2A"),
             )
         self.undo_btn = tk.Button(
-            bar,
-            text="回退",
+            self.toolbar_action_group,
+            text="撤销",
             bg="#f2f2f2",
             padx=8,
             pady=2,
@@ -10085,44 +12921,86 @@ class SheetView:
         self.use_left_group.pack(side="right")
         self.undo_btn.pack(side="right", padx=(6, 0))
 
-        self.manual_rescan_btn = ttk.Button(bar, text="刷新本Sheet", command=self._manual_rescan)
+        self.manual_rescan_btn = ttk.Button(self.toolbar_action_group, text="刷新", command=self._manual_rescan)
         self.manual_rescan_btn.pack(side="right", padx=(6, 0))
         self._full_render = False
-        self._load_all_btn = ttk.Button(bar, text="加载全部", command=self._load_all_rows)
+        self._load_all_btn = ttk.Button(self.toolbar_action_group, text="全量", command=self._load_all_rows)
         if _FAST_OPEN_ENABLED:
             self._load_all_btn.pack(side="right", padx=(6, 0))
-
         # Structural-column action bar.  Buttons stay disabled until a user
         # selects a highlighted logical block from a header or minimap marker.
-        self.column_action_bar = ttk.Frame(self.frame)
-        self.column_action_bar.pack(fill="x", padx=8, pady=(0, 4))
         self.column_action_status_var = tk.StringVar(
-            value="列块：点击带 + / − / ? 标记的表头或下方橙色列标记进行选择"
+            value="列块：点击 + / − / ? 标记选择"
         )
-        ttk.Label(
+        self.column_action_status_label = ttk.Label(
             self.column_action_bar,
             textvariable=self.column_action_status_var,
             foreground="#6A4A00",
-        ).pack(side="left", fill="x", expand=True)
+            anchor="w",
+        )
+        self.column_action_status_label._identity_detail_text = (
+            "列块：点击带 + / − / ? 标记的表头或下方橙色列标记进行选择"
+        )
+        self._bind_identity_label_tooltip(self.column_action_status_label)
+        self.column_action_selection_var = tk.StringVar(value="")
+        self.column_action_status_prefix_var = tk.StringVar(value="")
+        self.column_action_status_suffix_var = tk.StringVar(value="")
+        self.column_action_status_group = tk.Frame(self.column_action_bar)
+        self.column_action_status_prefix_label = tk.Label(
+            self.column_action_status_group,
+            textvariable=self.column_action_status_prefix_var,
+            foreground="#6A4A00",
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.column_action_selection_label = tk.Label(
+            self.column_action_status_group,
+            textvariable=self.column_action_selection_var,
+            foreground="#C62828",
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+        )
+        self.column_action_status_suffix_label = tk.Label(
+            self.column_action_status_group,
+            textvariable=self.column_action_status_suffix_var,
+            foreground="#6A4A00",
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        for widget in (
+            self.column_action_status_prefix_label,
+            self.column_action_selection_label,
+            self.column_action_status_suffix_label,
+        ):
+            widget._identity_detail_text = ""
+            self._bind_identity_label_tooltip(widget)
+            widget.pack(side="left")
+        # General transient sheet feedback lives beside (not inside) the
+        # fixed toolbar actions. Its normal render text is deliberately short.
+        self.info = ttk.Label(self.column_action_bar, text="", foreground="#444", anchor="w")
+        # Pack the action group first so a long status never squeezes the
+        # buttons out of the GunshipsModify header.
+        self.column_action_button_group = ttk.Frame(self.column_action_bar)
+        self.column_action_button_group.pack(side="right")
         self.use_theirs_col_btn = tk.Button(
-            self.column_action_bar,
-            text="采用Theirs列",
+            self.column_action_button_group,
+            text=f"采用{merge_side_label(getattr(self.app, 'launch_context', None), 'B')}列",
             padx=8,
             pady=1,
             state="disabled",
             command=lambda: self._on_column_action_button("B"),
         )
         self.use_base_col_btn = tk.Button(
-            self.column_action_bar,
-            text="采用Base列",
+            self.column_action_button_group,
+            text=f"采用{merge_side_label(getattr(self.app, 'launch_context', None), 'BASE')}列",
             padx=8,
             pady=1,
             state="disabled",
             command=lambda: self._on_column_action_button("BASE"),
         )
         self.use_mine_col_btn = tk.Button(
-            self.column_action_bar,
-            text="保留Mine列",
+            self.column_action_button_group,
+            text=f"保留{merge_side_label(getattr(self.app, 'launch_context', None), 'A')}列",
             padx=8,
             pady=1,
             state="disabled",
@@ -10132,11 +13010,27 @@ class SheetView:
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
             self.use_base_col_btn.pack(side="right", padx=(4, 0))
         self.use_mine_col_btn.pack(side="right", padx=(4, 0))
+        # The complete structural summary is a tagged group immediately left
+        # of the three buttons: the logical range alone is red/bold while its
+        # surrounding decision text stays neutral.
+        self.column_action_status_group.pack(side="right", padx=(0, 8))
+        # Transient feedback occupies only the free left portion of this row.
+        # It is placed (rather than packed) so it yields to the centered diff
+        # navigation before any protected structural action is clipped.
+        for widget in (
+            self.column_action_bar,
+            self.diff_nav_group,
+            self.column_action_status_group,
+            self.column_action_button_group,
+        ):
+            widget.bind("<Configure>", self._schedule_column_action_row_layout, add="+")
         self._refresh_column_action_buttons()
+        self._schedule_column_action_row_layout()
 
-        # Path bar (requested red-box area): show full paths above the diff panes
+        # Semantic identity bar. Keep role/revision/Author visible; full paths
+        # are available from the hover detail instead of consuming grid width.
         path_bar = ttk.Frame(self.frame)
-        path_bar.pack(fill="x", padx=8, pady=(0, 4))
+        path_bar.pack(fill="x", padx=8, pady=(0, 2))
 
         self._path_font = ("Segoe UI", 9)
         path_bar.grid_columnconfigure(0, weight=1)
@@ -10202,6 +13096,13 @@ class SheetView:
             pady=2,
         )
         self.path_label_b.grid(row=0, column=2, sticky="ew")
+        for identity_label in (
+            self.path_label_a,
+            self.path_label_base,
+            self.path_label_b,
+        ):
+            identity_label._identity_detail_text = ""
+            self._bind_identity_label_tooltip(identity_label)
 
         # Extra vertical scrollbar (left side) for convenience; controls both panes.
         # NOTE: must be packed BEFORE the paned window so it remains visible.
@@ -10219,7 +13120,7 @@ class SheetView:
 
         # Panes
         paned = ttk.PanedWindow(self.frame, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        paned.pack(fill="both", expand=True, padx=8, pady=(0, 2))
         self._main_paned = paned
 
         left_wrap = ttk.Frame(paned)
@@ -10237,7 +13138,7 @@ class SheetView:
             try:
                 total = self._main_paned.winfo_width()
                 if total and total > 2:
-                    if self._is_three_way_enabled():
+                    if self._is_three_way_expanded():
                         self._main_paned.sashpos(0, total // 3)
                         self._main_paned.sashpos(1, (total * 2) // 3)
                     else:
@@ -10250,15 +13151,17 @@ class SheetView:
         self._main_paned.bind("<ButtonRelease-1>", self._keep_panes_equal)
         self.frame.after(0, self._keep_panes_equal)
 
-        self.left_title = ttk.Label(left_wrap, text="Mine", background=_MINE_BG)
+        self.left_title = ttk.Label(left_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "A"), background=_MINE_BG)
         self.left_title.pack(fill="x")
-        self.mid_title = ttk.Label(mid_wrap, text="Base", background=_BASE_BG)
+        self.mid_title = ttk.Label(mid_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "BASE"), background=_BASE_BG)
         self.mid_title.pack(fill="x")
-        self.right_title = ttk.Label(right_wrap, text="Base", background=_THEIRS_BG)
+        self.right_title = ttk.Label(right_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "B"), background=_THEIRS_BG)
         self.right_title.pack(fill="x")
 
         # Font size tuned closer to TortoiseMerge (+~20%)
-        self.editor_font = ("Consolas", 11)
+        # 新宋体 has an actual 1:2 ASCII/CJK advance at 11pt on supported
+        # Windows installs, matching the fixed display-cell formatter.
+        self.editor_font = ("新宋体", 11, "normal")
         left_body = ttk.Frame(left_wrap)
         left_body.pack(fill="both", expand=True)
         mid_body = ttk.Frame(mid_wrap)
@@ -10579,9 +13482,11 @@ class SheetView:
         self.right.tag_raise("paddingcol")
 
         # selection should not overwrite diff colors
-        self.left.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
-        self.base.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
-        self.right.tag_configure("selrow", underline=1, font=("Consolas", 11, "bold"))
+        # Selection must not override the pane font: a font change would make
+        # wide-cell pixel geometry diverge from headers and other panes.
+        self.left.tag_configure("selrow", underline=1)
+        self.base.tag_configure("selrow", underline=1)
+        self.right.tag_configure("selrow", underline=1)
         # Selected-cell highlight (same blue as C区 cselcell), applied on A/B/(Base).
         self.left.tag_configure("selcell", background="#8EB9FF")
         self.base.tag_configure("selcell", background="#8EB9FF")
@@ -10653,8 +13558,8 @@ class SheetView:
         self.right_ln.bind("<Leave>", lambda e: self._clear_row_header_hover(self.right_ln))
 
         # C区: compact cursor compare block + cell-aligned view
-        self.c_area = ttk.Notebook(self.lower_area)
-        self.c_area.pack(fill="x", padx=8, pady=(0, 4))
+        self.c_area = ttk.Notebook(self.lower_area, style="CompactPanel.TNotebook")
+        self.c_area.pack(fill="x", padx=8, pady=(0, 2))
 
         # ---- C1: compact row compare (2 lines in 2-way, 3 lines in 3-way) ----
         c_text_frame = ttk.Frame(self.c_area)
@@ -10726,7 +13631,10 @@ class SheetView:
         self.c_area.add(c_cell_frame, text="C区-单元格对齐")
         if not self._enable_c_cell:
             try:
-                self.c_area.tab(c_cell_frame, state="hidden")
+                # A merely "hidden" Notebook page still contributes its
+                # six-line requested height on Tk/Windows, leaving a large
+                # blank strip under C1. Detach it while retaining the widgets.
+                self.c_area.forget(c_cell_frame)
             except Exception:
                 pass
 
@@ -10764,14 +13672,16 @@ class SheetView:
         self._pending_hover_args = None
         self._hover_debounce_ms = 30
         self.hover_cmp_host = ttk.Frame(self.lower_area, height=self._hover_compare_reserved_height())
-        self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 4))
+        self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 2))
         try:
             self.hover_cmp_host.pack_propagate(False)
         except Exception:
             pass
-        hover_cmp_frame = ttk.LabelFrame(self.hover_cmp_host, text="悬停完整对比")
+        # One heading line carries both the panel purpose and the current
+        # Sheet/cell identity. A second LabelFrame title only consumed height.
+        hover_cmp_frame = ttk.Frame(self.hover_cmp_host)
         hover_cmp_frame.pack(fill="both", expand=True)
-        self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比：-")
+        self.hover_cmp_title_var = tk.StringVar(value="悬停完整对比 | 当前单元格：-")
         self.hover_cmp_pin_var = tk.IntVar(value=0)
         hover_hdr = ttk.Frame(hover_cmp_frame)
         hover_hdr.pack(fill="x", padx=4, pady=(2, 2))
@@ -10787,6 +13697,9 @@ class SheetView:
         ).pack(side="right")
         self.hover_cmp_text = tk.Text(
             hover_cmp_frame,
+            # The host also contains the heading and horizontal scrollbar;
+            # three source rows therefore need a fourth Text display line to
+            # avoid clipping the bottom half of Theirs in 3-way mode.
             height=4 if self._is_three_way_enabled() else 2,
             wrap="none",
             font=self.editor_font,
@@ -10825,8 +13738,15 @@ class SheetView:
 
     # ---------- Scrolling sync ----------
     def _is_three_way_enabled(self) -> bool:
+        """Whether the underlying comparison model is three-way (never folded away)."""
         try:
-            return bool(getattr(self, "three_way_var", None) and self.three_way_var.get() and getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False))
+            return bool(getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False))
+        except Exception:
+            return False
+
+    def _is_three_way_expanded(self) -> bool:
+        try:
+            return bool(self._is_three_way_enabled() and self.three_way_var.get())
         except Exception:
             return False
 
@@ -10839,9 +13759,10 @@ class SheetView:
             line_px = max(16, int(tkfont.Font(font=self.editor_font).metrics("linespace")))
         except Exception:
             pass
-        # Reserve enough vertical room for the header row, text chrome and x-scrollbar.
-        baseline = 160 if enabled else 118
-        return max(baseline, int(line_px * line_count + 88))
+        # One compact heading + exact source rows + x-scrollbar. The main grid
+        # receives every remaining pixel instead of reserving two blank lines.
+        baseline = 124 if enabled else 84
+        return max(baseline, int(line_px * line_count + 48))
 
     def _sync_hover_compare_reserved_height(self, enabled: bool | None = None):
         enabled = self._is_three_way_enabled() if enabled is None else bool(enabled)
@@ -11031,6 +13952,38 @@ class SheetView:
         )
         return False
 
+    def _column_undo_model_ready(self) -> bool:
+        """Allow a column transaction while only-diff presentation finishes.
+
+        Column actions have a complete workbook snapshot, and both applying and
+        restoring them rely only on the exact row, Base, formula, and column
+        models.  They therefore remain safe while the optional only-diff row
+        list is still being rebuilt.
+        """
+        try:
+            if bool(getattr(self.app, "_is_closing", False)):
+                return False
+            if getattr(self, "_lifecycle_error", None) or bool(getattr(self, "_lifecycle_canceled", False)):
+                return False
+            event = getattr(self.app, "_interactive_action_event", None)
+            if event is not None and event.is_set():
+                return False
+            if not all((
+                bool(getattr(self, "_data_ready", False)),
+                bool(getattr(self, "_row_model_exact", False)),
+                bool(getattr(self, "_cache_formula_aware", False)),
+                bool(getattr(self, "_pair_diff_full_exact", False)),
+                bool(getattr(self, "_column_mapping_is_current", lambda: False)()),
+            )):
+                return False
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                if not bool(getattr(self, "_base_diff_full_exact", False)):
+                    return False
+            edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
+            return not callable(edit_ready) or bool(edit_ready())
+        except Exception:
+            return False
+
     def _refresh_interaction_gate(self):
         """Atomically project lifecycle readiness onto every mutation control."""
         previous = getattr(self, "_lifecycle_state", None)
@@ -11048,7 +14001,7 @@ class SheetView:
             checkbox_state = mutation_state
             if getattr(self.app, "merge_conflict_mode", False):
                 checkbox_state = "disabled"
-            self.only_diff_cb.configure(text="只看差异内容", state=checkbox_state)
+            self.only_diff_cb.configure(text="仅差异", state=checkbox_state)
         except Exception:
             pass
         try:
@@ -11089,20 +14042,149 @@ class SheetView:
         self._update_sheet_role_labels()
         self._refresh_column_action_buttons()
 
+    def _hide_identity_label_tooltip(self):
+        after_id = getattr(self, "_identity_tooltip_after_id", None)
+        if after_id is not None and self.root is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._identity_tooltip_after_id = None
+        tooltip = getattr(self, "_identity_tooltip_window", None)
+        if tooltip is not None:
+            try:
+                tooltip.destroy()
+            except Exception:
+                pass
+        self._identity_tooltip_window = None
+
+    def _show_identity_label_tooltip(self, label):
+        self._identity_tooltip_after_id = None
+        detail = str(getattr(label, "_identity_detail_text", "") or "").strip()
+        if not detail or self.root is None:
+            return
+        self._hide_identity_label_tooltip()
+        try:
+            tooltip = tk.Toplevel(self.root)
+            tooltip.wm_overrideredirect(True)
+            tooltip.attributes("-topmost", True)
+            tk.Label(
+                tooltip,
+                text=detail,
+                justify="left",
+                anchor="w",
+                bg="#FFFDE7",
+                fg="#263238",
+                bd=1,
+                relief="solid",
+                padx=8,
+                pady=6,
+                wraplength=900,
+            ).pack(fill="both", expand=True)
+            x = max(0, int(label.winfo_rootx()))
+            y = max(0, int(label.winfo_rooty() + label.winfo_height() + 2))
+            tooltip.geometry(f"+{x}+{y}")
+            self._identity_tooltip_window = tooltip
+        except Exception:
+            self._identity_tooltip_window = None
+
+    def _bind_identity_label_tooltip(self, label):
+        def _enter(_event=None):
+            self._hide_identity_label_tooltip()
+            if self.root is None:
+                return
+            try:
+                self._identity_tooltip_after_id = self.root.after(
+                    350,
+                    lambda: self._show_identity_label_tooltip(label),
+                )
+            except Exception:
+                self._identity_tooltip_after_id = None
+
+        label.bind("<Enter>", _enter, add="+")
+        label.bind("<Leave>", lambda _event=None: self._hide_identity_label_tooltip(), add="+")
+
+    @staticmethod
+    def _identity_detail_text(
+        role_label: str,
+        identity: VersionIdentity | None,
+        *,
+        candidate: bool = False,
+    ) -> str:
+        if identity is None:
+            return f"{role_label}：-"
+        full_path = identity.path or identity.effective_path or "-"
+        lines = [
+            f"{role_label}：{format_version_identity(identity, candidate=candidate)}",
+            f"完整路径：{full_path}",
+        ]
+        if identity.availability_reason:
+            lines.append(f"Author/版本说明：{identity.availability_reason}")
+        return "\n".join(lines)
+
     def _update_sheet_role_labels(self):
         enabled = self._is_three_way_enabled()
         meta = self._sheet_meta()
         try:
             if enabled:
-                mine_src = getattr(self.app, "raw_mine", None) or self.app.file_a
-                base_src = getattr(self.app, "raw_base", None) or getattr(self.app, "base_path", "")
-                theirs_src = getattr(self.app, "raw_theirs", None) or self.app.file_b
-                mine_text = f"mine={self._source_display_name(mine_src)}" if meta.get("has_a") else "mine=空白(该侧无此Sheet)"
-                base_text = f"base={self._source_display_name(base_src)}" if (base_src and meta.get("has_base")) else "base=空白(该侧无此Sheet)"
-                theirs_text = f"theirs={self._source_display_name(theirs_src)}" if meta.get("has_b") else "theirs=空白(该侧无此Sheet)"
+                context = getattr(self.app, "launch_context", None)
+                outcome = getattr(self.app, "startup_outcome", None)
+                mine_identity = context.identity_for("mine") if context else None
+                base_identity = context.identity_for("base") if context else None
+                theirs_identity = context.identity_for("theirs") if context else None
+                mine_label = merge_role_label(context, "mine")
+                base_label = merge_role_label(context, "base")
+                theirs_label = merge_role_label(context, "theirs")
+                if meta.get("has_a") and getattr(outcome, "candidate_path", None):
+                    source_role = str(getattr(outcome, "source_role", "") or "mine").lower()
+                    source_identity = context.identity_for(source_role) if context else mine_identity
+                    mine_text = (
+                        "Merged="
+                        f"{format_compact_version_identity(source_identity)}"
+                    )
+                    mine_detail = self._identity_detail_text(
+                        f"{merge_role_label(context, 'mine', candidate=True)}"
+                        f"（初始化自 {merge_role_label(context, source_role)}）",
+                        source_identity,
+                        candidate=True,
+                    )
+                else:
+                    mine_text = (
+                        mine_label + "=" + format_compact_version_identity(mine_identity)
+                        if meta.get("has_a") and mine_identity else
+                        (f"{mine_label}={self._source_display_name(getattr(self.app, 'raw_mine', None) or self.app.file_a)}" if meta.get("has_a") else f"{mine_label}=空白(该侧无此Sheet)")
+                    )
+                    mine_detail = (
+                        self._identity_detail_text(mine_label, mine_identity)
+                        if meta.get("has_a") and mine_identity
+                        else mine_text
+                    )
+                base_text = (
+                    base_label + "=" + format_compact_version_identity(base_identity)
+                    if meta.get("has_base") and base_identity else
+                    (f"{base_label}={self._source_display_name(getattr(self.app, 'raw_base', None) or getattr(self.app, 'base_path', ''))}" if meta.get("has_base") else f"{base_label}=空白(该侧无此Sheet)")
+                )
+                theirs_text = (
+                    theirs_label + "=" + format_compact_version_identity(theirs_identity)
+                    if meta.get("has_b") and theirs_identity else
+                    (f"{theirs_label}={self._source_display_name(getattr(self.app, 'raw_theirs', None) or self.app.file_b)}" if meta.get("has_b") else f"{theirs_label}=空白(该侧无此Sheet)")
+                )
+                base_detail = (
+                    self._identity_detail_text(base_label, base_identity)
+                    if meta.get("has_base") and base_identity
+                    else base_text
+                )
+                theirs_detail = (
+                    self._identity_detail_text(theirs_label, theirs_identity)
+                    if meta.get("has_b") and theirs_identity
+                    else theirs_text
+                )
                 self.path_label_a.configure(text=mine_text, bg=_MINE_BG)
                 self.path_label_base.configure(text=base_text, bg=_BASE_BG)
                 self.path_label_b.configure(text=theirs_text, bg=_THEIRS_BG)
+                self.path_label_a._identity_detail_text = mine_detail
+                self.path_label_base._identity_detail_text = base_detail
+                self.path_label_b._identity_detail_text = theirs_detail
             else:
                 base_src = getattr(self.app, "raw_base", None) or self.app.file_a
                 mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
@@ -11110,6 +14192,8 @@ class SheetView:
                 right_text = f"mine={self._source_display_name(mine_src)}" if meta.get("has_b") else "mine=空白(该侧无此Sheet)"
                 self.path_label_a.configure(text=left_text, bg=_BASE_BG)
                 self.path_label_b.configure(text=right_text, bg=_MINE_BG)
+                self.path_label_a._identity_detail_text = f"Base\n完整路径：{base_src}"
+                self.path_label_b._identity_detail_text = f"Mine\n完整路径：{mine_src}"
         except Exception:
             pass
         try:
@@ -11144,7 +14228,18 @@ class SheetView:
                 pass
             self._guard_mutation_ready("切换三方视图")
             return
-        enabled = self._is_three_way_enabled()
+        model_enabled = self._is_three_way_enabled()
+        expanded = self._is_three_way_expanded()
+        context = getattr(self.app, "launch_context", None)
+        outcome = getattr(self.app, "startup_outcome", None)
+        branch_candidate = bool(
+            context
+            and context.scenario == MergeScenario.CROSS_BRANCH_MERGE
+            and getattr(outcome, "candidate_path", None)
+        )
+        mine_pane_label = merge_role_label(context, "mine", candidate=branch_candidate)
+        base_pane_label = merge_role_label(context, "base")
+        theirs_pane_label = merge_role_label(context, "theirs")
         def _one_line_text(s: str, max_len: int = 120) -> str:
             s = (s or "").replace("\r", " ").replace("\n", " ")
             if len(s) <= max_len:
@@ -11153,58 +14248,82 @@ class SheetView:
         try:
             panes = list(self._main_paned.panes())
             mid_id = str(self._mid_wrap)
+            right_id = str(self._right_wrap)
             has_mid = mid_id in panes
-            if enabled and (not has_mid):
-                self._main_paned.insert(0, self._mid_wrap, weight=1)
-            elif (not enabled) and has_mid:
-                self._main_paned.forget(self._mid_wrap)
+            has_right = right_id in panes
+            folded_role = str(self._folded_identity or "base").lower()
+            if expanded:
+                if not has_mid:
+                    self._main_paned.insert(0, self._mid_wrap, weight=1)
+                if not has_right:
+                    self._main_paned.add(self._right_wrap, weight=1)
+            elif folded_role == "theirs":
+                if not has_mid:
+                    self._main_paned.insert(0, self._mid_wrap, weight=1)
+                if has_right:
+                    self._main_paned.forget(self._right_wrap)
+            else:
+                if not has_right:
+                    self._main_paned.add(self._right_wrap, weight=1)
+                if has_mid:
+                    self._main_paned.forget(self._mid_wrap)
         except Exception:
             pass
         try:
-            if enabled:
+            if expanded:
                 # Layout: left=Base, center=Mine, right=Theirs — reorder header labels to match
                 self.path_label_base.grid(row=0, column=0, sticky="ew")
                 self.path_label_a.grid(row=0, column=1, sticky="ew")
                 self.path_label_b.grid(row=0, column=2, sticky="ew")
-                self.left_title.configure(text="Mine", background=_MINE_BG)
-                self.mid_title.configure(text="Base", background=_BASE_BG)
-                self.right_title.configure(text="Theirs", background=_THEIRS_BG)
+                self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
+                self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
+                self.right_title.configure(text=theirs_pane_label, background=_THEIRS_BG)
             else:
-                self.path_label_base.grid_remove()
-                # Restore 2-way labels to left/right columns
-                self.path_label_a.grid(row=0, column=0, sticky="ew")
-                self.path_label_b.grid(row=0, column=2, sticky="ew")
-                self.left_title.configure(text="Base", background=_BASE_BG)
-                self.right_title.configure(text="Mine", background=_MINE_BG)
-                self.mid_title.configure(text="Base", background=_BASE_BG)
+                if str(self._folded_identity or "base").lower() == "theirs":
+                    # Mine ≡ Theirs: keep Base plus the initialized candidate
+                    # visible and fold only the proven-redundant Theirs pane.
+                    self.path_label_b.grid_remove()
+                    self.path_label_base.grid(row=0, column=0, sticky="ew")
+                    self.path_label_a.grid(row=0, column=2, sticky="ew")
+                    self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
+                    self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
+                else:
+                    self.path_label_base.grid_remove()
+                    # Base is redundant to one working side; keep the candidate
+                    # and Theirs visible while retaining Base in memory.
+                    self.path_label_a.grid(row=0, column=0, sticky="ew")
+                    self.path_label_b.grid(row=0, column=2, sticky="ew")
+                    self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
+                    self.right_title.configure(text=theirs_pane_label, background=_THEIRS_BG)
+                    self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
             self._update_sheet_role_labels()
+            if self.three_way_cb is not None:
+                self.three_way_cb.configure(text="折叠三方" if expanded else "展开三方")
         except Exception:
             pass
         try:
-            self.cursor_cmp.configure(height=3 if enabled else 2)
+            self.cursor_cmp.configure(height=3 if model_enabled else 2)
         except Exception:
             pass
         try:
-            self.cursor_cmp_ln.configure(height=3 if enabled else 2)
+            self.cursor_cmp_ln.configure(height=3 if model_enabled else 2)
         except Exception:
             pass
         try:
             if hasattr(self, "hover_cmp_text"):
-                # 3-way hover panel needs one extra visible line to fully show
-                # BASE / mine / theirs together after accounting for widget chrome.
-                self.hover_cmp_text.configure(height=4 if enabled else 2)
+                self.hover_cmp_text.configure(height=4 if model_enabled else 2)
         except Exception:
             pass
         try:
-            self._sync_hover_compare_reserved_height(enabled)
+            self._sync_hover_compare_reserved_height(model_enabled)
         except Exception:
             pass
         if not init_only:
             try:
                 self._last_three_way_value = int(self.three_way_var.get())
-                self._invalidate_only_diff_snapshot_cache()
-                self.refresh(row_only=None, rescan=False)
-                self._update_cursor_lines()
+                # Folding only changes pane geometry.  Do not invalidate/rebuild
+                # the three-way model: that preserves sheet, scroll position,
+                # cursor/selection, pending operations, and candidate state.
                 self._refresh_interaction_gate()
             except Exception:
                 pass
@@ -12464,7 +15583,7 @@ class SheetView:
     def _clear_hover_compare_panel(self):
         try:
             if hasattr(self, "hover_cmp_title_var"):
-                self.hover_cmp_title_var.set("悬停完整对比：-")
+                self.hover_cmp_title_var.set("悬停完整对比 | 当前单元格：-")
             if hasattr(self, "hover_cmp_text"):
                 self.hover_cmp_text.configure(state="normal")
                 self.hover_cmp_text.delete("1.0", "end")
@@ -12483,7 +15602,9 @@ class SheetView:
         try:
             if self._hover_compare_is_pinned():
                 if getattr(self, "_last_hover_compare_key", None) is None:
-                    self.hover_cmp_title_var.set("悬停完整对比 | 已固定（等待下一次悬停内容）")
+                    self.hover_cmp_title_var.set(
+                        "悬停完整对比 | 当前单元格：- | 已固定（等待悬停内容）"
+                    )
                 elif hasattr(self, "hover_cmp_title_var"):
                     t = str(self.hover_cmp_title_var.get() or "")
                     if "已固定" not in t:
@@ -12574,16 +15695,35 @@ class SheetView:
         if getattr(self, "_last_hover_compare_key", None) == key:
             return
         col_text = "-"
+        cell_text = "-"
         try:
             if isinstance(key, tuple) and len(key) >= 4 and int(key[3]) > 0:
                 ci = int(key[3])
                 col_text = f"{get_column_letter(ci)}({ci})"
+                payload = (getattr(self, "_hover_payload_cache", {}) or {}).get(key) or {}
+                sides = tuple(payload.get("sides") or ())
+                rows = tuple(payload.get("rows") or ())
+                preferred_row = None
+                if "A" in sides:
+                    a_idx = sides.index("A")
+                    if a_idx < len(rows):
+                        preferred_row = rows[a_idx]
+                if preferred_row is None:
+                    preferred_row = next((row for row in rows if row is not None), None)
+                if preferred_row is not None:
+                    cell_text = f"{_excel_column_display(ci)}{int(preferred_row)}"
+                else:
+                    cell_text = _excel_column_display(ci)
         except Exception:
             col_text = "-"
+            cell_text = "-"
         try:
             if hasattr(self, "hover_cmp_title_var"):
                 suffix = " | 已固定" if self._hover_compare_is_pinned() else ""
-                self.hover_cmp_title_var.set(f"悬停完整对比 | Sheet: {self.sheet} | Col: {col_text}{suffix}")
+                self.hover_cmp_title_var.set(
+                    f"悬停完整对比 | 当前单元格：{self.sheet}!{cell_text}"
+                    f"（列 {col_text}）{suffix}"
+                )
             self._render_hover_compare_panel(text, key)
         except Exception:
             pass
@@ -13655,9 +16795,223 @@ class SheetView:
                 causes.append(reason_labels.get(slot.confidence.reason, "结构列变化（内部判定）"))
         return "；".join(dict.fromkeys(str(value) for value in causes if value)) or "结构列变化"
 
+    def _merge_side_label(self, side: str) -> str:
+        return merge_side_label(getattr(self.app, "launch_context", None), side)
+
+    def _schedule_column_action_row_layout(self, _event=None):
+        """Coalesce geometry updates for the compact nav/action row."""
+        bar = getattr(self, "column_action_bar", None)
+        if bar is None:
+            return
+        pending = getattr(self, "_action_row_layout_after_id", None)
+        if pending is not None:
+            try:
+                bar.after_cancel(pending)
+            except Exception:
+                pass
+        try:
+            self._action_row_layout_after_id = bar.after_idle(self._layout_column_action_row)
+        except Exception:
+            self._action_row_layout_after_id = None
+            self._layout_column_action_row()
+
+    def _layout_column_action_row(self):
+        """Center navigation, moving it only left when right actions need room."""
+        self._action_row_layout_after_id = None
+        bar = getattr(self, "column_action_bar", None)
+        nav = getattr(self, "diff_nav_group", None)
+        info = getattr(self, "info", None)
+        if bar is None or nav is None:
+            return
+        try:
+            bar_width = int(bar.winfo_width())
+            nav_width = int(nav.winfo_reqwidth())
+        except Exception:
+            return
+        if bar_width <= 0 or nav_width <= 0:
+            return
+
+        protected_lefts = []
+        for widget in (
+            getattr(self, "column_action_status_group", None),
+            getattr(self, "column_action_button_group", None),
+        ):
+            try:
+                if widget is not None and widget.winfo_ismapped():
+                    protected_lefts.append(int(widget.winfo_x()))
+            except Exception:
+                pass
+        gap = 10
+        nav_x = (bar_width - nav_width) // 2
+        if protected_lefts:
+            protected_left = min(protected_lefts)
+            if nav_x + nav_width + gap > protected_left:
+                # Keep the navigation's right edge clear of structural status
+                # and all three decision buttons.  Do not move those controls.
+                nav_x = protected_left - gap - nav_width
+        try:
+            nav.place(x=nav_x, rely=0.5, anchor="w")
+        except Exception:
+            pass
+
+        # The informational label is intentionally expendable: it cannot
+        # compete with the centered navigation or protected right-hand actions.
+        if info is not None:
+            info_width = max(0, nav_x - gap)
+            try:
+                if info_width:
+                    info.place(x=0, rely=0.5, anchor="w", width=info_width)
+                else:
+                    info.place_forget()
+            except Exception:
+                pass
+
+    def _set_column_action_status(self, summary: str, detail: str | None = None):
+        """Keep the action bar compact while preserving its audit detail on hover."""
+        self._column_action_status_detail = detail or summary
+        try:
+            self.column_action_status_var.set(summary)
+        except Exception:
+            pass
+        self._sync_column_structure_status_detail()
+        self._refresh_column_action_selection_badge()
+        self._schedule_column_action_row_layout()
+
+    def _refresh_column_action_selection_badge(self):
+        """Render the compact structural status beside the action buttons."""
+        range_label = getattr(self, "column_action_selection_label", None)
+        if range_label is None:
+            return
+        block = self._selected_column_block()
+        if block is None:
+            range_text = ""
+            detail = ""
+        else:
+            start_col = int(block.start_slot_idx) + 1
+            end_col = int(block.end_slot_idx) + 1
+            range_text = _excel_column_range_display(start_col, end_col)
+            detail = (
+                f"已选择结构列块 {range_text}｜原因："
+                f"{self._column_block_cause_text(block)}"
+            )
+        try:
+            summary = str(self.column_action_status_var.get() or "")
+        except Exception:
+            summary = ""
+        if range_text and range_text in summary:
+            prefix, suffix = summary.split(range_text, 1)
+        elif range_text:
+            prefix, suffix = "已选 ", ""
+        else:
+            prefix, suffix = summary, ""
+        try:
+            self.column_action_status_prefix_var.set(prefix)
+            self.column_action_selection_var.set(range_text)
+            self.column_action_status_suffix_var.set(suffix)
+            for widget in (
+                getattr(self, "column_action_status_prefix_label", None),
+                range_label,
+                getattr(self, "column_action_status_suffix_label", None),
+            ):
+                if widget is not None:
+                    widget._identity_detail_text = detail or summary
+        except Exception:
+            pass
+        self._schedule_column_action_row_layout()
+
+    def _sync_column_structure_status_detail(self, structure_summary: str | None = None):
+        """Append full structural evidence to hover/log, never the top toolbar."""
+        label = getattr(self, "column_action_status_label", None)
+        if label is None:
+            return
+        if structure_summary is None:
+            try:
+                structure_summary = self._column_structure_summary()
+            except Exception:
+                structure_summary = ""
+        base_detail = str(
+            getattr(self, "_column_action_status_detail", "")
+            or getattr(label, "_identity_detail_text", "")
+            or ""
+        ).strip()
+        full_detail = base_detail
+        if structure_summary:
+            full_detail = f"{base_detail}\n完整结构列摘要：{structure_summary}".strip()
+        try:
+            label._identity_detail_text = full_detail
+        except Exception:
+            pass
+        if structure_summary != getattr(self, "_last_logged_column_structure_summary", None):
+            self._last_logged_column_structure_summary = structure_summary
+            _dlog(
+                f"COLUMN_STRUCTURE_SUMMARY sheet={self.sheet} "
+                f"summary={structure_summary or '-'}"
+            )
+
+    def _auto_select_first_structural_column_block_if_ready(self) -> ColumnBlock | None:
+        """Select one proven structural block per current projection.
+
+        This is presentation state only.  The existing action path still
+        revalidates the projection and retains all ambiguous-mapping and
+        write-time safety gates. A user clear consumes the current projection's
+        automatic selection, while a completed structural action may rebuild
+        the projection and expose the next pending block.
+        """
+        if getattr(self, "_lifecycle_state", "") != "READY":
+            return None
+        try:
+            projection = self._ensure_column_projection_current("自动选择结构列块")
+            generation = int(getattr(self, "_column_projection_generation", 0))
+            if getattr(self, "_auto_structural_selection_generation", None) == generation:
+                return None
+            if self._selected_column_block() is not None:
+                self._auto_structural_selection_generation = generation
+                return None
+            # Mark before entering the ordinary selection path, which refreshes
+            # the buttons recursively after it applies selection tags.
+            self._auto_structural_selection_generation = generation
+            cache = self._active_column_comparison_cache()
+            if not (cache.structural_diff_cols or cache.unresolved_cols):
+                return None
+            block = next(
+                (
+                    candidate
+                    for candidate in projection.model.blocks
+                    if self._column_block_is_structural(candidate)
+                ),
+                None,
+            )
+            if block is None:
+                return None
+            selected = self._select_column_block_by_logical_col(
+                int(block.start_slot_idx) + 1,
+                "LOGICAL",
+            )
+            if selected is not None:
+                start_col = int(selected.start_slot_idx) + 1
+                end_col = int(selected.end_slot_idx) + 1
+                range_text = _excel_column_range_display(start_col, end_col)
+                cause_text = self._column_block_cause_text(selected)
+                self._set_column_action_status(
+                    f"待处理 {range_text} 已自动选｜可执行",
+                    f"已自动选择待处理列块 {range_text}｜原因：{cause_text}",
+                )
+            return selected
+        except Exception as exc:
+            _dlog(
+                f"COLUMN_AUTO_SELECT_SKIPPED sheet={self.sheet} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+            return None
+
     def _refresh_column_action_buttons(self):
+        self._auto_select_first_structural_column_block_if_ready()
+        self._refresh_column_action_selection_badge()
         selected = self._selected_column_block() is not None
-        ready = getattr(self, "_lifecycle_state", "") == "READY"
+        ready = (
+            getattr(self, "_lifecycle_state", "") == "READY"
+            or self._column_undo_model_ready()
+        )
         state = "normal" if selected and ready else "disabled"
         for name in ("use_mine_col_btn", "use_theirs_col_btn"):
             widget = getattr(self, name, None)
@@ -13674,10 +17028,13 @@ class SheetView:
                 pass
         try:
             self.use_mine_col_btn.configure(
-                text="保留Mine列" if self._is_three_way_enabled() else "采用左侧(A)列"
+                text=f"保留{self._merge_side_label('A')}列" if self._is_three_way_enabled() else "采用左侧(A)列"
             )
             self.use_theirs_col_btn.configure(
-                text="采用Theirs列" if self._is_three_way_enabled() else "采用右侧(B)列"
+                text=f"采用{self._merge_side_label('B')}列" if self._is_three_way_enabled() else "采用右侧(B)列"
+            )
+            self.use_base_col_btn.configure(
+                text=f"采用{self._merge_side_label('BASE')}列"
             )
         except Exception:
             pass
@@ -13722,12 +17079,16 @@ class SheetView:
             self.selected_column_logical_range = None
             self.selected_column_source_side = None
             self._selected_column_projection_generation = None
+            # Explicitly clearing the selection must not cause this projection
+            # to reselect a block on the refresh immediately below.
+            self._auto_structural_selection_generation = int(
+                getattr(self, "_column_projection_generation", 0)
+            )
             self._apply_column_block_selection_tags()
             self._refresh_column_action_buttons()
-            try:
-                self.column_action_status_var.set(f"L{logical_col} 不是结构差异列块")
-            except Exception:
-                pass
+            self._set_column_action_status(
+                f"{_excel_column_display(logical_col)} 不是结构差异列块"
+            )
             return None
         start_col = int(block.start_slot_idx) + 1
         end_col = int(block.end_slot_idx) + 1
@@ -13736,8 +17097,8 @@ class SheetView:
         self.selected_column_logical_range = (start_col, end_col)
         self.selected_column_source_side = normalized_source
         self._selected_column_projection_generation = int(self._column_projection_generation)
-        range_text = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
-        source_text = {"A": "Mine", "BASE": "Base", "B": "Theirs", "LOGICAL": "逻辑列"}.get(
+        range_text = _excel_column_range_display(start_col, end_col)
+        source_text = {"A": self._merge_side_label("A"), "BASE": self._merge_side_label("BASE"), "B": self._merge_side_label("B"), "LOGICAL": "Excel列"}.get(
             normalized_source, normalized_source
         )
         unresolved = any(
@@ -13746,12 +17107,11 @@ class SheetView:
             if projection.slot(idx + 1) is not None
         )
         state_text = "待显式确认" if unresolved else "可执行"
-        try:
-            self.column_action_status_var.set(
-                f"已选择列块 {range_text}｜来源 {source_text}｜{state_text}｜原因：{self._column_block_cause_text(block)}"
-            )
-        except Exception:
-            pass
+        cause_text = self._column_block_cause_text(block)
+        self._set_column_action_status(
+            f"已选 {range_text}｜{source_text}｜{state_text}",
+            f"已选择列块 {range_text}｜来源 {source_text}｜{state_text}｜原因：{cause_text}",
+        )
         self._apply_column_block_selection_tags()
         self._refresh_column_action_buttons()
         return block
@@ -13801,7 +17161,7 @@ class SheetView:
             start_col = int(block.start_slot_idx) + 1
             end_col = int(block.end_slot_idx) + 1
             raise RuntimeError(
-                f"逻辑列块 L{start_col}:L{end_col} 映射待确认：{self._column_block_cause_text(block)}。"
+                f"Excel列块 {_excel_column_range_display(start_col, end_col)} 映射待确认：{self._column_block_cause_text(block)}。"
                 "必须显式确认后才能执行列结构操作。"
             )
         source_values = tuple(projection.physical_col(source_side, idx + 1) for idx in block.slot_indices)
@@ -14544,21 +17904,8 @@ class SheetView:
             }
             widths_restored = False
             try:
-                width_records = tuple(state.get("col_char_widths") or ())
-                widths = {
-                    int(logical_col): int(width)
-                    for logical_col, width in width_records
-                }
-                expected_cols = set(range(1, new_projection.slot_count + 1))
-                if set(widths) == expected_cols and all(width >= 1 for width in widths.values()):
-                    self.col_char_widths = widths
-                    self._rownum_display_width = int(
-                        state.get("rownum_display_width", 0)
-                    )
-                    self._col_widths_version = int(
-                        getattr(self, "_col_widths_version", 0)
-                    ) + 1
-                    widths_restored = True
+                self._set_uniform_logical_column_widths(new_projection)
+                widths_restored = True
             except Exception:
                 widths_restored = False
             self._pair_diff_full_exact = True
@@ -14752,21 +18099,8 @@ class SheetView:
         widths_restored = False
         if plan.action_kind == "insert_copy":
             try:
-                width_records = tuple(state.get("col_char_widths") or ())
-                widths = {
-                    int(logical_col): int(width)
-                    for logical_col, width in width_records
-                }
-                expected_cols = set(range(1, new_projection.slot_count + 1))
-                if set(widths) == expected_cols and all(width >= 1 for width in widths.values()):
-                    self.col_char_widths = widths
-                    self._rownum_display_width = int(
-                        state.get("rownum_display_width", 0)
-                    )
-                    self._col_widths_version = int(
-                        getattr(self, "_col_widths_version", 0)
-                    ) + 1
-                    widths_restored = True
+                self._set_uniform_logical_column_widths(new_projection)
+                widths_restored = True
             except Exception:
                 widths_restored = False
         self._pair_diff_full_exact = True
@@ -15381,7 +18715,10 @@ class SheetView:
         confirm_unresolved: bool = False,
         _failure_injector=None,
     ) -> ColumnBlockActionPlan:
-        if not self._guard_mutation_ready("列结构操作"):
+        if (
+            not self._guard_mutation_ready("列结构操作", notify=False)
+            and not self._column_undo_model_ready()
+        ):
             raise RuntimeError(self._mutation_block_message("列结构操作"))
         plan = self._plan_selected_column_block_action(
             source_side,
@@ -15394,6 +18731,9 @@ class SheetView:
             "source_side": self.selected_column_source_side,
             "cell": self._snapshot_explicit_selection_state(),
         }
+        accepted_common_before = dict(
+            getattr(self, "_accepted_common_insert_sources", {}) or {}
+        )
         if plan.action_kind == "retain":
             previous = set(self._retained_column_decisions)
             self._retained_column_decisions.add((plan.logical_start, plan.logical_end, plan.source_side))
@@ -15406,8 +18746,9 @@ class SheetView:
                 "retained_decisions": previous,
                 "selection": selection_before,
             })
-            self.column_action_status_var.set(
-                f"已保留Mine列块 L{plan.logical_start}:L{plan.logical_end}；工作簿未改动。"
+            self._set_column_action_status(
+                f"已保留{self._merge_side_label(plan.source_side)}列块 "
+                f"{_excel_column_range_display(plan.logical_start, plan.logical_end)}；工作簿未改动。"
             )
             return plan
 
@@ -15418,8 +18759,9 @@ class SheetView:
         snapshot = None
         try:
             self.root.configure(cursor="watch")
-            self.column_action_status_var.set(
-                f"正在验证并采用列块 L{plan.logical_start}:L{plan.logical_end}..."
+            self._set_column_action_status(
+                f"正在验证并采用列块 "
+                f"{_excel_column_range_display(plan.logical_start, plan.logical_end)}..."
             )
             self.root.update_idletasks()
             source_edit = self._display_ws(plan.source_side, edit=True)
@@ -15557,6 +18899,23 @@ class SheetView:
             else:
                 self.app.modified_b = True
                 self.app.modified_sheets_b.add(self.sheet)
+            # Any structural action can move previous logical positions, so
+            # retain only the newly proven common insertion.  This state is
+            # restored exactly by undo/rollback.
+            self._accepted_common_insert_sources = {}
+            if (
+                plan.action_kind == "insert_copy"
+                and {plan.source_side, plan.target_side} == {"A", "B"}
+            ):
+                self._accepted_common_insert_sources.update(
+                    {
+                        logical_col: plan.source_side
+                        for logical_col in range(
+                            int(plan.logical_start),
+                            int(plan.logical_end) + 1,
+                        )
+                    }
+                )
             self._mark_column_mapping_stale(
                 "column-block-action",
                 column_structure=True,
@@ -15580,6 +18939,7 @@ class SheetView:
                 "plan": plan,
                 "snapshot": snapshot,
                 "selection": selection_before,
+                "accepted_common_insert_sources_before": accepted_common_before,
             })
             self.selected_column_block_ordinal = None
             self.selected_column_logical_range = None
@@ -15587,12 +18947,46 @@ class SheetView:
             self._selected_column_projection_generation = None
             self._apply_column_block_selection_tags()
             self._refresh_column_action_buttons()
-            self.column_action_status_var.set(
-                f"已完成列块 L{plan.logical_start}:L{plan.logical_end}，"
-                f"{plan.source_side} → {plan.target_side}；可单步撤销。"
+            next_block = self._selected_column_block()
+            next_text = ""
+            if next_block is not None:
+                next_start = int(next_block.start_slot_idx) + 1
+                next_end = int(next_block.end_slot_idx) + 1
+                next_range = _excel_column_range_display(next_start, next_end)
+                next_text = f"｜下一项 {next_range} 已选"
+            completed_range = _excel_column_range_display(
+                plan.logical_start, plan.logical_end
             )
+            if next_block is not None:
+                summary = f"已处理 {completed_range}{next_text}"
+                detail = (
+                    f"已完成列块 {completed_range}，"
+                    f"{plan.source_side} → {plan.target_side}；可单步撤销。{next_text}"
+                )
+            else:
+                comparison_cache = self._active_column_comparison_cache()
+                still_pending = bool(
+                    comparison_cache.structural_diff_cols
+                    or comparison_cache.unresolved_cols
+                )
+                if still_pending:
+                    summary = f"已处理 {completed_range}｜仍有列差异待检查"
+                    detail = (
+                        f"已完成列块 {completed_range}，"
+                        f"{plan.source_side} → {plan.target_side}；"
+                        "仍存在无法自动选择的结构列差异，请检查列标记。"
+                    )
+                else:
+                    summary = f"列结构处理完成｜已处理 {completed_range}"
+                    detail = (
+                        f"已完成列块 {completed_range}，"
+                        f"{plan.source_side} → {plan.target_side}；"
+                        "当前 Sheet 已无待处理结构列差异，可单步撤销。"
+                    )
+            self._set_column_action_status(summary, detail)
             return plan
         except Exception:
+            self._accepted_common_insert_sources = accepted_common_before
             if snapshot is not None:
                 self._restore_column_action_workbook_snapshot(snapshot)
                 self._mark_column_mapping_stale(
@@ -15646,13 +19040,16 @@ class SheetView:
             self._update_cursor_lines()
 
     def _undo_column_action(self, action: dict) -> bool:
-        if not self._guard_mutation_ready("撤销列结构操作"):
+        if (
+            not self._guard_mutation_ready("撤销列结构操作", notify=False)
+            and not self._column_undo_model_ready()
+        ):
             return False
         snapshot = action.get("snapshot")
         if snapshot is None:
             self._retained_column_decisions = set(action.get("retained_decisions") or set())
             self._restore_column_block_selection(action.get("selection"))
-            self.column_action_status_var.set("已撤销保留列块决定。")
+            self._set_column_action_status("已撤销保留列块决定。")
             return True
         begin_interactive = getattr(self.app, "_begin_interactive_action", None)
         end_interactive = getattr(self.app, "_end_interactive_action", None)
@@ -15662,6 +19059,9 @@ class SheetView:
             self._restore_column_action_workbook_snapshot(snapshot)
             plan = action.get("plan")
             target_side = plan.target_side if isinstance(plan, ColumnBlockActionPlan) else snapshot.get("target_side")
+            self._accepted_common_insert_sources = dict(
+                action.get("accepted_common_insert_sources_before") or {}
+            )
             self._mark_column_mapping_stale(
                 "undo-column-block-action",
                 column_structure=True,
@@ -15683,7 +19083,7 @@ class SheetView:
             )
             self._restore_column_block_selection(action.get("selection") or snapshot.get("selection"))
             self._update_cursor_lines()
-            self.column_action_status_var.set("已完整撤销列结构操作并恢复列映射与选择。")
+            self._set_column_action_status("已完整撤销列结构操作并恢复列映射与选择。")
             return True
         finally:
             if callable(end_interactive):
@@ -15691,7 +19091,10 @@ class SheetView:
 
     def _on_column_action_button(self, source_side: str):
         try:
-            if not self._guard_mutation_ready("列结构操作"):
+            if (
+                not self._guard_mutation_ready("列结构操作", notify=False)
+                and not self._column_undo_model_ready()
+            ):
                 return
             block = self._selected_column_block()
             if block is None:
@@ -15810,7 +19213,7 @@ class SheetView:
                 return None
         if slot.state == "unresolved" or slot.confidence.ambiguous:
             raise RuntimeError(
-                f"逻辑列 L{logical_col} 的映射待确认，已阻止覆盖以避免写入错误物理列。"
+                f"Excel列 {_excel_column_display(logical_col)} 的映射待确认，已阻止覆盖以避免写入错误物理列。"
             )
         side_pair = {
             "A2B": ("A", "B"),
@@ -15823,7 +19226,7 @@ class SheetView:
         destination_col = projection.physical_col(side_pair[1], logical_col)
         if source_col is None or destination_col is None:
             raise RuntimeError(
-                f"逻辑列 L{logical_col} 在源侧或目标侧不存在；请使用列结构操作，不能按单元格覆盖。"
+                f"Excel列 {_excel_column_display(logical_col)} 在源侧或目标侧不存在；请使用列结构操作，不能按单元格覆盖。"
             )
         return int(source_col), int(destination_col)
 
@@ -16246,7 +19649,7 @@ class SheetView:
 
     def _set_copy_scope_mode(self, mode: str):
         mode_norm = str(mode or "").strip().lower()
-        mode_norm = "region" if mode_norm == "region" else "row"
+        mode_norm = mode_norm if mode_norm in ("row", "region", "global") else "row"
         self._copy_scope_mode = mode_norm
         try:
             self._copy_scope_var.set(mode_norm)
@@ -16256,8 +19659,8 @@ class SheetView:
 
     def _refresh_copy_scope_buttons(self):
         if self._is_missing_sheet_view():
-            left_text = "使用左侧Sheet" if self._is_three_way_enabled() else "采用左侧Sheet"
-            right_text = "使用右侧Sheet" if self._is_three_way_enabled() else "采用右侧Sheet"
+            left_text = "采用左表"
+            right_text = "采用右表"
             try:
                 self.use_left_btn.configure(text=left_text)
             except Exception:
@@ -16269,11 +19672,14 @@ class SheetView:
             return
         mode = getattr(self, "_copy_scope_mode", "row")
         if mode == "region":
-            left_text = "使用左侧区域"
-            right_text = "使用右侧区域"
+            left_text = "采用左区"
+            right_text = "采用右区"
+        elif mode == "global":
+            left_text = "采用左全局"
+            right_text = "采用右全局"
         else:
-            left_text = "使用左侧行"
-            right_text = "使用右侧行"
+            left_text = "采用左行"
+            right_text = "采用右行"
         try:
             self.use_left_btn.configure(text=left_text)
         except Exception:
@@ -16292,8 +19698,444 @@ class SheetView:
         mode = getattr(self, "_copy_scope_mode", "row")
         if mode == "region":
             self._copy_selected_region(direction)
+        elif mode == "global":
+            self._copy_all_safe_sheet_differences(direction)
         else:
             self._copy_selected_row(direction)
+
+    def _show_global_apply_feedback(self, text: str, *, reason: str):
+        """Report a global-mode refusal without hiding the no-write guarantee."""
+        message = f"全局模式未写入：{text}"
+        try:
+            self.info.configure(text=message)
+        except Exception:
+            pass
+        _dlog(
+            f"GLOBAL_APPLY_BLOCKED sheet={self.sheet} reason={reason} text={message}"
+        )
+
+    def _capture_global_safe_apply_snapshot(
+        self,
+        direction: str,
+        candidates: list[tuple[int, tuple[int, ...]]],
+        projection: LogicalColumnProjection,
+    ) -> dict:
+        """Capture every writable target before the first global write.
+
+        This snapshot is intentionally broader than row-level undo cells: it
+        records manual-edit maps, dirty flags, touched rows, and conflict state
+        as well.  A failure after a row has partially written can therefore be
+        restored without relying on that row's local exception path.
+        """
+        target = "B" if direction == "A2B" else "A"
+        ws_edit = self.app.ws_b_edit(self.sheet) if target == "B" else self.app.ws_a_edit(self.sheet)
+        ws_val = self.app.ws_b_val(self.sheet) if target == "B" else self.app.ws_a_val(self.sheet)
+        seen = set()
+        cells = []
+        for pair_idx, cols in candidates:
+            pair = self.row_pairs[int(pair_idx)]
+            row = self._row_for_side(pair, target)
+            if row is None:
+                raise RuntimeError("全局覆盖预检发现目标行缺失")
+            for logical_col in cols:
+                physical_col = projection.physical_col(target, int(logical_col))
+                if physical_col is None:
+                    raise RuntimeError(
+                        f"全局覆盖预检发现 {_excel_column_display(logical_col)} 目标列缺失"
+                    )
+                key = (int(row), int(physical_col))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cells.append((
+                    key[0],
+                    key[1],
+                    copy.deepcopy(ws_edit.cell(row=key[0], column=key[1]).value),
+                    copy.deepcopy(ws_val.cell(row=key[0], column=key[1]).value),
+                ))
+        if target == "A":
+            manual_cells = self.app.manual_a_cell_ops
+            manual_cache = self.app.manual_a_formula_cache_ops
+            manual_rows = self.app.manual_a_row_ops
+            modified = bool(self.app.modified_a)
+            modified_sheets = set(self.app.modified_sheets_a)
+        else:
+            manual_cells = self.app.manual_b_cell_ops
+            manual_cache = self.app.manual_b_formula_cache_ops
+            manual_rows = self.app.manual_b_row_ops
+            modified = bool(self.app.modified_b)
+            modified_sheets = set(self.app.modified_sheets_b)
+        conflict_map = getattr(self.app, "merge_conflict_cells_by_sheet", None)
+        conflict_present = bool(isinstance(conflict_map, dict) and self.sheet in conflict_map)
+        return {
+            "sheet": self.sheet,
+            "target": target,
+            "cells": cells,
+            "manual_cells": copy.deepcopy(dict(manual_cells)),
+            "manual_cache": copy.deepcopy(dict(manual_cache)),
+            "manual_rows": copy.deepcopy(list(manual_rows)),
+            "modified": modified,
+            "modified_sheets": modified_sheets,
+            "touched_rows": set(self.touched_rows),
+            "formula_skips_pending": int(getattr(self, "_formula_copy_skips_pending", 0)),
+            "conflict_sheet_present": conflict_present,
+            "conflict_sheet_before": copy.deepcopy(
+                conflict_map.get(self.sheet) if conflict_present else None
+            ),
+            "user_touched_conflicts_before": bool(
+                getattr(self.app, "user_touched_conflicts", False)
+            ),
+        }
+
+    def _restore_global_safe_apply_snapshot(
+        self,
+        snapshot: dict,
+        *,
+        restore_conflicts: bool = True,
+    ) -> set[int]:
+        """Restore a global snapshot for both undo and in-flight rollback."""
+        if not isinstance(snapshot, dict) or snapshot.get("sheet") != self.sheet:
+            raise RuntimeError("全局覆盖快照无效或不属于当前 Sheet")
+        target = str(snapshot.get("target") or "")
+        if target == "A":
+            ws_edit = self.app.ws_a_edit(self.sheet)
+            ws_val = self.app.ws_a_val(self.sheet)
+            manual_cells = self.app.manual_a_cell_ops
+            manual_cache = self.app.manual_a_formula_cache_ops
+            manual_rows = self.app.manual_a_row_ops
+            modified_sheets = self.app.modified_sheets_a
+        elif target == "B":
+            ws_edit = self.app.ws_b_edit(self.sheet)
+            ws_val = self.app.ws_b_val(self.sheet)
+            manual_cells = self.app.manual_b_cell_ops
+            manual_cache = self.app.manual_b_formula_cache_ops
+            manual_rows = self.app.manual_b_row_ops
+            modified_sheets = self.app.modified_sheets_b
+        else:
+            raise RuntimeError("全局覆盖快照缺少目标侧")
+        rows = set()
+        for row, col, old_edit, old_val in snapshot.get("cells") or ():
+            row, col = int(row), int(col)
+            _assign_edit_cell_value(
+                ws_edit.cell(row=row, column=col),
+                _choose_edit_value(old_val, old_edit),
+            )
+            ws_val.cell(row=row, column=col).value = old_val
+            rows.add(row)
+        manual_cells.clear()
+        manual_cells.update(copy.deepcopy(dict(snapshot.get("manual_cells") or {})))
+        manual_cache.clear()
+        manual_cache.update(copy.deepcopy(dict(snapshot.get("manual_cache") or {})))
+        manual_rows[:] = copy.deepcopy(list(snapshot.get("manual_rows") or ()))
+        if target == "A":
+            self.app.modified_a = bool(snapshot.get("modified", False))
+        else:
+            self.app.modified_b = bool(snapshot.get("modified", False))
+        modified_sheets.clear()
+        modified_sheets.update(set(snapshot.get("modified_sheets") or ()))
+        self.touched_rows.clear()
+        self.touched_rows.update(set(snapshot.get("touched_rows") or ()))
+        self._formula_copy_skips_pending = int(snapshot.get("formula_skips_pending", 0))
+        if restore_conflicts:
+            self._restore_global_conflict_snapshot(
+                bool(snapshot.get("conflict_sheet_present", False)),
+                snapshot.get("conflict_sheet_before"),
+                bool(snapshot.get("user_touched_conflicts_before", False)),
+            )
+        return rows
+
+    def _restore_global_conflict_snapshot(
+        self,
+        sheet_present: bool,
+        sheet_before,
+        user_touched_before: bool,
+    ):
+        """Restore only this Sheet's conflict bookkeeping without auto-save."""
+        conflict_map = getattr(self.app, "merge_conflict_cells_by_sheet", None)
+        if not isinstance(conflict_map, dict):
+            return
+        if sheet_present:
+            conflict_map[self.sheet] = copy.deepcopy(sheet_before or {})
+        else:
+            conflict_map.pop(self.sheet, None)
+        self.app.user_touched_conflicts = bool(user_touched_before)
+
+    def _copy_all_safe_sheet_differences(self, direction: str) -> bool:
+        """Atomically apply every proved cell diff in this Sheet.
+
+        This mode deliberately consumes the complete exact diff maps rather
+        than the rendered/only-diff list.  It owns ordinary mapped cells only:
+        a stale projection, any structural row/column difference, or an
+        ambiguous slot rejects the entire command before the first write.
+        """
+        if not self._guard_mutation_ready("全局覆盖"):
+            return False
+        side_pair = {
+            "A2B": ("A", "B"),
+            "B2A": ("B", "A"),
+            "BASE2A": ("BASE", "A"),
+        }.get(str(direction or ""))
+        if side_pair is None:
+            self._show_global_apply_feedback("当前方向不支持全局模式。", reason="direction")
+            return False
+        if self._is_missing_sheet_view():
+            self._show_global_apply_feedback("缺失 Sheet 必须使用整 Sheet 操作。", reason="missing-sheet")
+            return False
+        if self._is_three_way_enabled() and direction == "A2B":
+            self._show_global_apply_feedback(
+                "三方视图的左侧全局操作必须使用 Base→A 方向。",
+                reason="invalid-three-way-direction",
+            )
+            return False
+        if not self._is_three_way_enabled() and direction == "BASE2A":
+            self._show_global_apply_feedback(
+                "双向视图不支持 Base→A 全局方向。",
+                reason="invalid-two-way-direction",
+            )
+            return False
+        if not self._column_mapping_is_current():
+            self._show_global_apply_feedback("列映射已过期（STALE），请刷新后重试。", reason="stale")
+            return False
+        if not bool(getattr(self, "_pair_diff_full_exact", False)):
+            self._show_global_apply_feedback("完整 A/B 差异仍在计算。", reason="ab-diff-not-exact")
+            return False
+        if direction == "BASE2A" and not bool(getattr(self, "_base_diff_full_exact", False)):
+            self._show_global_apply_feedback("完整 Base 差异仍在计算。", reason="base-diff-not-exact")
+            return False
+
+        cache = self._active_column_comparison_cache()
+        if cache.structural_diff_cols:
+            cols = ", ".join(
+                _excel_column_display(int(col))
+                for col in sorted(cache.structural_diff_cols)
+            )
+            self._show_global_apply_feedback(
+                f"本 Sheet 含列结构差异（{cols}）；请先处理列结构。",
+                reason="column-structure",
+            )
+            return False
+        if cache.unresolved_cols:
+            cols = ", ".join(
+                _excel_column_display(int(col))
+                for col in sorted(cache.unresolved_cols)
+            )
+            self._show_global_apply_feedback(
+                f"本 Sheet 含歧义列映射（{cols}）；请先确认列结构。",
+                reason="column-ambiguous",
+            )
+            return False
+
+        source_side, destination_side = side_pair
+        diff_map = self.pair_base_diff_cols if direction == "BASE2A" else self.pair_diff_cols
+        projection = self._active_column_projection()
+        candidates: list[tuple[int, tuple[int, ...]]] = []
+        blocker = None
+        for pair_idx in range(len(self.row_pairs)):
+            raw_cols = set(diff_map.get(pair_idx, set()))
+            if not raw_cols:
+                continue
+            if any(int(col) <= 0 for col in raw_cols):
+                blocker = "本 Sheet 含单侧/结构行差异"
+                break
+            pair = self.row_pairs[pair_idx]
+            source_row = (
+                self._base_row_for_pair(pair_idx, pair)
+                if source_side == "BASE"
+                else self._row_for_side(pair, source_side)
+            )
+            destination_row = self._row_for_side(pair, destination_side)
+            if source_row is None or destination_row is None:
+                blocker = "本 Sheet 含单侧/结构行差异"
+                break
+            cols = tuple(sorted(int(col) for col in raw_cols if int(col) > 0))
+            for logical_col in cols:
+                slot = projection.slot(logical_col)
+                if (
+                    slot is None
+                    or slot.state != "retained"
+                    or slot.confidence.ambiguous
+                    or projection.physical_col(source_side, logical_col) is None
+                    or projection.physical_col(destination_side, logical_col) is None
+                ):
+                    blocker = (
+                        f"{_excel_column_display(logical_col)} 不是可安全映射的普通列"
+                    )
+                    break
+            if blocker:
+                break
+            candidates.append((pair_idx, cols))
+
+        if blocker:
+            self._show_global_apply_feedback(
+                f"{blocker}；全局模式不会新增/删除行列或猜测映射。",
+                reason="structural-row-or-slot",
+            )
+            return False
+        if not candidates:
+            self._show_global_apply_feedback("没有可安全写入的完整差异。", reason="no-candidates")
+            return False
+
+        cell_count = sum(len(cols) for _pair_idx, cols in candidates)
+        source_label = {
+            "A2B": "左侧(A)",
+            "B2A": "右侧(B)",
+            "BASE2A": self._merge_side_label("BASE"),
+        }[direction]
+        target_label = "右侧(B)" if direction == "A2B" else self._merge_side_label("A")
+        confirmation = (
+            f"确认在 Sheet“{self.sheet}”中，以{source_label}为准并写入{target_label}？\n\n"
+            f"将原子应用 {cell_count} 个安全映射的差异单元格（{len(candidates)} 行）。\n"
+            "列结构、歧义映射和单侧行均不会写入；可通过一次“撤销”整体还原。"
+        )
+        if not messagebox.askyesno("确认全局应用", confirmation, parent=self.root):
+            try:
+                self.info.configure(text="已取消全局模式；未写入任何内容。")
+            except Exception:
+                pass
+            return False
+
+        started = time.perf_counter()
+        changed_any = False
+        undo_group_active = False
+        interactive_started = False
+        row_undo_cells: list = []
+        snapshot = None
+        previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        try:
+            # Validate formulas and capture every destination cell before the
+            # first mutation. A row primitive may fail after writing one cell;
+            # the outer snapshot remains authoritative for rollback.
+            self._preflight_region_formula_copy(
+                direction, [pair_idx for pair_idx, _cols in candidates]
+            )
+            snapshot = self._capture_global_safe_apply_snapshot(
+                direction, candidates, projection
+            )
+            if callable(begin_interactive):
+                begin_interactive(self)
+                interactive_started = True
+            self._suppress_bg_apply = True
+            self.app.begin_undo_group(
+                self.sheet,
+                f"全局采用{source_label}",
+                direction=direction,
+                row_count=len(candidates),
+                cell_count=cell_count,
+                global_conflict_sheet_present=bool(snapshot["conflict_sheet_present"]),
+                global_conflict_sheet_before=copy.deepcopy(snapshot["conflict_sheet_before"]),
+                global_user_touched_conflicts_before=bool(snapshot["user_touched_conflicts_before"]),
+            )
+            undo_group_active = True
+            try:
+                self.info.configure(text=f"正在全局采用{source_label}：0/{len(candidates)} 行...")
+                self.root.configure(cursor="watch")
+                self.root.update_idletasks()
+            except Exception:
+                pass
+            for ordinal, (pair_idx, cols) in enumerate(candidates, start=1):
+                changed_any = bool(
+                    self._copy_selected_row(
+                        direction,
+                        row_header=False,
+                        override_pair_idx=pair_idx,
+                        override_cols=set(cols),
+                        suppress_refresh=True,
+                        _undo_out=row_undo_cells,
+                        raise_on_error=True,
+                    )
+                ) or changed_any
+                if ordinal % 200 == 0:
+                    try:
+                        self.info.configure(
+                            text=f"正在全局采用{source_label}：{ordinal}/{len(candidates)} 行..."
+                        )
+                        self.root.update_idletasks()
+                    except Exception:
+                        pass
+
+            if not changed_any:
+                self.app.finish_undo_group(commit=False)
+                undo_group_active = False
+                self._show_global_apply_feedback("所有候选单元格已经一致。", reason="unchanged")
+                return False
+
+            # One child action plus the compound metadata creates exactly one
+            # visible undo. The same snapshot powers ordinary undo and an
+            # exception rollback, including manual ops and conflict state.
+            self.app.push_undo({
+                "kind": "global_safe_cells",
+                "sheet": self.sheet,
+                "target": snapshot["target"],
+                "snapshot": snapshot,
+            })
+            self.app.finish_undo_group(commit=True)
+            undo_group_active = False
+            self._mark_nonstructural_cell_edit(
+                "global-safe-overwrite",
+                edited_sides=("B",) if direction == "A2B" else ("A",),
+            )
+            exact_rows = self._refresh_pair_indices_exact(
+                [pair_idx for pair_idx, _cols in candidates]
+            )
+            if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
+                self._cache_only_diff_rows_from_exact_pair_maps()
+            self._invalidate_render_cache()
+            self.refresh(row_only=None, rescan=False)
+            self._refresh_diff_block_ui()
+            self._update_cursor_lines()
+            elapsed = time.perf_counter() - started
+            try:
+                self.info.configure(
+                    text=(
+                        f"已全局采用{source_label}：{cell_count} 个安全单元格／"
+                        f"{len(candidates)} 行，耗时 {elapsed:.1f} 秒"
+                    )
+                )
+            except Exception:
+                pass
+            _dlog(
+                f"GLOBAL_APPLY_DONE sheet={self.sheet} dir={direction} "
+                f"cells={cell_count} pairs={exact_rows} "
+                f"ms={elapsed * 1000.0:.1f}"
+            )
+            return True
+        except Exception as exc:
+            try:
+                if snapshot is not None:
+                    self._restore_global_safe_apply_snapshot(snapshot)
+                if undo_group_active:
+                    self.app.finish_undo_group(commit=False)
+                    undo_group_active = False
+                if snapshot is not None:
+                    self._refresh_pair_indices_exact(
+                        [pair_idx for pair_idx, _cols in candidates]
+                    )
+                    self._invalidate_render_cache()
+                    self.refresh(row_only=None, rescan=False)
+                    self._update_cursor_lines()
+            except Exception as rollback_error:
+                _dlog(
+                    f"CRITICAL global snapshot rollback failed sheet={self.sheet} "
+                    f"dir={direction} err={rollback_error}"
+                )
+            _dlog(
+                f"GLOBAL_APPLY_ERROR sheet={self.sheet} dir={direction} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+            messagebox.showerror("全局覆盖失败", f"全局覆盖失败，已完整还原：\n{exc}", parent=self.root)
+            return False
+        finally:
+            if undo_group_active:
+                self.app.finish_undo_group(commit=False)
+            self._suppress_bg_apply = previous_bg_suppression
+            if interactive_started and callable(end_interactive):
+                end_interactive()
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
 
     def _copy_missing_sheet(self, direction: str, *, _guarded: bool = False):
         if not _guarded and not self._guard_mutation_ready("整 Sheet 操作"):
@@ -16307,8 +20149,8 @@ class SheetView:
         meta = self._sheet_meta()
         action_text = {
             "A2B": "正在复制左侧整张 Sheet...",
-            "B2A": "正在复制 theirs 整张 Sheet 到 mine...",
-            "BASE2A": "正在按 Base 恢复或删除整张 Sheet...",
+            "B2A": f"正在复制 {self._merge_side_label('B')} 整张 Sheet 到 {self._merge_side_label('A')}...",
+            "BASE2A": f"正在按 {self._merge_side_label('BASE')} 恢复或删除整张 Sheet...",
         }.get(direction, "正在处理整张 Sheet...")
         try:
             self.info.configure(text=action_text)
@@ -16836,8 +20678,8 @@ class SheetView:
         }.get(str(direction or ""), "LOGICAL")
         action_text = {
             "A2B": "采用左侧(A)列",
-            "B2A": "采用Theirs列" if self._is_three_way_enabled() else "采用右侧(B)列",
-            "BASE2A": "采用Base列",
+            "B2A": f"采用{self._merge_side_label('B')}列" if self._is_three_way_enabled() else "采用右侧(B)列",
+            "BASE2A": f"采用{self._merge_side_label('BASE')}列",
         }.get(str(direction or ""), "对应列结构按钮")
         first_col = int(blocker_cols[0])
         block = self._select_column_block_by_logical_col(first_col, source_side)
@@ -16846,7 +20688,7 @@ class SheetView:
             end_col = int(block.end_slot_idx) + 1
         else:
             start_col = end_col = first_col
-        range_text = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
+        range_text = _excel_column_range_display(start_col, end_col)
         column_name = self._logical_column_display_name(first_col)
         named_range = f"{range_text}（{column_name}）" if column_name else range_text
         extra_count = len(blocker_cols) - 1
@@ -16864,7 +20706,7 @@ class SheetView:
         except Exception:
             pass
         try:
-            self.column_action_status_var.set(
+            self._set_column_action_status(
                 f"区域操作已暂停｜{named_range}｜请点击“{action_text}”｜本次未写入"
             )
         except Exception:
@@ -16968,7 +20810,7 @@ class SheetView:
         source_label = {
             "A2B": "左侧",
             "B2A": "右侧",
-            "BASE2A": "Base",
+            "BASE2A": self._merge_side_label("BASE"),
         }.get(str(direction or ""), "所选侧")
         if reason == "calculating":
             text = "差异区域仍在计算，请稍后再试。"
@@ -17018,7 +20860,7 @@ class SheetView:
         direction_text = {
             "B2A": "右侧区域",
             "A2B": "左侧区域",
-            "BASE2A": "Base 区域",
+            "BASE2A": f"{self._merge_side_label('BASE')} 区域",
         }.get(direction, direction)
         try:
             formula_skip_before = int(getattr(self, "_formula_copy_skips_pending", 0))
@@ -17421,7 +21263,7 @@ class SheetView:
                         changed_any = True
                     if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
                         self.app.user_touched_conflicts = True
-                        self._resolve_conflict_row(ra, applied_cols)
+                        self._resolve_conflict_row(ra, applied_cols, refresh=False)
                     processed_rows += 1
                     if processed_rows % 200 == 0:
                         try:
@@ -17837,7 +21679,7 @@ class SheetView:
             self.info.configure(
                 text=(
                     f"已定位首个冲突：{self.sheet}｜{excel_coordinate}｜"
-                    f"第 {excel_row} 行，第 {logical_col} 列（逻辑列 L{logical_col}）"
+                    f"第 {excel_row} 行，Excel 列 {_excel_column_display(logical_col)}"
                 )
             )
         except Exception:
@@ -18045,6 +21887,9 @@ class SheetView:
     ):
         if row_structure:
             self._row_model_version = int(getattr(self, "_row_model_version", 0)) + 1
+            self._row_alignment_reuse_requested = False
+        elif getattr(self, "row_pairs", None):
+            self._row_alignment_reuse_requested = True
         if column_structure:
             self._column_model_version = int(getattr(self, "_column_model_version", 0)) + 1
         normalized_sides = set()
@@ -18152,6 +21997,7 @@ class SheetView:
             getattr(self, "_column_projection_generation", 0)
         ) + 1
         self._column_mapping_stale_reason = ""
+        self._set_uniform_logical_column_widths(projection)
         self._base_spans_cache = None
         self._base_spans_cache_key = None
         return projection
@@ -18198,44 +22044,52 @@ class SheetView:
         pair_parts_base=None,
         fallback_physical_widths=None,
     ):
-        projection = self._active_column_projection()
-        widths = {}
-        side_maps = (
-            ("A", pair_parts_a or {}),
-            ("B", pair_parts_b or {}),
-            ("BASE", pair_parts_base or {}),
+        # Background caches still carry raw parts for text/diff rendering, but
+        # never participate in display geometry.  A Sheet's logical columns
+        # are fixed-width across every row and pane.
+        return self._set_uniform_logical_column_widths()
+
+    def _set_uniform_logical_column_widths(
+        self,
+        projection: LogicalColumnProjection | None = None,
+    ) -> dict[int, int]:
+        """Install the Sheet-wide bounded logical-column width model.
+
+        The formatter historically accepts a ``{logical_column: width}`` map;
+        retain that interface while recording the canonical equal-width tuple.
+        Content and scrolling therefore cannot change any column's geometry.
+        """
+        projection = projection or self._active_column_projection()
+        width = max(
+            _LOGICAL_COLUMN_DISPLAY_WIDTH_MIN,
+            min(
+                _LOGICAL_COLUMN_DISPLAY_WIDTH_MAX,
+                int(getattr(self, "_logical_column_display_width", _LOGICAL_COLUMN_DISPLAY_WIDTH_MIN)),
+            ),
         )
-        for side, parts_by_pair in side_maps:
-            for parts in parts_by_pair.values():
-                projected = self._project_raw_parts(parts, side)
-                for logical_col, value in enumerate(projected, start=1):
-                    width = min(len(str(value)), _COL_MAX_DISPLAY_WIDTH)
-                    if width > widths.get(logical_col, 0):
-                        widths[logical_col] = width
-        fallback = fallback_physical_widths or {}
-        for logical_col in range(1, projection.slot_count + 1):
-            header_width = max(
-                len(projection.header_label(side, logical_col))
-                for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B"))
-            )
-            fallback_width = 0
-            for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B")):
-                physical_col = projection.physical_col(side, logical_col)
-                if physical_col is not None:
-                    fallback_width = max(
-                        fallback_width,
-                        int(fallback.get(int(physical_col), 0) or 0),
-                    )
-            widths[logical_col] = max(
-                4,
-                header_width,
-                min(max(widths.get(logical_col, 0), fallback_width), _COL_MAX_DISPLAY_WIDTH),
-            )
-        self.col_char_widths = widths
+        count = max(0, int(projection.slot_count))
+        widths_tuple = tuple(width for _ in range(count))
+        key = (
+            int(getattr(self, "_column_projection_generation", 0)),
+            count,
+            width,
+        )
+        if (
+            getattr(self, "_logical_column_widths_key", None) == key
+            and getattr(self, "_logical_column_widths", ()) == widths_tuple
+            and len(getattr(self, "col_char_widths", {})) == count
+        ):
+            return self.col_char_widths
+        self._logical_column_widths = widths_tuple
+        self._logical_column_widths_key = key
+        self.col_char_widths = {
+            logical_col: width
+            for logical_col in range(1, count + 1)
+        }
         self._col_widths_version = int(getattr(self, "_col_widths_version", 0)) + 1
         self._base_spans_cache = None
         self._base_spans_cache_key = None
-        return widths
+        return self.col_char_widths
 
     def _stage_cached_pair_parts(
         self,
@@ -18948,7 +22802,6 @@ class SheetView:
         contain a real cell edit, so it remains in the row channel (merge
         actions can still reject that ambiguous mapping independently).
         """
-        pair_cols = set(self.pair_diff_cols.get(pair_idx, set()))
         cols = self._all_logical_diff_cols_for_pair(pair_idx)
         try:
             cache = self._active_column_comparison_cache()
@@ -18956,29 +22809,116 @@ class SheetView:
             cols.difference_update(c for c in structural if c > 0)
             # A resolved insertion owned identically by Mine and Theirs has no
             # Base physical column by definition.  Base-relative comparison
-            # therefore marks that logical slot on every populated row even
-            # though the two current sides agree.  Remove only that Base-only
-            # contribution: a real Mine/Theirs cell disagreement, an
-            # unresolved mapping, or any one-sided slot remains visible.
-            resolved_common_insertions = {
-                slot.logical_idx + 1
-                for slot in cache.model.slots
-                if (
-                    slot.base_col is None
-                    and slot.mine_col is not None
-                    and slot.theirs_col is not None
-                    and slot.state != "unresolved"
-                    and not slot.confidence.ambiguous
+            # therefore marks that logical slot on every populated row.  A
+            # paired common insertion is structural, not a row-content diff:
+            # physical row offsets can make its accepted copied payload differ
+            # even when the logical insertion itself is proven and intentional.
+            # Keep that evidence in the column marker/action bar instead of
+            # flooding only-diff with every populated row.
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                resolved_common_insertions = {
+                    slot.logical_idx + 1
+                    for slot in cache.model.slots
+                    if (
+                        slot.base_col is None
+                        and slot.mine_col is not None
+                        and slot.theirs_col is not None
+                        and slot.state != "unresolved"
+                        and not slot.confidence.ambiguous
+                    )
+                }
+                pair_cols = set(self.pair_diff_cols.get(pair_idx, set()))
+                accepted_sources = dict(
+                    getattr(self, "_accepted_common_insert_sources", {}) or {}
                 )
-            }
-            cols.difference_update(
-                logical_col
-                for logical_col in resolved_common_insertions
-                if logical_col not in pair_cols
-            )
+                cols.difference_update(
+                    col
+                    for col in resolved_common_insertions
+                    if (
+                        col not in pair_cols
+                        or (
+                            col in accepted_sources
+                            and self._accepted_common_insertion_row_is_unchanged(
+                                pair_idx,
+                                col,
+                                accepted_sources[col],
+                            )
+                        )
+                    )
+                )
         except Exception:
             pass
         return cols
+
+    def _accepted_common_insertion_row_is_unchanged(
+        self,
+        pair_idx: int,
+        logical_col: int,
+        source_side: str,
+    ) -> bool:
+        """Prove an accepted common-insert cell still matches its copy source.
+
+        The comparison deliberately uses the target side's physical row on
+        both current workbooks.  That is the coordinate copied by the column
+        transaction; comparing the normal Mine/Theirs row pair here would
+        reproduce the row-alignment offset that this guard is meant to remove.
+        Any subsequent edit on either side breaks equality and immediately
+        restores the real visual difference.
+        """
+        source = str(source_side or "").upper()
+        if source not in ("A", "B"):
+            return False
+        if not (0 <= int(pair_idx) < len(self.row_pairs)):
+            return False
+        row_a, row_b = self.row_pairs[int(pair_idx)]
+        physical_row = row_b if source == "A" else row_a
+        if physical_row is None:
+            return False
+        projection = self._active_column_projection()
+        mine_col = projection.physical_col("A", int(logical_col))
+        theirs_col = projection.physical_col("B", int(logical_col))
+        if mine_col is None or theirs_col is None:
+            return False
+
+        def _raw_value(ws, row: int, col: int):
+            cells = getattr(ws, "_cells", None)
+            if isinstance(cells, dict):
+                cell = cells.get((int(row), int(col)))
+                return getattr(cell, "value", None) if cell is not None else None
+            return ws.cell(row=int(row), column=int(col)).value
+
+        ws_a_val = self.app.ws_a_val(self.sheet)
+        ws_b_val = self.app.ws_b_val(self.sheet)
+        ws_a_edit = self.app.ws_a_edit(self.sheet)
+        ws_b_edit = self.app.ws_b_edit(self.sheet)
+        row = int(physical_row)
+        a_val = _raw_value(ws_a_val, row, mine_col)
+        b_val = _raw_value(ws_b_val, row, theirs_col)
+        a_edit = _raw_value(ws_a_edit, row, mine_col)
+        b_edit = _raw_value(ws_b_edit, row, theirs_col)
+        a_edit = _translate_normal_formula_for_compare(
+            a_val,
+            a_edit,
+            row,
+            int(mine_col),
+            row,
+            int(logical_col),
+        )
+        b_edit = _translate_normal_formula_for_compare(
+            b_val,
+            b_edit,
+            row,
+            int(theirs_col),
+            row,
+            int(logical_col),
+        )
+        _display_a, _display_b, equal = _cell_display_and_equal_from_values(
+            a_val,
+            b_val,
+            a_edit,
+            b_edit,
+        )
+        return bool(equal)
 
     def _pair_has_visual_diff(self, pair_idx: int) -> bool:
         return bool(self._visual_diff_cols_for_pair(pair_idx))
@@ -18992,74 +22932,14 @@ class SheetView:
         *,
         row_cache_bundle: dict | None = None,
     ):
-        """Quick first-pass scan to populate col_char_widths before building formatted lines.
-        max_pairs>0 limits scanning to first N pairs (for large sheets)."""
-        self.col_char_widths = {}
-        self._rownum_display_width = 0
-        pairs = self.row_pairs[:max_pairs] if max_pairs > 0 else self.row_pairs
-        rows_a_cache = _read_rows_into_shared_cache(
-            ws_a_val,
-            [ra for ra, _rb in pairs if ra is not None],
-            self.max_col,
-            cache_bundle=row_cache_bundle,
-            cache_key="a_val",
-        )
-        rows_b_cache = _read_rows_into_shared_cache(
-            ws_b_val,
-            [rb for _ra, rb in pairs if rb is not None],
-            self.max_col,
-            cache_bundle=row_cache_bundle,
-            cache_key="b_val",
-        )
-        base_rows_needed = []
-        if ws_base_val is not None:
-            for idx, (ra, rb) in enumerate(pairs):
-                r_base = self._base_row_for_pair(idx, (ra, rb))
-                if r_base is not None:
-                    base_rows_needed.append(r_base)
-        rows_base_cache = _read_rows_into_shared_cache(
-            ws_base_val,
-            base_rows_needed,
-            self.max_col,
-            cache_bundle=row_cache_bundle,
-            cache_key="base_val",
-        ) if ws_base_val is not None else {}
+        """Install fixed Sheet geometry; cell values never affect widths.
 
-        projection = self._active_column_projection()
-        for idx, (ra, rb) in enumerate(pairs):
-            row_a = _row_from_cache(rows_a_cache, ra, self.max_col)
-            row_b = _row_from_cache(rows_b_cache, rb, self.max_col)
-            r_base = self._base_row_for_pair(idx, (ra, rb))
-            row_base = _row_from_cache(rows_base_cache, r_base, self.max_col) if ws_base_val is not None else None
-            for c in range(1, projection.slot_count + 1):
-                col_a = projection.physical_col("A", c)
-                col_b = projection.physical_col("B", c)
-                col_base = projection.physical_col("BASE", c)
-                sa = (
-                    _val_to_str(_logical_row_value(row_a, col_a))
-                    if col_a is not None else _LOGICAL_COLUMN_PLACEHOLDER
-                )
-                sb = (
-                    _val_to_str(_logical_row_value(row_b, col_b))
-                    if col_b is not None else _LOGICAL_COLUMN_PLACEHOLDER
-                )
-                w = min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH)
-                if row_base is not None and r_base is not None and col_base is not None:
-                    sv = _val_to_str(_logical_row_value(row_base, col_base))
-                    w = min(max(w, len(sv)), _COL_MAX_DISPLAY_WIDTH)
-                header_width = max(
-                    len(projection.header_label(side, c))
-                    for side in (("BASE", "A", "B") if self._is_three_way_enabled() else ("A", "B"))
-                )
-                w = max(w, header_width)
-                if w > self.col_char_widths.get(c, 0):
-                    self.col_char_widths[c] = w
-        # Avoid ultra-narrow columns (which render as repeated "...").
-        # Keep a readable lower bound after grid on/off toggles.
-        for c in range(1, projection.slot_count + 1):
-            self.col_char_widths[c] = max(4, int(self.col_char_widths.get(c, 1)))
-        # Invalidate cached base spans: column widths just changed.
-        self._col_widths_version = int(getattr(self, "_col_widths_version", 0)) + 1
+        Arguments remain for callers that previously supplied row caches. The
+        width model intentionally does no cell scan: every logical column is
+        the same bounded 18-character width in A/Base/B/C and all rows.
+        """
+        self._rownum_display_width = 0
+        return self._set_uniform_logical_column_widths()
 
     def _build_row_pairs(
         self,
@@ -20615,7 +24495,10 @@ class SheetView:
             # Do not sweep a large pair map on the Tk callback. The exact worker
             # owns progress, cancellation, and publication for that path.
             cached_synchronously = False
-            if not bool(getattr(self, "_is_large_sheet", False)):
+            if (
+                not bool(getattr(self, "_is_large_sheet", False))
+                or self._has_user_edits_for_current_sheet()
+            ):
                 cached_synchronously = self._cache_only_diff_rows_from_exact_pair_maps()
             self._only_diff_request_origin_value = previous
             if (not cached_synchronously) and self._start_async_large_only_diff_build(
@@ -22306,6 +26189,7 @@ class SheetView:
         override_cols: set[int] | None = None,
         suppress_refresh: bool = False,
         _undo_out: list | None = None,
+        raise_on_error: bool = False,
     ) -> bool:
         # Region actions acquire readiness at their public entry and then reuse
         # this primitive while the app advertises BUSY.
@@ -22491,12 +26375,22 @@ class SheetView:
                     cols = set(rows.get(conflict_row, set())) if action_direction == "A2B" else cols
                 if action_direction == "A2B":
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(conflict_row, cols)
+                    self._resolve_conflict_row(
+                        conflict_row,
+                        cols,
+                        refresh=not suppress_refresh,
+                        raise_on_error=raise_on_error,
+                    )
                     resolved_only = True
                     changed = True
                 elif action_direction == "MINE2A":
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(conflict_row, cols)
+                    self._resolve_conflict_row(
+                        conflict_row,
+                        cols,
+                        refresh=not suppress_refresh,
+                        raise_on_error=raise_on_error,
+                    )
                     resolved_only = True
                     changed = True
 
@@ -22618,7 +26512,12 @@ class SheetView:
                 # In conflict mode, B2A applies theirs; mark conflict resolved.
                 if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(conflict_row, applied_cols)
+                    self._resolve_conflict_row(
+                        conflict_row,
+                        applied_cols,
+                        refresh=not suppress_refresh,
+                        raise_on_error=raise_on_error,
+                    )
                     resolved_only = True
                     changed = True
             else:
@@ -22674,7 +26573,12 @@ class SheetView:
                         self.app.push_undo({"sheet": self.sheet, "target": "A", "cells": undo_cells})
                 if getattr(self.app, "merge_conflict_mode", False) and applied_cols:
                     self.app.user_touched_conflicts = True
-                    self._resolve_conflict_row(dst_r, applied_cols)
+                    self._resolve_conflict_row(
+                        dst_r,
+                        applied_cols,
+                        refresh=not suppress_refresh,
+                        raise_on_error=raise_on_error,
+                    )
                     resolved_only = True
                     changed = True
 
@@ -22710,6 +26614,8 @@ class SheetView:
                 f"OVERWRITE_ROW_FAILED sheet={self.sheet} dir={direction} "
                 f"err={type(e).__name__}:{e}"
             )
+            if raise_on_error:
+                raise
             messagebox.showerror("Error", f"覆盖整行失败：\n{e}")
             return False
         finally:
@@ -22743,9 +26649,15 @@ class SheetView:
                 duration_ms=6000,
             )
             return
+        allow_column_undo_while_diffing = bool(
+            pending
+            and pending.get("kind") == "column_action"
+            and undo_view._column_undo_model_ready()
+        )
         if (
             not _internal_rollback
-            and not undo_view._guard_mutation_ready("撤销")
+            and not undo_view._guard_mutation_ready("撤销", notify=False)
+            and not allow_column_undo_while_diffing
         ):
             return
         try:
@@ -22774,6 +26686,17 @@ class SheetView:
                     if len(self.app.undo_stack) >= stack_size:
                         raise RuntimeError("复合操作中的子操作未能撤销")
                     undone += 1
+                if "global_conflict_sheet_present" in action:
+                    undo_view._restore_global_conflict_snapshot(
+                        bool(action.get("global_conflict_sheet_present", False)),
+                        action.get("global_conflict_sheet_before"),
+                        bool(action.get("global_user_touched_conflicts_before", False)),
+                    )
+                    try:
+                        undo_view.refresh(row_only=None, rescan=False)
+                        undo_view._update_cursor_lines()
+                    except Exception:
+                        pass
                 try:
                     undo_view.info.configure(
                         text=(
@@ -22790,6 +26713,32 @@ class SheetView:
                 return
             if action.get("kind") == "column_action":
                 column_undo_view._undo_column_action(action)
+                return
+            if action.get("kind") == "global_safe_cells":
+                snapshot = action.get("snapshot")
+                rows = undo_view._restore_global_safe_apply_snapshot(
+                    snapshot,
+                    # The enclosing compound restores the conflict map only
+                    # after all chronological child actions have completed.
+                    restore_conflicts=False,
+                )
+                undo_view._invalidate_only_diff_snapshot_cache()
+                undo_view._invalidate_render_cache()
+                side_lookup = (
+                    undo_view.row_a_to_pair_idx
+                    if action.get("target") == "A"
+                    else undo_view.row_b_to_pair_idx
+                )
+                affected_pair_indices = list(dict.fromkeys(
+                    int(side_lookup[row])
+                    for row in sorted(rows)
+                    if row in side_lookup
+                ))
+                undo_view._refresh_pair_indices_exact(affected_pair_indices)
+                if bool(undo_view.only_diff_var.get()) and undo_view.snapshot_only_diff:
+                    undo_view._cache_only_diff_rows_from_exact_pair_maps()
+                undo_view.refresh(row_only=None, rescan=False)
+                undo_view._update_cursor_lines()
                 return
             sheet = action.get("sheet")
             target = action.get("target")
@@ -23086,13 +27035,23 @@ class SheetView:
         except Exception:
             pass
 
-    def _resolve_conflict_row(self, r: int, cols):
+    def _resolve_conflict_row(
+        self,
+        r: int,
+        cols,
+        *,
+        refresh: bool = True,
+        raise_on_error: bool = False,
+    ):
+        """Resolve conflict state, optionally deferring repaint to a batch owner."""
         try:
             if self.app.resolve_conflict_row(self.sheet, r, cols):
-                self.refresh(row_only=None, rescan=False)
-                self._update_cursor_lines()
+                if refresh:
+                    self.refresh(row_only=None, rescan=False)
+                    self._update_cursor_lines()
         except Exception:
-            pass
+            if raise_on_error:
+                raise
 
     def _refresh_row_text_only(self, r: int):
         """Update the rendered row text for row r without recomputing diff_cols_by_row."""
@@ -23451,8 +27410,8 @@ class SheetView:
         state_labels = {
             "inserted": "新增列",
             "deleted": "删除列",
-            "mine-deleted": "Mine删除",
-            "theirs-deleted": "Theirs删除",
+            "mine-deleted": f"{self._merge_side_label('A')}删除",
+            "theirs-deleted": f"{self._merge_side_label('B')}删除",
             "both-deleted": "双方删除",
             "unresolved": "待确认",
         }
@@ -23471,7 +27430,7 @@ class SheetView:
                 continue
             start_col = logical_cols[0]
             end_col = logical_cols[-1]
-            range_label = f"L{start_col}" if start_col == end_col else f"L{start_col}:L{end_col}"
+            range_label = _excel_column_range_display(start_col, end_col)
             slots = [projection.slot(col) for col in logical_cols]
             slots = [slot for slot in slots if slot is not None]
             unresolved = any(
@@ -23480,7 +27439,7 @@ class SheetView:
             )
             state_text = "待确认" if unresolved else state_labels.get(block.state, "结构变化")
             missing_sides = []
-            for side, label in (("A", "Mine"), ("BASE", "Base"), ("B", "Theirs")):
+            for side, label in (("A", self._merge_side_label("A")), ("BASE", self._merge_side_label("BASE")), ("B", self._merge_side_label("B"))):
                 if side == "BASE" and not self._is_three_way_enabled():
                     continue
                 if all(projection.is_missing(side, col) for col in logical_cols):
@@ -23503,11 +27462,21 @@ class SheetView:
         return preview
 
     def _info_column_text(self) -> str:
-        text = f"Cols: {self._logical_slot_count()}"
         summary = self._column_structure_summary()
-        if summary:
-            text += f"   ColumnStructure: {summary}"
-        return text
+        self._sync_column_structure_status_detail(summary)
+        structural_blocks = sum(
+            1
+            for block in self._active_column_projection().model.blocks
+            if self._column_block_is_structural(block)
+        )
+        return f"列 {self._logical_slot_count()}｜结构 {structural_blocks}"
+
+    def _normal_sheet_info_text(self) -> str:
+        total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
+        return (
+            f"显示 {len(self.display_rows)}/{total_rows}｜差异行 "
+            f"{self._display_diff_row_count}｜{self._info_column_text()}"
+        )
 
     def _apply_column_header_structure_tags(self, widget: tk.Text, side: str):
         try:
@@ -23549,6 +27518,9 @@ class SheetView:
             (self.left_colhdr, "A"),
             (self.base_colhdr, "BASE"),
             (self.right_colhdr, "B"),
+            # C is a focused logical projection. Its logical headers now use
+            # the same Excel A..Z/AA convention as the main panes while
+            # retaining structural markers independent of a physical side.
             (self.cursor_cmp_colhdr, "LOGICAL"),
         )
         for w, side in header_widgets:
@@ -23711,9 +27683,7 @@ class SheetView:
 
         # row numbers are rendered in dedicated row-header widgets
 
-        mode = "只看差异" if self.only_diff_var.get() else "全量"
-        total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {self._display_diff_row_count}")
+        self.info.configure(text=self._normal_sheet_info_text())
 
         if first is not None:
             try:
@@ -23881,8 +27851,8 @@ class SheetView:
 
         self._refresh_diff_block_ui()
         diff_count = len(self.display_rows)
-        self.info.configure(text=f"缺失Sheet对照 | RowsShown: {len(self.display_rows)} / {len(self.row_pairs)}   {self._info_column_text()}   DiffRows: {diff_count}")
         self._display_diff_row_count = diff_count
+        self.info.configure(text=f"缺失 Sheet 对照｜{self._normal_sheet_info_text()}")
         self.app.set_sheet_has_diff(
             self.sheet,
             diff_count > 0 or bool(self._active_column_comparison_cache().structural_diff_cols),
@@ -23944,12 +27914,21 @@ class SheetView:
             ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
         except Exception:
             ws_base_edit_ready = None
-        reuse_row_alignment = bool(column_only and rescan and getattr(self, "row_pairs", None))
+        reuse_row_alignment = bool(
+            rescan
+            and getattr(self, "row_pairs", None)
+            and (
+                column_only
+                or getattr(self, "_row_alignment_reuse_requested", False)
+            )
+        )
         preserved_row_pairs = list(self.row_pairs) if reuse_row_alignment else []
         preserved_mine_to_base = dict(getattr(self, "mine_to_base_row", {}) or {})
         preserved_theirs_to_base = dict(getattr(self, "theirs_to_base_row", {}) or {})
         preserved_base_overrides = dict(getattr(self, "pair_base_row_override", {}) or {})
         preserved_align_enabled = bool(getattr(self, "_align_rows_enabled", False))
+        if reuse_row_alignment:
+            self._row_alignment_reuse_requested = False
 
         if (
             not rescan
@@ -24686,9 +28665,7 @@ class SheetView:
             # keep fast; do not rebuild sheet nav here
             try:
                 self._display_diff_row_count = sum(1 for idx in self.display_rows if self._pair_has_visual_diff(idx))
-                mode = "只看差异" if self.only_diff_var.get() else "全量"
-                total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {self._display_diff_row_count}")
+                self.info.configure(text=self._normal_sheet_info_text())
             except Exception:
                 pass
             try:
@@ -24786,10 +28763,8 @@ class SheetView:
                 # rownum gutter tags are unused when row headers are separate
                 self._refresh_diff_block_ui()
 
-                mode = "只看差异" if self.only_diff_var.get() else "全量"
-                total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-                self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {diff_row_count}")
                 self._display_diff_row_count = diff_row_count
+                self.info.configure(text=self._normal_sheet_info_text())
                 self.app.set_sheet_has_diff(
                     self.sheet,
                     diff_row_count > 0 or bool(self._active_column_comparison_cache().structural_diff_cols),
@@ -24951,10 +28926,8 @@ class SheetView:
         # row-number styling handled by dedicated row-header widgets
         self._refresh_diff_block_ui()
 
-        mode = "只看差异" if self.only_diff_var.get() else "全量"
-        total_rows = len(self.row_pairs) if self.row_pairs else self.max_row
-        self.info.configure(text=f"{mode} | RowsShown: {len(self.display_rows)} / {total_rows}   {self._info_column_text()}   DiffRows: {diff_row_count}")
         self._display_diff_row_count = diff_row_count
+        self.info.configure(text=self._normal_sheet_info_text())
 
         self.app.set_sheet_has_diff(
             self.sheet,
@@ -24980,7 +28953,9 @@ class SowMergeApp:
     def __init__(self, file_a: str, file_b: str, merge_mode: bool = False, merged_path: str | None = None,
                  base_path: str | None = None,
                  merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False,
-                 raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None):
+                 raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None,
+                 launch_context: MergeLaunchContext | None = None,
+                 startup_outcome: StartupMergeOutcome | None = None):
         # Sequential GUI instances are common in smoke tests and can also occur
         # in host integrations. Collect destroyed Tk object cycles on the UI
         # thread before any new background XML parser can trigger that GC.
@@ -25010,13 +28985,25 @@ class SowMergeApp:
         self._only_diff_progress_started = 0.0
         self._only_diff_tab_states = {}
         self._sheet_switch_guard = False
-        self.file_a = file_a
-        self.file_b = file_b
-        self.base_path = base_path
+        # GUI callers may construct the app directly with SVN sidecars whose
+        # trailing ``.rN`` hides the real workbook extension from openpyxl.
+        # Stable copies are an implementation detail; raw identities stay in
+        # the launch context/labels below.
+        self.file_a = _ensure_xlsx_copy(file_a) if file_a else file_a
+        self.file_b = _ensure_xlsx_copy(file_b) if file_b else file_b
+        self.base_path = _ensure_xlsx_copy(base_path) if base_path else base_path
         self.has_base = bool(base_path and os.path.exists(base_path))
         self.raw_base = raw_base
         self.raw_mine = raw_mine
         self.raw_theirs = raw_theirs
+        self.launch_context = launch_context
+        self.startup_outcome = startup_outcome or StartupMergeOutcome()
+        self.merge_candidate_path = file_a if (startup_outcome and startup_outcome.candidate_path) else None
+        self.workspace_chrome_color = WORKSPACE_CHROME_COLORS.get(
+            getattr(launch_context, "scenario", MergeScenario.TWO_WAY),
+            WORKSPACE_CHROME_COLORS[MergeScenario.TWO_WAY],
+        )
+        self.workspace_color = self.workspace_chrome_color
         self.merge_mode = merge_mode
         self.diff_base_mine_mode = bool((not merge_mode) and raw_base and raw_mine)
         self.merged_path = merged_path
@@ -25111,15 +29098,15 @@ class SowMergeApp:
 
         def _load_initial_state(report):
             try:
-                report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(file_a)}", 8)
+                report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(self.file_a)}", 8)
                 t0 = datetime.now()
-                self._file_a_val_path = _prepare_val_path(file_a)
+                self._file_a_val_path = _prepare_val_path(self.file_a)
                 self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True)
                 _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
-                report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(file_b)}", 30)
+                report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(self.file_b)}", 30)
                 t0 = datetime.now()
-                self._file_b_val_path = _prepare_val_path(file_b)
+                self._file_b_val_path = _prepare_val_path(self.file_b)
                 self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True)
                 _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
@@ -25178,6 +29165,7 @@ class SowMergeApp:
         self.root.title(self._window_title_suffix)
         self.root.resizable(True, True)
         ttk.Style().theme_use("clam")
+        self._configure_workspace_chrome()
         if self.merge_mode:
             self.root.title(f"{self._window_title_suffix} (SVN Merge)")
         else:
@@ -25238,6 +29226,39 @@ class SowMergeApp:
         self._safe_root_after(0, _show_main_window_after_layout)
         self._safe_root_after(50, _ui_heartbeat)
         self._schedule_auto_recalc()
+
+    def _configure_workspace_chrome(self):
+        """Install styles for surrounding UI chrome without touching sheet cells."""
+        color = getattr(self, "workspace_chrome_color", WORKSPACE_CHROME_COLORS[MergeScenario.TWO_WAY])
+        try:
+            self.root.configure(bg=color)
+        except Exception:
+            pass
+        try:
+            style = ttk.Style(self.root)
+            # SheetView contains many nested ttk containers.  Make the
+            # scenario colour the default chrome background so the distinction
+            # remains visible around the white spreadsheet Text widgets, not
+            # only in the top and bottom bars.
+            style.configure("TFrame", background=color)
+            style.configure("TLabel", background=color)
+            style.configure("TLabelframe", background=color)
+            style.configure("TLabelframe.Label", background=color)
+            style.configure("TCheckbutton", background=color)
+            style.configure("MergeChrome.TFrame", background=color)
+            style.configure("MergeChrome.TLabel", background=color)
+            style.configure("MergeChrome.TNotebook", background=color, bordercolor=color)
+            # Notebook pages remain the lazy-loading host, but their duplicate
+            # tab rows are hidden. The lower Sheet strip is the sole navigator.
+            client_only_layout = [("Notebook.client", {"sticky": "nswe"})]
+            style.layout("SheetHost.TNotebook", client_only_layout)
+            style.configure("SheetHost.TNotebook", background=color, borderwidth=0)
+            # C has one user-visible view; hide its otherwise empty tab chrome.
+            style.layout("CompactPanel.TNotebook", client_only_layout)
+            style.configure("CompactPanel.TNotebook", background=color, borderwidth=0)
+            style.configure("MergeChrome.TPanedwindow", background=color)
+        except Exception as exc:
+            _dlog(f"workspace chrome style failed: {exc}")
 
     def _sheet_names_for_side(self, side: str) -> list[str]:
         side = str(side or "").upper()
@@ -26003,6 +30024,39 @@ class SowMergeApp:
             snap = getattr(self, "_merge_mine_snapshot", None)
             if snap and os.path.exists(snap):
                 os.remove(snap)
+        except Exception:
+            pass
+        try:
+            startup_temp_paths = {
+                getattr(self, "merge_candidate_path", None),
+                getattr(self, "file_a", None),
+                getattr(self, "file_b", None),
+                getattr(self, "base_path", None),
+            }
+            context = getattr(self, "launch_context", None)
+            for identity in getattr(context, "identities", {}).values():
+                stable_path = getattr(identity, "stable_path", None)
+                original_path = getattr(identity, "path", None)
+                if stable_path and (
+                    not original_path
+                    or os.path.abspath(stable_path) != os.path.abspath(original_path)
+                ):
+                    startup_temp_paths.add(stable_path)
+            temp_root = os.path.abspath(tempfile.gettempdir())
+            for temp_path in startup_temp_paths:
+                if not temp_path:
+                    continue
+                candidate = os.path.abspath(temp_path)
+                if (
+                    os.path.commonpath((temp_root, candidate)) != temp_root
+                    or not os.path.basename(candidate).lower().startswith(APP_NAME.lower())
+                ):
+                    continue
+                try:
+                    if os.path.isfile(candidate):
+                        os.remove(candidate)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -27143,47 +31197,322 @@ class SowMergeApp:
         except Exception as e:
             _dlog(f"nonblocking notice failed: {e}")
 
-    def _build_ui(self):
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=10, pady=8)
+    def show_startup_outcome_dialog_deferred(self):
+        """Show the single post-analysis modal after the main window is visible."""
+        if not self.merge_mode or getattr(self, "launch_context", None) is None:
+            return
+        self._safe_root_after(350, self._show_startup_outcome_dialog)
 
-        # Keep top area minimal (summary + actions). File-source labels are shown inside each Sheet.
-        summary = f"同名Sheet: {len(self.common_sheets)}   仅A: {len(self.only_a)}   仅B: {len(self.only_b)}"
-        ttk.Label(top, text=summary).grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        detail_row = 1
-        if self.merge_mode and (self.raw_mine or self.raw_base or self.raw_theirs):
-            raw_line = (
-                f"SVN原始传参: mine={os.path.basename(self.raw_mine or '-')}"
-                f" | base={os.path.basename(self.raw_base or '-')}"
-                f" | theirs={os.path.basename(self.raw_theirs or '-')}"
+    def _show_startup_outcome_dialog(self):
+        if self._is_closing:
+            return
+        outcome = getattr(self, "startup_outcome", None)
+        context = getattr(self, "launch_context", None)
+        if outcome is None or context is None:
+            return
+        try:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("三方合并启动结果")
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            dialog.configure(bg=self.workspace_chrome_color)
+            body = tk.Frame(dialog, bg=self.workspace_chrome_color, padx=18, pady=14)
+            body.pack(fill="both", expand=True)
+            is_cross_branch = context.scenario == MergeScenario.CROSS_BRANCH_MERGE
+            action_label = {
+                "initialize-from-theirs": "已由 Theirs 初始化合并候选",
+                "initialize-from-mine": "已由 Mine 初始化合并候选",
+                "initialize-from-common-mine-theirs": "Mine 与 Theirs 相同，已初始化共同候选",
+                "initialize-from-mine-empty-branch-delta": "源分支无变化，已保留 Mine",
+                "semantic-premerge": "已应用安全的 Base 锚定语义预合并",
+                "cross-branch-source-delta": "已将 Source Before → Source After 的变更投影到 Target Working",
+                "incoming-already-present": "所有支持的 incoming 变更已存在于 Target Working；候选保持原始内容",
+                "manual-review": "未执行不安全的自动合并，保留人工三方审查",
+            }.get(outcome.automatic_action, outcome.automatic_action)
+            if is_cross_branch:
+                action_label = {
+                    "initialize-from-theirs": "Target Working 等于 Source Before，已由 Source After 初始化候选",
+                    "initialize-from-mine": "Source After 等于 Source Before，已保留 Target Working",
+                    "initialize-from-common-mine-theirs": "Target Working 与 Source After 相同，已保留共同候选",
+                    "initialize-from-mine-empty-branch-delta": "Source Before 与 Source After 相同，已保留 Target Working",
+                }.get(outcome.automatic_action, action_label)
+            lines = [
+                f"场景：{context.scenario.value}",
+                action_label,
+                "等价证据：" + ("；".join(outcome.equality_evidence) or "无完整包等价收敛"),
+            ]
+            if is_cross_branch:
+                lines.append(
+                    "Source delta："
+                    f"incoming {outcome.incoming_count} 项；applied {outcome.applied_count} 项；"
+                    f"already present {outcome.already_present_count} 项；"
+                    f"target retained {outcome.target_retained_count} 项；"
+                    f"unresolved {outcome.unresolved_count} 项"
+                )
+            else:
+                lines.append(f"自动处理：{outcome.merged_count} 项；待解决：{outcome.unresolved_count} 项")
+            lines.append(
+                (
+                    f"已折叠冗余 {merge_role_label(context, outcome.folded_identity)} 窗格；可随时点“展开三方”。"
+                    if outcome.folded_identity else "保持完整三方视图。"
+                )
             )
-            ttk.Label(top, text=raw_line, foreground="#555").grid(row=detail_row, column=0, columnspan=3, sticky="w", pady=(4, 0))
-            detail_row += 1
-            read_line = (
-                f"当前实际读取: left(A)={os.path.basename(self.file_a or '-')}"
-                f" | base={os.path.basename(self.base_path or '-')}"
-                f" | right(B)={os.path.basename(self.file_b or '-')}"
+            if outcome.fallback_reasons:
+                lines.append("保守回退：" + "；".join(outcome.fallback_reasons[:2]))
+            tk.Label(
+                body, text="\n".join(lines), justify="left", anchor="w",
+                bg=self.workspace_chrome_color, fg="#263238", wraplength=680,
+            ).pack(fill="x")
+            button_row = tk.Frame(body, bg=self.workspace_chrome_color)
+            button_row.pack(fill="x", pady=(14, 0))
+            first_navigable_conflict = (
+                self._first_unresolved_conflict_cell()
+                if outcome.unresolved_count else None
             )
-            ttk.Label(top, text=read_line, foreground="#555").grid(row=detail_row, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        ttk.Label(top, text=f"Build: {APP_BUILD_TAG}", foreground="#666").grid(row=0, column=3, sticky="ne", padx=(16, 0))
+            review_sheet_hint = (
+                self._source_delta_review_sheet_from_fallback(outcome)
+                if outcome.unresolved_count and first_navigable_conflict is None
+                else None
+            )
+
+            def _close():
+                try:
+                    dialog.grab_release()
+                except Exception:
+                    pass
+                dialog.destroy()
+
+            def _primary():
+                _close()
+                self._activate_startup_outcome_primary_action(
+                    outcome,
+                    first_conflict=first_navigable_conflict,
+                )
+
+            if outcome.unresolved_count:
+                primary_text = (
+                    "前往第一处未解决冲突"
+                    if first_navigable_conflict is not None
+                    else (
+                        f"检查 {review_sheet_hint} 完整三方"
+                        if review_sheet_hint else "检查完整三方"
+                    )
+                )
+            elif outcome.automatic_action == "manual-review":
+                primary_text = "检查完整三方"
+            else:
+                primary_text = "查看并保存 Merged"
+            tk.Button(button_row, text="关闭", command=_close, padx=12).pack(side="right")
+            primary = tk.Button(button_row, text=primary_text, command=_primary, padx=12)
+            primary.pack(side="right", padx=(0, 8))
+            dialog.protocol("WM_DELETE_WINDOW", _close)
+            dialog.update_idletasks()
+            try:
+                dialog.grab_set()
+            except Exception:
+                pass
+            primary.focus_set()
+        except Exception as exc:
+            _dlog(f"startup outcome dialog failed: {exc}")
+
+    def _focus_save_merged_action(self):
+        def _focus():
+            try:
+                view = self.sheet_views.get(getattr(self, "selected_sheet", ""))
+                button = getattr(view, "save_a_btn", None) if view is not None else None
+                if button is not None:
+                    button.focus_set()
+                    return
+            except Exception:
+                pass
+            try:
+                self.root.focus_set()
+            except Exception:
+                pass
+        self._safe_root_after(0, _focus)
+
+    def _source_delta_review_sheet_from_fallback(
+        self,
+        outcome: StartupMergeOutcome | None,
+    ) -> str | None:
+        """Resolve a declined Source OOXML part back to a real review Sheet.
+
+        A package member such as ``xl/worksheets/sheet2.xml`` is review
+        evidence, not a cell address.  Source Before owns the authoritative
+        sheet-part mapping, so use it only to select a real displayed Sheet and
+        never manufacture a row or column coordinate.
+        """
+        if outcome is None:
+            return None
+        member = None
+        for reason in tuple(getattr(outcome, "fallback_reasons", ()) or ()):
+            match = re.search(
+                r"Unsupported Source OOXML (?:representation|member) change:\s*([^\s;]+)",
+                str(reason or ""),
+                re.IGNORECASE,
+            )
+            if match:
+                member = match.group(1).replace("\\", "/").lstrip("/")
+                break
+        if not member:
+            return None
+        try:
+            context = getattr(self, "launch_context", None)
+            source_before = context.identity_for("base") if context else None
+            source_path = source_before.effective_path if source_before else None
+            fingerprint = _ooxml_package_fingerprint(source_path)
+            if not fingerprint.ready:
+                return None
+            displayed = {
+                str(sheet) for sheet in (getattr(self, "display_sheets", ()) or ())
+            }
+            containers = getattr(self, "_sheet_containers", {}) or {}
+            for sheet, part in _ooxml_sheet_part_map(fingerprint.payloads).items():
+                normalized_part = str(part or "").replace("\\", "/").lstrip("/")
+                if (
+                    normalized_part == member
+                    and sheet in displayed
+                    and sheet in containers
+                ):
+                    _dlog(
+                        f"SOURCE_DELTA_REVIEW_SHEET member={member} sheet={sheet}"
+                    )
+                    return sheet
+        except Exception as exc:
+            _dlog(
+                f"SOURCE_DELTA_REVIEW_SHEET_SKIPPED member={member} "
+                f"err={type(exc).__name__}:{exc}"
+            )
+        return None
+
+    def _focus_full_three_way_manual_review(
+        self,
+        outcome: StartupMergeOutcome | None = None,
+    ):
+        """Return from a global/manual marker to an inspectable full view."""
+        review_sheet = self._source_delta_review_sheet_from_fallback(outcome)
+
+        def _expand_when_ready(sheet: str, remaining: int = 30):
+            view = getattr(self, "sheet_views", {}).get(sheet)
+            if view is None:
+                if remaining > 0:
+                    self._safe_root_after(
+                        50,
+                        lambda: _expand_when_ready(sheet, remaining - 1),
+                    )
+                return
+            try:
+                if view._is_three_way_enabled() and not view._is_three_way_expanded():
+                    if view._derive_lifecycle_state() != "READY":
+                        if remaining > 0:
+                            self._safe_root_after(
+                                50,
+                                lambda: _expand_when_ready(sheet, remaining - 1),
+                            )
+                        return
+                    view.three_way_var.set(1)
+                    view._toggle_three_way_view()
+            except Exception:
+                pass
+            try:
+                self.root.focus_set()
+            except Exception:
+                pass
+
+        def _focus():
+            try:
+                selected = review_sheet or str(
+                    getattr(self, "selected_sheet", "") or ""
+                )
+                if review_sheet:
+                    container = getattr(self, "_sheet_containers", {}).get(review_sheet)
+                    if container is not None:
+                        self.nb.select(container)
+                    self.selected_sheet = review_sheet
+                view = getattr(self, "sheet_views", {}).get(selected)
+                if view is None and not review_sheet:
+                    for candidate in getattr(self, "sheet_views", {}).values():
+                        if candidate is not None:
+                            view = candidate
+                            break
+                if (
+                    view is not None
+                    and view._is_three_way_enabled()
+                    and not view._is_three_way_expanded()
+                ):
+                    view.three_way_var.set(1)
+                    view._toggle_three_way_view()
+            except Exception:
+                pass
+            if selected:
+                _expand_when_ready(selected)
+            try:
+                self._set_task_status(
+                    "存在工作簿级未解决项，请检查"
+                    f" {selected or '完整三方视图'}。",
+                    active=False,
+                )
+            except Exception:
+                pass
+            try:
+                self.root.focus_set()
+            except Exception:
+                pass
+        self._safe_root_after(0, _focus)
+
+    def _activate_startup_outcome_primary_action(
+        self,
+        outcome: StartupMergeOutcome,
+        *,
+        first_conflict: tuple[str, int, int] | None = None,
+    ) -> str:
+        """Run the outcome dialog's primary action without routing pseudo Sheets."""
+        if outcome.unresolved_count:
+            first = first_conflict or self._first_unresolved_conflict_cell()
+            if first is not None:
+                self._navigate_to_conflict_cell(*first)
+                return "navigate"
+            self._focus_full_three_way_manual_review(outcome)
+            return "manual-review"
+        if outcome.automatic_action == "manual-review":
+            self._focus_full_three_way_manual_review(outcome)
+            return "manual-review"
+        self._focus_save_merged_action()
+        return "save"
+
+    def _build_ui(self):
+        top = ttk.Frame(self.root, style="MergeChrome.TFrame")
+        top.pack(fill="x", padx=10, pady=(4, 2))
+        # Keep the four permanent workbook actions anchored at the far left;
+        # the final empty column absorbs any spare title-bar width.
+        top.grid_columnconfigure(4, weight=1)
+
+        # Permanent raw-argument, identity-matrix, build and Sheet-count text
+        # duplicated diagnostics and consumed several spreadsheet rows. Keep
+        # those facts in the log/diagnostic bundle; this row is actions only.
+        _dlog(
+            f"WORKSPACE_SUMMARY common={len(self.common_sheets)} "
+            f"only_a={len(self.only_a)} only_b={len(self.only_b)} "
+            f"build={APP_BUILD_TAG}"
+        )
 
         self.recalc_btn = ttk.Button(
             top,
             text="重算并刷新",
             command=self.recalc_and_refresh,
         )
-        self.recalc_btn.grid(row=0, column=2, sticky="ne", padx=(10, 0))
-        ttk.Button(top, text="导出诊断包", command=self.export_diagnostic_bundle).grid(row=0, column=4, sticky="ne", padx=(10, 0))
-        ttk.Button(top, text="复制反馈信息", command=self.copy_feedback_info).grid(row=0, column=5, sticky="ne", padx=(10, 0))
+        self.recalc_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="导出诊断包", command=self.export_diagnostic_bundle).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="复制反馈信息", command=self.copy_feedback_info).grid(row=0, column=2, sticky="w", padx=(0, 8))
         self.update_btn = ttk.Button(top, text="检查更新", command=self._do_svn_update)
-        self.update_btn.grid(row=0, column=6, sticky="ne", padx=(10, 0))
+        self.update_btn.grid(row=0, column=3, sticky="w")
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 2))
 
-        self.task_status_frame = ttk.Frame(self.root)
-        self.task_status_frame.pack(fill="x", padx=10, pady=(0, 4))
+        self.task_status_frame = ttk.Frame(self.root, style="MergeChrome.TFrame")
+        self.task_status_frame.pack(fill="x", padx=10, pady=(0, 2))
         self.task_status_var = tk.StringVar(value="正在准备 Sheet 数据...")
-        ttk.Label(self.task_status_frame, textvariable=self.task_status_var, foreground="#555").pack(
+        ttk.Label(self.task_status_frame, textvariable=self.task_status_var, foreground="#555", style="MergeChrome.TLabel").pack(
             side="left", fill="x", expand=True
         )
         self.task_progress = ttk.Progressbar(self.task_status_frame, mode="indeterminate", length=240)
@@ -27217,28 +31546,28 @@ class SowMergeApp:
         self.notice_close.pack(side="right")
         self._notice_after_id = None
 
-        self.nb = ttk.Notebook(self.root)
+        self.nb = ttk.Notebook(self.root, style="SheetHost.TNotebook")
         try:
             self.root.bind("<F4>", self._on_global_f4)
         except Exception:
             pass
 
         # Bottom bar: sheet nav (only)
-        self.bottom = ttk.Frame(self.root)
-        self.bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        self.bottom = ttk.Frame(self.root, style="MergeChrome.TFrame")
+        self.bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
 
-        self.nav = ttk.Frame(self.bottom)
+        self.nav = ttk.Frame(self.bottom, style="MergeChrome.TFrame")
         self.nav.pack(side="left", fill="x", expand=True)
-        ttk.Label(self.nav, text="Sheets（浅黄=预检，亮黄=确认）:").pack(side="left")
-        self.nav_canvas = tk.Canvas(self.nav, height=28, highlightthickness=0)
+        ttk.Label(self.nav, text="Sheets（浅黄=预检，亮黄=确认）:", style="MergeChrome.TLabel").pack(side="left")
+        self.nav_canvas = tk.Canvas(self.nav, height=24, highlightthickness=0, bg=self.workspace_chrome_color)
         self.nav_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.nav_scroll = ttk.Scrollbar(self.nav, orient="horizontal", command=self.nav_canvas.xview)
         self.nav_scroll.pack(side="bottom", fill="x")
         self.nav_canvas.configure(xscrollcommand=self.nav_scroll.set)
-        self.nav_inner = ttk.Frame(self.nav_canvas)
+        self.nav_inner = ttk.Frame(self.nav_canvas, style="MergeChrome.TFrame")
         self.nav_canvas.create_window((0, 0), window=self.nav_inner, anchor="nw")
         self.nav_inner.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
-        self.nb.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 6))
+        self.nb.pack(side="top", fill="both", expand=True, padx=10, pady=(2, 2))
 
         # Tabs are created up-front, but heavy SheetView is created lazily on first activation.
         self.sheet_views = {}
@@ -30427,16 +34756,18 @@ class SowMergeApp:
         rows_by_sheet = getattr(self, "merge_conflict_cells_by_sheet", None) or {}
         if not rows_by_sheet:
             return None
-        ordered_sheets = []
-        for sheet in tuple(getattr(self, "display_sheets", ()) or ()):
-            if sheet in rows_by_sheet and sheet not in ordered_sheets:
-                ordered_sheets.append(sheet)
-        for sheet in sorted(str(name) for name in rows_by_sheet):
-            if sheet not in ordered_sheets:
-                ordered_sheets.append(sheet)
+        displayed_sheets = tuple(
+            str(sheet) for sheet in (getattr(self, "display_sheets", ()) or ())
+        )
+        containers = getattr(self, "_sheet_containers", {}) or {}
+        ordered_sheets = [
+            sheet
+            for sheet in displayed_sheets
+            if sheet in rows_by_sheet and sheet in containers
+        ]
         for sheet in ordered_sheets:
             rows = rows_by_sheet.get(sheet) or {}
-            for row in sorted(int(value) for value in rows):
+            for row in sorted(int(value) for value in rows if int(value) > 0):
                 cols = rows.get(row) or set()
                 positive_cols = sorted(int(value) for value in cols if int(value) > 0)
                 if positive_cols:
@@ -30454,7 +34785,7 @@ class SowMergeApp:
         return (
             f"Sheet：{sheet}\n"
             f"位置：{coordinate}\n"
-            f"行号：{int(row)}　列号：{int(logical_col)}　逻辑列：L{int(logical_col)}"
+            f"行号：{int(row)}　列号：{_excel_column_display(logical_col)}"
         )
 
     def _show_unresolved_conflict_save_dialog(
@@ -31023,9 +35354,12 @@ def main():
                 return
             if sel[0] == "merge":
                 _mode, base_p, mine_p, theirs_p, merged_p, force_ui = sel
-                args.base = _ensure_xlsx_copy(base_p)
-                args.mine = _ensure_xlsx_copy(mine_p)
-                args.theirs = _ensure_xlsx_copy(theirs_p)
+                # Preserve auto-detected/file-picker conflict artifacts as raw
+                # SVN identities.  The shared startup analysis creates stable
+                # copies only after scenario/revision evidence is recorded.
+                args.base = base_p
+                args.mine = mine_p
+                args.theirs = theirs_p
                 args.merged = merged_p
                 args.force_ui = bool(force_ui)
             else:
@@ -31053,30 +35387,12 @@ def main():
         raw_mine_arg = args.mine
         raw_theirs_arg = args.theirs
 
-        # Normalize SVN merge temp files (merge-left/right.r####) by exporting true revision.
-        # IMPORTANT:
-        # - base/theirs may legitimately be revision snapshots.
-        # - mine must stay as the working-copy side; do NOT rewrite mine to a revision export,
-        #   otherwise local edits can be replaced by an old revision file.
-        full_merge_args = bool(args.base and args.mine and args.theirs and args.merged)
-        if (not full_merge_args) and args.base:
-            args.base = _try_export_svn_revision_from_merge_temp(args.base)
-        if args.theirs:
-            # In merge mode, keep "theirs" exactly as passed by SVN/Tortoise wrapper.
-            # This avoids accidental re-export to another revision snapshot and ensures
-            # content matches the user-visible *.merge-right.r#### sidecar file.
-            if not full_merge_args:
-                try:
-                    args.theirs = _try_export_svn_revision_from_merge_temp(args.theirs)
-                except Exception:
-                    args.theirs = args.theirs
-        if args.file_a:
-            args.file_a = _try_export_svn_revision_from_merge_temp(args.file_a)
-        if args.file_b:
-            args.file_b = _try_export_svn_revision_from_merge_temp(args.file_b)
+        # Preserve every sidecar exactly as TortoiseSVN supplied it.  In
+        # particular, a cross-branch ``.merge-left.rN`` is source Base and must
+        # never be guessed/re-exported from the target working copy.
         try:
             _trace_launch(
-                "normalized args: "
+                "raw-preserved args: "
                 + f"base={repr(args.base)} mine={repr(args.mine)} "
                 + f"theirs={repr(args.theirs)} merged={repr(args.merged)} "
                 + f"raw_base={repr(raw_base_arg)} raw_theirs={repr(raw_theirs_arg)}"
@@ -31084,57 +35400,50 @@ def main():
         except Exception:
             pass
 
-        # Merge mode (manual 3-way): detect conflicts only; do NOT pre-merge before UI.
+        # Merge mode: preserve raw roles, analyse four identities, then expose a
+        # separate safe candidate (never overwrite SVN's merged path at startup).
         if args.base and args.mine and args.theirs and args.merged:
             conflicts = []
             conflict_map = {}
+            launch_context = build_merge_launch_context(
+                raw_base_arg,
+                raw_mine_arg,
+                raw_theirs_arg,
+                args.merged,
+            )
+            analysis = None
             try:
                 _dlog(f"merge args: base={args.base} mine={args.mine} theirs={args.theirs} merged={args.merged}")
-                _dlog(f"merge manual mode unknown={unknown}")
+                _dlog(f"merge startup analysis unknown={unknown}")
             except Exception:
                 pass
             try:
                 def _prepare_merge_inputs(report):
-                    nonlocal raw_base_arg
-                    report("正在读取 SVN 合并来源", "从工作副本的 .svn 数据读取 BASE...", 5)
-                    base_source = None
-                    try:
-                        base_source = _try_export_svn_base_from_working_copy(args.merged)
-                    except Exception:
-                        base_source = None
-                    if base_source:
-                        _dlog(f"merge base selected from WC BASE: {base_source}")
-                        mine_for_note = raw_mine_arg or args.mine or args.merged or "-"
-                        raw_base_arg = f"{mine_for_note}@BASE(.svn)"
-                    else:
-                        report("正在读取 SVN 合并来源", "准备 TortoiseSVN 提供的 base 版本...", 15)
-                        base_source = _try_export_svn_revision_from_merge_temp(args.base)
+                    report("正在识别 SVN 三方角色", launch_context.classification_reason, 8)
+                    report("正在读取本地 WC pristine 和作者", "仅查询 .svn/wc.db，不访问网络...", 22)
+                    report("正在比较 OOXML 包", "逐成员比较 Base、Mine、Theirs 和 target pristine...", 45)
+                    result = run_startup_merge_analysis(launch_context)
+                    report(
+                        "三方启动分析完成",
+                        f"自动处理 {result.outcome.merged_count} 项；未解决 {result.outcome.unresolved_count} 项",
+                        100,
+                    )
+                    return result
 
-                    report("正在准备三方合并", "规范化 base 版本文件...", 22)
-                    base_path = _ensure_xlsx_copy(base_source)
-                    report("正在准备三方合并", "规范化 mine 工作副本...", 30)
-                    mine_path = _ensure_xlsx_copy(args.mine)
-                    report("正在准备三方合并", "规范化 theirs 版本文件...", 38)
-                    theirs_path = _ensure_xlsx_copy(args.theirs)
-                    _dlog("merge start: calling _scan_three_way_conflicts (no pre-merge)")
-                    report("正在扫描三方冲突", "精确比较 base、mine 和 theirs，请稍候...", 45)
-                    scan_conflicts, scan_map = _scan_three_way_conflicts(base_path, mine_path, theirs_path)
-                    report("三方扫描完成", f"检测到 {len(scan_conflicts)} 个冲突单元格", 100)
-                    return base_path, mine_path, theirs_path, scan_conflicts, scan_map
-
-                (
-                    args.base,
-                    args.mine,
-                    args.theirs,
-                    conflicts,
-                    conflict_map,
-                ) = _run_startup_progress_task(
-                    "Excel 合并工具 - 三方扫描",
-                    "正在准备 SVN 合并数据...",
+                analysis = _run_startup_progress_task(
+                    "Excel 合并工具 - 三方启动分析",
+                    "正在保留 SVN 原始语义并准备合并候选...",
                     _prepare_merge_inputs,
                 )
+                launch_context = analysis.context
+                conflicts = analysis.conflicts
+                conflict_map = analysis.conflict_cells_by_sheet
                 try:
-                    _dlog(f"merge scan result: conflicts={len(conflicts)} conflict_sheets={len(conflict_map)}")
+                    _dlog(
+                        f"merge startup result: scenario={launch_context.scenario.value} "
+                        f"action={analysis.outcome.automatic_action} conflicts={len(conflicts)} "
+                        f"conflict_sheets={len(conflict_map)}"
+                    )
                 except Exception:
                     pass
             except Exception as e:
@@ -31148,49 +35457,51 @@ def main():
                     print(f"Merge failed: {e}", file=sys.stderr)
                 sys.exit(1)
 
-            if conflicts:
-                detail_lines = []
-                for sheet, row_idx, col_idx, _mine_value, _theirs_value in conflicts[:3]:
-                    detail_lines.append(f"{sheet}!{get_column_letter(col_idx)}{row_idx}")
-                if len(conflicts) > 3:
-                    detail_lines.append("...")
-                startup_notice = (
-                    f"检测到 {len(conflicts)} 个冲突单元格，已进入手动 3 视图。"
-                    "请与协作者确认后再保存。"
-                )
-                if detail_lines:
-                    startup_notice += "  示例：" + "、".join(detail_lines)
-                startup_notice_warning = True
-            else:
-                startup_notice = (
-                    "未检测到直接冲突，已进入手动 3 视图。"
-                    "所有差异仍由你确认后保存。"
-                )
-                startup_notice_warning = False
+            base_identity = launch_context.identity_for("base")
+            mine_identity = launch_context.identity_for("mine")
+            theirs_identity = launch_context.identity_for("theirs")
+            candidate_path = analysis.outcome.candidate_path if analysis else None
+            ui_mine_path = candidate_path or (mine_identity.effective_path if mine_identity else args.mine)
+            ui_base_path = base_identity.effective_path if base_identity else args.base
+            ui_theirs_path = theirs_identity.effective_path if theirs_identity else args.theirs
 
             app = SowMergeApp(
-                args.mine,
-                args.theirs,
+                ui_mine_path,
+                ui_theirs_path,
                 merge_mode=True,
                 merged_path=args.merged,
-                base_path=args.base,
+                base_path=ui_base_path,
                 merge_conflict_cells_by_sheet=conflict_map,
                 merge_conflict_mode=False,
                 raw_base=raw_base_arg,
                 raw_mine=raw_mine_arg,
                 raw_theirs=raw_theirs_arg,
+                launch_context=launch_context,
+                startup_outcome=analysis.outcome if analysis else None,
             )
             try:
-                _dlog("open UI: manual 3-way mode")
+                _dlog("open UI: five-identity merge mode")
             except Exception:
                 pass
-            app.show_nonblocking_notice(
-                startup_notice,
-                warning=startup_notice_warning,
-                duration_ms=20000 if conflicts else 12000,
-            )
+            show_outcome = getattr(app, "show_startup_outcome_dialog_deferred", None)
+            if callable(show_outcome):
+                show_outcome()
+            else:
+                # Lightweight host/test adapters may not implement the new
+                # modal API; retain a harmless informational fallback.
+                app.show_nonblocking_notice("三方启动分析完成。", warning=bool(conflicts), duration_ms=8000)
             app.run()
             sys.exit(0)
+
+        # Two-way diff inputs can also be raw SVN sidecars such as
+        # ``Book.xlsx.r123``.  Preserve their diagnostic identities, but give
+        # openpyxl stable workbook-suffixed copies just as the three-way path
+        # does.  This is normalization only; it never re-exports or substitutes
+        # content from the working copy.
+        if a:
+            a = _ensure_xlsx_copy(a)
+        if b:
+            b = _ensure_xlsx_copy(b)
 
         if args.textdiff:
             try:
@@ -31230,4 +35541,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-author-query":
+        raise SystemExit(_run_tortoise_svn_author_probe_entrypoint(sys.argv[2:]))
     main()

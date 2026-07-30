@@ -30,6 +30,9 @@ class _Var:
     def get(self):
         return self.value
 
+    def set(self, value):
+        self.value = value
+
 
 def _rows(columns, count: int = 8, *, edit=None):
     columns = tuple(columns)
@@ -312,8 +315,8 @@ def test_only_diff_minimap_uses_logical_slots_without_row_flooding():
     assert diff_cols == [2, 3, 5, 7], diff_cols
     assert view._all_logical_diff_cols_for_pair(0) == {2, 3, 5}
     summary = view._column_structure_summary()
-    assert "L2:L3" in summary and "新增列" in summary, summary
-    assert "L5" in summary and "删除列" in summary, summary
+    assert "B:C" in summary and "新增列" in summary, summary
+    assert "E" in summary and "删除列" in summary, summary
 
 
 def test_three_way_common_base_missing_column_does_not_flood_visual_rows():
@@ -350,6 +353,34 @@ def test_three_way_common_base_missing_column_does_not_flood_visual_rows():
     # diff even though Base also lacks that common inserted column.
     view.pair_diff_cols[1] = {2}
     assert view._visual_diff_cols_for_pair(1) == {2}
+
+    # An explicitly accepted whole-column copy may still look different when
+    # row alignment pairs different physical rows.  Suppress that artifact
+    # only while the copied physical cells remain equal; a later real edit
+    # must immediately make the row visible again.
+    wb_a_val = Workbook()
+    wb_b_val = Workbook()
+    wb_a_edit = Workbook()
+    wb_b_edit = Workbook()
+    for workbook in (wb_a_val, wb_b_val, wb_a_edit, wb_b_edit):
+        workbook.active.title = view.sheet
+        workbook[view.sheet].cell(2, 2).value = "accepted-copy"
+    view.app = SimpleNamespace(
+        merge_mode=True,
+        has_base=True,
+        get_sheet_meta=lambda _sheet: {"view_mode": "normal"},
+        ws_a_val=lambda _sheet: wb_a_val[view.sheet],
+        ws_b_val=lambda _sheet: wb_b_val[view.sheet],
+        ws_a_edit=lambda _sheet: wb_a_edit[view.sheet],
+        ws_b_edit=lambda _sheet: wb_b_edit[view.sheet],
+    )
+    view._accepted_common_insert_sources = {2: "B"}
+    assert view._visual_diff_cols_for_pair(1) == set()
+    wb_a_val[view.sheet].cell(2, 2).value = "later-real-edit"
+    wb_a_edit[view.sheet].cell(2, 2).value = "later-real-edit"
+    assert view._visual_diff_cols_for_pair(1) == {2}
+    for workbook in (wb_a_val, wb_b_val, wb_a_edit, wb_b_edit):
+        workbook.close()
 
     unresolved = smt.ColumnMappingConfidence(
         0.0,
@@ -407,11 +438,15 @@ def test_only_diff_toggle_after_column_edit_caches_current_visual_rows_synchrono
     view.pair_base_diff_cols = {}
     view.only_diff_var = _Var(1)
     view._data_ready = True
+    view._row_model_exact = True
+    view._cache_formula_aware = True
+    view._pair_diff_full_exact = True
     view._is_large_sheet = True
     view._full_render = True
     view._last_only_diff_value = 0
     view._only_diff_rows_cache = None
     view._only_diff_rows_cache_key = None
+    view._active_column_projection()
     view.app.modified_sheets_a = {view.sheet}
     view.app.modified_sheets_b = set()
     view.app._start_background_thread = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -421,6 +456,8 @@ def test_only_diff_toggle_after_column_edit_caches_current_visual_rows_synchrono
     view._refresh_mode_switch_preserving_selection = (
         lambda *, rescan: refresh_calls.append(bool(rescan))
     )
+    view._schedule_cached_only_diff_mode_switch = lambda _value: False
+    view._refresh_interaction_gate = lambda: None
     view._persist_only_diff_setting_debounced = lambda: None
 
     smt.SheetView._toggle_only_diff(view)
@@ -716,6 +753,7 @@ def test_stale_lifecycle_rebuilds_before_geometry_and_append_has_no_free_rescan(
 def test_undo_and_save_guard_mapping_before_consuming_operations():
     undo_events = []
     undo_view = object.__new__(smt.SheetView)
+    undo_view._guard_mutation_ready = lambda _operation, **_kwargs: True
     undo_view._ensure_column_projection_current = lambda operation: undo_events.append(
         ("ensure", operation)
     )
@@ -724,7 +762,11 @@ def test_undo_and_save_guard_mapping_before_consuming_operations():
         undo_events.append(("pop", None))
         return None
 
-    undo_view.app = SimpleNamespace(pop_undo=_pop_undo)
+    undo_view.sheet = "S"
+    undo_view.app = SimpleNamespace(
+        pop_undo=_pop_undo,
+        undo_stack=[{"sheet": "S", "kind": "fixture"}],
+    )
     undo_view._undo_last_action()
     assert undo_events == [("ensure", "撤销操作"), ("pop", None)], undo_events
 
@@ -863,9 +905,18 @@ def test_real_gui_background_replay_only_diff_sync_and_click_x():
         view._sync_c_x_to_frac(0.42)
         _pump(app.root, 0.05)
         main_first = float(view.left.xview()[0])
-        for widget in (view.right, view.left_colhdr, view.right_colhdr, view.cursor_cmp, view.cursor_cmp_colhdr):
+        for widget in (view.right, view.left_colhdr, view.right_colhdr):
             assert abs(float(widget.xview()[0]) - main_first) < 0.025, (
                 widget, widget.xview(), view.left.xview()
+            )
+        expected_c = view._map_xfirst_between_widgets(
+            view.left,
+            view.cursor_cmp,
+            main_first,
+        )
+        for widget in (view.cursor_cmp, view.cursor_cmp_colhdr):
+            assert abs(float(widget.xview()[0]) - expected_c) < 0.025, (
+                widget, widget.xview(), expected_c
             )
 
         # Click a visible character after horizontal scrolling.  Tk converts
