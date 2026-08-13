@@ -57,7 +57,7 @@ def main():
                 break
         assert insert_pair is not None, view.row_pairs
         base_line = view._build_base_line(insert_pair).strip()
-        assert "此侧" in base_line, repr(base_line)
+        assert "此侧" in base_line.replace(mod._TK_INDEX_PLACEHOLDER, ""), repr(base_line)
 
         # The C-area cell action must use mine->base row mapping. Mine row 4
         # corresponds to base row 3 after the inserted B row.

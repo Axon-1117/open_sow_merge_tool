@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-31
+goal: Make 2-way global replacement actionable without risking wrong-column
+  writes, while preserving Chinese text and Excel-openable output.

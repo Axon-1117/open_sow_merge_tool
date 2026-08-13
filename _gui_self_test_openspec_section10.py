@@ -707,8 +707,14 @@ def test_global_merge_conflict_mode_apply_undo_and_failure_restore_metadata():
 def _assert_zero_write(view, app, direction: str = "B2A"):
     before = _app_mutation_state(app)
     view._set_copy_scope_mode("global")
-    view._run_copy_action_by_mode(direction)
-    _pump(app.root, 0.12)
+    original_chooser = getattr(view, "_ask_global_ambiguous_action", None)
+    view._ask_global_ambiguous_action = lambda _direction, _details: "cancel"
+    try:
+        view._run_copy_action_by_mode(direction)
+        _pump(app.root, 0.12)
+    finally:
+        if original_chooser is not None:
+            view._ask_global_ambiguous_action = original_chooser
     assert _app_mutation_state(app) == before
 
 

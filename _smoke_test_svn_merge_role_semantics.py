@@ -352,7 +352,11 @@ def test_two_way_sidecar_is_normalized_without_rewriting_raw_identity() -> None:
         "/mine",
         mine,
     ]
-    with patch.object(sys, "argv", argv), patch.object(smt, "SowMergeApp", _FakeApp):
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(smt, "SowMergeApp", _FakeApp),
+        patch.object(smt, "resolve_svn_author_metadata", lambda context: context.identities),
+    ):
         smt.main()
 
     assert captured.app_args is not None
@@ -365,6 +369,62 @@ def test_two_way_sidecar_is_normalized_without_rewriting_raw_identity() -> None:
     assert os.path.abspath(ui_mine) == os.path.abspath(mine)
     assert os.path.abspath(captured.app_kwargs["raw_base"]) == os.path.abspath(base)
     assert os.path.abspath(captured.app_kwargs["raw_mine"]) == os.path.abspath(mine)
+
+
+def test_two_way_production_path_preserves_author_metadata() -> None:
+    root = make_temp_dir("sow_two_way_author_context_")
+    base = os.path.join(root, "Design.xlsx.r301")
+    mine = os.path.join(root, "Design.xlsx")
+    _make_book(base, "base")
+    _make_book(mine, "mine")
+    captured = SimpleNamespace(app_kwargs=None)
+
+    class _FakeApp:
+        def __init__(self, *_args, **kwargs):
+            captured.app_kwargs = kwargs
+
+        def run(self):
+            return None
+
+    def _resolve(context):
+        context.identity_for("base").author = "alice"
+        context.identity_for("base").author_status = "resolved"
+        context.identity_for("mine").author = "bob"
+        context.identity_for("mine").author_status = "resolved"
+        return context.identities
+
+    argv = ["sow_merge_tool.py", "/base", base, "/mine", mine]
+    with (
+        patch.object(sys, "argv", argv),
+        patch.object(smt, "SowMergeApp", _FakeApp),
+        patch.object(smt, "resolve_svn_author_metadata", _resolve),
+    ):
+        smt.main()
+
+    context = captured.app_kwargs["launch_context"]
+    assert _scenario_name(context.scenario) == "TWO_WAY"
+    assert context.identity_for("base").author == "alice"
+    assert context.identity_for("mine").author == "bob"
+    assert "Author = alice" in smt.format_compact_version_identity(context.identity_for("base"))
+    assert "Author = bob" in smt.format_compact_version_identity(context.identity_for("mine"))
+    assert os.path.abspath(captured.app_kwargs["raw_base"]) == os.path.abspath(base)
+    assert os.path.abspath(captured.app_kwargs["raw_mine"]) == os.path.abspath(mine)
+
+
+def test_two_way_local_author_fallback_is_visible() -> None:
+    root = make_temp_dir("sow_two_way_author_fallback_")
+    base = os.path.join(root, "old.xlsx")
+    mine = os.path.join(root, "new.xlsx")
+    _make_book(base, "base")
+    _make_book(mine, "mine")
+    context = smt.build_merge_launch_context(base, mine, None)
+    identities = smt.resolve_svn_author_metadata(context)
+    assert identities["base"].author == "未知"
+    assert identities["mine"].author == "未知"
+    assert identities["base"].availability_reason
+    assert identities["mine"].availability_reason
+    assert "Author = 未知" in smt.format_compact_version_identity(identities["base"])
+    assert "Author = 未知" in smt.format_compact_version_identity(identities["mine"])
 
 
 def test_auto_detected_conflict_preserves_raw_sidecar_identities() -> None:
@@ -426,6 +486,8 @@ def main() -> None:
         test_update_production_path_preserves_raw_old_base,
         test_branch_production_path_preserves_merge_left,
         test_two_way_sidecar_is_normalized_without_rewriting_raw_identity,
+        test_two_way_production_path_preserves_author_metadata,
+        test_two_way_local_author_fallback_is_visible,
         test_auto_detected_conflict_preserves_raw_sidecar_identities,
     )
     for test in tests:

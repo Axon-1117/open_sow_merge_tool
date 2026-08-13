@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-07-30.update68"
-APP_BUILD_TAG = "new145-cjk-compact-layout"
+APP_VERSION = "2026-08-13.update72"
+APP_BUILD_TAG = "new149-missing-dimension-diff-fix"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -514,6 +514,41 @@ def load_workbook(filename, *args, **kwargs):
         return _openpyxl_load_workbook(repaired, *args, **kwargs)
 
 
+def _worksheet_scan_bounds(ws) -> tuple[int, int]:
+    """Return safe worksheet dimensions, recovering absent OOXML dimensions.
+
+    Some valid XLSX writers omit ``<dimension>`` from worksheet XML.  Excel
+    scans the sheet data when opening those files, but openpyxl's read-only
+    mode leaves ``max_row`` and ``max_column`` as ``None``.  Treating that as
+    a 1x1 sheet makes every later column look deleted.  Ask openpyxl to scan
+    only in that incomplete-metadata case; normal workbooks keep their cheap
+    declared dimensions.
+    """
+    try:
+        max_r = getattr(ws, "max_row", None)
+        max_c = getattr(ws, "max_column", None)
+    except Exception:
+        return 1, 1
+    if max_r is None or max_c is None:
+        try:
+            ws.calculate_dimension(force=True)
+            max_r = getattr(ws, "max_row", None)
+            max_c = getattr(ws, "max_column", None)
+            _dlog(
+                f"worksheet dimension recovered: sheet={getattr(ws, 'title', '?')} "
+                f"rows={max_r} cols={max_c}"
+            )
+        except Exception as e:
+            _dlog(
+                f"worksheet dimension recovery failed: sheet={getattr(ws, 'title', '?')} "
+                f"err={e}"
+            )
+    try:
+        return max(1, int(max_r or 1)), max(1, int(max_c or 1))
+    except (TypeError, ValueError):
+        return 1, 1
+
+
 def _blank_worksheet(title: str = "Sheet"):
     wb = Workbook()
     ws = wb.active
@@ -656,13 +691,23 @@ def _shared_physical_row_horizon(
     effective bounds so genuine row inserts are not hidden.
     """
     try:
+        left_rows, _left_cols = _worksheet_scan_bounds(ws_left)
+        right_rows, _right_cols = _worksheet_scan_bounds(ws_right)
+        left_edit_rows = (
+            _worksheet_scan_bounds(ws_left_edit)[0]
+            if ws_left_edit is not None else 1
+        )
+        right_edit_rows = (
+            _worksheet_scan_bounds(ws_right_edit)[0]
+            if ws_right_edit is not None else 1
+        )
         physical_left = max(
-            int(ws_left.max_row or 1),
-            int(ws_left_edit.max_row or 1) if ws_left_edit is not None else 1,
+            left_rows,
+            left_edit_rows,
         )
         physical_right = max(
-            int(ws_right.max_row or 1),
-            int(ws_right_edit.max_row or 1) if ws_right_edit is not None else 1,
+            right_rows,
+            right_edit_rows,
         )
     except Exception:
         return max(1, int(effective_left or 1)), max(1, int(effective_right or 1))
@@ -3485,8 +3530,10 @@ def _compute_row_pairs_generic(
     ws_b_edit=None,
 ):
     """Compute row alignment pairs between two worksheets."""
-    max_row_a = max(1, int(max_row_a if max_row_a is not None else (ws_a.max_row or 1)))
-    max_row_b = max(1, int(max_row_b if max_row_b is not None else (ws_b.max_row or 1)))
+    ws_a_rows, ws_a_cols = _worksheet_scan_bounds(ws_a)
+    ws_b_rows, ws_b_cols = _worksheet_scan_bounds(ws_b)
+    max_row_a = max(1, int(max_row_a if max_row_a is not None else ws_a_rows))
+    max_row_b = max(1, int(max_row_b if max_row_b is not None else ws_b_rows))
     max_row_a, max_row_b = _shared_physical_row_horizon(
         ws_a,
         ws_b,
@@ -3501,14 +3548,8 @@ def _compute_row_pairs_generic(
     if not _should_auto_row_align(max_row_a, max_row_b, force=force):
         return [(r if r <= max_row_a else None, r if r <= max_row_b else None) for r in range(1, max_row + 1)]
 
-    source_width_a = max(
-        int(ws_a.max_column or 1),
-        int(ws_a_edit.max_column or 1) if ws_a_edit is not None else 1,
-    )
-    source_width_b = max(
-        int(ws_b.max_column or 1),
-        int(ws_b_edit.max_column or 1) if ws_b_edit is not None else 1,
-    )
+    source_width_a = max(ws_a_cols, _worksheet_scan_bounds(ws_a_edit)[1] if ws_a_edit is not None else 1)
+    source_width_b = max(ws_b_cols, _worksheet_scan_bounds(ws_b_edit)[1] if ws_b_edit is not None else 1)
     width_a = max(1, min(int(max_col or 1), source_width_a))
     width_b = max(1, min(int(max_col or 1), source_width_b))
     rows_a_cache = _read_rows_into_cache(
@@ -4169,6 +4210,16 @@ def _copy_sheet_basic(src_ws, dst_ws):
         dst_ws.auto_filter = copy.copy(src_ws.auto_filter)
     except Exception:
         pass
+    try:
+        dst_ws.data_validations = copy.deepcopy(src_ws.data_validations)
+    except Exception:
+        pass
+    try:
+        dst_ws.conditional_formatting._cf_rules = copy.deepcopy(
+            src_ws.conditional_formatting._cf_rules
+        )
+    except Exception:
+        pass
 
 
 def _remove_sheet_if_exists(wb, sheet_name: str):
@@ -4413,8 +4464,7 @@ def _effective_bounds(ws):
     artificially large. On read-only worksheets we avoid shrinking max_col from a
     single tail row because that can truncate real columns seen earlier in the sheet.
     """
-    max_r = ws.max_row or 1
-    max_c = ws.max_column or 1
+    max_r, max_c = _worksheet_scan_bounds(ws)
     last_r = 1
     last_c = 1
     found = False
@@ -7827,7 +7877,11 @@ def _build_manual_merge_output_with_excel(
             "$mineSrc='" + mine_src + "';"
             "$baseSrc='" + base_src + "';"
             "$theirsSrc='" + theirs_src + "';"
-            "$payload=Get-Content -Raw -LiteralPath $opsPath | ConvertFrom-Json;"
+            # The producer writes UTF-8 JSON without a locale-specific BOM.
+            # Windows PowerShell's default Get-Content decoding follows the
+            # active system code page and can turn Chinese payloads into
+            # mojibake before Excel receives them.  Read the bytes explicitly.
+            "$payload=ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($opsPath,[System.Text.Encoding]::UTF8));"
             "$xl=$null;$wb=$null;$wbMine=$null;$wbBase=$null;$wbTheirs=$null;$wbCheck=$null;"
             "try{"
             "$xl=New-Object -ComObject Excel.Application;"
@@ -7859,9 +7913,21 @@ def _build_manual_merge_output_with_excel(
             "    elseif($op.source_side -eq 'A'){$srcWs=$wb.Worksheets.Item($op.sheet)};"
             "    if($srcWs -eq $null){continue};"
             "    try{$wb.Worksheets.Item($op.sheet).Delete()}catch{};"
-            "    $after=$wb.Worksheets.Item($wb.Worksheets.Count);"
-            "    $srcWs.Copy($null, $after);"
-            "    $newWs=$wb.Worksheets.Item($wb.Worksheets.Count);"
+            "    $targetIndex=$null;try{$targetIndex=[int]$op.target_index}catch{$targetIndex=$null};"
+            "    if($null -eq $targetIndex){"
+            "      $after=$wb.Worksheets.Item($wb.Worksheets.Count);"
+            "      $srcWs.Copy($null, $after);"
+            "    }elseif($targetIndex -le 0){"
+            "      $before=$wb.Worksheets.Item(1);"
+            "      $srcWs.Copy($before, $null);"
+            "    }else{"
+            "      $afterIndex=[Math]::Min($targetIndex,[int]$wb.Worksheets.Count);"
+            "      $after=$wb.Worksheets.Item($afterIndex);"
+            "      $srcWs.Copy($null, $after);"
+            "    };"
+            "    if($null -eq $targetIndex){$newWs=$wb.Worksheets.Item($wb.Worksheets.Count)}"
+            "    elseif($targetIndex -le 0){$newWs=$wb.Worksheets.Item(1)}"
+            "    else{$newWs=$wb.Worksheets.Item([Math]::Min($afterIndex + 1,[int]$wb.Worksheets.Count))};"
             "    try{$newWs.Name=$op.sheet}catch{};"
             "  }"
             "};"
@@ -8058,7 +8124,13 @@ def _build_manual_merge_output_with_openpyxl(
                 src_ws = wb_b[sheet] if wb_b is not None and sheet in wb_b.sheetnames else None
             if src_ws is None:
                 continue
-            _create_sheet_from_source(wb, src_ws, sheet)
+            target_index = op.get("target_index")
+            _create_sheet_from_source(
+                wb,
+                src_ws,
+                sheet,
+                index=(int(target_index) if target_index is not None else None),
+            )
         for op in list(row_ops or []):
             kind = str(op.get("kind") or "")
             if kind not in ("insert_rows", "delete_rows"):
@@ -8105,7 +8177,12 @@ def _build_manual_merge_output_with_openpyxl(
 def _merge_cmp_value(v):
     """Build a type-aware comparison key without collapsing meaningful data."""
     try:
-        if v is None:
+        # Excel/openpyxl can represent a visually empty cell either as an
+        # absent value (None) or as an exact zero-length string.  They render
+        # identically and must not create a value diff.  Formula identity is
+        # checked before this helper by the formula-aware comparison paths, so
+        # this does not hide formula-vs-literal or distinct-formula changes.
+        if v is None or (isinstance(v, str) and v == ""):
             return "BLANK:"
         if isinstance(v, bool):
             return "BOOL:1" if v else "BOOL:0"
@@ -8147,8 +8224,8 @@ def _scan_formula_cache(path: str):
             if sheet not in wb_val.sheetnames:
                 continue
             ws_v = wb_val[sheet]
-            max_row = max(int(ws_e.max_row or 1), int(ws_v.max_row or 1))
-            max_col = max(int(ws_e.max_column or 1), int(ws_v.max_column or 1))
+            max_row = max(_worksheet_scan_bounds(ws_e)[0], _worksheet_scan_bounds(ws_v)[0])
+            max_col = max(_worksheet_scan_bounds(ws_e)[1], _worksheet_scan_bounds(ws_v)[1])
             edit_rows = ws_e.iter_rows(
                 min_row=1, max_row=max_row, min_col=1, max_col=max_col,
                 values_only=False,
@@ -14186,14 +14263,35 @@ class SheetView:
                 self.path_label_base._identity_detail_text = base_detail
                 self.path_label_b._identity_detail_text = theirs_detail
             else:
+                context = getattr(self.app, "launch_context", None)
+                base_identity = context.identity_for("base") if context else None
+                mine_identity = context.identity_for("mine") if context else None
+                base_label = merge_role_label(context, "base")
+                mine_label = merge_role_label(context, "mine")
                 base_src = getattr(self.app, "raw_base", None) or self.app.file_a
                 mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
-                left_text = f"base={self._source_display_name(base_src)}" if meta.get("has_a") else "base=空白(该侧无此Sheet)"
-                right_text = f"mine={self._source_display_name(mine_src)}" if meta.get("has_b") else "mine=空白(该侧无此Sheet)"
+                left_text = (
+                    base_label + "=" + format_compact_version_identity(base_identity)
+                    if meta.get("has_a") and base_identity
+                    else (f"{base_label}={self._source_display_name(base_src)}" if meta.get("has_a") else f"{base_label}=空白(该侧无此Sheet)")
+                )
+                right_text = (
+                    mine_label + "=" + format_compact_version_identity(mine_identity)
+                    if meta.get("has_b") and mine_identity
+                    else (f"{mine_label}={self._source_display_name(mine_src)}" if meta.get("has_b") else f"{mine_label}=空白(该侧无此Sheet)")
+                )
                 self.path_label_a.configure(text=left_text, bg=_BASE_BG)
                 self.path_label_b.configure(text=right_text, bg=_MINE_BG)
-                self.path_label_a._identity_detail_text = f"Base\n完整路径：{base_src}"
-                self.path_label_b._identity_detail_text = f"Mine\n完整路径：{mine_src}"
+                self.path_label_a._identity_detail_text = (
+                    self._identity_detail_text(base_label, base_identity)
+                    if meta.get("has_a") and base_identity
+                    else f"{base_label}\n完整路径：{base_src}"
+                )
+                self.path_label_b._identity_detail_text = (
+                    self._identity_detail_text(mine_label, mine_identity)
+                    if meta.get("has_b") and mine_identity
+                    else f"{mine_label}\n完整路径：{mine_src}"
+                )
         except Exception:
             pass
         try:
@@ -19714,6 +19812,474 @@ class SheetView:
             f"GLOBAL_APPLY_BLOCKED sheet={self.sheet} reason={reason} text={message}"
         )
 
+    def _global_column_cause_text(self, logical_col: int) -> str:
+        """Return the user-facing cause for one unresolved logical column."""
+        slot_index = int(logical_col) - 1
+        try:
+            projection = self._active_column_projection()
+            for block in projection.model.blocks:
+                if slot_index in block.slot_indices:
+                    return self._column_block_cause_text(block)
+        except Exception:
+            pass
+        return "列映射待确认"
+
+    def _collect_global_ambiguous_diff_details(
+        self,
+        direction: str,
+        diff_map: dict[int, set[int]],
+        projection: LogicalColumnProjection,
+    ) -> tuple[dict[str, object], ...]:
+        """Collect unresolved columns that actually contain exact differences.
+
+        An unresolved slot with equal source/destination cells is harmless for
+        value-level global replacement.  Only slots present in the exact diff
+        map are blockers, and the returned records are deliberately small so
+        they can be shown in a modal dialog without rendering the whole sheet.
+        """
+        cache = self._active_column_comparison_cache()
+        unresolved = set(int(col) for col in cache.unresolved_cols)
+        if not unresolved:
+            return ()
+        source_side, destination_side = {
+            "A2B": ("A", "B"),
+            "B2A": ("B", "A"),
+            "BASE2A": ("BASE", "A"),
+        }.get(str(direction or ""), (None, None))
+        if source_side is None or destination_side is None:
+            return ()
+        details: dict[int, dict[str, object]] = {}
+        for pair_idx, raw_cols in (diff_map or {}).items():
+            ambiguous_cols = sorted(
+                int(col)
+                for col in (raw_cols or ())
+                if int(col) > 0 and int(col) in unresolved
+            )
+            if not ambiguous_cols:
+                continue
+            try:
+                pair = self.row_pairs[int(pair_idx)]
+            except (IndexError, TypeError, ValueError):
+                pair = None
+            source_row = (
+                self._base_row_for_pair(int(pair_idx), pair)
+                if source_side == "BASE"
+                else self._row_for_side(pair, source_side)
+            )
+            destination_row = self._row_for_side(pair, destination_side)
+            for logical_col in ambiguous_cols:
+                item = details.setdefault(
+                    logical_col,
+                    {
+                        "logical_col": logical_col,
+                        "cause": self._global_column_cause_text(logical_col),
+                        "source_col": projection.physical_col(source_side, logical_col),
+                        "destination_col": projection.physical_col(destination_side, logical_col),
+                        "count": 0,
+                        "samples": [],
+                    },
+                )
+                item["count"] = int(item.get("count", 0)) + 1
+                samples = item.setdefault("samples", [])
+                if len(samples) >= 4:
+                    continue
+                source_col = projection.physical_col(source_side, logical_col)
+                destination_col = projection.physical_col(destination_side, logical_col)
+                if source_row is not None and destination_row is not None:
+                    source_text = (
+                        f"{source_side}!{_excel_column_display(source_col)}{int(source_row)}"
+                        if source_col is not None
+                        else f"{source_side}!缺列"
+                    )
+                    destination_text = (
+                        f"{destination_side}!{_excel_column_display(destination_col)}{int(destination_row)}"
+                        if destination_col is not None
+                        else f"{destination_side}!缺列"
+                    )
+                    samples.append(f"{source_text} ↔ {destination_text}")
+                else:
+                    samples.append(
+                        f"行映射 {pair_idx}（{source_side}行={source_row or '-'}，"
+                        f"{destination_side}行={destination_row or '-'}）"
+                    )
+        return tuple(details[col] for col in sorted(details))
+
+    def _confirm_global_sheet_overwrite(
+        self,
+        source_side: str,
+        target_side: str,
+    ) -> bool:
+        source_label = self._merge_side_label(source_side)
+        target_label = self._merge_side_label(target_side)
+        return bool(
+            messagebox.askyesno(
+                "确认整 Sheet 覆盖",
+                (
+                    f"即将使用{source_label}整张 Sheet 覆盖{target_label}。\n\n"
+                    "这是高风险操作，将替换目标 Sheet 的全部内容和结构，"
+                    "包括目标侧独有的单元格、行列、公式、样式、合并区域、"
+                    "批注、超链接、数据验证、隐藏状态和布局。\n\n"
+                    "确认继续吗？"
+                ),
+                parent=self.root,
+            )
+        )
+
+    def _ask_global_ambiguous_action(
+        self,
+        direction: str,
+        details: tuple[dict[str, object], ...],
+    ) -> str:
+        """Ask how to proceed after a real ambiguous global difference.
+
+        The return value is ``cancel``, ``A2B_SHEET`` or ``B2A_SHEET``.  A
+        separate destructive confirmation is required for either Sheet copy.
+        3-way callers are intentionally handled by the existing fail-closed
+        feedback path and never reach this dialog.
+        """
+        if self._is_three_way_enabled() or not details:
+            return "cancel"
+        result = {"action": "cancel"}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("全局替换遇到歧义列")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.minsize(720, 420)
+
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"Sheet“{self.sheet}”无法安全执行单元格级全局替换",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text=(
+                "以下列既无法唯一确认左右对应关系，又存在真实差异。"
+                "工具不会猜测目标物理列。请返回检查，或明确选择整 Sheet 覆盖。"
+            ),
+            justify="left",
+            wraplength=680,
+        ).pack(anchor="w", pady=(7, 8))
+
+        text = tk.Text(body, height=13, width=88, wrap="word")
+        text.pack(fill="both", expand=True)
+        lines = []
+        for item in details:
+            logical_label = _excel_column_display(int(item["logical_col"]))
+            source_col = item.get("source_col")
+            destination_col = item.get("destination_col")
+            physical = (
+                f"左右物理列 {source_col or '-'} ↔ {destination_col or '-'}"
+            )
+            samples = "、".join(str(value) for value in item.get("samples") or ())
+            if samples:
+                samples = f"；示例：{samples}"
+            lines.append(
+                f"列 {logical_label}：{item.get('cause') or '列映射待确认'}；"
+                f"{physical}；差异 {int(item.get('count', 0))} 个{samples}"
+            )
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+
+        ttk.Label(
+            body,
+            text="整 Sheet 覆盖会丢弃目标侧当前 Sheet 的独有内容，执行前还会再次确认。",
+            foreground="#B3261E",
+            justify="left",
+            wraplength=680,
+        ).pack(anchor="w", pady=(9, 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(12, 0))
+
+        def _close():
+            result["action"] = "cancel"
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        def _choose(action: str, source_side: str, target_side: str):
+            if not self._confirm_global_sheet_overwrite(source_side, target_side):
+                return
+            result["action"] = action
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(buttons, text="返回检查", command=_close).pack(side="right")
+        ttk.Button(
+            buttons,
+            text="左侧整 Sheet 覆盖右侧",
+            command=lambda: _choose("A2B_SHEET", "A", "B"),
+        ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            buttons,
+            text="右侧整 Sheet 覆盖左侧",
+            command=lambda: _choose("B2A_SHEET", "B", "A"),
+        ).pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+        dialog.bind("<Escape>", lambda _event: _close())
+        try:
+            dialog.update_idletasks()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            dw = dialog.winfo_width()
+            dh = dialog.winfo_height()
+            dialog.geometry(f"+{max(0, rx + (rw - dw) // 2)}+{max(0, ry + (rh - dh) // 2)}")
+        except Exception:
+            pass
+        dialog.grab_set()
+        try:
+            dialog.focus_force()
+        except Exception:
+            pass
+        dialog.wait_window()
+        return str(result.get("action") or "cancel")
+
+    def _capture_global_sheet_copy_snapshot(self, target_side: str) -> dict[str, object]:
+        """Capture target Sheet and operation bookkeeping for one-step undo."""
+        target_side = str(target_side or "").upper()
+        target_val_wb, target_edit_wb = self.app._workbooks_for_side(target_side)
+        target_index = None
+        edit_snapshot = None
+        value_snapshot = None
+        if target_edit_wb is not None and self.sheet in target_edit_wb.sheetnames:
+            target_index = int(target_edit_wb.sheetnames.index(self.sheet))
+            snapshot_wb = Workbook()
+            snapshot_wb.remove(snapshot_wb.active)
+            _create_sheet_from_source(snapshot_wb, target_edit_wb[self.sheet], self.sheet, index=0)
+            edit_snapshot = snapshot_wb
+        if target_val_wb is not None and self.sheet in target_val_wb.sheetnames:
+            snapshot_wb = Workbook()
+            snapshot_wb.remove(snapshot_wb.active)
+            _create_sheet_from_source(snapshot_wb, target_val_wb[self.sheet], self.sheet, index=0)
+            value_snapshot = snapshot_wb
+        return {
+            "sheet": self.sheet,
+            "target_side": target_side,
+            "target_index": target_index,
+            "edit_snapshot": edit_snapshot,
+            "value_snapshot": value_snapshot,
+            "manual_sheet_ops": copy.deepcopy(list(self.app.manual_sheet_ops)),
+            "modified_a": bool(self.app.modified_a),
+            "modified_b": bool(self.app.modified_b),
+            "modified_sheets_a": set(self.app.modified_sheets_a),
+            "modified_sheets_b": set(self.app.modified_sheets_b),
+            "manual_cell_ops": copy.deepcopy(
+                dict(self.app.manual_a_cell_ops if target_side == "A" else self.app.manual_b_cell_ops)
+            ),
+            "manual_formula_cache_ops": copy.deepcopy(
+                dict(
+                    self.app.manual_a_formula_cache_ops
+                    if target_side == "A"
+                    else self.app.manual_b_formula_cache_ops
+                )
+            ),
+            "manual_row_ops": copy.deepcopy(
+                list(self.app.manual_a_row_ops if target_side == "A" else self.app.manual_b_row_ops)
+            ),
+            "manual_column_ops": copy.deepcopy(
+                list(
+                    self.app.manual_a_column_ops
+                    if target_side == "A"
+                    else self.app.manual_b_column_ops
+                )
+            ),
+            "touched_rows": set(self.touched_rows),
+        }
+
+    def _discard_global_sheet_target_ops(self, target_side: str):
+        """Make a confirmed Sheet replacement authoritative at save time."""
+        target_side = str(target_side or "").upper()
+        if target_side == "A":
+            cell_ops = self.app.manual_a_cell_ops
+            formula_cache_ops = self.app.manual_a_formula_cache_ops
+            row_ops = self.app.manual_a_row_ops
+            column_ops = self.app.manual_a_column_ops
+        else:
+            cell_ops = self.app.manual_b_cell_ops
+            formula_cache_ops = self.app.manual_b_formula_cache_ops
+            row_ops = self.app.manual_b_row_ops
+            column_ops = self.app.manual_b_column_ops
+        for op_map in (cell_ops, formula_cache_ops):
+            for key in list(op_map):
+                if key[0] == self.sheet:
+                    op_map.pop(key, None)
+        row_ops[:] = [op for op in row_ops if str(op.get("sheet") or "") != self.sheet]
+        column_ops[:] = [op for op in column_ops if str(op.get("sheet") or "") != self.sheet]
+        self.app.manual_sheet_ops[:] = [
+            op
+            for op in self.app.manual_sheet_ops
+            if not (
+                str(op.get("sheet") or "") == self.sheet
+                and str(op.get("target_side") or "").upper() == target_side
+            )
+        ]
+
+    def _restore_global_sheet_copy_snapshot(self, snapshot: dict[str, object]):
+        """Restore a pre-overwrite Sheet and all target-side operation state."""
+        if not isinstance(snapshot, dict) or snapshot.get("sheet") != self.sheet:
+            raise RuntimeError("整 Sheet 覆盖撤销快照无效")
+        target_side = str(snapshot.get("target_side") or "").upper()
+        target_val_wb, target_edit_wb = self.app._workbooks_for_side(target_side)
+        target_index = snapshot.get("target_index")
+
+        def _restore_one(dst_wb, source_wb):
+            if dst_wb is None:
+                return
+            _remove_sheet_if_exists(dst_wb, self.sheet)
+            if source_wb is not None and self.sheet in source_wb.sheetnames:
+                _create_sheet_from_source(
+                    dst_wb,
+                    source_wb[self.sheet],
+                    self.sheet,
+                    index=(int(target_index) if target_index is not None else None),
+                )
+
+        _restore_one(target_edit_wb, snapshot.get("edit_snapshot"))
+        _restore_one(target_val_wb, snapshot.get("value_snapshot"))
+        self.app.manual_sheet_ops[:] = copy.deepcopy(
+            list(snapshot.get("manual_sheet_ops") or [])
+        )
+        if target_side == "A":
+            self.app.manual_a_cell_ops.clear()
+            self.app.manual_a_cell_ops.update(copy.deepcopy(dict(snapshot.get("manual_cell_ops") or {})))
+            self.app.manual_a_formula_cache_ops.clear()
+            self.app.manual_a_formula_cache_ops.update(
+                copy.deepcopy(dict(snapshot.get("manual_formula_cache_ops") or {}))
+            )
+            self.app.manual_a_row_ops[:] = copy.deepcopy(list(snapshot.get("manual_row_ops") or []))
+            self.app.manual_a_column_ops[:] = copy.deepcopy(list(snapshot.get("manual_column_ops") or []))
+            self.app.modified_a = bool(snapshot.get("modified_a", False))
+        else:
+            self.app.manual_b_cell_ops.clear()
+            self.app.manual_b_cell_ops.update(copy.deepcopy(dict(snapshot.get("manual_cell_ops") or {})))
+            self.app.manual_b_formula_cache_ops.clear()
+            self.app.manual_b_formula_cache_ops.update(
+                copy.deepcopy(dict(snapshot.get("manual_formula_cache_ops") or {}))
+            )
+            self.app.manual_b_row_ops[:] = copy.deepcopy(list(snapshot.get("manual_row_ops") or []))
+            self.app.manual_b_column_ops[:] = copy.deepcopy(list(snapshot.get("manual_column_ops") or []))
+            self.app.modified_b = bool(snapshot.get("modified_b", False))
+        self.app.modified_sheets_a.clear()
+        self.app.modified_sheets_a.update(set(snapshot.get("modified_sheets_a") or set()))
+        self.app.modified_sheets_b.clear()
+        self.app.modified_sheets_b.update(set(snapshot.get("modified_sheets_b") or set()))
+        self.touched_rows.clear()
+        self.touched_rows.update(set(snapshot.get("touched_rows") or set()))
+        self.app._refresh_sheet_catalog()
+        self._mark_column_mapping_stale(
+            "undo-sheet-copy",
+            row_structure=True,
+            column_structure=True,
+            edited_sides=(target_side,),
+        )
+        self._data_ready = False
+        self._bounds_checked = False
+        self._invalidate_only_diff_snapshot_cache()
+        self._invalidate_render_cache()
+        self._update_sheet_role_labels()
+        self.app.refresh_sheet_nav()
+        self.refresh(row_only=None, rescan=True)
+        self._update_cursor_lines()
+
+    def _apply_global_sheet_overwrite(self, source_side: str, target_side: str) -> bool:
+        """Replace the target Sheet after an explicit ambiguity decision."""
+        if self._is_three_way_enabled():
+            return False
+        if not self._guard_mutation_ready("整 Sheet 覆盖"):
+            return False
+        source_side = str(source_side or "").upper()
+        target_side = str(target_side or "").upper()
+        if source_side not in ("A", "B") or target_side not in ("A", "B"):
+            return False
+        snapshot = self._capture_global_sheet_copy_snapshot(target_side)
+        begin_interactive = getattr(self.app, "_begin_interactive_action", None)
+        end_interactive = getattr(self.app, "_end_interactive_action", None)
+        interactive_started = False
+        previous_bg_suppression = bool(getattr(self, "_suppress_bg_apply", False))
+        started = time.perf_counter()
+        try:
+            if callable(begin_interactive):
+                begin_interactive(self)
+                interactive_started = True
+            self._suppress_bg_apply = True
+            self._discard_global_sheet_target_ops(target_side)
+            self.info.configure(
+                text=(
+                    f"正在使用{self._merge_side_label(source_side)}整 Sheet 覆盖"
+                    f"{self._merge_side_label(target_side)}..."
+                )
+            )
+            self.root.configure(cursor="watch")
+            self.root.update_idletasks()
+            self.app._copy_sheet_between_sides(self.sheet, source_side, target_side)
+            self._mark_column_mapping_stale(
+                "global-sheet-overwrite",
+                row_structure=True,
+                column_structure=True,
+                edited_sides=(target_side,),
+            )
+            self._data_ready = False
+            self._bounds_checked = False
+            self._invalidate_only_diff_snapshot_cache()
+            self._invalidate_render_cache()
+            self._update_sheet_role_labels()
+            self.app.refresh_sheet_nav()
+            self.refresh(row_only=None, rescan=True)
+            self._update_cursor_lines()
+            self.app.push_undo({
+                "kind": "global_sheet_copy",
+                "sheet": self.sheet,
+                "target": target_side,
+                "source": source_side,
+                "snapshot": snapshot,
+            })
+            elapsed = time.perf_counter() - started
+            self.info.configure(
+                text=(
+                    f"已使用{self._merge_side_label(source_side)}整 Sheet 覆盖"
+                    f"{self._merge_side_label(target_side)}，耗时 {elapsed:.1f} 秒"
+                )
+            )
+            _dlog(
+                f"GLOBAL_SHEET_COPY_DONE sheet={self.sheet} source={source_side} "
+                f"target={target_side} ms={elapsed * 1000.0:.1f}"
+            )
+            return True
+        except Exception as exc:
+            try:
+                self._restore_global_sheet_copy_snapshot(snapshot)
+            except Exception as rollback_error:
+                _dlog(
+                    f"CRITICAL global Sheet rollback failed sheet={self.sheet} "
+                    f"err={rollback_error}"
+                )
+            _dlog(
+                f"GLOBAL_SHEET_COPY_ERROR sheet={self.sheet} source={source_side} "
+                f"target={target_side} err={type(exc).__name__}:{exc}"
+            )
+            messagebox.showerror(
+                "整 Sheet 覆盖失败",
+                f"整 Sheet 覆盖失败，已尝试完整还原：\n{exc}",
+                parent=self.root,
+            )
+            return False
+        finally:
+            self._suppress_bg_apply = previous_bg_suppression
+            if interactive_started and callable(end_interactive):
+                end_interactive()
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
+
     def _capture_global_safe_apply_snapshot(
         self,
         direction: str,
@@ -19914,20 +20480,37 @@ class SheetView:
                 reason="column-structure",
             )
             return False
-        if cache.unresolved_cols:
-            cols = ", ".join(
-                _excel_column_display(int(col))
-                for col in sorted(cache.unresolved_cols)
-            )
-            self._show_global_apply_feedback(
-                f"本 Sheet 含歧义列映射（{cols}）；请先确认列结构。",
-                reason="column-ambiguous",
-            )
-            return False
-
         source_side, destination_side = side_pair
         diff_map = self.pair_base_diff_cols if direction == "BASE2A" else self.pair_diff_cols
         projection = self._active_column_projection()
+
+        ambiguous_details = self._collect_global_ambiguous_diff_details(
+            direction,
+            diff_map,
+            projection,
+        )
+        if ambiguous_details:
+            if self._is_three_way_enabled():
+                cols = ", ".join(
+                    _excel_column_display(int(item["logical_col"]))
+                    for item in ambiguous_details
+                )
+                self._show_global_apply_feedback(
+                    f"真实差异落在歧义列（{cols}）；请先确认列结构。",
+                    reason="column-ambiguous-diff",
+                )
+                return False
+            action = self._ask_global_ambiguous_action(direction, ambiguous_details)
+            if action == "A2B_SHEET":
+                return self._apply_global_sheet_overwrite("A", "B")
+            if action == "B2A_SHEET":
+                return self._apply_global_sheet_overwrite("B", "A")
+            self._show_global_apply_feedback(
+                "真实差异落在歧义列；已取消写入。",
+                reason="column-ambiguous-diff-canceled",
+            )
+            return False
+
         candidates: list[tuple[int, tuple[int, ...]]] = []
         blocker = None
         for pair_idx in range(len(self.row_pairs)):
@@ -26740,6 +27323,19 @@ class SheetView:
                 undo_view.refresh(row_only=None, rescan=False)
                 undo_view._update_cursor_lines()
                 return
+            if action.get("kind") == "global_sheet_copy":
+                undo_view._restore_global_sheet_copy_snapshot(
+                    action.get("snapshot") or {}
+                )
+                try:
+                    undo_view.info.configure(text="已撤销整 Sheet 覆盖。")
+                except Exception:
+                    pass
+                _dlog(
+                    f"UNDO_GLOBAL_SHEET_COPY sheet={action.get('sheet')} "
+                    f"source={action.get('source')} target={action.get('target')}"
+                )
+                return
             sheet = action.get("sheet")
             target = action.get("target")
             if sheet == undo_view.sheet:
@@ -30620,14 +31216,23 @@ class SowMergeApp:
                 return True
         return False
 
-    def record_manual_sheet_copy(self, sheet: str, source_side: str, target_side: str):
+    def record_manual_sheet_copy(
+        self,
+        sheet: str,
+        source_side: str,
+        target_side: str,
+        target_index: int | None = None,
+    ):
         try:
-            self.manual_sheet_ops.append({
+            operation = {
                 "kind": "copy_sheet",
                 "sheet": sheet,
                 "source_side": str(source_side or "").upper(),
                 "target_side": str(target_side or "").upper(),
-            })
+            }
+            if target_index is not None:
+                operation["target_index"] = int(target_index)
+            self.manual_sheet_ops.append(operation)
         except Exception:
             pass
 
@@ -30663,16 +31268,39 @@ class SowMergeApp:
             raise KeyError(f"sheet copy unavailable: {sheet} {source_side}->{target_side}")
         src_val_ws = src_val_wb[sheet] if src_val_wb is not None and sheet in src_val_wb.sheetnames else src_edit_wb[sheet]
         src_edit_ws = src_edit_wb[sheet]
-        _create_sheet_from_source(dst_edit_wb, src_edit_ws, sheet)
-        _create_sheet_from_source(dst_val_wb, src_val_ws, sheet)
+        target_index = None
+        if dst_edit_wb is not None and sheet in dst_edit_wb.sheetnames:
+            target_index = int(dst_edit_wb.sheetnames.index(sheet))
+        _create_sheet_from_source(
+            dst_edit_wb,
+            src_edit_ws,
+            sheet,
+            index=target_index,
+        )
+        _create_sheet_from_source(
+            dst_val_wb,
+            src_val_ws,
+            sheet,
+            index=target_index,
+        )
         if target_side == "A":
             self.modified_a = True
             self.modified_sheets_a.add(sheet)
-            self.record_manual_sheet_copy(sheet, source_side, target_side)
+            self.record_manual_sheet_copy(
+                sheet,
+                source_side,
+                target_side,
+                target_index=target_index,
+            )
         elif target_side == "B":
             self.modified_b = True
             self.modified_sheets_b.add(sheet)
-            self.record_manual_sheet_copy(sheet, source_side, target_side)
+            self.record_manual_sheet_copy(
+                sheet,
+                source_side,
+                target_side,
+                target_index=target_index,
+            )
         self._refresh_sheet_catalog()
 
     def _delete_sheet_on_side(self, sheet: str, target_side: str):
@@ -31685,8 +32313,7 @@ class SowMergeApp:
             # Find the true last non-empty row for this sheet. Empty strings are
             # treated as empty so formulas returning "" do not expand the bounds.
             # Keep max_c on read-only fallback paths so earlier wide rows are preserved.
-            max_r = ws.max_row or 1
-            max_c = ws.max_column or 1
+            max_r, max_c = _worksheet_scan_bounds(ws)
             last_r = 1
             last_c = 1
             found = False
@@ -31788,12 +32415,12 @@ class SowMergeApp:
                 return pairs
 
             source_width_a = max(
-                int(ws_a.max_column or 1),
-                int(ws_a_edit.max_column or 1) if ws_a_edit is not None else 1,
+                _worksheet_scan_bounds(ws_a)[1],
+                _worksheet_scan_bounds(ws_a_edit)[1] if ws_a_edit is not None else 1,
             )
             source_width_b = max(
-                int(ws_b.max_column or 1),
-                int(ws_b_edit.max_column or 1) if ws_b_edit is not None else 1,
+                _worksheet_scan_bounds(ws_b)[1],
+                _worksheet_scan_bounds(ws_b_edit)[1] if ws_b_edit is not None else 1,
             )
             width_a = max(1, min(int(max_col or 1), source_width_a))
             width_b = max(1, min(int(max_col or 1), source_width_b))
@@ -31867,7 +32494,7 @@ class SowMergeApp:
             if not isinstance(cached, (list, tuple)):
                 return None
             try:
-                worksheet_rows = max(1, int(ws.max_row or 1))
+                worksheet_rows = _worksheet_scan_bounds(ws)[0]
             except Exception:
                 return None
             if len(cached) < worksheet_rows:
@@ -33239,8 +33866,8 @@ class SowMergeApp:
         def _sheet_has_diff_fast_tail(ws_a, ws_b, max_row: int, max_col: int, min_row: int = 1):
             none_sig = tuple("" for _ in range(max_col))
             block = _LARGE_SHEET_BLOCK_ROWS
-            max_row_a = ws_a.max_row or 1
-            max_row_b = ws_b.max_row or 1
+            max_row_a = _worksheet_scan_bounds(ws_a)[0]
+            max_row_b = _worksheet_scan_bounds(ws_b)[0]
 
             for block_end in range(max_row, 0, -block):
                 block_start = max(1, block_end - block + 1)
@@ -33339,8 +33966,8 @@ class SowMergeApp:
                         break
                     ws_a = wb_a_ro[s]
                     ws_b = wb_b_ro[s]
-                    max_row = max(ws_a.max_row or 1, ws_b.max_row or 1)
-                    max_col = max(ws_a.max_column or 1, ws_b.max_column or 1)
+                    max_row = max(_worksheet_scan_bounds(ws_a)[0], _worksheet_scan_bounds(ws_b)[0])
+                    max_col = max(_worksheet_scan_bounds(ws_a)[1], _worksheet_scan_bounds(ws_b)[1])
                     # Read-only tail iteration still reparses XML from row 1. On a
                     # large sheet this optional pre-mark duplicates the exact
                     # background compute and can outlive the window during close.
@@ -35493,6 +36120,25 @@ def main():
             app.run()
             sys.exit(0)
 
+        # Two-way comparisons also need the raw SVN identities before the
+        # sidecar paths are normalized to workbook-suffixed temporary copies.
+        # The 3-way path has always built this context during startup
+        # analysis; keeping the same identity chain here restores author and
+        # revision metadata without changing comparison file contents.
+        two_way_context = None
+        if a and b:
+            try:
+                two_way_context = build_merge_launch_context(
+                    raw_base_arg or a,
+                    raw_mine_arg or b,
+                    None,
+                )
+                resolve_svn_author_metadata(two_way_context)
+            except Exception as exc:
+                # Metadata is diagnostic only.  A failed lookup must never
+                # prevent an ordinary 2-way comparison from opening.
+                _dlog(f"2-way author metadata unavailable: {type(exc).__name__}:{exc}")
+
         # Two-way diff inputs can also be raw SVN sidecars such as
         # ``Book.xlsx.r123``.  Preserve their diagnostic identities, but give
         # openpyxl stable workbook-suffixed copies just as the three-way path
@@ -35524,6 +36170,7 @@ def main():
             raw_base=raw_base_arg,
             raw_mine=raw_mine_arg,
             raw_theirs=raw_theirs_arg,
+            launch_context=two_way_context,
         )
         app.run()
 
