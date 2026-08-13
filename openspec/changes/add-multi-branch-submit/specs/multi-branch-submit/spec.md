@@ -35,3 +35,12 @@
 - **WHEN** the tool is launched with existing two-way, three-way, or TortoiseSVN diff/merge arguments
 - **THEN** those paths retain their current behavior and do not enter branch submit mode
 
+## Scenario: Explorer context menu
+
+- **WHEN** the current user installs the `.xlsx` context menu and invokes “多分支 SVN 提交” on a workbook
+- **THEN** the tool opens branch-submit mode, infers the SVN working-copy root and source branch from that file, and preselects it without changing legacy TortoiseSVN registrations
+
+## Scenario: context-menu uninstall
+
+- **WHEN** the current user runs the dedicated context-menu uninstaller
+- **THEN** only the `SowMultiBranchSVNSubmit` shell key is removed and other Explorer or TortoiseSVN settings remain untouched

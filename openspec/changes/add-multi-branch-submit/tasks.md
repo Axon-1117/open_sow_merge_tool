@@ -8,3 +8,4 @@
 - [x] Add unit/smoke tests for merge states, commit message, pathfile encoding, cancellation, recovery, and legacy launch compatibility.
 - [x] Run first-principles design review, implementation review, and adversarial interruption/concurrency review.
 - [x] Build portable EXE/ZIP with `-SkipPublish`, update documentation/version, push `master`, and open Draft PR.
+- [x] Add an installable/uninstallable `.xlsx` Explorer context menu that preselects the right-clicked workbook.

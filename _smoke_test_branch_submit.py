@@ -7,10 +7,12 @@ import os
 import shutil
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
 import branch_submit as bs
+import sow_merge_tool as smt
 
 
 def _book(path: str, value: int) -> None:
@@ -184,9 +186,43 @@ def test_source_changes_after_preflight_are_rejected() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_explorer_path_inference_and_cli_handoff() -> None:
+    root = tempfile.mkdtemp(prefix="branch-submit-explorer-")
+    try:
+        os.makedirs(os.path.join(root, ".svn"))
+        open(os.path.join(root, ".svn", "wc.db"), "wb").close()
+        for branch in ("develop", "release", "sandbox"):
+            os.makedirs(os.path.join(root, branch, "config"))
+        source = os.path.join(root, "release", "config", "A.xlsx")
+        _book(source, 1)
+        wc_root, branch, files = bs.infer_context_from_files([source])
+        assert os.path.normcase(wc_root) == os.path.normcase(root)
+        assert branch == "release"
+        assert files == [os.path.abspath(source)]
+        captured = []
+        with patch.object(bs, "launch_ui", lambda paths=None: captured.append(list(paths or []))):
+            with patch.object(__import__("sys"), "argv", ["sow_merge_tool.py", "--branch-submit", source]):
+                smt.main()
+        assert captured == [[source]]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_context_menu_scripts_are_scoped_and_quoted() -> None:
+    repo = os.path.dirname(os.path.abspath(__file__))
+    install = open(os.path.join(repo, "install_context_menu.bat"), "r", encoding="utf-8").read()
+    uninstall = open(os.path.join(repo, "uninstall_context_menu.bat"), "r", encoding="utf-8").read()
+    key = r"SystemFileAssociations\.xlsx\shell\SowMultiBranchSVNSubmit"
+    assert key in install and key in uninstall
+    assert r'--branch-submit \"%%1\"' in install
+    assert "TortoiseSVN" not in uninstall
+
+
 if __name__ == "__main__":
     test_discover_and_validate()
     test_preflight_persists_delta_and_blocks_conflict()
     test_pathfile_is_utf16_without_bom_and_footer_is_generated()
     test_source_changes_after_preflight_are_rejected()
+    test_explorer_path_inference_and_cli_handoff()
+    test_context_menu_scripts_are_scoped_and_quoted()
     print("branch submit smoke tests passed")

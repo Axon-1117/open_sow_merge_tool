@@ -128,6 +128,45 @@ def _relative_source_files(wc_root: str, source_branch: str, selected: Iterable[
     return sorted(dict.fromkeys(result))
 
 
+def infer_context_from_files(initial_paths: Iterable[str]) -> tuple[str, str, list[str]]:
+    """Infer one SVN root and source branch from Explorer-selected workbooks."""
+    paths = [os.path.abspath(str(path)) for path in initial_paths if str(path).strip()]
+    if not paths:
+        raise ValueError("没有可用的右键文件")
+    wc_root = ""
+    source_branch = ""
+    for path in paths:
+        if not os.path.isfile(path):
+            raise ValueError(f"右键文件不存在：{path}")
+        if Path(path).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise ValueError(f"右键入口目前只支持 .xlsx：{path}")
+        probe = os.path.dirname(path)
+        current_root = ""
+        while True:
+            if os.path.isfile(os.path.join(probe, ".svn", "wc.db")):
+                current_root = probe
+                break
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if not current_root:
+            raise ValueError(f"文件不在 SVN 工作副本中：{path}")
+        relative = os.path.relpath(path, current_root).replace("\\", "/")
+        parts = relative.split("/")
+        if len(parts) < 2:
+            raise ValueError(f"无法从路径识别源分支：{path}")
+        current_branch = parts[0]
+        if not wc_root:
+            wc_root, source_branch = current_root, current_branch
+        elif os.path.normcase(current_root) != os.path.normcase(wc_root) or current_branch != source_branch:
+            raise ValueError("右键选择的文件必须位于同一 SVN 工作副本和同一源分支")
+    branches = discover_branches(wc_root)
+    _validate_branch_name(source_branch, branches)
+    _relative_source_files(wc_root, source_branch, paths)
+    return wc_root, source_branch, paths
+
+
 def _wc_revision(core, path: str) -> int | None:
     root = core._find_svn_wc_root_for_path(path)
     if not root:
@@ -467,7 +506,7 @@ def _choose_files(root, source_root: str) -> list[str]:
     ))
 
 
-def launch_ui() -> None:
+def launch_ui(initial_paths: Iterable[str] | None = None) -> None:
     """Launch a compact, user-confirmed branch-submit workflow."""
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -477,10 +516,20 @@ def launch_ui() -> None:
     root.geometry("720x560")
     settings = load_settings()
     default_root = settings.get("wc_root") if settings.get("wc_root") else None
-    wc_root = filedialog.askdirectory(parent=root, title="选择 SVN 工作副本根目录", initialdir=default_root or os.getcwd())
-    if not wc_root:
-        root.destroy()
-        return
+    initial_files = [os.path.abspath(str(path)) for path in (initial_paths or []) if str(path).strip()]
+    inferred_source = ""
+    if initial_files:
+        try:
+            wc_root, inferred_source, initial_files = infer_context_from_files(initial_files)
+        except Exception as exc:
+            messagebox.showerror("无法识别右键文件", str(exc), parent=root)
+            root.destroy()
+            return
+    else:
+        wc_root = filedialog.askdirectory(parent=root, title="选择 SVN 工作副本根目录", initialdir=default_root or os.getcwd())
+        if not wc_root:
+            root.destroy()
+            return
     try:
         branches = discover_branches(wc_root)
     except Exception as exc:
@@ -494,21 +543,48 @@ def launch_ui() -> None:
     form = ttk.Frame(root, padding=16)
     form.pack(fill="both", expand=True)
     ttk.Label(form, text="源分支").grid(row=0, column=0, sticky="w")
-    source_var = tk.StringVar(value=branches[0])
+    source_var = tk.StringVar(value=inferred_source or branches[0])
     source_box = ttk.Combobox(form, textvariable=source_var, values=branches, state="readonly", width=20)
     source_box.grid(row=0, column=1, sticky="w", padx=(8, 0))
     ttk.Label(form, text="目标分支（可多选）").grid(row=1, column=0, sticky="nw", pady=(12, 0))
     target_list = tk.Listbox(form, selectmode=tk.MULTIPLE, exportselection=False, height=5)
     target_list.grid(row=1, column=1, sticky="ew", pady=(12, 0))
-    for branch in branches[1:]:
-        target_list.insert(tk.END, branch)
     selected_var = tk.StringVar(value="尚未选择文件")
-    file_holder = {"paths": []}
+    file_holder = {"paths": list(initial_files)}
+
+    def refresh_targets(*_args):
+        target_list.delete(0, tk.END)
+        for branch in branches:
+            if branch != source_var.get():
+                target_list.insert(tk.END, branch)
+
+    def show_selected_files():
+        if not file_holder["paths"]:
+            selected_var.set("尚未选择文件")
+            return
+        source_root = os.path.join(wc_root, source_var.get())
+        selected_var.set("\n".join(os.path.relpath(path, source_root) for path in file_holder["paths"]))
+
+    def source_changed(_event=None):
+        refresh_targets()
+        source_root = os.path.abspath(os.path.join(wc_root, source_var.get()))
+        def belongs_to_source(path: str) -> bool:
+            try:
+                return os.path.normcase(os.path.commonpath((source_root, os.path.abspath(path)))) == os.path.normcase(source_root)
+            except ValueError:
+                return False
+        if any(not belongs_to_source(path) for path in file_holder["paths"]):
+            file_holder["paths"] = []
+        show_selected_files()
+
+    refresh_targets()
+    show_selected_files()
+    source_box.bind("<<ComboboxSelected>>", source_changed)
     def choose_files():
         picked = _choose_files(root, os.path.join(wc_root, source_var.get()))
         if picked:
             file_holder["paths"] = picked
-            selected_var.set("\n".join(os.path.relpath(p, os.path.join(wc_root, source_var.get())) for p in picked))
+            show_selected_files()
     ttk.Button(form, text="选择 Excel", command=choose_files).grid(row=2, column=0, sticky="nw", pady=(12, 0))
     ttk.Label(form, textvariable=selected_var, justify="left", wraplength=560).grid(row=2, column=1, sticky="w", pady=(12, 0))
     ttk.Label(form, text="提交说明").grid(row=3, column=0, sticky="nw", pady=(12, 0))
@@ -528,6 +604,7 @@ def launch_ui() -> None:
             lines.extend(f"目标 {branch}：{batch.target_status[branch]}" for branch in batch.target_branches)
             if not messagebox.askyesno("确认提交", "\n".join(lines) + "\n\n将依次打开源分支和目标分支提交窗口，取消会停止后续分支。继续吗？", parent=root):
                 return
+            save_settings({"wc_root": wc_root, "last_source_branch": source_var.get()})
             result = engine.commit(batch)
             status.set(f"批次完成：source={result.source_status}; " + ", ".join(f"{k}={v}" for k, v in result.target_status.items()))
             messagebox.showinfo("批次结果", status.get(), parent=root)

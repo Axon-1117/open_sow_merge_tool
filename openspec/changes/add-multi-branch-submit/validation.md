@@ -25,8 +25,9 @@
 - Target commit cancellation: post-commit pristine/hash verification prevents false `committed`; remaining targets are not processed and the batch is resumable.
 - Process restart after a target cancellation: a matching stored candidate is recognized and is not overwritten by a second update/replay.
 - Existing TortoiseSVN diff/merge argument paths: role-semantics regression suite passed after the no-argument mode chooser was restricted to the default picker.
+- Explorer right-click launch: path inference requires one existing `.xlsx` under one whitelisted branch in one SVN working copy; other paths fail before the submission UI can mutate files.
+- Context-menu uninstall deletes only `HKCU\\Software\\Classes\\SystemFileAssociations\\.xlsx\\shell\\SowMultiBranchSVNSubmit`; registry round-trip validation confirmed the command preserves quoted paths and `%1` substitution.
 
 ## Known validation boundary
 
 The current machine has TortoiseSVN GUI (`TortoiseProc.exe`) but no `svn.exe`; real networked commit/cancel/update dialogs therefore remain an acceptance step on a disposable SVN test repository. The implementation fails closed if post-dialog pristine/hash verification cannot prove success.
-

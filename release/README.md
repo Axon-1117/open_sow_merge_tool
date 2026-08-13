@@ -1,8 +1,8 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-08-13.update73`
-- Build Tag：`multi-branch-svn-submit`
+- 版本号：`2026-08-13.update74`
+- Build Tag：`explorer-context-menu`
 
 ### 多分支 SVN 提交（新增）
 - 启动 `sow_merge_tool.exe --branch-submit`，或双击启动后选择“多分支 SVN 提交”。
@@ -11,6 +11,12 @@
 - 源分支先打开 TortoiseSVN 提交确认窗口，成功验证后逐个打开目标分支确认窗口；目标提交说明自动追加 `[MultiBranchSync] batch=... source=...@r...`。
 - 任意窗口取消或提交失败会停止后续分支，并把可恢复批次保存到 `%LOCALAPPDATA%\SowMergeTool\branch_submit\batches`。
 - v1 自动提交范围为 `.xlsx` 的值、公式和行新增/删除；`.xlsm`、工作表/列/合并单元格/样式等结构变化请使用现有人工合并流程。
+
+### 资源管理器右键入口（新增）
+- 双击 `install_context_menu.bat` 后，在 SVN 工作副本中的 `.xlsx` 文件上右键选择“多分支 SVN 提交”。Windows 11 上该入口可能位于“显示更多选项”中。
+- 工具会从所选文件自动识别 SVN 工作副本和源分支，并把文件带入多分支提交页面，不再要求重新选择目录和文件。
+- 双击 `uninstall_context_menu.bat` 只移除该右键入口；完整的 `install.bat` / `uninstall.bat` 会同时安装或移除 TortoiseSVN Diff/Merge 配置与右键入口。
+- 右键菜单写入 `HKCU` 当前用户注册表，不需要管理员权限；v1 为避免资源管理器重复启动批次，一次处理一个右键文件，需要多文件时可在工具界面继续选择。
 
 ### 本次修复
 - 修复部分 SVN 导出的有效 XLSX 缺少 worksheet `<dimension>` 元数据时被误判为 `1×1` 表的问题；现在会按实际 XML 单元格计算行列范围，避免把仍存在的后续列批量显示为“已删除”。

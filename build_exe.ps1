@@ -128,6 +128,8 @@ $releaseSha = Join-Path $releaseDir 'SHA256SUMS.txt'
 $releaseRegister = Join-Path $releaseDir 'register_tortoisesvn_sow_tool.bat'
 $releaseInstall = Join-Path $releaseDir 'install.bat'
 $releaseUninstall = Join-Path $releaseDir 'uninstall.bat'
+$releaseContextInstall = Join-Path $releaseDir 'install_context_menu.bat'
+$releaseContextUninstall = Join-Path $releaseDir 'uninstall_context_menu.bat'
 $releaseStage = Join-Path $releaseDir '_package'
 $publishDir = Join-Path (Join-Path 'C:\GM15\design\design' $commonSoftwareDir) 'excel_merge_tool'
 
@@ -153,6 +155,8 @@ Copy-Item -Force $builtExe $archiveExe
 
 Copy-Item -Force $builtExe $releaseExe
 Copy-Item -Force (Join-Path $PSScriptRoot 'register_tortoisesvn_sow_tool.bat') $releaseRegister
+Copy-Item -Force (Join-Path $PSScriptRoot 'install_context_menu.bat') $releaseContextInstall
+Copy-Item -Force (Join-Path $PSScriptRoot 'uninstall_context_menu.bat') $releaseContextUninstall
 
 if (Test-Path $releaseUsageSource) {
   Copy-Item -Force $releaseUsageSource $releaseUsageMd
@@ -186,6 +190,8 @@ $packageFiles = @(
   $releaseRegister,
   $releaseInstall,
   $releaseUninstall,
+  $releaseContextInstall,
+  $releaseContextUninstall,
   $releaseUsageMd,
   $releaseUsageTxt
 )
@@ -213,7 +219,9 @@ $hashFiles = @(
   $releaseUsageTxt,
   $releaseRegister,
   $releaseInstall,
-  $releaseUninstall
+  $releaseUninstall,
+  $releaseContextInstall,
+  $releaseContextUninstall
 ) | Where-Object { Test-Path $_ }
 
 $hashLines = foreach ($file in $hashFiles) {

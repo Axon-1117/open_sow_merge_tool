@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-13.update73"
-APP_BUILD_TAG = "multi-branch-svn-submit"
+APP_VERSION = "2026-08-13.update74"
+APP_BUILD_TAG = "explorer-context-menu"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -35903,6 +35903,12 @@ def main():
             action="store_true",
             help="Open the user-confirmed multi-branch SVN Excel submission workflow",
         )
+        parser.add_argument(
+            "--branch-file",
+            action="append",
+            default=[],
+            help="Preselect an .xlsx file for branch-submit mode (repeatable)",
+        )
         args, unknown = parser.parse_known_args()
         try:
             _trace_launch(f"argparse={repr(vars(args))} unknown={repr(unknown)}")
@@ -35918,7 +35924,12 @@ def main():
         # any existing TortoiseSVN diff/merge argument combinations.
         if args.branch_submit:
             from branch_submit import launch_ui
-            launch_ui()
+            initial_branch_files = list(args.branch_file or [])
+            if args.file_a:
+                initial_branch_files.append(args.file_a)
+            if args.file_b:
+                initial_branch_files.append(args.file_b)
+            launch_ui(initial_branch_files)
             return
 
         # Map /path:/path2:/base: style args (TortoiseProc)
