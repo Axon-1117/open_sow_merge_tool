@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-13.update72"
-APP_BUILD_TAG = "new149-missing-dimension-diff-fix"
+APP_VERSION = "2026-08-13.update73"
+APP_BUILD_TAG = "multi-branch-svn-submit"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -35898,6 +35898,11 @@ def main():
         parser.add_argument("--merged")
         parser.add_argument("--title")
         parser.add_argument("--textdiff", action="store_true", help="Only generate text files and open TortoiseMerge")
+        parser.add_argument(
+            "--branch-submit",
+            action="store_true",
+            help="Open the user-confirmed multi-branch SVN Excel submission workflow",
+        )
         args, unknown = parser.parse_known_args()
         try:
             _trace_launch(f"argparse={repr(vars(args))} unknown={repr(unknown)}")
@@ -35908,6 +35913,13 @@ def main():
                 _dlog(f"unknown args: {unknown}")
             except Exception:
                 pass
+
+        # The new workflow is deliberately explicit and does not intercept
+        # any existing TortoiseSVN diff/merge argument combinations.
+        if args.branch_submit:
+            from branch_submit import launch_ui
+            launch_ui()
+            return
 
         # Map /path:/path2:/base: style args (TortoiseProc)
         if not args.base and "base" in slash_args:
@@ -35976,6 +35988,18 @@ def main():
             else:
                 a, b = args.file_a, None
         else:
+            # Keep the legacy picker available, but make the new batch flow
+            # discoverable on a normal desktop launch.
+            # Embedders/tests may replace the legacy picker; in that case keep
+            # their injected selection synchronous and do not create a second
+            # startup Tk root just to show the optional mode chooser.
+            picker_is_default = getattr(pick_files_or_conflict, "__module__", __name__) == __name__
+            if picker_is_default and not any((args.file_a, args.file_b, args.base, args.mine, args.theirs, args.merged, args.textdiff)):
+                from branch_submit import prompt_mode
+                if prompt_mode() == "branch":
+                    from branch_submit import launch_ui
+                    launch_ui()
+                    return
             sel = pick_files_or_conflict()
             if not sel:
                 return

@@ -1,8 +1,16 @@
 # sow_merge_tool 使用指南
 
 ## 0. 当前版本
-- 版本号：`2026-08-13.update72`
-- Build Tag：`new149-missing-dimension-diff-fix`
+- 版本号：`2026-08-13.update73`
+- Build Tag：`multi-branch-svn-submit`
+
+### 多分支 SVN 提交（新增）
+- 启动 `sow_merge_tool.exe --branch-submit`，或双击启动后选择“多分支 SVN 提交”。
+- 选择 SVN 工作副本根目录、源分支、一个或多个目标分支及 `.xlsx` 配置文件。
+- 预检查只投影“源分支 pristine → 源分支工作文件”的单元格/公式/行变化，保留目标分支独有内容；冲突或不支持的结构变化会阻止提交。
+- 源分支先打开 TortoiseSVN 提交确认窗口，成功验证后逐个打开目标分支确认窗口；目标提交说明自动追加 `[MultiBranchSync] batch=... source=...@r...`。
+- 任意窗口取消或提交失败会停止后续分支，并把可恢复批次保存到 `%LOCALAPPDATA%\SowMergeTool\branch_submit\batches`。
+- v1 自动提交范围为 `.xlsx` 的值、公式和行新增/删除；`.xlsm`、工作表/列/合并单元格/样式等结构变化请使用现有人工合并流程。
 
 ### 本次修复
 - 修复部分 SVN 导出的有效 XLSX 缺少 worksheet `<dimension>` 元数据时被误判为 `1×1` 表的问题；现在会按实际 XML 单元格计算行列范围，避免把仍存在的后续列批量显示为“已删除”。
@@ -109,6 +117,12 @@
 ## 3. 直接运行
 双击：
 `sow_merge_tool.exe`
+
+多分支提交模式：
+
+```bat
+sow_merge_tool.exe --branch-submit
+```
 
 ## 3.1 打包发布与 GitHub 提交
 常用发布命令：

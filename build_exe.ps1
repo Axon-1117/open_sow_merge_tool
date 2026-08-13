@@ -134,7 +134,7 @@ $publishDir = Join-Path (Join-Path 'C:\GM15\design\design' $commonSoftwareDir) '
 if (Test-Path $tmpBuild) { Remove-Item -Recurse -Force $tmpBuild }
 if (Test-Path $tmpDist) { Remove-Item -Recurse -Force $tmpDist }
 
-& $python -m PyInstaller --noconsole --onefile --name sow_merge_tool --distpath $tmpDist --workpath $tmpBuild --specpath $tmpBuild sow_merge_tool.py
+& $python -m PyInstaller --noconsole --onefile --hidden-import branch_submit --name sow_merge_tool --distpath $tmpDist --workpath $tmpBuild --specpath $tmpBuild sow_merge_tool.py
 
 $builtExe = Join-Path $tmpDist 'sow_merge_tool.exe'
 if (-not (Test-Path $builtExe)) {
