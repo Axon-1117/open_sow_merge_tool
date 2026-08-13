@@ -3,7 +3,12 @@
 ## Scenario: select branches and files
 
 - **WHEN** the user opens branch submit mode
-- **THEN** the tool discovers the configured SVN working-copy root, shows only whitelisted branches (`develop`, `release`, `sandbox` by default), excludes `master`, and requires one source, one or more targets, and one or more `.xlsx` files
+- **THEN** the tool discovers the SVN working-copy root and dynamically shows same-repository top-level branches, keeps `master` visible but disabled, and requires one source, one or more targets, and one or more safe `.xlsx` changes
+
+## Scenario: recursive multi-file workbench
+
+- **WHEN** the user starts from an `.xlsx`, folder, or folder background
+- **THEN** the tool recursively scans that folder, shows all SVN changes with status metadata, defaults safe modified/added/deleted Excel files on, keeps unversioned Excel off, and displays non-Excel changes read-only
 
 ## Scenario: source delta preflight
 
@@ -12,23 +17,33 @@
 
 ## Scenario: fail closed
 
-- **WHEN** a selected target has SVN conflict, an unselected local change would be included, an unsupported structural change is detected, or a target changed since analysis
+- **WHEN** status collection fails, a selected target is dirty, conflict/switch/property/external/unsupported structure is detected, or a target changed since analysis
 - **THEN** the batch is blocked and no commit dialog is opened until the condition is resolved and analysis is rerun
+
+## Scenario: added, deleted, and renamed files
+
+- **WHEN** an added or deleted Excel file is selected
+- **THEN** add requires an absent target path and versioned parent, delete requires target content equal to the deletion baseline, and a detected rename is blocked with a Repair Move instruction
 
 ## Scenario: source commit first
 
 - **WHEN** the user starts a ready batch
-- **THEN** the source branch commit dialog opens first with the user message prefilled, and targets remain pending until source revision and file hashes are verified after the dialog closes
+- **THEN** the source branch commit dialog opens first with the frozen user message, and targets remain pending until every file is reconciled against SVN status, pristine, hashes, and revisions after the dialog closes
+
+## Scenario: partial source selection
+
+- **WHEN** the user commits only some selected source files
+- **THEN** propagation stops, the committed files are split into an explicit child batch, and the remaining source files return to the workbench
 
 ## Scenario: per-target confirmation
 
 - **WHEN** a target is ready after revalidation
-- **THEN** the tool applies only the planned candidate, opens one TortoiseSVN commit dialog for that target with the source message and tracking footer, and marks the target committed only after post-commit verification
+- **THEN** the tool writes a durable prepare intent and backup, applies only the planned candidate, opens one TortoiseSVN commit dialog with the frozen message and tracking footer, and marks each file committed only after post-commit reconciliation
 
 ## Scenario: cancellation and recovery
 
 - **WHEN** any source or target commit is cancelled or fails
-- **THEN** the tool stops subsequent targets, persists the batch as resumable, keeps completed target states, and on resume rechecks revisions/hashes before continuing
+- **THEN** the tool stops subsequent targets, persists per-file facts, keeps completed files immutable, and on resume reconciles actual SVN state before opening another dialog or restoring only hash-matching uncommitted candidates
 
 ## Scenario: legacy compatibility
 
@@ -37,10 +52,10 @@
 
 ## Scenario: Explorer context menu
 
-- **WHEN** the current user installs the `.xlsx` context menu and invokes “多分支 SVN 提交” on a workbook
-- **THEN** the tool opens branch-submit mode, infers the SVN working-copy root and source branch from that file, and preselects it without changing legacy TortoiseSVN registrations
+- **WHEN** the current user invokes “多分支 SVN 提交” from an `.xlsx`, folder, or folder background
+- **THEN** the tool opens branch-submit mode, infers the working-copy/source/scope, and recursively scans the selected folder without changing legacy TortoiseSVN registrations
 
 ## Scenario: context-menu uninstall
 
 - **WHEN** the current user runs the dedicated context-menu uninstaller
-- **THEN** only the `SowMultiBranchSVNSubmit` shell key is removed and other Explorer or TortoiseSVN settings remain untouched
+- **THEN** only the three owned `SowMultiBranchSVNSubmit` shell trees are removed and other Explorer or TortoiseSVN settings remain untouched

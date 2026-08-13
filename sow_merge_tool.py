@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-13.update74"
-APP_BUILD_TAG = "explorer-context-menu"
+APP_VERSION = "2026-08-13.update75"
+APP_BUILD_TAG = "recoverable-multi-branch-workbench"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -36223,6 +36223,9 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-status-query":
+        from svn_status_provider import internal_status_entrypoint
+        raise SystemExit(internal_status_entrypoint(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-author-query":
         raise SystemExit(_run_tortoise_svn_author_probe_entrypoint(sys.argv[2:]))
     main()

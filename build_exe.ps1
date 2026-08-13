@@ -244,7 +244,9 @@ if (-not $SkipPublish) {
     @{ Source = $releaseUsageTxt; Target = (Join-Path $publishDir ("{0}.txt" -f $usageStem)) },
     @{ Source = $releaseRegister; Target = (Join-Path $publishDir 'register_tortoisesvn_sow_tool.bat') },
     @{ Source = $releaseInstall; Target = (Join-Path $publishDir 'install.bat') },
-    @{ Source = $releaseUninstall; Target = (Join-Path $publishDir 'uninstall.bat') }
+    @{ Source = $releaseUninstall; Target = (Join-Path $publishDir 'uninstall.bat') },
+    @{ Source = $releaseContextInstall; Target = (Join-Path $publishDir 'install_context_menu.bat') },
+    @{ Source = $releaseContextUninstall; Target = (Join-Path $publishDir 'uninstall_context_menu.bat') }
   )
 
   foreach ($item in $publishMap) {

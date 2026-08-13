@@ -1,12 +1,11 @@
 @echo off
 setlocal
-chcp 65001 >nul
 
-set "MENU_KEY=HKCU\Software\Classes\SystemFileAssociations\.xlsx\shell\SowMultiBranchSVNSubmit"
-reg delete "%MENU_KEY%" /f >nul 2>nul
+rem Delete only the three registry trees owned by this tool.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $paths=@('HKCU:\Software\Classes\SystemFileAssociations\.xlsx\shell\SowMultiBranchSVNSubmit','HKCU:\Software\Classes\Directory\shell\SowMultiBranchSVNSubmit','HKCU:\Software\Classes\Directory\Background\shell\SowMultiBranchSVNSubmit'); foreach($path in $paths){ if(Test-Path -LiteralPath $path){ Remove-Item -LiteralPath $path -Recurse -Force } }"
+if errorlevel 1 exit /b 1
+
 if exist "%SystemRoot%\System32\ie4uinit.exe" "%SystemRoot%\System32\ie4uinit.exe" -show >nul 2>nul
-
-echo 已卸载 .xlsx 右键菜单：多分支 SVN 提交
+echo Removed the three Sow multi-branch SVN context menus.
 if /i not "%~1"=="/quiet" pause
 exit /b 0
-
