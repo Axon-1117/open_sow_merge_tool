@@ -1,11 +1,12 @@
 # Tasks
 
 - [x] Add branch-submit domain model, settings, batch persistence, and safe path validation.
-- [x] Add SVN working-copy discovery/status/pristine adapter with TortoiseSVN update/commit automation.
-- [x] Add source-delta preflight, target candidate generation, conflict/unsupported-structure gates, and preview summaries.
-- [x] Add Tkinter branch selection, preview, confirmation, progress, and resumable failure states.
+- [x] Add fail-closed recursive SVN status provider using `svn --xml` or an isolated TortoiseSVN DLL child process.
+- [x] Add dynamic same-repository branch discovery, recursive change scanning, source-delta preflight, add/delete gates, and per-file action matrix.
+- [x] Add Tortoise-style Tk workbench with unlimited branch checkboxes, favorites/search, multi-file filters, recent messages, progress/cancel, diff and path actions.
+- [x] Add write-ahead batch journal, candidate/backup hashes, source partial child batches, target partial stop, restart reconciliation, guarded restore, and corrupt-state reporting.
 - [x] Add `--branch-submit` and no-argument mode chooser without changing existing TortoiseSVN argument paths.
-- [x] Add unit/smoke tests for merge states, commit message, pathfile encoding, cancellation, recovery, and legacy launch compatibility.
+- [x] Add adversarial tests for dirty targets, rename blocks, partial selection, server-success/client-error, process death after source/target commit, write-intent crash, guarded restore, and corrupt state.
 - [x] Run first-principles design review, implementation review, and adversarial interruption/concurrency review.
-- [x] Build portable EXE/ZIP with `-SkipPublish`, update documentation/version, push `master`, and open Draft PR.
-- [x] Add an installable/uninstallable `.xlsx` Explorer context menu that preselects the right-clicked workbook.
+- [x] Build and deploy portable `update75` EXE/ZIP, update documentation/version, verify installed hashes, and keep release actions independent of PR workflow.
+- [x] Add installable/uninstallable `.xlsx`, folder, and folder-background Explorer context menus with exact three-key uninstall scope.
