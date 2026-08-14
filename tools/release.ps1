@@ -1,6 +1,6 @@
 param(
   [string]$DeployPath = 'C:\sow_main\excel\excel_merge_tool',
-  [string]$Version = '2026-08-14.update78',
+  [string]$Version = '2026-08-14.update79',
   [switch]$SkipDeploy
 )
 
@@ -8,13 +8,13 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $repo = (Get-Location).Path
 & (Join-Path $repo 'tools\test.ps1') -Profile Fast
-if ($LASTEXITCODE -ne 0) { throw 'Fast gate failed.' }
+if (-not $?) { throw 'Fast gate failed.' }
 & (Join-Path $repo 'tools\build.ps1') -Clean
-if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+if (-not $?) { throw 'Build failed.' }
 & (Join-Path $repo 'tools\package.ps1') -Version $Version
-if ($LASTEXITCODE -ne 0) { throw 'Package failed.' }
+if (-not $?) { throw 'Package failed.' }
 if (-not $SkipDeploy) {
   & (Join-Path $repo 'tools\deploy.ps1') -DeployPath $DeployPath
-  if ($LASTEXITCODE -ne 0) { throw 'Deployment failed.' }
+  if (-not $?) { throw 'Deployment failed.' }
 }
 Write-Host 'Release workflow passed.' -ForegroundColor Green

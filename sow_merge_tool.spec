@@ -14,6 +14,7 @@ a = Analysis(
         "sow_merge_tool.legacy_core",
         "sow_merge_tool.branch_submit",
         "sow_merge_tool.svn_status_provider",
+        "sow_merge_tool.ui_foundation",
     ],
     hookspath=[],
     hooksconfig={},

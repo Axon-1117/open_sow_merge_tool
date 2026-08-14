@@ -42,11 +42,12 @@ from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
+from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-14.update78"
-APP_BUILD_TAG = "chinese-docs-engineering-cleanup"
+APP_VERSION = "2026-08-14.update79"
+APP_BUILD_TAG = "ui-refresh-performance"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -10490,17 +10491,25 @@ def _run_startup_progress_task(title: str, message: str, fn):
     root.protocol("WM_DELETE_WINDOW", lambda: None)
     root.deiconify()
 
-    frame = ttk.Frame(root, padding=18)
+    try:
+        root.configure(bg=THEME.window_bg)
+    except Exception:
+        pass
+    frame = ttk.Frame(root, padding=18, style="App.TFrame")
     frame.pack(fill="both", expand=True)
-    title_label = ttk.Label(frame, text=message, font=("Microsoft YaHei", 11, "bold"))
+    try:
+        configure_ttk_style(root)
+    except Exception:
+        pass
+    title_label = ttk.Label(frame, text=message, style="Title.App.TLabel")
     title_label.pack(anchor="w")
-    detail_label = ttk.Label(frame, text="正在准备...", foreground="#555", wraplength=500)
+    detail_label = ttk.Label(frame, text="正在准备...", style="Muted.App.TLabel", wraplength=500)
     detail_label.pack(
         anchor="w", fill="x", pady=(8, 10)
     )
     progress = ttk.Progressbar(frame, mode="indeterminate", length=500)
     progress.pack(fill="x")
-    elapsed_label = ttk.Label(frame, text="已用时 0.0 秒", foreground="#777")
+    elapsed_label = ttk.Label(frame, text="已用时 0.0 秒", style="Muted.App.TLabel")
     elapsed_label.pack(anchor="e", pady=(7, 0))
     progress.start(12)
 
@@ -29557,6 +29566,8 @@ class SowMergeApp:
         # in host integrations. Collect destroyed Tk object cycles on the UI
         # thread before any new background XML parser can trigger that GC.
         gc.collect()
+        self._startup_trace = UiTrace()
+        self._startup_trace.mark("app-init")
         self._is_closing = False
         self._background_threads_lock = threading.Lock()
         self._background_threads: set[threading.Thread] = set()
@@ -29695,23 +29706,24 @@ class SowMergeApp:
 
         def _load_initial_state(report):
             try:
+                self._startup_trace.mark("value-load-start")
                 report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(self.file_a)}", 8)
                 t0 = datetime.now()
                 self._file_a_val_path = _prepare_val_path(self.file_a)
-                self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True)
+                self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True, keep_links=False)
                 _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(self.file_b)}", 30)
                 t0 = datetime.now()
                 self._file_b_val_path = _prepare_val_path(self.file_b)
-                self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True)
+                self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True, keep_links=False)
                 _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 if self.has_base:
                     report("正在打开 Excel 合并工具", f"加载 base：{os.path.basename(self.base_path)}", 52)
                     t0 = datetime.now()
                     self._file_base_val_path = _prepare_val_path(self.base_path)
-                    self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True)
+                    self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True, keep_links=False)
                     _dlog(f"load wb_base_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                     report("正在准备三方合并", "创建 mine 安全快照...", 68)
@@ -29729,6 +29741,7 @@ class SowMergeApp:
 
                 report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 76)
                 self._refresh_sheet_catalog()
+                self._startup_trace.mark("sheet-catalog-ready")
                 if self._wb_a_edit is None or self._wb_b_edit is None or (self.has_base and self._wb_base_edit is None):
                     self._edit_loading_started = True
                     self._edit_preload_thread = self._start_background_thread(
@@ -29742,6 +29755,7 @@ class SowMergeApp:
                     f"共 {len(self.display_sheets)} 个 Sheet；公式、样式和批注将在后台继续预载...",
                     100,
                 )
+                self._startup_trace.mark("value-load-ready")
             except Exception:
                 _wbs_close(self._wb_a_val, self._wb_b_val, self._wb_base_val)
                 raise
@@ -29758,15 +29772,19 @@ class SowMergeApp:
         self.modified_sheets_b = set()
 
         self.root = _take_startup_progress_root()
+        self._startup_trace.mark("startup-window-ready")
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
         self.root.title(self._window_title_suffix)
         self.root.resizable(True, True)
-        ttk.Style().theme_use("clam")
+        try:
+            configure_ttk_style(self.root)
+        except Exception:
+            pass
         self._configure_workspace_chrome()
         if self.merge_mode:
-            self.root.title(f"{self._window_title_suffix} (SVN Merge)")
+            self.root.title(f"{self._window_title_suffix}（SVN 合并）")
         else:
-            self.root.title(f"{self._window_title_suffix} (TortoiseMerge-like)")
+            self.root.title(f"{self._window_title_suffix}（差异对比）")
         self.root.geometry("1450x860")
         self._intended_window_state = "zoomed"
 
@@ -29777,6 +29795,7 @@ class SowMergeApp:
             pass
 
         self._build_ui()
+        self._startup_trace.mark("main-ui-built")
         self._safe_root_after(0, self._ensure_only_diff_progress_dialog)
         self._ui_heartbeat_last = time.perf_counter()
         self._ui_heartbeat_max_gap = 0.0
@@ -29817,6 +29836,8 @@ class SowMergeApp:
                     f"WINDOW_STATE stage=after-show state={self.root.state()} "
                     f"geometry={self.root.geometry()}"
                 )
+                durations = self._startup_trace.durations()
+                _dlog("STARTUP_TRACE " + " ".join(f"{key}={value * 1000.0:.1f}ms" for key, value in durations.items()))
             except Exception as exc:
                 _dlog(f"main window show failed: {exc}")
 
@@ -29828,32 +29849,31 @@ class SowMergeApp:
         """Install styles for surrounding UI chrome without touching sheet cells."""
         color = getattr(self, "workspace_chrome_color", WORKSPACE_CHROME_COLORS[MergeScenario.TWO_WAY])
         try:
-            self.root.configure(bg=color)
+            self.root.configure(bg=THEME.window_bg)
         except Exception:
             pass
         try:
-            style = ttk.Style(self.root)
-            # SheetView contains many nested ttk containers.  Make the
-            # scenario colour the default chrome background so the distinction
-            # remains visible around the white spreadsheet Text widgets, not
-            # only in the top and bottom bars.
-            style.configure("TFrame", background=color)
-            style.configure("TLabel", background=color)
-            style.configure("TLabelframe", background=color)
-            style.configure("TLabelframe.Label", background=color)
-            style.configure("TCheckbutton", background=color)
-            style.configure("MergeChrome.TFrame", background=color)
-            style.configure("MergeChrome.TLabel", background=color)
+            style = configure_ttk_style(self.root)
+            # Scenario color is an accent for the status chrome only.  Keeping
+            # the rest neutral makes the spreadsheet data and conflict colors
+            # carry the visual hierarchy.
+            style.configure("TFrame", background=THEME.window_bg)
+            style.configure("TLabel", background=THEME.window_bg, foreground=THEME.text)
+            style.configure("TLabelframe", background=THEME.panel_bg)
+            style.configure("TLabelframe.Label", background=THEME.panel_bg, foreground=THEME.text)
+            style.configure("TCheckbutton", background=THEME.window_bg, foreground=THEME.text)
+            style.configure("MergeChrome.TFrame", background=THEME.window_bg)
+            style.configure("MergeChrome.TLabel", background=THEME.window_bg, foreground=THEME.secondary_text)
             style.configure("MergeChrome.TNotebook", background=color, bordercolor=color)
             # Notebook pages remain the lazy-loading host, but their duplicate
             # tab rows are hidden. The lower Sheet strip is the sole navigator.
             client_only_layout = [("Notebook.client", {"sticky": "nswe"})]
             style.layout("SheetHost.TNotebook", client_only_layout)
-            style.configure("SheetHost.TNotebook", background=color, borderwidth=0)
+            style.configure("SheetHost.TNotebook", background=THEME.window_bg, borderwidth=0)
             # C has one user-visible view; hide its otherwise empty tab chrome.
             style.layout("CompactPanel.TNotebook", client_only_layout)
-            style.configure("CompactPanel.TNotebook", background=color, borderwidth=0)
-            style.configure("MergeChrome.TPanedwindow", background=color)
+            style.configure("CompactPanel.TNotebook", background=THEME.window_bg, borderwidth=0)
+            style.configure("MergeChrome.TPanedwindow", background=THEME.window_bg)
         except Exception as exc:
             _dlog(f"workspace chrome style failed: {exc}")
 
@@ -32110,11 +32130,12 @@ class SowMergeApp:
         return "save"
 
     def _build_ui(self):
+        tk.Frame(self.root, height=4, bg=self.workspace_chrome_color, bd=0, highlightthickness=0).pack(fill="x")
         top = ttk.Frame(self.root, style="MergeChrome.TFrame")
         top.pack(fill="x", padx=10, pady=(4, 2))
-        # Keep the four permanent workbook actions anchored at the far left;
+        # Keep the permanent workbook actions anchored at the far left;
         # the final empty column absorbs any spare title-bar width.
-        top.grid_columnconfigure(4, weight=1)
+        top.grid_columnconfigure(5, weight=1)
 
         # Permanent raw-argument, identity-matrix, build and Sheet-count text
         # duplicated diagnostics and consumed several spreadsheet rows. Keep
@@ -32125,16 +32146,18 @@ class SowMergeApp:
             f"build={APP_BUILD_TAG}"
         )
 
+        ttk.Label(top, text="Excel 配置合并工作区", style="Title.App.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 16))
         self.recalc_btn = ttk.Button(
             top,
             text="重算并刷新",
+            style="Primary.TButton",
             command=self.recalc_and_refresh,
         )
-        self.recalc_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="导出诊断包", command=self.export_diagnostic_bundle).grid(row=0, column=1, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="复制反馈信息", command=self.copy_feedback_info).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        self.recalc_btn.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="导出诊断包", style="App.TButton", command=self.export_diagnostic_bundle).grid(row=0, column=2, sticky="w", padx=(0, 8))
+        ttk.Button(top, text="复制反馈信息", style="App.TButton", command=self.copy_feedback_info).grid(row=0, column=3, sticky="w", padx=(0, 8))
         self.update_btn = ttk.Button(top, text="检查更新", command=self._do_svn_update)
-        self.update_btn.grid(row=0, column=3, sticky="w")
+        self.update_btn.grid(row=0, column=4, sticky="w")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 2))
 
@@ -32187,8 +32210,8 @@ class SowMergeApp:
 
         self.nav = ttk.Frame(self.bottom, style="MergeChrome.TFrame")
         self.nav.pack(side="left", fill="x", expand=True)
-        ttk.Label(self.nav, text="Sheets（浅黄=预检，亮黄=确认）:", style="MergeChrome.TLabel").pack(side="left")
-        self.nav_canvas = tk.Canvas(self.nav, height=24, highlightthickness=0, bg=self.workspace_chrome_color)
+        ttk.Label(self.nav, text="工作表（浅黄=预检，亮黄=确认）：", style="MergeChrome.TLabel").pack(side="left")
+        self.nav_canvas = tk.Canvas(self.nav, height=24, highlightthickness=0, bg=THEME.window_bg)
         self.nav_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.nav_scroll = ttk.Scrollbar(self.nav, orient="horizontal", command=self.nav_canvas.xview)
         self.nav_scroll.pack(side="bottom", fill="x")
