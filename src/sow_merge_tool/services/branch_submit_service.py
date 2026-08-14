@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
 
 from ..branch_submit import BranchSubmitBatch, BranchSubmitEngine, SvnChangeItem
 

@@ -13,4 +13,5 @@ $python = Join-Path $venv 'Scripts\python.exe'
 & $python -m pip install -U pip
 & $python -m pip install -e '.[dev]'
 if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+git config core.hooksPath .githooks
 Write-Host "Environment ready: $python" -ForegroundColor Green
