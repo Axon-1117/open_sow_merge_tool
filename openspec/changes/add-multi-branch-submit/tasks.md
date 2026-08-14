@@ -8,5 +8,6 @@
 - [x] Add `--branch-submit` and no-argument mode chooser without changing existing TortoiseSVN argument paths.
 - [x] Add adversarial tests for dirty targets, rename blocks, partial selection, server-success/client-error, process death after source/target commit, write-intent crash, guarded restore, and corrupt state.
 - [x] Run first-principles design review, implementation review, and adversarial interruption/concurrency review.
-- [x] Build and deploy portable `update75` EXE/ZIP, update documentation/version, verify installed hashes, and keep release actions independent of PR workflow.
+- [x] Build and deploy portable release EXE/ZIP packages, update documentation/version, verify installed hashes, and keep release actions independent of PR workflow.
 - [x] Add installable/uninstallable `.xlsx`, folder, and folder-background Explorer context menus with exact three-key uninstall scope.
+- [x] Enable `master`, sort branch candidates by newest SVN change time, and move the static Explorer verb from forced top placement to the natural slot before SVN extension commands.

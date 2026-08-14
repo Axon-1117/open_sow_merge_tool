@@ -44,7 +44,6 @@ TERMINAL_ACTION_STATES = {"committed", "already_applied", "restored"}
 BLOCKING_NODE_STATES = {"conflicted", "obstructed", "replaced", "incomplete", "status-callback-failed"}
 SOURCE_CHANGE_STATES = {"modified", "added", "deleted", "missing", "unversioned"}
 STATE_VERSION = 2
-MASTER_BRANCH = "master"
 
 
 def _sha256(path: str) -> str:
@@ -169,6 +168,7 @@ class BranchCandidate:
     enabled: bool = True
     reason: str = ""
     favorite: bool = False
+    last_changed_at: float = 0.0
 
 
 def _contains_excel(path: str) -> bool:
@@ -182,12 +182,39 @@ def _contains_excel(path: str) -> bool:
     return False
 
 
+def _branch_last_changed_times(wc_root: str, repo_root: str, repo_uuid: str) -> dict[str, float]:
+    """Return each branch's newest SVN changed_date as a Unix timestamp."""
+    try:
+        with sqlite3.connect(f"file:{_wc_db_path(wc_root)}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                """
+                select case
+                         when instr(n.local_relpath, '/')=0 then n.local_relpath
+                         else substr(n.local_relpath, 1, instr(n.local_relpath, '/')-1)
+                       end as branch_name,
+                       max(coalesce(n.changed_date, 0))
+                from NODES n join REPOSITORY r on r.id=n.repos_id
+                where n.local_relpath<>'' and n.op_depth=0 and n.presence='normal'
+                  and coalesce(n.file_external,0)=0 and r.root=? and r.uuid=?
+                group by branch_name
+                """,
+                (repo_root, repo_uuid),
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {
+        str(name): (float(changed_date) / 1_000_000.0)
+        for name, changed_date in rows if name and changed_date
+    }
+
+
 def discover_branch_candidates(wc_root: str, *, favorites: Iterable[str] = ()) -> list[BranchCandidate]:
     root = os.path.abspath(wc_root)
     if not os.path.isfile(_wc_db_path(root)):
         raise ValueError(f"不是 SVN 工作副本根目录：{root}")
     favorite_set = {str(item) for item in favorites}
     expected_root, expected_uuid = repository_metadata(root)
+    changed_times = _branch_last_changed_times(root, expected_root, expected_uuid)
     candidates: list[BranchCandidate] = []
     for entry in os.scandir(root):
         if not entry.is_dir(follow_symlinks=False) or entry.name.startswith(".") or entry.is_symlink():
@@ -201,14 +228,13 @@ def discover_branch_candidates(wc_root: str, *, favorites: Iterable[str] = ()) -
         if not _contains_excel(entry.path):
             continue
         url = node.repo_root + ("/" + node.repos_path.strip("/") if node.repos_path else "")
-        enabled = entry.name.lower() != MASTER_BRANCH
         candidates.append(BranchCandidate(
             name=entry.name, path=os.path.abspath(entry.path), url=url,
             repo_root=node.repo_root, repo_uuid=node.repo_uuid,
-            enabled=enabled, reason="master 分支禁止自动提交" if not enabled else "",
             favorite=entry.name in favorite_set,
+            last_changed_at=changed_times.get(entry.name, entry.stat(follow_symlinks=False).st_mtime),
         ))
-    candidates.sort(key=lambda item: (not item.favorite, item.name.lower()))
+    candidates.sort(key=lambda item: (-item.last_changed_at, item.name.lower()))
     return candidates
 
 
@@ -228,12 +254,10 @@ def discover_branches(wc_root: str, allowed: Iterable[str] | None = None) -> lis
     return sorted(dict.fromkeys(names), key=lambda item: (item != "develop", item.lower()))
 
 
-def _validate_branch_name(branch: str, branches: Iterable[str], *, allow_master: bool = False) -> str:
+def _validate_branch_name(branch: str, branches: Iterable[str]) -> str:
     value = str(branch or "").strip()
     if value not in set(branches):
         raise ValueError(f"分支不在已验证候选中：{value or '<empty>'}")
-    if not allow_master and value.lower() == MASTER_BRANCH:
-        raise ValueError("master 分支不进入多分支自动提交")
     return value
 
 

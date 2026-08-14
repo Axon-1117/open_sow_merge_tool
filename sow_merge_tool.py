@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-13.update75"
-APP_BUILD_TAG = "recoverable-multi-branch-workbench"
+APP_VERSION = "2026-08-14.update76"
+APP_BUILD_TAG = "branch-recency-and-shell-order"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
