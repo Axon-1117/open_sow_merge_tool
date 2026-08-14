@@ -10,15 +10,30 @@
 - **WHEN** the user starts from an `.xlsx`, folder, or folder background
 - **THEN** the tool recursively scans that folder, shows all SVN changes with status metadata, defaults safe modified/added/deleted Excel files on, keeps unversioned Excel off, and displays non-Excel changes read-only
 
-## Scenario: source delta preflight
+## Scenario: optional source delta preflight
 
-- **WHEN** source and all selected targets are clean enough to analyze
-- **THEN** the tool obtains source pristine and working content, computes source-before to source-after changes, and previews per-target applied, already-present, retained, unresolved, and unsupported counts without changing target files
+- **WHEN** the user chooses “预检查（可选）” and source and all selected targets are clean enough to analyze
+- **THEN** the tool obtains source pristine and working content, computes source-before to source-after changes, and previews a per-target action matrix without changing target files
+
+## Scenario: direct submission without preflight
+
+- **WHEN** the user clicks “开始提交” without opening the optional preflight dialog
+- **THEN** the same checks run in the background immediately before the source commit; safe unique-key tail-row changes are prepared automatically, already-applied files are skipped, and ambiguous changes open the Excel merge tool instead of being silently copied
 
 ## Scenario: fail closed
 
 - **WHEN** status collection fails, a selected target is dirty, conflict/switch/property/external/unsupported structure is detected, or a target changed since analysis
-- **THEN** the batch is blocked and no commit dialog is opened until the condition is resolved and analysis is rerun
+- **THEN** the affected action is blocked and no commit dialog is opened for that unsafe action; a manual action remains available through the Excel merge tool
+
+## Scenario: conservative fast path
+
+- **WHEN** a source delta is limited to value/formula changes or unique-key rows appended at the source tail, with stable headers and default styles
+- **THEN** the tool classifies the target in read-only OOXML, projects only the proven cells/rows into a candidate in place of a full openpyxl rewrite, and reports the automatic/already/manual counts
+
+## Scenario: manual merge fallback
+
+- **WHEN** a target cell has an independent value, a row is inserted in the middle, styles/structure changed, or the unique key cannot be proved stable
+- **THEN** the tool marks the file “需人工合并”, launches the existing Excel merge UI with source-before/source-after aliases, and accepts the result only after the target hash changes and SVN status is rechecked
 
 ## Scenario: added, deleted, and renamed files
 

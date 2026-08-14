@@ -17,6 +17,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +28,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import ClassVar
 
+from .fast_branch_merge import analyze_source as fast_analyze_source
+from .fast_branch_merge import analyze_target as fast_analyze_target
+from .fast_branch_merge import apply_one_click_plan
 from .svn_status_provider import (
     SvnStatusRecord,
     records_by_path,
@@ -34,14 +38,13 @@ from .svn_status_provider import (
 )
 from .ui_foundation import THEME, UiTaskRunner, configure_ttk_style
 
-
 SUPPORTED_EXTENSIONS = (".xlsx",)
 DEFAULT_BRANCHES = ("develop", "release", "sandbox")
 HIDDEN_BRANCH_NAMES = {".svn", "tool", "tools", "sow_merge_tool", "excel_merge_tool"}
 TERMINAL_ACTION_STATES = {"committed", "already_applied", "restored"}
 BLOCKING_NODE_STATES = {"conflicted", "obstructed", "replaced", "incomplete", "status-callback-failed"}
 SOURCE_CHANGE_STATES = {"modified", "added", "deleted", "missing", "unversioned"}
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 
 def _sha256(path: str) -> str:
@@ -510,6 +513,9 @@ class BatchFileAction:
     revision_before: int | None = None
     revision_after: int | None = None
     prepared_at: str = ""
+    disposition: str = ""
+    reason_code: str = ""
+    manual_result: str = ""
 
 
 @dataclass
@@ -525,6 +531,7 @@ class FilePlan:
     source_committed_revision: int | None = None
     actions: dict[str, BatchFileAction] = field(default_factory=dict)
     target_summaries: dict[str, dict] = field(default_factory=dict)
+    target_details: dict[str, list[dict]] = field(default_factory=dict)
 
 
 @dataclass
@@ -569,13 +576,20 @@ class BranchSubmitBatch:
         with open(path, "r", encoding="utf-8") as stream:
             payload = json.load(stream)
         version = int(payload.pop("state_version", 1))
-        if version != STATE_VERSION:
+        if version not in {2, STATE_VERSION}:
             raise ValueError(f"批次状态版本不兼容：{version}")
         plans: list[FilePlan] = []
         for raw in payload.pop("files", []):
             actions = {name: BatchFileAction(**action) for name, action in raw.pop("actions", {}).items()}
             plans.append(FilePlan(actions=actions, **raw))
-        return cls(files=plans, **payload)
+        batch = cls(files=plans, **payload)
+        # v2 batches did not classify semantic actions.  Keep them resumable;
+        # the next target revalidation will fill the new disposition fields.
+        if version == 2:
+            for plan in batch.files:
+                for action in plan.actions.values():
+                    action.disposition = action.disposition or ("already_applied" if action.state == "already_applied" else "")
+        return batch
 
 
 def list_unfinished_batches() -> list[BranchSubmitBatch]:
@@ -669,6 +683,7 @@ class BranchSubmitEngine:
         self.runner = runner or self._default_runner
         self.status_scanner = status_scanner or scan_status
         self.candidates = list(candidates) if candidates is not None else None
+        self._fast_delta_cache: dict[tuple[str, str], object] = {}
 
     def _load_core(self):
         if self.core is None:
@@ -678,7 +693,7 @@ class BranchSubmitEngine:
 
     @staticmethod
     def _default_runner(args, *, timeout=300):
-        return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
+        return subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout, check=False)
 
     def _tortoise(self, command: str, paths: list[str], *, message: str | None = None) -> int:
         core = self._load_core()
@@ -721,6 +736,60 @@ class BranchSubmitEngine:
     def _update(self, paths: list[str]) -> None:
         if paths and self._tortoise("update", sorted(dict.fromkeys(paths))) != 0:
             raise RuntimeError("SVN update 未成功或被取消")
+
+    def _launch_manual_merge(self, batch: BranchSubmitBatch, plan: FilePlan, target_path: str) -> int:
+        """Open the existing Excel merger with explicit cross-branch roles."""
+        stamp = str(batch.source_revision_after or plan.source_revision or 0)
+        base_alias = os.path.join(tempfile.gettempdir(), f"{Path(plan.relative_path).stem}.xlsx.merge-left.r{stamp}")
+        theirs_alias = os.path.join(tempfile.gettempdir(), f"{Path(plan.relative_path).stem}.xlsx.merge-right.r{stamp}")
+        _safe_copy(plan.source_before, base_alias)
+        _safe_copy(plan.source_after, theirs_alias)
+        if getattr(sys, "frozen", False):
+            command = [sys.executable]
+        else:
+            command = [sys.executable, "-m", "sow_merge_tool"]
+        command.extend((
+            "--base", base_alias, "--mine", target_path, "--theirs", theirs_alias,
+            "--merged", target_path, "--title", f"多分支人工合并 · {target_path}",
+        ))
+        try:
+            result = subprocess.run(command, timeout=3600, check=False)
+            return int(result.returncode or 0)
+        finally:
+            for path in (base_alias, theirs_alias):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def _prepare_manual_action(self, batch: BranchSubmitBatch, plan: FilePlan, target: str) -> None:
+        action = plan.actions[target]
+        path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
+        if not os.path.isfile(path):
+            raise RuntimeError(f"{target}/{plan.relative_path}：目标文件不存在，无法打开人工合并")
+        backup = _artifact_path(batch.folder, os.path.join("backups", target), plan.relative_path)
+        _safe_copy(path, backup)
+        action.backup_path = backup
+        action.target_before_hash = _sha256(backup)
+        action.state = "manual"
+        batch.event("manual-merge-intent", target=target, path=plan.relative_path, backup=backup)
+        # Persist the intent before launching Excel.  A crash or user cancel
+        # must leave a recoverable journal even though the merge UI is outside
+        # this process.
+        batch.save()
+        batch.event("manual-merge-open", target=target, path=plan.relative_path)
+        exit_code = self._launch_manual_merge(batch, plan, path)
+        if not os.path.isfile(path) or _sha256(path) == action.target_before_hash:
+            action.reason = "人工合并未产生已保存的目标内容"
+            batch.event("manual-merge-cancelled", target=target, path=plan.relative_path, exit_code=exit_code)
+            batch.save()
+            raise RuntimeError(f"{target}/{plan.relative_path}：用户取消或未保存人工合并")
+        action.candidate_hash = _sha256(path)
+        action.manual_result = "saved"
+        action.state = "prepared"
+        action.reason = "人工合并已保存，等待 TortoiseSVN 提交"
+        batch.event("manual-merge-prepared", target=target, path=plan.relative_path, exit_code=exit_code)
+        batch.save()
 
     def _source_snapshot(self, batch: BranchSubmitBatch, item: SvnChangeItem) -> FilePlan:
         core = self._load_core()
@@ -817,19 +886,35 @@ class BranchSubmitEngine:
             if not _semantic_equal(plan.source_before, target_path):
                 action.state, action.reason = "blocked", "目标文件已有独立内容变化，不能安全删除"
             return action
-        conflicts, candidate, _mapping, summary, merge_reason = core._cross_branch_source_delta_premerge(
-            plan.source_before, target_path, plan.source_after
-        )
-        plan.target_summaries[target] = dict(summary)
-        if merge_reason or conflicts:
-            action.state, action.reason = "blocked", merge_reason or f"存在 {len(conflicts)} 个待解决冲突"
+        # Semantic analysis is deliberately a fast, read-only classification.
+        # It must not turn an Excel structure that TortoiseSVN can commit into
+        # a source-branch submission blocker.  Candidate materialization is
+        # deferred until the target is actually processed.
+        try:
+            cache_key = (plan.source_before, plan.source_after)
+            delta = getattr(self, "_fast_delta_cache", {}).get(cache_key)
+            if delta is None:
+                delta = fast_analyze_source(plan.source_before, plan.source_after)
+                self._fast_delta_cache[cache_key] = delta
+            decision = fast_analyze_target(delta, target_path)
+        except Exception as exc:
+            action.disposition = "manual"
+            action.state, action.reason = "manual", f"快速分析失败，需打开 Excel 合并器：{exc}"
+            action.reason_code = "fast-analysis-error"
+            plan.target_summaries[target] = {"manual": 1, "reason": str(exc)}
             return action
-        if not summary.get("applied_count", 0):
+        action.disposition = decision.disposition
+        action.reason_code = decision.disposition
+        plan.target_summaries[target] = dict(decision.summary)
+        plan.target_details[target] = list(decision.details)
+        if decision.disposition == "already_applied":
             action.state = "already_applied"
-            return action
-        candidate_copy = _artifact_path(batch.folder, os.path.join("candidates", target), plan.relative_path)
-        _safe_copy(candidate, candidate_copy)
-        action.candidate_path, action.candidate_hash = candidate_copy, _sha256(candidate_copy)
+            action.reason = decision.reason
+        elif decision.disposition == "manual":
+            action.state, action.reason = "manual", decision.reason
+        else:
+            action.state = "ready"
+            action.reason = decision.reason
         return action
 
     def preflight(
@@ -1041,7 +1126,6 @@ class BranchSubmitEngine:
         if reason:
             action.state, action.reason = "blocked", reason
             return action
-        core = self._load_core()
         if plan.operation == "add":
             if os.path.isfile(target_path):
                 if record.versioned and record.node_status == "normal" and _semantic_equal(plan.source_after, target_path):
@@ -1062,18 +1146,30 @@ class BranchSubmitEngine:
         if not os.path.isfile(target_path) or record.node_status != "normal":
             action.state, action.reason = "blocked", f"更新后目标状态不是 normal：{record.node_status}"
             return action
-        conflicts, candidate, _mapping, summary, merge_reason = core._cross_branch_source_delta_premerge(
-            plan.source_before, target_path, plan.source_after
-        )
-        plan.target_summaries[target] = dict(summary)
-        if merge_reason or conflicts:
-            action.state, action.reason = "blocked", merge_reason or f"更新后出现 {len(conflicts)} 个冲突"
-        elif not summary.get("applied_count", 0):
-            action.state = "already_applied"
-        else:
-            candidate_copy = _artifact_path(batch.folder, os.path.join("candidates", target), plan.relative_path)
-            _safe_copy(candidate, candidate_copy)
-            action.candidate_path, action.candidate_hash = candidate_copy, _sha256(candidate_copy)
+        try:
+            cache_key = (plan.source_before, plan.source_after)
+            delta = self._fast_delta_cache.get(cache_key)
+            if delta is None:
+                delta = fast_analyze_source(plan.source_before, plan.source_after)
+                self._fast_delta_cache[cache_key] = delta
+            decision = fast_analyze_target(delta, target_path)
+            plan.target_summaries[target] = dict(decision.summary)
+            plan.target_details[target] = list(decision.details)
+            action.disposition = decision.disposition
+            action.reason_code = decision.disposition
+            if decision.disposition == "already_applied":
+                action.state, action.reason = "already_applied", decision.reason
+            elif decision.disposition == "manual":
+                action.state, action.reason = "manual", decision.reason
+            else:
+                candidate_copy = _artifact_path(batch.folder, os.path.join("candidates", target), plan.relative_path)
+                apply_one_click_plan(plan.source_before, plan.source_after, target_path, candidate_copy, decision)
+                action.candidate_path, action.candidate_hash = candidate_copy, _sha256(candidate_copy)
+                action.state, action.reason = "ready", decision.reason
+        except Exception as exc:
+            action.state, action.reason = "manual", f"无法自动生成候选，需打开 Excel 合并器：{exc}"
+            action.disposition = "manual"
+            action.reason_code = "materialize-error"
         return action
 
     def _prepare_target_action(self, batch: BranchSubmitBatch, plan: FilePlan, target: str) -> None:
@@ -1218,7 +1314,11 @@ class BranchSubmitEngine:
                     if action.state in {"blocked", "unknown"}:
                         raise RuntimeError(f"{target}/{plan.relative_path}：{action.reason}")
                 for plan in batch.files:
-                    self._prepare_target_action(batch, plan, target)
+                    action = plan.actions[target]
+                    if action.state == "manual":
+                        self._prepare_manual_action(batch, plan, target)
+                    else:
+                        self._prepare_target_action(batch, plan, target)
                 commit_paths = [
                     os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
                     for plan in batch.files if plan.actions[target].state == "prepared"
@@ -1368,6 +1468,7 @@ class BranchSubmitWorkbench:
         self.target_vars: dict[str, object] = {}
         self._target_selection: dict[str, bool] = {}
         self._target_rows: dict[str, str] = {}
+        self._target_status_map: dict[str, str] = {}
         self._target_rebuild_after = None
         self._item_rows: dict[str, SvnChangeItem] = {}
         self._preflight_generation = 0
@@ -1395,8 +1496,12 @@ class BranchSubmitWorkbench:
     def _build_style(self):
         style = configure_ttk_style(self.root)
         style.configure("Title.TLabel", background=THEME.window_bg, foreground=THEME.text, font=(THEME.font_family, 10, "bold"))
-        style.configure("Panel.TLabelframe", background=THEME.panel_bg)
+        # Keep the three work areas visibly separated on both light and dark
+        # Windows themes.  A subtle solid border reads closer to TortoiseSVN
+        # than a collection of borderless frames.
+        style.configure("Panel.TLabelframe", background=THEME.panel_bg, relief="solid", borderwidth=1)
         style.configure("Panel.TLabelframe.Label", background=THEME.panel_bg, foreground=THEME.text, font=(THEME.font_family, 9, "bold"))
+        style.configure("Status.App.TLabel", background=THEME.window_bg, foreground=THEME.secondary_text, padding=(4, 3))
 
     def _build_ui(self):
         tk, ttk = self.tk, self.ttk
@@ -1417,6 +1522,8 @@ class BranchSubmitWorkbench:
 
         paned = ttk.Panedwindow(outer, orient="horizontal"); paned.pack(fill="both", expand=True, pady=(10, 0))
         target_box = ttk.LabelFrame(paned, text="目标分支", padding=8, style="Panel.TLabelframe"); paned.add(target_box, weight=1)
+        self.target_summary_var = tk.StringVar(value="待检查 · 选择目标分支后可直接开始提交")
+        ttk.Label(target_box, textvariable=self.target_summary_var, style="Muted.App.TLabel").pack(anchor="w", pady=(0, 6))
         search_row = ttk.Frame(target_box); search_row.pack(fill="x")
         ttk.Label(search_row, text="筛选").pack(side="left", padx=(0, 6))
         ttk.Entry(search_row, textvariable=self.target_search_var).pack(side="left", fill="x", expand=True)
@@ -1429,15 +1536,19 @@ class BranchSubmitWorkbench:
         target_scroll = ttk.Scrollbar(canvas_holder, orient="vertical")
         self.target_tree = ttk.Treeview(
             canvas_holder,
-            columns=("check", "favorite", "branch", "changed"),
+            columns=("check", "favorite", "branch", "state", "changed"),
             show="headings",
             selectmode="browse",
             yscrollcommand=target_scroll.set,
         )
         target_scroll.configure(command=self.target_tree.yview)
-        for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 150), ("changed", "最近修改", 112)):
+        for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 125), ("state", "处理状态", 90), ("changed", "最近修改", 112)):
             self.target_tree.heading(key, text=title)
             self.target_tree.column(key, width=width, anchor="center" if key in {"check", "favorite"} else "w", stretch=key == "branch")
+        self.target_tree.tag_configure("ready", foreground=THEME.success)
+        self.target_tree.tag_configure("manual", foreground=THEME.warning)
+        self.target_tree.tag_configure("blocked", foreground=THEME.error)
+        self.target_tree.tag_configure("committed", foreground=THEME.success)
         self.target_tree.pack(side="left", fill="both", expand=True); target_scroll.pack(side="right", fill="y")
         self.target_tree.bind("<Button-1>", self._target_tree_click)
         self.target_tree.bind("<space>", self._target_space)
@@ -1450,6 +1561,7 @@ class BranchSubmitWorkbench:
         ttk.Button(message_tools, text="显示日志", command=self._show_log).pack(side="left")
         self.message = tk.Text(message_box, height=5, wrap="word", font=("Segoe UI", 9), undo=True)
         self.message.pack(fill="x")
+        self.message.bind("<KeyRelease>", lambda _event: self._refresh_primary_button())
 
         changes = ttk.LabelFrame(main, text="文件变更（双击查看差异）", padding=8, style="Panel.TLabelframe"); changes.pack(fill="both", expand=True, pady=(10, 0))
         filters = ttk.Frame(changes); filters.pack(fill="x", pady=(0, 6))
@@ -1478,10 +1590,10 @@ class BranchSubmitWorkbench:
         self.scan_progress = ttk.Progressbar(bottom, mode="indeterminate", length=110)
         self.scan_progress.pack(side="left", padx=(0, 8))
         ttk.Label(bottom, textvariable=self.count_var).pack(side="left")
-        ttk.Label(bottom, textvariable=self.status_var, foreground=THEME.secondary_text).pack(side="left", padx=18)
+        ttk.Label(bottom, textvariable=self.status_var, style="Status.App.TLabel").pack(side="left", padx=18)
         ttk.Button(bottom, text="取消", command=self._close).pack(side="right")
         self.submit_button = ttk.Button(bottom, text="开始提交", style="Primary.TButton", command=self._submit); self.submit_button.pack(side="right", padx=6); self.submit_button.state(["disabled"])
-        self.preflight_button = ttk.Button(bottom, text="预检查", style="App.TButton", command=self._preflight); self.preflight_button.pack(side="right")
+        self.preflight_button = ttk.Button(bottom, text="预检查（可选）", style="App.TButton", command=self._preflight); self.preflight_button.pack(side="right")
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _candidate_for_source(self):
@@ -1527,7 +1639,9 @@ class BranchSubmitWorkbench:
             iid = f"branch-{index}"
             self._target_rows[iid] = candidate.name
             changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(candidate.last_changed_at)) if candidate.last_changed_at else "—"
-            self.target_tree.insert("", "end", iid=iid, values=("☑" if var.get() else "☐", "★" if candidate.favorite else "☆", candidate.name, changed))
+            state = self._target_status_map.get(candidate.name, "待检查")
+            tag = {"可一键处理": "ready", "需人工合并": "manual", "安全阻断": "blocked", "已提交": "committed"}.get(state, "")
+            self.target_tree.insert("", "end", iid=iid, values=("☑" if var.get() else "☐", "★" if candidate.favorite else "☆", candidate.name, state, changed), tags=(tag,))
 
     def _target_tree_click(self, event):
         iid = self.target_tree.identify_row(event.y)
@@ -1598,6 +1712,7 @@ class BranchSubmitWorkbench:
         scope_path = self.scope_var.get()
         cancel_event = self.scan_cancel
         self.status_var.set("正在递归读取 SVN 状态…"); self.preflight_button.state(["disabled"])
+        self.submit_button.state(["disabled"])
         self.scan_stop_button.state(["!disabled"]); self.scan_progress.start(12)
         def worker():
             try:
@@ -1636,9 +1751,10 @@ class BranchSubmitWorkbench:
         self.scan_progress.stop(); self.scan_progress.configure(value=0); self.scan_stop_button.state(["disabled"])
         self.preflight_button.state(["!disabled"])
         if error:
-            self.items = []; self._render_items(); self.status_var.set(error); return
+            self.items = []; self._render_items(); self.status_var.set(error); self._refresh_primary_button(); return
         self.items = items; self._render_items()
         self.status_var.set("状态扫描完成；灰色或带原因的项目不会进入批次")
+        self._refresh_primary_button()
 
     def _render_items(self):
         for iid in self.tree.get_children(): self.tree.delete(iid)
@@ -1653,6 +1769,7 @@ class BranchSubmitWorkbench:
             self.tree.insert("", "end", iid=iid, values=(mark, item.relative_path, item.extension, status, item.prop_status, item.lock_owner or ("已锁定" if item.wc_locked else ""), "是" if item.switched else "", item.changelist))
         selected = sum(item.checked for item in self.items)
         self.count_var.set(f"已选 {selected} 个，显示 {len(visible)} 个，共 {len(self.items)} 个")
+        self._refresh_primary_button()
 
     def _tree_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell" or self.tree.identify_column(event.x) != "#1": return
@@ -1699,13 +1816,55 @@ class BranchSubmitWorkbench:
     def _invalidate_batch(self):
         self._selection_generation += 1
         self.current_batch = None
-        self.submit_button.state(["disabled"])
+        self._refresh_primary_button()
         if self._preflight_generation:
             self.ui_tasks.cancel(self._preflight_generation)
+
+    def _can_start(self) -> bool:
+        try:
+            message = self.message.get("1.0", self.tk.END).strip()
+        except Exception:
+            message = ""
+        return bool(self.items and self._selected_items() and self._selected_targets() and message)
+
+    def _refresh_primary_button(self):
+        if not hasattr(self, "submit_button"):
+            return
+        if self._commit_active or self.closing or not self._can_start():
+            self.submit_button.state(["disabled"])
+        else:
+            self.submit_button.state(["!disabled"])
 
     def _selected_targets(self):
         self._target_selection.update({name: bool(var.get()) for name, var in self.target_vars.items()})
         return [candidate.name for candidate in self.candidates if self._target_selection.get(candidate.name, False) and candidate.name != self.source_var.get()]
+
+    def _render_target_statuses(self):
+        labels = {
+            "ready": "可一键处理", "manual": "需人工合并", "blocked": "安全阻断",
+            "already_present": "已同步", "committed": "已提交", "partial": "部分成功",
+            "unknown": "未知", "cancelled": "已取消", "failed": "失败", "pending": "待处理",
+        }
+        self._target_status_map = {}
+        if self.current_batch:
+            for target, state in self.current_batch.target_status.items():
+                actions = [plan.actions.get(target) for plan in self.current_batch.files]
+                actions = [action for action in actions if action is not None]
+                if state == "ready" and any(action.state == "manual" for action in actions):
+                    label = "需人工合并"
+                elif state == "ready" and any(action.state in {"ready", "prepared"} for action in actions):
+                    label = "可一键处理"
+                else:
+                    label = labels.get(state, state)
+                self._target_status_map[target] = label
+        selected = self._selected_targets()
+        counts = {"可一键处理": 0, "需人工合并": 0, "安全阻断": 0, "已提交": 0}
+        for name in selected:
+            counts[self._target_status_map.get(name, "待检查")] = counts.get(self._target_status_map.get(name, "待检查"), 0) + 1
+        self.target_summary_var.set(
+            f"已选 {len(selected)} · 可一键 {counts['可一键处理']} · 人工 {counts['需人工合并']} · 阻断 {counts['安全阻断']}"
+        )
+        self._rebuild_targets()
 
     def _selected_items(self):
         return [item for item in self.items if item.checked and item.selectable]
@@ -1743,19 +1902,23 @@ class BranchSubmitWorkbench:
         tree=ttk.Treeview(frame,columns=("branch","file","operation","state","reason"),show="headings")
         for key,title,width in (("branch","目标分支",100),("file","文件",310),("operation","动作",80),("state","状态",110),("reason","说明",260)):
             tree.heading(key,text=title);tree.column(key,width=width,anchor="w")
+        state_labels = {
+            "ready": "可一键处理", "manual": "需人工合并", "already_applied": "已同步",
+            "blocked": "安全阻断", "prepared": "已准备", "committed": "已提交",
+        }
         for plan in batch.files:
             for target in batch.target_branches:
                 action=plan.actions[target]; summary=plan.target_summaries.get(target,{})
-                reason=action.reason or (f"应用 {summary.get('applied_count',0)} 项" if plan.operation=="modify" else "")
-                tree.insert("","end",values=(target,plan.relative_path,plan.operation,action.state,reason))
+                reason=action.reason or (f"可处理 {summary.get('auto',0)} 项" if plan.operation=="modify" else "")
+                tree.insert("","end",values=(target,plan.relative_path,plan.operation,state_labels.get(action.state, action.state),reason))
         tree.pack(fill="both",expand=True)
         buttons=ttk.Frame(frame);buttons.pack(fill="x",pady=(8,0))
         def accept():result["ok"]=True;win.destroy()
         ttk.Button(buttons,text="关闭",command=win.destroy).pack(side="right")
-        if batch.source_status=="ready":ttk.Button(buttons,text="确认预检查结果",command=accept).pack(side="right",padx=6)
+        if batch.source_status=="ready":ttk.Button(buttons,text="关闭并保留结果",command=accept).pack(side="right",padx=6)
         win.grab_set();self.root.wait_window(win);return result["ok"]
 
-    def _preflight(self):
+    def _preflight(self, *, auto_start: bool = False):
         from tkinter import messagebox
         if self._commit_active:
             return
@@ -1789,9 +1952,14 @@ class BranchSubmitWorkbench:
                 self.status_var.set("预检查已取消")
                 return
             self.current_batch = batch
-            if self._matrix_dialog(batch) and batch.source_status == "ready":
+            self._render_target_statuses()
+            if not auto_start:
+                self._matrix_dialog(batch)
+            if batch.source_status == "ready":
                 self.submit_button.state(["!disabled"])
-                self.status_var.set(f"批次 {batch.batch_id} 已冻结，点击开始提交")
+                self.status_var.set(f"预检查完成：可一键 {sum(a.state == 'ready' for p in batch.files for a in p.actions.values())} 项，需人工 {sum(a.state == 'manual' for p in batch.files for a in p.actions.values())} 项；可直接开始提交")
+                if auto_start:
+                    self.root.after(0, self._submit)
             else:
                 self.submit_button.state(["disabled"])
                 self.status_var.set(batch.error or "预检查结果未确认")
@@ -1801,7 +1969,10 @@ class BranchSubmitWorkbench:
     def _submit(self):
         from tkinter import messagebox
         batch=self.current_batch
-        if not batch or self._commit_active:return
+        if self._commit_active:return
+        if not batch:
+            self._preflight(auto_start=True)
+            return
         if not messagebox.askyesno("开始分步提交","将依次打开源分支和目标分支的 TortoiseSVN 提交窗口。\n任何取消、部分勾选或未知结果都会停止后续分支。\n\n继续吗？",parent=self.root):return
         self.submit_button.state(["disabled"])
         self.preflight_button.state(["disabled"])
@@ -1817,6 +1988,7 @@ class BranchSubmitWorkbench:
                 messagebox.showerror("提交失败", str(error), parent=self.root)
                 return
             self.current_batch = result
+            self._render_target_statuses()
             self.status_var.set(_format_batch_result(result).replace("\n", " · "))
             messagebox.showinfo("批次结果", _format_batch_result(result), parent=self.root)
             if result.superseded_by:

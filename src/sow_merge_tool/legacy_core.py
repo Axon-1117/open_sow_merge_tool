@@ -46,7 +46,7 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-14.update79"
+APP_VERSION = "2026-08-14.update80"
 APP_BUILD_TAG = "ui-refresh-performance"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
