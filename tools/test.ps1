@@ -54,7 +54,8 @@ function Invoke-PythonFile {
   Write-Host ("PASS {0} ({1:N2}s)" -f (Split-Path -Leaf $Path), $watch.Elapsed.TotalSeconds) -ForegroundColor Green
 }
 
-$smoke = @(Get-ChildItem -File '_smoke_test*.py' | Sort-Object Name)
+$testScriptRoot = Join-Path $repo 'tests\legacy'
+$smoke = @(Get-ChildItem -LiteralPath $testScriptRoot -File -Filter '_smoke_test*.py' | Sort-Object Name)
 if ($Profile -in @('Fast', 'Full', 'Adversarial')) {
   foreach ($test in $smoke) { Invoke-PythonFile $test.FullName }
 }
@@ -68,12 +69,12 @@ if ($Profile -in @('Full', 'Adversarial')) {
 }
 
 if ($Profile -eq 'Gui') {
-  & $python 'ui_test_scenarios.py'
+  & $python (Join-Path $testScriptRoot 'ui_test_scenarios.py')
   if ($LASTEXITCODE -ne 0) { throw "GUI tests failed with exit code $LASTEXITCODE" }
 }
 
 if ($Profile -eq 'Native') {
-  & $python '_gui_self_test_branch_submit_workbench.py'
+  & $python (Join-Path $testScriptRoot '_gui_self_test_branch_submit_workbench.py')
   if ($LASTEXITCODE -ne 0) { throw "Native GUI test failed with exit code $LASTEXITCODE" }
 }
 

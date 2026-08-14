@@ -12,9 +12,11 @@ SVN submission. The user-facing executable remains `sow_merge_tool.exe`.
 .\tools\release.ps1 -DeployPath 'C:\sow_main\excel\excel_merge_tool'
 ```
 
-Development happens on `SWolf`. After the local gate and post-build
-adversarial review pass, `SWolf` is merged directly into `master`; this
-repository does not use pull requests for the release flow.
+Development happens directly on `master`. The repository does not use pull
+requests for the release flow.
+
+Regression and GUI scripts live under `tests/legacy`; they are not runtime
+entry points and are invoked through `tools/test.ps1`.
 
 The Feishu requirements document and real business workbooks remain
 read-only during validation.

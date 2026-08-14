@@ -489,7 +489,7 @@ def _worker(args) -> int:
         "case": args.case,
         "phase": args.phase,
         "repeat": args.repeat,
-        "implementation_sha256": _sha256(REPO_ROOT / "sow_merge_tool.py"),
+        "implementation_sha256": _sha256(REPO_ROOT / "src" / "sow_merge_tool" / "legacy_core.py"),
         "script_sha256": _sha256(Path(__file__).resolve()),
     })
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -535,7 +535,7 @@ def _git_metadata() -> dict:
 
 
 def _environment() -> dict:
-    implementation_path = REPO_ROOT / "sow_merge_tool.py"
+    implementation_path = REPO_ROOT / "src" / "sow_merge_tool" / "legacy_core.py"
     return {
         "captured_at": datetime.now().astimezone().isoformat(),
         "timezone": str(datetime.now().astimezone().tzinfo),
@@ -727,7 +727,7 @@ def _driver(args) -> int:
     worker_script_hashes = {record["script_sha256"] for record in raw}
     if worker_implementation_hashes != {environment_metadata["implementation_sha256"]}:
         raise RuntimeError(
-            "sow_merge_tool.py changed during the run; discard this mixed-code report"
+            "src/sow_merge_tool/legacy_core.py changed during the run; discard this mixed-code report"
         )
     if worker_script_hashes != {environment_metadata["script_sha256"]}:
         raise RuntimeError("benchmark script changed during the run")

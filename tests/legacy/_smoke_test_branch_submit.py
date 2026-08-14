@@ -11,9 +11,9 @@ from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
-import branch_submit as bs
 import sow_merge_tool as smt
-import svn_status_provider as sp
+from sow_merge_tool import branch_submit as bs
+from sow_merge_tool import svn_status_provider as sp
 
 
 def _book(path: str, value: int) -> None:
@@ -509,7 +509,9 @@ def test_write_intent_crash_restore_and_corrupt_state_detection() -> None:
 
 
 def test_entrypoint_registry_scope_and_real_status_child() -> None:
-    repo=os.path.dirname(os.path.abspath(__file__))
+    repo=os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     install=open(os.path.join(repo,"install_context_menu.bat"),encoding="utf-8").read()
     uninstall=open(os.path.join(repo,"uninstall_context_menu.bat"),encoding="utf-8").read()
     for key in (

@@ -50,12 +50,17 @@ def main():
     _make_xlsx(fa, a_rows)
     _make_xlsx(fb, b_rows)
 
-    # Always benchmark the source beside this script. A hard-coded tool install
-    # path previously made this benchmark silently measure an older build.
-    source_dir = os.path.dirname(os.path.abspath(__file__))
+    # Always benchmark the checked-in package. A hard-coded tool install path
+    # previously made this benchmark silently measure an older build.
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    source_dir = os.path.join(repo_root, "src")
     sys.path.insert(0, source_dir)
     import sow_merge_tool as mod
-    expected_module = os.path.normcase(os.path.join(source_dir, "sow_merge_tool.py"))
+    expected_module = os.path.normcase(
+        os.path.join(source_dir, "sow_merge_tool", "legacy_core.py")
+    )
     actual_module = os.path.normcase(os.path.abspath(mod.__file__))
     if actual_module != expected_module:
         raise RuntimeError(

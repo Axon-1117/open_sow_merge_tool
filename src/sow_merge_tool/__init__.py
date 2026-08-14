@@ -1,20 +1,21 @@
-"""Public Python package for the Excel merge tool.
+"""Public package boundary for the Excel merge tool.
 
-The legacy implementation is kept behind this package boundary while the
-remaining modules are migrated.  Re-exporting the legacy symbols here keeps
-the executable and existing automation on one import path during the
-refactor; new code must depend on the service and adapter modules instead of
-reaching into this compatibility surface.
+The implementation is still being split incrementally.  During that migration
+the public package aliases the legacy module object so existing test and plugin
+monkeypatches continue to modify the real implementation globals.  New code
+should import services and adapters explicitly instead of depending on this
+compatibility surface.
 """
 
-from . import legacy_core as _legacy_core
+from __future__ import annotations
 
-for _name, _value in vars(_legacy_core).items():
-    if _name not in {"__name__", "__package__", "__loader__", "__spec__"}:
-        globals()[_name] = _value
+import sys
 
-__all__ = tuple(
-    _name
-    for _name in globals()
-    if not _name.startswith("__") and _name not in {"_legacy_core", "_name", "_value"}
-)
+from . import legacy_core as _implementation
+
+# Keep the package path so ``sow_merge_tool.branch_submit`` and the other
+# extracted modules remain importable after the public module alias is set.
+_implementation.__name__ = __name__
+_implementation.__package__ = __name__
+_implementation.__path__ = list(__path__)
+sys.modules[__name__] = _implementation

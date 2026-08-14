@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import tkinter as tk
 
-import branch_submit as bs
+from sow_merge_tool import branch_submit as bs
 
 
 def _create_fixture():
