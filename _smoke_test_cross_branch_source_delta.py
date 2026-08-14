@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
@@ -98,6 +99,11 @@ def _materialize_shared_strings(path: str, *, reverse_table: bool = False) -> No
 
 def _book_sheets(path: str, sheets: dict[str, list[list[object]]]) -> None:
     workbook = Workbook()
+    # These fixtures represent revisions of one logical workbook. Keep the
+    # generated package timestamps stable across wall-clock boundaries.
+    fixed_time = datetime(2020, 1, 1, 0, 0, 0)
+    workbook.properties.created = fixed_time
+    workbook.properties.modified = fixed_time
     first = True
     for name, rows in sheets.items():
         sheet = workbook.active if first else workbook.create_sheet()

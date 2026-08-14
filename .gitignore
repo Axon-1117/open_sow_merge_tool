@@ -36,4 +36,6 @@ build_tmp*/
 dist_new*/
 dist_tmp*/
 tmp/
+artifacts/
+.local/
 sow_merge_tool_new*.spec
