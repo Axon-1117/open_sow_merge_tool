@@ -526,6 +526,9 @@ def test_entrypoint_registry_scope_and_real_status_child() -> None:
     assert "New-ItemProperty -LiteralPath $item.Path -Name 'Position'" not in install
     assert "TortoiseSVN" not in uninstall
     real_wc=r"C:\sow_main\excel"
+    if os.environ.get("SOW_SKIP_REAL_WC_TESTS") == "1":
+        print("SKIP real working-copy status scan (set by synthetic test profile)")
+        return
     if os.path.isfile(os.path.join(real_wc,".svn","wc.db")):
         rows=sp.scan_status(real_wc)
         assert all(os.path.isabs(row.path) for row in rows)
