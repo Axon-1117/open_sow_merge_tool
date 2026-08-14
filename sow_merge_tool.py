@@ -10047,7 +10047,7 @@ def merge_side_label(context: MergeLaunchContext | None, side: str, *, candidate
 
 def _create_startup_candidate_copy(source_path: str, role: str) -> str:
     ext = _workbook_ext(source_path)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{time.time_ns()}"
     candidate = os.path.join(
         tempfile.gettempdir(),
         f"{APP_NAME}_startup_candidate_{role}_{os.getpid()}_{stamp}{ext}",
@@ -11739,7 +11739,7 @@ def _cross_branch_source_delta_premerge(
         summary["merged_count"] = summary["applied_count"]
         candidate = None
         if summary["applied_count"]:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{time.time_ns()}"
             candidate = os.path.join(
                 tempfile.gettempdir(),
                 f"{APP_NAME}_cross_branch_candidate_{os.getpid()}_{stamp}{_workbook_ext(target_working_path)}",

@@ -71,9 +71,11 @@ def main():
 
         mod._build_manual_merge_output_with_excel = _fake_excel
         out = app.build_manual_b_output_file()
-        assert captured["src"] == theirs
+        # The application deliberately replays from its immutable stable
+        # snapshot, not the caller's mutable input path.
+        assert captured["src"] == app.file_b
         assert captured["column_ops"] == []
-        assert captured["source_paths"]["A"] == mine
+        assert captured["source_paths"]["A"] == app.file_a
         assert captured["row_ops"][0]["source_side"] == "A"
 
         wb = load_workbook(out, data_only=False)
