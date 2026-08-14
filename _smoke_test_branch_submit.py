@@ -70,6 +70,14 @@ def _insert_node(conn, relpath: str, kind: str = "file", revision: int = 100) ->
     )
 
 
+def _set_branch_changed(root: str, branch: str, unix_seconds: int) -> None:
+    with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+        conn.execute(
+            "update NODES set changed_date=? where local_relpath=? or local_relpath like ?",
+            (unix_seconds * 1_000_000, branch, branch + "/%"),
+        )
+
+
 def _delete_node(root: str, path: str) -> None:
     rel = os.path.relpath(path, root).replace("\\", "/")
     with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
@@ -235,9 +243,12 @@ def test_dynamic_branches_context_and_defaults() -> None:
     try:
         for branch in ("develop", "release", "sandbox", "master"):
             _book(os.path.join(root, branch, "config", "A.xlsx"), 1)
-        candidates = bs.discover_branch_candidates(root)
-        assert [item.name for item in candidates] == ["develop", "master", "release", "sandbox"]
-        assert not next(item for item in candidates if item.name == "master").enabled
+        for branch, changed in (("develop", 100), ("release", 200), ("sandbox", 300), ("master", 400)):
+            _set_branch_changed(root, branch, changed)
+        candidates = bs.discover_branch_candidates(root, favorites=("develop",))
+        assert [item.name for item in candidates] == ["master", "sandbox", "release", "develop"]
+        assert all(item.enabled for item in candidates)
+        assert bs._validate_branch_name("master", [item.name for item in candidates]) == "master"
         context = bs.infer_context([os.path.join(root, "develop", "config", "A.xlsx")])
         assert context.source_branch == "develop"
         assert context.scope_path == os.path.join(root, "develop", "config")
@@ -511,6 +522,8 @@ def test_entrypoint_registry_scope_and_real_status_child() -> None:
     assert "$percent=[char]37" in install
     assert "Token='1'" in install and "Token='V'" in install
     assert "ASCII-only" in install
+    assert "Remove-ItemProperty -LiteralPath $item.Path -Name 'Position'" in install
+    assert "New-ItemProperty -LiteralPath $item.Path -Name 'Position'" not in install
     assert "TortoiseSVN" not in uninstall
     real_wc=r"C:\sow_main\excel"
     if os.path.isfile(os.path.join(real_wc,".svn","wc.db")):

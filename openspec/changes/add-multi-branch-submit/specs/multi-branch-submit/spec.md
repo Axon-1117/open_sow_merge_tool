@@ -3,7 +3,7 @@
 ## Scenario: select branches and files
 
 - **WHEN** the user opens branch submit mode
-- **THEN** the tool discovers the SVN working-copy root and dynamically shows same-repository top-level branches, keeps `master` visible but disabled, and requires one source, one or more targets, and one or more safe `.xlsx` changes
+- **THEN** the tool discovers the SVN working-copy root, dynamically shows all same-repository top-level branches including `master` in descending SVN change-time order, and requires one source, one or more targets, and one or more safe `.xlsx` changes
 
 ## Scenario: recursive multi-file workbench
 
