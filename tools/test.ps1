@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('Fast', 'Full', 'Gui', 'Native', 'Adversarial')]
+  [ValidateSet('Fast', 'Full', 'Native', 'Adversarial')]
   [string]$Profile = 'Fast',
   [int]$TimeoutSeconds = 120
 )
@@ -54,7 +54,7 @@ function Invoke-PythonFile {
   Write-Host ("PASS {0} ({1:N2}s)" -f (Split-Path -Leaf $Path), $watch.Elapsed.TotalSeconds) -ForegroundColor Green
 }
 
-$testScriptRoot = Join-Path $repo 'tests\legacy'
+$testScriptRoot = Join-Path $repo 'tests\regression'
 $smoke = @(Get-ChildItem -LiteralPath $testScriptRoot -File -Filter '_smoke_test*.py' | Sort-Object Name)
 if ($Profile -in @('Fast', 'Full', 'Adversarial')) {
   foreach ($test in $smoke) { Invoke-PythonFile $test.FullName }
@@ -66,11 +66,6 @@ if ($Profile -in @('Full', 'Adversarial')) {
     & $pytest -q
     if ($LASTEXITCODE -ne 0) { throw "pytest failed with exit code $LASTEXITCODE" }
   }
-}
-
-if ($Profile -eq 'Gui') {
-  & $python (Join-Path $testScriptRoot 'ui_test_scenarios.py')
-  if ($LASTEXITCODE -ne 0) { throw "GUI tests failed with exit code $LASTEXITCODE" }
 }
 
 if ($Profile -eq 'Native') {

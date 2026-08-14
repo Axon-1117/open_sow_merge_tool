@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = '',
-  [string]$Version = '2026-08-14.update77'
+  [string]$Version = '2026-08-14.update78'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,12 +15,20 @@ $release = Join-Path $repo "artifacts\release\$slug"
 if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $release | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $release 'sow_merge_tool.exe')
-foreach ($file in @('install_context_menu.bat','uninstall_context_menu.bat','register_tortoisesvn_sow_tool.bat')) {
+foreach ($file in @('安装.bat','卸载.bat','使用说明.md')) {
   Copy-Item -LiteralPath (Join-Path $repo $file) -Destination (Join-Path $release $file)
 }
-Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination (Join-Path $release 'README.md')
 $hash = (Get-FileHash -LiteralPath (Join-Path $release 'sow_merge_tool.exe') -Algorithm SHA256).Hash
 Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Value "$hash  sow_merge_tool.exe" -Encoding ASCII
+$manifest = [ordered]@{
+  version = $Version
+  package = "sow_merge_tool_$slug.zip"
+  directory = $slug
+  files = @('sow_merge_tool.exe','安装.bat','卸载.bat','使用说明.md','SHA256SUMS.txt')
+  sha256 = $hash
+  generatedAt = (Get-Date).ToUniversalTime().ToString('o')
+}
+$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $repo 'artifacts\release\latest.json') -Encoding UTF8
 $zip = Join-Path $repo "artifacts\release\sow_merge_tool_$slug.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -Path (Join-Path $release '*') -DestinationPath $zip -Force

@@ -1,5 +1,6 @@
 param(
   [string]$DeployPath = 'C:\sow_main\excel\excel_merge_tool',
+  [string]$Version = '2026-08-14.update78',
   [switch]$SkipDeploy
 )
 
@@ -10,7 +11,7 @@ $repo = (Get-Location).Path
 if ($LASTEXITCODE -ne 0) { throw 'Fast gate failed.' }
 & (Join-Path $repo 'tools\build.ps1') -Clean
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
-& (Join-Path $repo 'tools\package.ps1')
+& (Join-Path $repo 'tools\package.ps1') -Version $Version
 if ($LASTEXITCODE -ne 0) { throw 'Package failed.' }
 if (-not $SkipDeploy) {
   & (Join-Path $repo 'tools\deploy.ps1') -DeployPath $DeployPath

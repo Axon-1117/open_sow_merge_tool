@@ -45,8 +45,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-14.update77"
-APP_BUILD_TAG = "repository-refactor"
+APP_VERSION = "2026-08-14.update78"
+APP_BUILD_TAG = "chinese-docs-engineering-cleanup"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -10390,12 +10390,13 @@ def _try_export_svn_base_from_working_copy(path: str) -> str | None:
 
 
 def _find_handle_exe():
-    candidates = [
-        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "handle.exe"),
-        r"C:\Sysinternals\handle.exe",
-        r"C:\Tools\Sysinternals\handle.exe",
-        r"D:\Tools\Sysinternals\handle.exe",
-    ]
+    candidates = []
+    configured = os.environ.get("SOW_HANDLE_EXE", "").strip()
+    if configured:
+        candidates.append(configured)
+    candidates.append(
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "handle.exe")
+    )
     for p in candidates:
         if os.path.exists(p):
             return p

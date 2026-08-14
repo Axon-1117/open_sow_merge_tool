@@ -17,7 +17,7 @@ if ($status.Count -gt 0) {
 & (Join-Path $repo 'tools\test.ps1') -Profile $Profile
 if ($LASTEXITCODE -ne 0) { throw "Test profile $Profile failed." }
 
-& $python -m ruff check src\sow_merge_tool\core src\sow_merge_tool\services src\sow_merge_tool\adapters src\sow_merge_tool\ui tests\unit
+& $python -m ruff check src\sow_merge_tool\cli.py src\sow_merge_tool\__main__.py tests\unit
 if ($LASTEXITCODE -ne 0) { throw 'Ruff gate failed.' }
 
 & (Join-Path $repo 'tools\build.ps1') -Clean

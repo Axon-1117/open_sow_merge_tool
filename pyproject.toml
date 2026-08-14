@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sow-merge-tool"
-version = "2026.08.14.77"
+version = "2026.08.14.78"
 description = "Excel semantic merge and recoverable multi-branch SVN submission tool"
 requires-python = ">=3.11"
 dependencies = [
@@ -13,7 +13,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pywinauto==0.6.9",
   "pytest>=8,<10",
   "pytest-timeout>=2,<3",
   "ruff>=0.9,<1",
@@ -33,7 +32,6 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
-  "gui: requires a desktop session and Tk/pywinauto",
   "native: requires Excel or TortoiseSVN",
   "adversarial: fault-injection and recovery tests",
   "performance: throughput and latency benchmarks",

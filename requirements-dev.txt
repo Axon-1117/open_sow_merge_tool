@@ -1,3 +1,0 @@
-# Compatibility installer. Canonical development dependencies live in
-# pyproject.toml.
--e .[dev]
