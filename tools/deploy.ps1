@@ -25,7 +25,9 @@ Get-ChildItem -LiteralPath $target -Force -ErrorAction SilentlyContinue | ForEac
 $stage = Join-Path $target '.deploy-staging'
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
-Copy-Item -LiteralPath (Join-Path $source '*') -Destination $stage -Recurse -Force
+Get-ChildItem -LiteralPath $source -Force | ForEach-Object {
+  Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse -Force
+}
 foreach ($item in Get-ChildItem -LiteralPath $stage -Force) {
   Move-Item -LiteralPath $item.FullName -Destination $target -Force
 }
