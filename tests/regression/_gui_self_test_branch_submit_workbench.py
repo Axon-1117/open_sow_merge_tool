@@ -123,6 +123,24 @@ def main():
             assert app.manual_alert.winfo_manager() == "pack"
             assert "需人工合并" in app.manual_alert_var.get()
             assert app.submit_button.instate(["disabled"]), "manual items must keep submit gated"
+            app._open_manual_merge_dialog()
+            root.update_idletasks()
+            dialog_tree = app._manual_dialog_tree
+            assert dialog_tree is not None
+            assert tuple(dialog_tree["columns"]) == ("branch", "file", "state", "reason")
+            dialog_rows = dialog_tree.get_children()
+            assert len(dialog_rows) == 1 and dialog_tree.set(dialog_rows[0], "state") == "待处理"
+            app._set_manual_dialog_row(target_name, "配置_001.xlsx", "completed", "人工合并结果已保存")
+            root.update_idletasks()
+            assert len(dialog_tree.get_children()) == 1, "completed row must remain in the current dialog"
+            assert dialog_tree.set(dialog_rows[0], "state") == "处理完毕"
+            app._manual_dialog.grab_release()
+            app._manual_dialog.destroy()
+            app._manual_dialog = None
+            app._manual_dialog_tree = None
+            app._manual_dialog_button = None
+            app._manual_dialog_summary_var = None
+            app._manual_dialog_rows = {}
             action.state = "ready"
             action.manual_result = "saved"
             app._render_target_statuses()

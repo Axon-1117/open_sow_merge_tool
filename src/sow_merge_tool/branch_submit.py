@@ -1597,6 +1597,11 @@ class BranchSubmitWorkbench:
         self._scan_active = False
         self._preflight_active = False
         self._manual_merge_active = False
+        self._manual_dialog = None
+        self._manual_dialog_tree = None
+        self._manual_dialog_button = None
+        self._manual_dialog_summary_var = None
+        self._manual_dialog_rows: dict[tuple[str, str], str] = {}
         self._commit_active = False
         self.ui_tasks = UiTaskRunner(root)
         self.source_var = tk.StringVar(value=context.source_branch)
@@ -2186,6 +2191,14 @@ class BranchSubmitWorkbench:
 
         if self._manual_merge_active or self._commit_active:
             return
+        existing = self._manual_dialog
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify(); existing.lift(); existing.focus_force()
+                    return
+            except self.tk.TclError:
+                pass
         if not self.current_batch or self._approved_preflight_signature != self._request_signature():
             messagebox.showwarning(
                 "请先预检查",
@@ -2202,37 +2215,53 @@ class BranchSubmitWorkbench:
         tk, ttk = self.tk, self.ttk
         win = tk.Toplevel(self.root)
         win.title("需人工合并")
-        win.geometry("820x420")
+        win.geometry("900x440")
         win.transient(self.root)
+        self._manual_dialog = win
+        self._manual_dialog_rows = {}
         frame = ttk.Frame(win, padding=10); frame.pack(fill="both", expand=True)
+        self._manual_dialog_summary_var = tk.StringVar(
+            value=f"待处理 {len(entries)} 项 · 每次处理一个文件，完成项会保留到本窗口关闭"
+        )
         ttk.Label(
             frame,
-            text="以下内容无法安全自动投影。合并结果先保存在批次目录，不会立即修改目标工作副本。",
+            textvariable=self._manual_dialog_summary_var,
             style="Title.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            frame,
+            text="合并结果先保存在批次目录，不会立即修改目标工作副本。关闭后再次打开时，只显示尚未完成的文件。",
+            style="Muted.App.TLabel",
         ).pack(anchor="w", pady=(0, 8))
         tree = ttk.Treeview(
             frame,
-            columns=("branch", "file", "reason"),
+            columns=("branch", "file", "state", "reason"),
             show="headings",
             selectmode="browse",
         )
         for key, title, width in (
             ("branch", "目标分支", 130),
-            ("file", "文件", 280),
-            ("reason", "需人工合并原因", 370),
+            ("file", "文件", 230),
+            ("state", "处理状态", 100),
+            ("reason", "需人工合并原因", 390),
         ):
             tree.heading(key, text=title); tree.column(key, width=width, anchor="w")
-        tree.tag_configure("manual", foreground=THEME.error, background="#FDE7E9")
+        self._manual_dialog_tree = tree
+        tree.tag_configure("pending", foreground=THEME.error, background="#FDE7E9")
+        tree.tag_configure("processing", foreground=THEME.warning, background="#FFF4CE")
+        tree.tag_configure("completed", foreground=THEME.success, background="#DFF6DD")
+        tree.tag_configure("failed", foreground=THEME.error, background="#FDE7E9")
         row_entries: dict[str, tuple[str, FilePlan]] = {}
         for index, (target, plan, action) in enumerate(entries):
             iid = f"manual-{index}"
             row_entries[iid] = (target, plan)
+            self._manual_dialog_rows[(target, plan.relative_path)] = iid
             tree.insert(
                 "",
                 "end",
                 iid=iid,
-                values=(target, plan.relative_path, action.reason),
-                tags=("manual",),
+                values=(target, plan.relative_path, "待处理", action.reason),
+                tags=("pending",),
             )
         tree.pack(fill="both", expand=True)
         first = next(iter(row_entries), None)
@@ -2244,19 +2273,101 @@ class BranchSubmitWorkbench:
             selection = tree.selection()
             if not selection:
                 return
+            state = tree.set(selection[0], "state")
+            if state not in {"待处理", "未完成"} or self._manual_merge_active:
+                return
             target, plan = row_entries[selection[0]]
-            win.destroy()
+            self._set_manual_dialog_row(
+                target,
+                plan.relative_path,
+                "processing",
+                "正在等待 Excel 合并器保存结果…",
+            )
             self._start_manual_merge(target, plan.relative_path)
 
-        ttk.Button(buttons, text="关闭", command=win.destroy).pack(side="right")
-        ttk.Button(
+        def close_dialog():
+            if self._manual_merge_active:
+                self.status_var.set("请先保存或关闭当前 Excel 人工合并窗口")
+                return
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            self._manual_dialog = None
+            self._manual_dialog_tree = None
+            self._manual_dialog_button = None
+            self._manual_dialog_summary_var = None
+            self._manual_dialog_rows = {}
+            win.destroy()
+
+        ttk.Button(buttons, text="关闭", command=close_dialog).pack(side="right")
+        self._manual_dialog_button = ttk.Button(
             buttons,
             text="打开所选项进行合并",
             style="Danger.TButton",
             command=open_selected,
-        ).pack(side="right", padx=6)
+        )
+        self._manual_dialog_button.pack(side="right", padx=6)
+        tree.bind("<<TreeviewSelect>>", lambda _event: self._refresh_manual_dialog_controls())
         tree.bind("<Double-1>", open_selected)
+        win.protocol("WM_DELETE_WINDOW", close_dialog)
         win.grab_set()
+
+    def _set_manual_dialog_row(
+        self,
+        target: str,
+        relative_path: str,
+        state: str,
+        reason: str = "",
+    ) -> None:
+        tree = self._manual_dialog_tree
+        iid = self._manual_dialog_rows.get((target, relative_path))
+        if tree is None or iid is None:
+            return
+        try:
+            if not tree.winfo_exists() or not tree.exists(iid):
+                return
+            labels = {
+                "pending": "待处理",
+                "processing": "处理中…",
+                "completed": "处理完毕",
+                "failed": "未完成",
+            }
+            tree.set(iid, "state", labels.get(state, state))
+            if reason:
+                tree.set(iid, "reason", reason)
+            tree.item(iid, tags=(state,))
+            self._refresh_manual_dialog_controls()
+        except self.tk.TclError:
+            pass
+
+    def _refresh_manual_dialog_controls(self) -> None:
+        tree = self._manual_dialog_tree
+        button = self._manual_dialog_button
+        if tree is None or button is None:
+            return
+        try:
+            rows = list(tree.get_children())
+            completed = sum(tree.set(iid, "state") == "处理完毕" for iid in rows)
+            processing = sum(tree.set(iid, "state") == "处理中…" for iid in rows)
+            remaining = len(rows) - completed
+            if self._manual_dialog_summary_var is not None:
+                if remaining:
+                    self._manual_dialog_summary_var.set(
+                        f"待处理 {remaining} 项 · 已完成 {completed} 项 · 完成项将在关闭窗口前保留"
+                    )
+                else:
+                    self._manual_dialog_summary_var.set(
+                        f"全部 {completed} 项均已处理完毕，可以关闭窗口并开始提交"
+                    )
+            selection = tree.selection()
+            selected_state = tree.set(selection[0], "state") if selection else ""
+            if self._manual_merge_active or processing or selected_state not in {"待处理", "未完成"}:
+                button.state(["disabled"])
+            else:
+                button.state(["!disabled"])
+        except self.tk.TclError:
+            pass
 
     def _start_manual_merge(self, target: str, relative_path: str) -> None:
         from tkinter import messagebox
@@ -2273,6 +2384,7 @@ class BranchSubmitWorkbench:
         self.message.configure(state="disabled")
         self.status_var.set(f"等待人工合并：{target}/{relative_path}")
         self._update_manual_alert()
+        self._refresh_manual_dialog_controls()
         self._refresh_primary_button()
 
         def worker(_cancel_event):
@@ -2284,10 +2396,18 @@ class BranchSubmitWorkbench:
             self.message.configure(state="normal")
             if error:
                 self.status_var.set(str(error))
+                self._set_manual_dialog_row(target, relative_path, "failed", str(error))
                 self._update_manual_alert()
                 self._refresh_primary_button()
-                messagebox.showwarning("人工合并未完成", str(error), parent=self.root)
+                parent = self._manual_dialog or self.root
+                messagebox.showwarning("人工合并未完成", str(error), parent=parent)
                 return
+            self._set_manual_dialog_row(
+                target,
+                relative_path,
+                "completed",
+                "人工合并结果已保存",
+            )
             self._render_target_statuses()
             remaining = len(self._manual_entries())
             if remaining:
