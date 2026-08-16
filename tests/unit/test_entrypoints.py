@@ -5,5 +5,5 @@ import sow_merge_tool as public
 
 def test_public_entrypoint_and_version() -> None:
     assert public.APP_NAME == "sow_merge_tool"
-    assert public.APP_VERSION.endswith("update82")
+    assert public.APP_VERSION.endswith("update83")
     assert callable(public.run_entrypoint)

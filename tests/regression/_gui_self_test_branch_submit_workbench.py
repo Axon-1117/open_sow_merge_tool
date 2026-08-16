@@ -98,13 +98,19 @@ def main():
                 branch=target_name,
                 relative_path="配置_001.xlsx",
                 operation="modify",
-                state="manual",
+                state="confirmation_required",
                 reason="目标分支同一单元格已有独立修改",
             )
             plan = bs.FilePlan(
                 relative_path="配置_001.xlsx",
                 operation="modify",
                 actions={target_name: action},
+                target_summaries={target_name: {"confirmation": 1}},
+                target_details={target_name: [{
+                    "kind": "confirmation", "sheet": "Data", "key": "1001",
+                    "field": "value", "before": "旧", "source": "新", "target": "目标值",
+                    "reason": action.reason,
+                }]},
             )
             app.current_batch = bs.BranchSubmitBatch(
                 batch_id="gui-manual",
@@ -115,39 +121,42 @@ def main():
                 message="GUI 门禁测试",
                 scope_path=os.path.join(fixture, "develop"),
                 source_status="ready",
-                target_status={target_name: "ready"},
+                target_status={target_name: "confirmation_required"},
             )
             app._approved_preflight_signature = app._request_signature()
             app._render_target_statuses()
             root.update_idletasks()
-            assert app.manual_alert.winfo_manager() == "pack"
-            assert "需人工合并" in app.manual_alert_var.get()
-            assert app.submit_button.instate(["disabled"]), "manual items must keep submit gated"
-            app._open_manual_merge_dialog()
+            assert app.confirmation_alert.winfo_manager() == "pack"
+            assert "内容重叠" in app.confirmation_alert_var.get()
+            assert app.submit_button.instate(["disabled"]), "confirmation items must keep submit gated"
+            app._open_confirmation_dialog()
             root.update_idletasks()
-            dialog_tree = app._manual_dialog_tree
+            dialog_tree = app._confirmation_dialog_tree
             assert dialog_tree is not None
             assert tuple(dialog_tree["columns"]) == ("branch", "file", "state", "reason")
             dialog_rows = dialog_tree.get_children()
-            assert len(dialog_rows) == 1 and dialog_tree.set(dialog_rows[0], "state") == "待处理"
-            app._set_manual_dialog_row(target_name, "配置_001.xlsx", "completed", "人工合并结果已保存")
+            assert len(dialog_rows) == 1 and dialog_tree.set(dialog_rows[0], "state") == "待确认"
+            app._set_confirmation_dialog_row(target_name, "配置_001.xlsx", "completed", "已确认采用源修改")
             root.update_idletasks()
             assert len(dialog_tree.get_children()) == 1, "completed row must remain in the current dialog"
-            assert dialog_tree.set(dialog_rows[0], "state") == "处理完毕"
-            app._manual_dialog.grab_release()
-            app._manual_dialog.destroy()
-            app._manual_dialog = None
-            app._manual_dialog_tree = None
-            app._manual_dialog_button = None
-            app._manual_dialog_summary_var = None
-            app._manual_dialog_rows = {}
+            assert dialog_tree.set(dialog_rows[0], "state") == "已确认"
+            app._confirmation_dialog.grab_release()
+            app._confirmation_dialog.destroy()
+            app._confirmation_dialog = None
+            app._confirmation_dialog_tree = None
+            app._confirmation_dialog_button = None
+            app._confirmation_exclude_button = None
+            app._confirmation_detail = None
+            app._confirmation_dialog_summary_var = None
+            app._confirmation_dialog_rows = {}
             action.state = "ready"
-            action.manual_result = "saved"
+            action.confirmed = True
+            app.current_batch.target_status[target_name] = "ready"
             app._render_target_statuses()
             app._refresh_primary_button()
             root.update_idletasks()
-            assert not app.manual_alert.winfo_manager()
-            assert app.submit_button.instate(["!disabled"]), "resolved manual items may pass the gate"
+            assert not app.confirmation_alert.winfo_manager()
+            assert app.submit_button.instate(["!disabled"]), "confirmed items may pass the gate"
             hold = float(os.environ.get("SOW_GUI_TEST_HOLD", "0") or 0)
             deadline = time.time() + hold
             while time.time() < deadline:

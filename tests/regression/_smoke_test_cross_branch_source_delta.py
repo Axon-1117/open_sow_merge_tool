@@ -18,6 +18,13 @@ from _test_temp_utils import make_temp_dir
 
 def _book(path: str, rows: list[list[object]]) -> None:
     workbook = Workbook()
+    # These files model revisions of the same logical workbook.  A fresh
+    # Workbook otherwise gives each fixture a wall-clock `created` property;
+    # crossing a second boundary then looks like a real document-property
+    # change to the fail-closed OOXML audit.
+    fixed_time = datetime(2020, 1, 1, 0, 0, 0)
+    workbook.properties.created = fixed_time
+    workbook.properties.modified = fixed_time
     sheet = workbook.active
     sheet.title = "Data"
     for row in rows:

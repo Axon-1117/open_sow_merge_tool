@@ -10,35 +10,40 @@
 - **WHEN** the user starts from an `.xlsx`, folder, or folder background
 - **THEN** the tool recursively scans that folder, shows all SVN changes with status metadata, defaults safe modified/added/deleted Excel files on, keeps unversioned Excel off, and displays non-Excel changes read-only
 
-## Scenario: optional source delta preflight
+## Scenario: mandatory source-change preflight
 
-- **WHEN** the user chooses “预检查（可选）” and source and all selected targets are clean enough to analyze
-- **THEN** the tool obtains source pristine and working content, computes source-before to source-after changes, and previews a per-target action matrix without changing target files
+- **WHEN** one or more target branches are selected
+- **THEN** the user must run “预检查（必需）”; the tool obtains source pristine and working content, computes source-before to source-after changes, and previews a per-target action matrix without changing target files
 
-## Scenario: direct submission without preflight
+## Scenario: native single-branch submission remains unchanged
 
-- **WHEN** the user clicks “开始提交” without opening the optional preflight dialog
-- **THEN** the same checks run in the background immediately before the source commit; safe unique-key tail-row changes are prepared automatically, already-applied files are skipped, and ambiguous changes open the Excel merge tool instead of being silently copied
+- **WHEN** the user uses TortoiseSVN's original single-branch commit entry without selecting multi-branch targets
+- **THEN** the original TortoiseSVN flow remains available and is not gated by this workbench's preflight
 
 ## Scenario: fail closed
 
 - **WHEN** status collection fails, a selected target is dirty, conflict/switch/property/external/unsupported structure is detected, or a target changed since analysis
-- **THEN** the affected action is blocked and no commit dialog is opened for that unsafe action; a manual action remains available through the Excel merge tool
+- **THEN** the affected action is blocked and no commit dialog is opened for that unsafe action; the preflight matrix may open the standalone Excel comparer for inspection without treating that result as a batch candidate
 
 ## Scenario: conservative fast path
 
 - **WHEN** a source delta is limited to value/formula changes or unique-key rows appended at the source tail, with stable headers and default styles
-- **THEN** the tool classifies the target in read-only OOXML, projects only the proven cells/rows into a candidate in place of a full openpyxl rewrite, and reports the automatic/already/manual counts
+- **THEN** the tool classifies the target in read-only OOXML, projects only the proven cells/rows into a target-derived candidate, preserves unrelated target content, and reports direct/already/confirmation counts
 
-## Scenario: manual merge fallback
+## Scenario: overlapping target content requires confirmation
 
-- **WHEN** a target cell has an independent value, a row is inserted in the middle, styles/structure changed, or the unique key cannot be proved stable
-- **THEN** the tool marks the file “需人工合并”, launches the existing Excel merge UI with source-before/source-after aliases, and accepts the result only after the target hash changes and SVN status is rechecked
+- **WHEN** a target record or field differs from both source-before and source-after while the source-change location remains technically mappable
+- **THEN** the tool marks the file “需人工确认”, shows source-before/source-after/target values, and requires the user either to accept all source changes for that target/file pair or explicitly exclude it from the batch
+
+## Scenario: unsupported workbook changes remain blocked
+
+- **WHEN** rows are inserted away from the proven tail, styles or workbook structures change, or a unique record/field mapping cannot be proved
+- **THEN** the tool marks the action “安全阻断”; confirmation alone cannot convert an unsupported write into a successful synchronization
 
 ## Scenario: added, deleted, and renamed files
 
 - **WHEN** an added or deleted Excel file is selected
-- **THEN** add requires an absent target path and versioned parent, delete requires target content equal to the deletion baseline, and a detected rename is blocked with a Repair Move instruction
+- **THEN** add requires an absent target path and versioned parent; a different existing target file is blocked because there is no common baseline; delete is direct when the target equals the deletion baseline and otherwise requires explicit delete confirmation; a detected rename is blocked with a Repair Move instruction
 
 ## Scenario: source commit first
 
@@ -50,10 +55,15 @@
 - **WHEN** the user commits only some selected source files
 - **THEN** propagation stops, the committed files are split into an explicit child batch, and the remaining source files return to the workbench
 
-## Scenario: per-target confirmation
+## Scenario: per-target submission
 
 - **WHEN** a target is ready after revalidation
 - **THEN** the tool writes a durable prepare intent and backup, applies only the planned candidate, opens one TortoiseSVN commit dialog with the frozen message and tracking footer, and marks each file committed only after post-commit reconciliation
+
+## Scenario: modified targets are never replaced by source files
+
+- **WHEN** a modified-file action is prepared
+- **THEN** the candidate must exist, be derived from the exact target snapshot, and contain only accepted source-change locations; a missing or changed candidate blocks the action instead of falling back to copying the complete source workbook
 
 ## Scenario: cancellation and recovery
 

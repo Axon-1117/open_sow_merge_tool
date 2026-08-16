@@ -348,7 +348,11 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
         batch = engine.preflight("develop", ["release"], items, "配置调整", scope_path=os.path.join(root, "develop", "config"))
         assert batch.source_status == "ready", batch.error
         assert [plan.operation for plan in batch.files] == ["modify", "add", "delete"]
-        assert all(plan.actions["release"].state in {"planned", "ready", "manual", "blocked"} for plan in batch.files)
+        assert all(
+            plan.actions["release"].state
+            in {"planned", "ready", "confirmation_required", "blocked"}
+            for plan in batch.files
+        )
         dirty = os.path.join(root, "release", "config", "M.xlsx")
         scanner.overrides[dirty] = sp.SvnStatusRecord(path=dirty, node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True)
         blocked = engine.preflight("develop", ["release"], [items[0]], "配置调整", scope_path=os.path.join(root, "develop", "config"))
@@ -363,7 +367,7 @@ def test_source_partial_selection_stops_propagation() -> None:
         scanner = FixtureScanner(root); items=[]
         for name, value in (("A.xlsx", 7), ("B.xlsx", 8)):
             source=os.path.join(root,"develop","config",name);target=os.path.join(root,"release","config",name)
-            _book(source,value);_book(source+".pristine.xlsx",1);_book(target,1);_book(target+".pristine.xlsx",1)
+            _book(source,value);_book(source+".pristine.xlsx",1);_book(target,1);shutil.copy2(target,target+".pristine.xlsx")
             with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
                 _insert_node(conn,f"develop/config/{name}");_insert_node(conn,f"release/config/{name}")
             items.append(_item(source,root,"modified"))
@@ -411,12 +415,16 @@ def test_server_success_beats_error_exit_code() -> None:
     finally:_cleanup(root,old)
 
 
-def test_manual_merge_fallback_is_durable() -> None:
+def test_conflicting_source_change_requires_confirmation() -> None:
     root, old = _fixture()
     try:
         scanner=FixtureScanner(root)
         source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
         _book(source,9);_book(source+".pristine.xlsx",1);_book(target,7);shutil.copy2(target,target+".pristine.xlsx")
+        target_book=load_workbook(target)
+        target_book["Data"]["C1"]="target_only";target_book["Data"]["C2"]="keep"
+        target_book.save(target);target_book.close()
+        shutil.copy2(target,target+".pristine.xlsx")
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
@@ -424,20 +432,68 @@ def test_manual_merge_fallback_is_durable() -> None:
             if "/command:commit" in args:_commit_fixture_paths(root,_commit_paths(args))
             return SimpleNamespace(returncode=0)
         engine=bs.BranchSubmitEngine(root,runner=runner,status_scanner=scanner);engine.core=FakeCore
-        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工合并",scope_path=os.path.dirname(source))
-        assert batch.files[0].actions["release"].state=="manual"
-        opened=[]
-        def fake_manual(_batch,plan,target_path):
-            opened.append(target_path);shutil.copy2(plan.source_after,target_path);return 0
-        engine._launch_manual_merge=fake_manual
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工确认",scope_path=os.path.dirname(source))
+        action=batch.files[0].actions["release"]
+        assert action.state=="confirmation_required"
+        target_hash=bs._sha256(target)
+        try:
+            engine.commit(batch)
+        except RuntimeError as exc:
+            assert "人工确认" in str(exc)
+        else:
+            raise AssertionError("confirmation gate did not stop commit")
+        engine.confirm_source_changes(batch,"release",batch.files[0].relative_path)
+        assert action.state=="ready" and action.confirmed
+        assert bs._sha256(target)==target_hash
         engine.commit(batch)
-        assert opened==[target]
         assert batch.target_status["release"]=="committed",batch.error
-        assert any(event["kind"]=="manual-merge-intent" for event in batch.journal)
+        result=load_workbook(target,read_only=True,data_only=False)
+        assert result["Data"]["B2"].value==9
+        assert result["Data"]["C2"].value=="keep"
+        result.close()
+        assert any(event["kind"]=="source-change-confirmed" for event in batch.journal)
     finally:_cleanup(root,old)
 
 
-def test_manual_candidate_keeps_target_clean_until_submit() -> None:
+def test_confirmed_candidate_is_target_derived_and_deferred() -> None:
+    root, old = _fixture()
+    try:
+        scanner=FixtureScanner(root)
+        source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,7);shutil.copy2(target,target+".pristine.xlsx")
+        target_book=load_workbook(target)
+        target_book["Data"]["C1"]="target_only";target_book["Data"]["C2"]="keep"
+        target_book.save(target);target_book.close()
+        shutil.copy2(target,target+".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
+            _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
+        for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
+        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工确认候选",scope_path=os.path.dirname(source))
+        plan=batch.files[0];action=plan.actions["release"]
+        assert action.state=="confirmation_required"
+        target_hash=bs._sha256(target)
+        prepared=engine.confirm_source_changes(batch,"release",plan.relative_path)
+        assert bs._sha256(target)==target_hash,"confirmation must not dirty the target working copy"
+        assert prepared.state=="ready" and prepared.confirmed
+        assert not prepared.candidate_path
+        status_map=bs.records_by_path(scanner(os.path.join(root,"release")))
+        refreshed=engine._fresh_target_action(batch,plan,"release",status_map)
+        assert refreshed is prepared and refreshed.state=="ready"
+        assert os.path.isfile(prepared.candidate_path)
+        candidate=load_workbook(prepared.candidate_path,read_only=True,data_only=False)
+        assert candidate["Data"]["B2"].value==9
+        assert candidate["Data"]["C2"].value=="keep"
+        candidate.close()
+        candidate_hash=prepared.candidate_hash
+        engine._prepare_target_action(batch,plan,"release")
+        assert prepared.state=="prepared" and bs._sha256(target)==candidate_hash
+        assert prepared.backup_path and bs._sha256(prepared.backup_path)==target_hash
+        assert bs._sha256(target)!=bs._sha256(plan.source_after)
+    finally:_cleanup(root,old)
+
+
+def test_confirmation_invalidates_after_target_update() -> None:
     root, old = _fixture()
     try:
         scanner=FixtureScanner(root)
@@ -447,27 +503,84 @@ def test_manual_candidate_keeps_target_clean_until_submit() -> None:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
         engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
-        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工合并候选",scope_path=os.path.dirname(source))
-        plan=batch.files[0];action=plan.actions["release"]
-        assert action.state=="manual"
-        target_hash=bs._sha256(target)
-        def fake_manual(_batch,_plan,target_path,merged_path=None):
-            assert target_path==target and merged_path
-            shutil.copy2(_plan.source_after,merged_path)
-            return 0
-        engine._launch_manual_merge=fake_manual
-        prepared=engine.prepare_manual_candidate(batch,"release",plan.relative_path)
-        assert bs._sha256(target)==target_hash,"manual entry must not dirty the target working copy"
-        assert prepared.state=="ready" and prepared.manual_result=="saved"
-        assert os.path.isfile(prepared.candidate_path)
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"确认失效",scope_path=os.path.dirname(source))
+        plan=batch.files[0];action=engine.confirm_source_changes(batch,"release",plan.relative_path)
+        old_confirmation_hash=action.confirmation_target_hash
+        _book(target,8);shutil.copy2(target,target+".pristine.xlsx")
         status_map=bs.records_by_path(scanner(os.path.join(root,"release")))
-        refreshed=engine._fresh_target_action(batch,plan,"release",status_map)
-        assert refreshed is prepared and refreshed.state=="ready"
-        candidate_hash=prepared.candidate_hash
+        engine._fresh_target_action(batch,plan,"release",status_map)
+        assert action.state=="confirmation_required" and not action.confirmed
+        assert action.confirmation_target_hash=="" and bs._sha256(target)!=old_confirmation_hash
+    finally:_cleanup(root,old)
+
+
+def test_excluded_conflict_never_writes_target() -> None:
+    root, old = _fixture()
+    try:
+        scanner=FixtureScanner(root)
+        source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,7);shutil.copy2(target,target+".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
+            _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
+        for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
+        calls=[]
+        def runner(args,**_kwargs):
+            calls.append(args)
+            if "/command:commit" in args:_commit_fixture_paths(root,_commit_paths(args))
+            return SimpleNamespace(returncode=0)
+        engine=bs.BranchSubmitEngine(root,runner=runner,status_scanner=scanner);engine.core=FakeCore
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"移出冲突",scope_path=os.path.dirname(source))
+        target_hash=bs._sha256(target)
+        engine.exclude_target_file(batch,"release",batch.files[0].relative_path)
+        assert batch.target_status["release"]=="skipped"
+        engine.commit(batch)
+        assert batch.source_status=="committed" and batch.target_status["release"]=="skipped"
+        assert bs._sha256(target)==target_hash
+        assert sum("/command:commit" in args for args in calls)==1
+    finally:_cleanup(root,old)
+
+
+def test_diverged_delete_requires_confirmation() -> None:
+    root, old = _fixture()
+    try:
+        scanner=FixtureScanner(root)
+        source=os.path.join(root,"develop","config","D.xlsx");target=os.path.join(root,"release","config","D.xlsx")
+        _book(source+".pristine.xlsx",3);_book(target,7);shutil.copy2(target,target+".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
+            _insert_node(conn,"develop/config/D.xlsx");_insert_node(conn,"release/config/D.xlsx")
+        for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
+        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        batch=engine.preflight("develop",["release"],[_item(source,root,"missing")],"删除确认",scope_path=os.path.dirname(source))
+        plan=batch.files[0];action=plan.actions["release"]
+        assert action.state=="confirmation_required"
+        engine.confirm_source_changes(batch,"release",plan.relative_path)
+        status_map=bs.records_by_path(scanner(os.path.join(root,"release")))
+        engine._fresh_target_action(batch,plan,"release",status_map)
+        assert action.state=="ready" and action.disposition=="confirmed"
         engine._prepare_target_action(batch,plan,"release")
-        assert prepared.state=="prepared" and bs._sha256(target)==candidate_hash
-        assert prepared.backup_path and bs._sha256(prepared.backup_path)==target_hash
-        assert any(event["kind"]=="manual-candidate-saved" for event in batch.journal)
+        assert action.state=="prepared" and not os.path.exists(target)
+    finally:_cleanup(root,old)
+
+
+def test_modify_has_no_whole_file_fallback() -> None:
+    root, old = _fixture()
+    try:
+        scanner=FixtureScanner(root)
+        source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,1);shutil.copy2(target,target+".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
+            _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
+        for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
+        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"禁止覆盖",scope_path=os.path.dirname(source))
+        plan=batch.files[0];target_hash=bs._sha256(target)
+        try:
+            engine._prepare_target_action(batch,plan,"release")
+        except RuntimeError as exc:
+            assert "禁止回退为整文件覆盖" in str(exc)
+        else:
+            raise AssertionError("modify action unexpectedly copied the source workbook")
+        assert bs._sha256(target)==target_hash
     finally:_cleanup(root,old)
 
 
@@ -477,7 +590,7 @@ def test_target_partial_and_restore_guard() -> None:
         scanner=FixtureScanner(root);items=[]
         for name,value in (("A.xlsx",7),("B.xlsx",8)):
             source=os.path.join(root,"develop","config",name);target=os.path.join(root,"release","config",name)
-            _book(source,value);_book(source+".pristine.xlsx",1);_book(target,1);_book(target+".pristine.xlsx",1)
+            _book(source,value);_book(source+".pristine.xlsx",1);_book(target,1);shutil.copy2(target,target+".pristine.xlsx")
             with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
                 _insert_node(conn,f"develop/config/{name}");_insert_node(conn,f"release/config/{name}")
             items.append(_item(source,root,"modified"))
@@ -510,7 +623,7 @@ def test_resume_reconciles_commits_before_reopening_dialog() -> None:
     try:
         scanner=FixtureScanner(root)
         source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
-        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,1);_book(target+".pristine.xlsx",1)
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,1);shutil.copy2(target,target+".pristine.xlsx")
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
@@ -548,7 +661,7 @@ def test_write_intent_crash_restore_and_corrupt_state_detection() -> None:
     try:
         scanner=FixtureScanner(root)
         source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
-        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,1);_book(target+".pristine.xlsx",1)
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,1);shutil.copy2(target,target+".pristine.xlsx")
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
@@ -557,6 +670,8 @@ def test_write_intent_crash_restore_and_corrupt_state_detection() -> None:
         action=batch.files[0].actions["release"]
         status_map=bs.records_by_path(scanner(os.path.join(root,"release")))
         engine._fresh_target_action(batch,batch.files[0],"release",status_map)
+        assert action.state == "ready", (action.state, action.disposition, action.reason)
+        assert action.candidate_path and os.path.isfile(action.candidate_path), action.candidate_path
         action.state = "planned"  # simulate the crash window before state save
         backup=bs._artifact_path(batch.folder,os.path.join("backups","release"),batch.files[0].relative_path)
         bs._safe_copy(target,backup);action.backup_path=backup;action.target_before_hash=bs._sha256(backup)
@@ -618,8 +733,12 @@ if __name__ == "__main__":
         test_preflight_modify_add_delete_and_dirty_block,
         test_source_partial_selection_stops_propagation,
         test_server_success_beats_error_exit_code,
-        test_manual_merge_fallback_is_durable,
-        test_manual_candidate_keeps_target_clean_until_submit,
+        test_conflicting_source_change_requires_confirmation,
+        test_confirmed_candidate_is_target_derived_and_deferred,
+        test_confirmation_invalidates_after_target_update,
+        test_excluded_conflict_never_writes_target,
+        test_diverged_delete_requires_confirmation,
+        test_modify_has_no_whole_file_fallback,
         test_target_partial_and_restore_guard,
         test_resume_reconciles_commits_before_reopening_dialog,
         test_write_intent_crash_restore_and_corrupt_state_detection,
