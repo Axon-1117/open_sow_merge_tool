@@ -204,6 +204,11 @@ def _commit_paths(args):
     return []
 
 
+def _ok_runner(_args, **_kwargs):
+    """Keep SVN GUI operations deterministic inside the local fixture."""
+    return SimpleNamespace(returncode=0)
+
+
 def _commit_fixture_paths(root: str, paths: list[str]) -> None:
     for path in paths:
         if os.path.isfile(path):
@@ -304,7 +309,7 @@ def test_high_confidence_rename_is_blocked() -> None:
             _insert_node(conn, "develop/config/Old.xlsx")
         for branch in ("release", "sandbox", "master"):
             _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
-        engine = bs.BranchSubmitEngine(root, status_scanner=scanner); engine.core = FakeCore
+        engine = bs.BranchSubmitEngine(root, runner=_ok_runner, status_scanner=scanner); engine.core = FakeCore
         try:
             engine.preflight(
                 "develop", ["release"],
@@ -398,7 +403,14 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
         # Make all candidate branch roots discoverable.
         _book(os.path.join(root, "sandbox", "config", "seed.xlsx"), 1)
         _book(os.path.join(root, "master", "config", "seed.xlsx"), 1)
-        engine = bs.BranchSubmitEngine(root, status_scanner=scanner)
+        update_calls = []
+        updated_path_batches = []
+        def update_runner(args, **_kwargs):
+            update_calls.append(args)
+            if "/command:update" in args:
+                updated_path_batches.append(_commit_paths(args))
+            return SimpleNamespace(returncode=0)
+        engine = bs.BranchSubmitEngine(root, runner=update_runner, status_scanner=scanner)
         engine.core = FakeCore
         batch = engine.preflight("develop", ["release"], items, "", scope_path=os.path.join(root, "develop", "config"))
         assert batch.source_status == "ready", batch.error
@@ -409,17 +421,47 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
             in {"planned", "ready", "confirmation_required", "blocked"}
             for plan in batch.files
         )
+        svn_updates = [args for args in update_calls if "/command:update" in args]
+        assert len(svn_updates) == 1
+        assert set(updated_path_batches[0]) == {
+            os.path.abspath(release_m),
+            os.path.abspath(release_d),
+            os.path.abspath(os.path.dirname(release_m)),
+        }
+        journal_kinds = [event["kind"] for event in batch.journal]
+        assert journal_kinds.index("target-update-start") < journal_kinds.index("target-update-complete") < journal_kinds.index("preflight")
+        assert not bs.batch_requires_recovery(batch)
         try:
             engine.commit(batch)
         except RuntimeError as exc:
             assert "提交说明" in str(exc)
         else:
             raise AssertionError("final commit must reject an empty message")
+        cancelled_engine = bs.BranchSubmitEngine(
+            root,
+            runner=lambda _args, **_kwargs: SimpleNamespace(returncode=1),
+            status_scanner=scanner,
+        )
+        cancelled_engine.core = FakeCore
+        try:
+            cancelled_engine.preflight(
+                "develop", ["release"], [items[0]], "更新取消",
+                scope_path=os.path.join(root, "develop", "config"),
+            )
+        except RuntimeError as exc:
+            assert "目标分支 release 更新失败或被取消" in str(exc)
+        else:
+            raise AssertionError("cancelled target update must invalidate preflight")
+        assert bs.list_unfinished_batches() == []
         dirty = os.path.join(root, "release", "config", "M.xlsx")
         scanner.overrides[dirty] = sp.SvnStatusRecord(path=dirty, node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True)
-        blocked = engine.preflight("develop", ["release"], [items[0]], "配置调整", scope_path=os.path.join(root, "develop", "config"))
-        assert blocked.source_status == "pending"
-        assert blocked.files[0].actions["release"].state == "blocked"
+        try:
+            engine.preflight("develop", ["release"], [items[0]], "配置调整", scope_path=os.path.join(root, "develop", "config"))
+        except RuntimeError as exc:
+            assert "更新前工作副本检查失败" in str(exc)
+            assert "release" in str(exc) and "M.xlsx" in str(exc)
+        else:
+            raise AssertionError("dirty target must stop before SVN Update")
     finally: _cleanup(root, old)
 
 
@@ -437,7 +479,7 @@ def test_source_partial_selection_stops_propagation() -> None:
         calls=[]
         def runner(args, **_kwargs):
             calls.append(args)
-            if "/command:commit" in args and len(calls)==1:
+            if "/command:commit" in args and sum("/command:commit" in call for call in calls)==1:
                 _commit_fixture_paths(root,_commit_paths(args)[:1])
             return SimpleNamespace(returncode=0)
         engine=bs.BranchSubmitEngine(root,runner=runner,status_scanner=scanner);engine.core=FakeCore
@@ -449,7 +491,7 @@ def test_source_partial_selection_stops_propagation() -> None:
         assert batch.superseded_by.endswith("-committed")
         child=bs.BranchSubmitBatch.load(os.path.join(bs.settings_dir(),"batches",batch.superseded_by,"batch.json"))
         assert child.source_status=="committed" and len(child.files)==1
-        assert len(calls)==1
+        assert sum("/command:commit" in args for args in calls)==1
     finally:_cleanup(root,old)
 
 
@@ -530,7 +572,7 @@ def test_confirmed_candidate_is_target_derived_and_deferred() -> None:
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
-        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
         batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工确认候选",scope_path=os.path.dirname(source))
         plan=batch.files[0];action=plan.actions["release"]
         assert action.state=="confirmation_required"
@@ -582,7 +624,7 @@ def test_preview_is_target_before_vs_target_after_and_never_writes_wc() -> None:
             _insert_node(conn, "release/config/A.xlsx")
         for branch in ("sandbox", "master"):
             _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
-        engine = bs.BranchSubmitEngine(root, status_scanner=scanner)
+        engine = bs.BranchSubmitEngine(root, runner=_ok_runner, status_scanner=scanner)
         engine.core = FakeCore
         batch = engine.preflight(
             "develop", ["release"], [_item(source, root, "modified")],
@@ -626,7 +668,7 @@ def test_confirmation_invalidates_after_target_update() -> None:
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
-        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
         batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"确认失效",scope_path=os.path.dirname(source))
         plan=batch.files[0];action=engine.confirm_source_changes(batch,"release",plan.relative_path)
         old_confirmation_hash=action.confirmation_target_hash
@@ -673,7 +715,7 @@ def test_diverged_delete_requires_confirmation() -> None:
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/D.xlsx");_insert_node(conn,"release/config/D.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
-        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
         batch=engine.preflight("develop",["release"],[_item(source,root,"missing")],"删除确认",scope_path=os.path.dirname(source))
         plan=batch.files[0];action=plan.actions["release"]
         assert action.state=="confirmation_required"
@@ -695,7 +737,7 @@ def test_modify_has_no_whole_file_fallback() -> None:
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
-        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
         batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"禁止覆盖",scope_path=os.path.dirname(source))
         plan=batch.files[0];target_hash=bs._sha256(target)
         try:
@@ -789,7 +831,7 @@ def test_write_intent_crash_restore_and_corrupt_state_detection() -> None:
         with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
             _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
-        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
         batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"intent",scope_path=os.path.dirname(source))
         action=batch.files[0].actions["release"]
         status_map=bs.records_by_path(scanner(os.path.join(root,"release")))

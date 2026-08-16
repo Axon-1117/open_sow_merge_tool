@@ -619,6 +619,8 @@ def list_unfinished_batches() -> list[BranchSubmitBatch]:
 _READ_ONLY_BATCH_EVENTS = {
     "preflight",
     "preflight-failed",
+    "target-update-start",
+    "target-update-complete",
     "source-change-confirmed",
     "target-file-excluded",
     "target-preview-created",
@@ -629,11 +631,13 @@ _READ_ONLY_BATCH_EVENTS = {
 def batch_requires_recovery(batch: BranchSubmitBatch) -> bool:
     """Return whether a batch may have repository or working-copy effects.
 
-    A preflight creates candidates and previews only inside the batch folder.
-    Those read-only records must not interrupt the next launch.  Recovery is
-    reserved for a batch that entered the commit flow, wrote a target working
-    copy, reached a non-preflight source state, or contains an effect-bearing
-    action left by an older state version.
+    A preflight may run SVN Update on the selected target paths, then creates
+    candidates and previews only inside the batch folder.  An ordinary SVN
+    synchronization has no tool-owned candidate to roll back, so those records
+    must not interrupt the next launch.  Recovery is reserved for a batch that
+    entered the commit flow, wrote a target working copy, reached a
+    non-preflight source state, or contains an effect-bearing action left by an
+    older state version.
     """
     if batch.abandoned or batch.superseded_by:
         return False
@@ -874,6 +878,54 @@ class BranchSubmitEngine:
     def _update(self, paths: list[str]) -> None:
         if paths and self._tortoise("update", sorted(dict.fromkeys(paths))) != 0:
             raise RuntimeError("SVN update 未成功或被取消")
+
+    @staticmethod
+    def _target_update_paths(batch: BranchSubmitBatch, target: str) -> list[str]:
+        """Return the smallest safe SVN Update scope for a target branch.
+
+        Existing files can be updated directly.  A source-side add has no
+        target path yet, so its versioned parent must be updated to learn
+        whether the repository now contains a colliding file.
+        """
+        result: list[str] = []
+        seen: set[str] = set()
+        for plan in batch.files:
+            target_path = os.path.join(
+                batch.wc_root, target, *plan.relative_path.split("/")
+            )
+            update_path = os.path.dirname(target_path) if plan.operation == "add" else target_path
+            key = os.path.normcase(os.path.abspath(update_path))
+            if key not in seen:
+                seen.add(key)
+                result.append(os.path.abspath(update_path))
+        return sorted(result, key=os.path.normcase)
+
+    @staticmethod
+    def _verify_target_update_scope_clean(
+        target: str,
+        update_paths: list[str],
+        status_map: dict[str, SvnStatusRecord],
+    ) -> None:
+        """Prevent SVN Update from merging into pre-existing local changes."""
+        for record in status_map.values():
+            record_path = os.path.abspath(record.path)
+            affected = any(
+                os.path.normcase(record_path) == os.path.normcase(path)
+                or (os.path.isdir(path) and _is_within(record_path, path))
+                or (
+                    (record.node_kind == "dir" or os.path.isdir(record_path))
+                    and _is_within(path, record_path)
+                )
+                for path in update_paths
+            )
+            if not affected:
+                continue
+            reason = _status_block_reason(record, require_clean=True)
+            if reason:
+                raise RuntimeError(
+                    f"目标分支 {target} 更新前工作副本检查失败："
+                    f"{record_path}（{reason}）"
+                )
 
     @staticmethod
     def _refresh_target_status(batch: BranchSubmitBatch, target: str) -> str:
@@ -1159,6 +1211,15 @@ class BranchSubmitEngine:
             target_maps: dict[str, dict[str, SvnStatusRecord]] = {}
             for target in targets:
                 target_scope = os.path.join(self.wc_root, target)
+                update_paths = self._target_update_paths(batch, target)
+                before_update = records_by_path(self.status_scanner(target_scope))
+                self._verify_target_update_scope_clean(target, update_paths, before_update)
+                batch.event("target-update-start", target=target, paths=len(update_paths))
+                try:
+                    self._update(update_paths)
+                except Exception as exc:
+                    raise RuntimeError(f"目标分支 {target} 更新失败或被取消：{exc}") from exc
+                batch.event("target-update-complete", target=target, paths=len(update_paths))
                 target_maps[target] = records_by_path(self.status_scanner(target_scope))
             blocked = False
             for plan in batch.files:
@@ -1568,11 +1629,7 @@ class BranchSubmitEngine:
                         continue
                 resume_ready = any(action.state == "prepared" for action in actions)
                 if not resume_ready:
-                    update_paths = []
-                    for plan in batch.files:
-                        target_path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
-                        update_paths.append(os.path.dirname(target_path) if plan.operation == "add" else target_path)
-                    self._update(update_paths)
+                    self._update(self._target_update_paths(batch, target))
                 status_map = records_by_path(self.status_scanner(os.path.join(batch.wc_root, target)))
                 for plan in batch.files:
                     action = self._fresh_target_action(batch, plan, target, status_map)
@@ -3004,7 +3061,9 @@ class BranchSubmitWorkbench:
         self._update_confirmation_alert()
         self.submit_button.state(["disabled"])
         self.preflight_button.state(["disabled"])
-        self.status_var.set("正在后台生成分支 × 文件预检查矩阵…")
+        self.status_var.set(
+            f"正在更新 {len(targets)} 个目标分支的相关路径，随后生成预检查矩阵…"
+        )
         self.root.update_idletasks()
 
         def worker(cancel_event):
