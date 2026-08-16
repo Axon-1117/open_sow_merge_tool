@@ -87,6 +87,9 @@ def main():
             target_name = next(name for name in app.target_vars if name != "master")
             app.target_vars[target_name].set(True)
             app._target_selection[target_name] = True
+            app._refresh_primary_button()
+            assert app.preflight_button.instate(["!disabled"]), "empty commit message must not block preflight"
+            assert app.submit_button.instate(["disabled"]), "empty commit message must still block commit"
             app.message.insert("1.0", "GUI 门禁测试")
             app._refresh_primary_button()
             assert app.preflight_button.instate(["!disabled"])
@@ -182,6 +185,16 @@ def main():
             root.update_idletasks()
             assert not app.confirmation_alert.winfo_manager()
             assert app.submit_button.instate(["!disabled"]), "confirmed items may pass the gate"
+            signature = app._approved_preflight_signature
+            app.message.delete("1.0", tk.END)
+            app._message_changed()
+            assert app._approved_preflight_signature == signature, "commit message edits must preserve preflight"
+            assert app.preflight_button.instate(["!disabled"])
+            assert app.submit_button.instate(["disabled"]), "blank message must gate only final commit"
+            app.message.insert("1.0", "修改后的提交说明")
+            app._message_changed()
+            assert app._approved_preflight_signature == signature
+            assert app.submit_button.instate(["!disabled"]), "refilling message must not require preflight again"
             hold = float(os.environ.get("SOW_GUI_TEST_HOLD", "0") or 0)
             deadline = time.time() + hold
             while time.time() < deadline:

@@ -345,14 +345,21 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
         _book(os.path.join(root, "master", "config", "seed.xlsx"), 1)
         engine = bs.BranchSubmitEngine(root, status_scanner=scanner)
         engine.core = FakeCore
-        batch = engine.preflight("develop", ["release"], items, "配置调整", scope_path=os.path.join(root, "develop", "config"))
+        batch = engine.preflight("develop", ["release"], items, "", scope_path=os.path.join(root, "develop", "config"))
         assert batch.source_status == "ready", batch.error
+        assert batch.message == "", "empty commit message must be accepted during preflight"
         assert [plan.operation for plan in batch.files] == ["modify", "add", "delete"]
         assert all(
             plan.actions["release"].state
             in {"planned", "ready", "confirmation_required", "blocked"}
             for plan in batch.files
         )
+        try:
+            engine.commit(batch)
+        except RuntimeError as exc:
+            assert "提交说明" in str(exc)
+        else:
+            raise AssertionError("final commit must reject an empty message")
         dirty = os.path.join(root, "release", "config", "M.xlsx")
         scanner.overrides[dirty] = sp.SvnStatusRecord(path=dirty, node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True)
         blocked = engine.preflight("develop", ["release"], [items[0]], "配置调整", scope_path=os.path.join(root, "develop", "config"))

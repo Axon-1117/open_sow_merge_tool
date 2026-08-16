@@ -71,6 +71,8 @@ if ($Profile -in @('Full', 'Adversarial')) {
 if ($Profile -eq 'Native') {
   & $python (Join-Path $testScriptRoot '_gui_self_test_branch_submit_workbench.py')
   if ($LASTEXITCODE -ne 0) { throw "Native GUI test failed with exit code $LASTEXITCODE" }
+  & $python (Join-Path $testScriptRoot '_gui_self_test_merge_file_paths.py')
+  if ($LASTEXITCODE -ne 0) { throw "Native merge-path GUI test failed with exit code $LASTEXITCODE" }
 }
 
 Write-Host "Test profile $Profile passed." -ForegroundColor Green

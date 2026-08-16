@@ -46,8 +46,8 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-16.update84"
-APP_BUILD_TAG = "target-change-preview-fastpath"
+APP_VERSION = "2026-08-16.update85"
+APP_BUILD_TAG = "visible-path-workbench-polish"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -10011,6 +10011,22 @@ def format_compact_version_identity(
     )
 
 
+def format_visible_file_path(path_like, *, max_len: int = 150) -> str:
+    """Return a single-line absolute path while keeping its useful tail visible."""
+    raw = os.fspath(path_like) if path_like else ""
+    raw = str(raw or "").replace("\r", " ").replace("\n", " ").strip()
+    if not raw:
+        return "-"
+    try:
+        visible = os.path.normpath(os.path.abspath(raw))
+    except Exception:
+        visible = raw
+    if len(visible) <= max_len:
+        return visible
+    tail_len = max(24, max_len - 4)
+    return "…\\" + visible[-tail_len:].lstrip("\\/")
+
+
 def merge_role_label(context: MergeLaunchContext | None, role: str, *, candidate: bool = False) -> str:
     """Return the user-facing semantic role name without changing raw roles."""
     normalized = str(role or "").lower()
@@ -12805,7 +12821,11 @@ class SheetView:
         self.diff_nav_group = ttk.Frame(self.column_action_bar)
         self._action_row_layout_after_id = None
 
-        ttk.Label(bar, text=f"Sheet: {sheet_name}", font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Label(
+            bar,
+            text=f"工作表 · {sheet_name}",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left", padx=(2, 10))
         self.info = None
         self.loading_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
 
@@ -13176,24 +13196,15 @@ class SheetView:
         self._refresh_column_action_buttons()
         self._schedule_column_action_row_layout()
 
-        # Semantic identity bar. Keep role/revision/Author visible; full paths
-        # are available from the hover detail instead of consuming grid width.
+        # Each visible workbook gets an aligned identity card.  The first line
+        # carries semantic role/revision/Author, while the second line exposes
+        # the actual file path used by this pane.  Two-way mode therefore has
+        # two 50:50 cards instead of reserving a blank third column for Base.
         path_bar = ttk.Frame(self.frame)
-        path_bar.pack(fill="x", padx=8, pady=(0, 2))
-
-        self._path_font = ("Segoe UI", 9)
-        path_bar.grid_columnconfigure(0, weight=1)
-        path_bar.grid_columnconfigure(1, weight=1)
-        path_bar.grid_columnconfigure(2, weight=1)
-
+        path_bar.pack(fill="x", padx=8, pady=(2, 5))
+        self.path_bar = path_bar
         self._path_font = ("Segoe UI", 9, "bold")
-
-        def _one_line_text(s: str, max_len: int = 120) -> str:
-            s = (s or "").replace("\r", " ").replace("\n", " ")
-            if len(s) <= max_len:
-                return s
-            # keep file tail visible when path is long
-            return "..." + s[-(max_len - 3):]
+        self._path_file_font = ("Segoe UI", 8)
 
         if getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False):
             mine_src = getattr(self.app, "raw_mine", None) or self.app.file_a
@@ -13206,52 +13217,69 @@ class SheetView:
             # Diff mode: keep wording consistent with SVN semantics (left=base, right=mine).
             base_src = getattr(self.app, "raw_base", None) or self.app.file_a
             mine_src = getattr(self.app, "raw_mine", None) or self.app.file_b
-            base_disp = _one_line_text(str(base_src or "")) or "-"
-            mine_disp = _one_line_text(str(mine_src or "")) or "-"
-            label_a = f"base={base_disp}"
-            label_b = f"mine={mine_disp}"
-            label_base = _one_line_text(getattr(self.app, "base_path", "") or "")
+            label_a = f"base={self._source_display_name(base_src)}"
+            label_b = f"mine={self._source_display_name(mine_src)}"
+            label_base = f"base={self._source_display_name(getattr(self.app, 'base_path', '') or '')}"
         is_merge_labels = bool(getattr(self.app, "merge_mode", False) and getattr(self.app, "has_base", False))
         path_bg_a = _MINE_BG if is_merge_labels else _BASE_BG
         path_bg_b = _THEIRS_BG if is_merge_labels else _MINE_BG
 
-        self.path_label_a = tk.Label(
-            path_bar,
-            text=label_a,
-            font=self._path_font,
-            bg=path_bg_a,
-            anchor="w",
-            padx=6,
-            pady=2,
+        def _identity_card(background: str, identity_text: str):
+            card = tk.Frame(
+                path_bar,
+                bg=background,
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#D7DCE3",
+            )
+            identity = tk.Label(
+                card,
+                text=identity_text,
+                font=self._path_font,
+                bg=background,
+                fg="#20242A",
+                anchor="w",
+                padx=9,
+                pady=2,
+                width=1,
+            )
+            identity.pack(fill="x")
+            file_path = tk.Label(
+                card,
+                text="文件路径：-",
+                font=self._path_file_font,
+                bg=background,
+                fg="#4F5965",
+                anchor="w",
+                padx=9,
+                pady=2,
+                width=1,
+                cursor="hand2",
+            )
+            file_path.pack(fill="x")
+            return card, identity, file_path
+
+        self.path_card_a, self.path_label_a, self.path_file_label_a = _identity_card(path_bg_a, label_a)
+        self.path_card_base, self.path_label_base, self.path_file_label_base = _identity_card(
+            _BASE_BG,
+            label_base if label_base else "基础(base): -",
         )
-        self.path_label_a.grid(row=0, column=0, sticky="ew")
-        self.path_label_base = tk.Label(
-            path_bar,
-            text=label_base if label_base else "基础(base): -",
-            font=self._path_font,
-            bg=_BASE_BG,
-            anchor="w",
-            padx=6,
-            pady=2,
-        )
-        self.path_label_base.grid(row=0, column=1, sticky="ew")
-        self.path_label_b = tk.Label(
-            path_bar,
-            text=label_b,
-            font=self._path_font,
-            bg=path_bg_b,
-            anchor="w",
-            padx=6,
-            pady=2,
-        )
-        self.path_label_b.grid(row=0, column=2, sticky="ew")
-        for identity_label in (
-            self.path_label_a,
-            self.path_label_base,
-            self.path_label_b,
+        self.path_card_b, self.path_label_b, self.path_file_label_b = _identity_card(path_bg_b, label_b)
+        self._visible_pane_paths = {"a": "", "base": "", "b": ""}
+        for side, identity_label, file_label in (
+            ("a", self.path_label_a, self.path_file_label_a),
+            ("base", self.path_label_base, self.path_file_label_base),
+            ("b", self.path_label_b, self.path_file_label_b),
         ):
             identity_label._identity_detail_text = ""
+            file_label._identity_detail_text = ""
             self._bind_identity_label_tooltip(identity_label)
+            self._bind_identity_label_tooltip(file_label)
+            file_label.bind(
+                "<Button-1>",
+                lambda _event, pane_side=side: self._copy_visible_pane_path(pane_side),
+                add="+",
+            )
 
         # Extra vertical scrollbar (left side) for convenience; controls both panes.
         # NOTE: must be packed BEFORE the paned window so it remains visible.
@@ -13300,11 +13328,39 @@ class SheetView:
         self._main_paned.bind("<ButtonRelease-1>", self._keep_panes_equal)
         self.frame.after(0, self._keep_panes_equal)
 
-        self.left_title = ttk.Label(left_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "A"), background=_MINE_BG)
+        pane_title_font = ("Segoe UI", 9, "bold")
+        self.left_title = tk.Label(
+            left_wrap,
+            text=merge_side_label(getattr(self.app, "launch_context", None), "A"),
+            bg=_MINE_BG,
+            fg="#20242A",
+            font=pane_title_font,
+            anchor="w",
+            padx=9,
+            pady=4,
+        )
         self.left_title.pack(fill="x")
-        self.mid_title = ttk.Label(mid_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "BASE"), background=_BASE_BG)
+        self.mid_title = tk.Label(
+            mid_wrap,
+            text=merge_side_label(getattr(self.app, "launch_context", None), "BASE"),
+            bg=_BASE_BG,
+            fg="#20242A",
+            font=pane_title_font,
+            anchor="w",
+            padx=9,
+            pady=4,
+        )
         self.mid_title.pack(fill="x")
-        self.right_title = ttk.Label(right_wrap, text=merge_side_label(getattr(self.app, "launch_context", None), "B"), background=_THEIRS_BG)
+        self.right_title = tk.Label(
+            right_wrap,
+            text=merge_side_label(getattr(self.app, "launch_context", None), "B"),
+            bg=_THEIRS_BG,
+            fg="#20242A",
+            font=pane_title_font,
+            anchor="w",
+            padx=9,
+            pady=4,
+        )
         self.right_title.pack(fill="x")
 
         # Font size tuned closer to TortoiseMerge (+~20%)
@@ -13594,7 +13650,7 @@ class SheetView:
         save_b_row.pack(fill="x", pady=(2, 0))
         save_b_row.pack_propagate(False)
         if not getattr(self.app, "merge_mode", False):
-            save_b_text = "Save Mine" if getattr(self.app, "diff_base_mine_mode", False) else "Save B"
+            save_b_text = "保存修改后文件" if getattr(self.app, "diff_base_mine_mode", False) else "保存B"
             self.save_b_btn = tk.Button(
                 save_b_row, text=save_b_text, bg="#ffecec", padx=14, pady=4,
                 command=self.app.save_b_inplace
@@ -14253,6 +14309,83 @@ class SheetView:
         label.bind("<Enter>", _enter, add="+")
         label.bind("<Leave>", lambda _event=None: self._hide_identity_label_tooltip(), add="+")
 
+    def _pane_source_paths(self) -> dict[str, str]:
+        """Map visible pane roles to the concrete files currently rendered."""
+        if self._is_three_way_enabled():
+            outcome = getattr(self.app, "startup_outcome", None)
+            candidate = (
+                getattr(outcome, "candidate_path", None)
+                or getattr(self.app, "merge_candidate_path", None)
+            )
+            return {
+                "a": str(candidate or getattr(self.app, "raw_mine", None) or self.app.file_a or ""),
+                "base": str(
+                    getattr(self.app, "raw_base", None)
+                    or getattr(self.app, "base_path", None)
+                    or ""
+                ),
+                "b": str(getattr(self.app, "raw_theirs", None) or self.app.file_b or ""),
+            }
+        return {
+            "a": str(getattr(self.app, "raw_base", None) or self.app.file_a or ""),
+            "base": "",
+            "b": str(getattr(self.app, "raw_mine", None) or self.app.file_b or ""),
+        }
+
+    def _copy_visible_pane_path(self, side: str):
+        full_path = str(getattr(self, "_visible_pane_paths", {}).get(side, "") or "").strip()
+        if not full_path or self.root is None:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(full_path)
+            self.root.update_idletasks()
+            self.info.configure(text="已复制文件路径")
+            self.root.after(1800, lambda: self.info.configure(text=""))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_identity_card_background(card, identity_label, file_label, background: str):
+        for widget in (card, identity_label, file_label):
+            try:
+                widget.configure(bg=background)
+            except Exception:
+                pass
+
+    def _update_visible_path_labels(self):
+        paths = self._pane_source_paths()
+        self._visible_pane_paths = paths
+        for side, label in (
+            ("a", self.path_file_label_a),
+            ("base", self.path_file_label_base),
+            ("b", self.path_file_label_b),
+        ):
+            full_path = paths.get(side, "")
+            label.configure(text=f"文件路径：{format_visible_file_path(full_path)}")
+            label._identity_detail_text = f"完整路径：{format_visible_file_path(full_path, max_len=4096)}\n单击复制路径"
+
+    def _layout_identity_cards(self, expanded: bool | None = None):
+        expanded = self._is_three_way_expanded() if expanded is None else bool(expanded)
+        for card in (self.path_card_a, self.path_card_base, self.path_card_b):
+            card.grid_remove()
+        for column in range(3):
+            self.path_bar.grid_columnconfigure(column, weight=0, uniform="")
+
+        if not self._is_three_way_enabled():
+            visible = (self.path_card_a, self.path_card_b)
+        elif expanded:
+            visible = (self.path_card_base, self.path_card_a, self.path_card_b)
+        elif str(self._folded_identity or "base").lower() == "theirs":
+            visible = (self.path_card_base, self.path_card_a)
+        else:
+            visible = (self.path_card_a, self.path_card_b)
+
+        uniform = "visible_workbook_identity"
+        for column, card in enumerate(visible):
+            self.path_bar.grid_columnconfigure(column, weight=1, uniform=uniform)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 4 if column < len(visible) - 1 else 0))
+
     @staticmethod
     def _identity_detail_text(
         role_label: str,
@@ -14331,6 +14464,24 @@ class SheetView:
                 self.path_label_a.configure(text=mine_text, bg=_MINE_BG)
                 self.path_label_base.configure(text=base_text, bg=_BASE_BG)
                 self.path_label_b.configure(text=theirs_text, bg=_THEIRS_BG)
+                self._set_identity_card_background(
+                    self.path_card_a,
+                    self.path_label_a,
+                    self.path_file_label_a,
+                    _MINE_BG,
+                )
+                self._set_identity_card_background(
+                    self.path_card_base,
+                    self.path_label_base,
+                    self.path_file_label_base,
+                    _BASE_BG,
+                )
+                self._set_identity_card_background(
+                    self.path_card_b,
+                    self.path_label_b,
+                    self.path_file_label_b,
+                    _THEIRS_BG,
+                )
                 self.path_label_a._identity_detail_text = mine_detail
                 self.path_label_base._identity_detail_text = base_detail
                 self.path_label_b._identity_detail_text = theirs_detail
@@ -14354,6 +14505,18 @@ class SheetView:
                 )
                 self.path_label_a.configure(text=left_text, bg=_BASE_BG)
                 self.path_label_b.configure(text=right_text, bg=_MINE_BG)
+                self._set_identity_card_background(
+                    self.path_card_a,
+                    self.path_label_a,
+                    self.path_file_label_a,
+                    _BASE_BG,
+                )
+                self._set_identity_card_background(
+                    self.path_card_b,
+                    self.path_label_b,
+                    self.path_file_label_b,
+                    _MINE_BG,
+                )
                 self.path_label_a._identity_detail_text = (
                     self._identity_detail_text(base_label, base_identity)
                     if meta.get("has_a") and base_identity
@@ -14364,6 +14527,7 @@ class SheetView:
                     if meta.get("has_b") and mine_identity
                     else f"{mine_label}\n完整路径：{mine_src}"
                 )
+            self._update_visible_path_labels()
         except Exception:
             pass
         try:
@@ -14410,11 +14574,6 @@ class SheetView:
         mine_pane_label = merge_role_label(context, "mine", candidate=branch_candidate)
         base_pane_label = merge_role_label(context, "base")
         theirs_pane_label = merge_role_label(context, "theirs")
-        def _one_line_text(s: str, max_len: int = 120) -> str:
-            s = (s or "").replace("\r", " ").replace("\n", " ")
-            if len(s) <= max_len:
-                return s
-            return "..." + s[-(max_len - 3):]
         try:
             panes = list(self._main_paned.panes())
             mid_id = str(self._mid_wrap)
@@ -14440,11 +14599,8 @@ class SheetView:
         except Exception:
             pass
         try:
+            self._layout_identity_cards(expanded)
             if expanded:
-                # Layout: left=Base, center=Mine, right=Theirs — reorder header labels to match
-                self.path_label_base.grid(row=0, column=0, sticky="ew")
-                self.path_label_a.grid(row=0, column=1, sticky="ew")
-                self.path_label_b.grid(row=0, column=2, sticky="ew")
                 self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
                 self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
                 self.right_title.configure(text=theirs_pane_label, background=_THEIRS_BG)
@@ -14452,17 +14608,11 @@ class SheetView:
                 if str(self._folded_identity or "base").lower() == "theirs":
                     # Mine ≡ Theirs: keep Base plus the initialized candidate
                     # visible and fold only the proven-redundant Theirs pane.
-                    self.path_label_b.grid_remove()
-                    self.path_label_base.grid(row=0, column=0, sticky="ew")
-                    self.path_label_a.grid(row=0, column=2, sticky="ew")
                     self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
                     self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
                 else:
-                    self.path_label_base.grid_remove()
                     # Base is redundant to one working side; keep the candidate
                     # and Theirs visible while retaining Base in memory.
-                    self.path_label_a.grid(row=0, column=0, sticky="ew")
-                    self.path_label_b.grid(row=0, column=2, sticky="ew")
                     self.left_title.configure(text=mine_pane_label, background=_MINE_BG)
                     self.right_title.configure(text=theirs_pane_label, background=_THEIRS_BG)
                     self.mid_title.configure(text=base_pane_label, background=_BASE_BG)
@@ -29962,6 +30112,30 @@ class SowMergeApp:
             style.configure("TCheckbutton", background=THEME.window_bg, foreground=THEME.text)
             style.configure("MergeChrome.TFrame", background=THEME.window_bg)
             style.configure("MergeChrome.TLabel", background=THEME.window_bg, foreground=THEME.secondary_text)
+            style.configure(
+                "Workspace.Title.TLabel",
+                background=THEME.window_bg,
+                foreground=THEME.text,
+                font=(THEME.font_family, 13, "bold"),
+            )
+            style.configure(
+                "Workspace.Subtitle.TLabel",
+                background=THEME.window_bg,
+                foreground=THEME.secondary_text,
+                font=(THEME.font_family, 9),
+            )
+            style.configure(
+                "Workspace.Status.TFrame",
+                background=THEME.panel_bg,
+                relief="solid",
+                borderwidth=1,
+            )
+            style.configure(
+                "Workspace.Status.TLabel",
+                background=THEME.panel_bg,
+                foreground=THEME.secondary_text,
+                padding=(8, 4),
+            )
             style.configure("MergeChrome.TNotebook", background=color, bordercolor=color)
             # Notebook pages remain the lazy-loading host, but their duplicate
             # tab rows are hidden. The lower Sheet strip is the sole navigator.
@@ -32230,10 +32404,8 @@ class SowMergeApp:
     def _build_ui(self):
         tk.Frame(self.root, height=4, bg=self.workspace_chrome_color, bd=0, highlightthickness=0).pack(fill="x")
         top = ttk.Frame(self.root, style="MergeChrome.TFrame")
-        top.pack(fill="x", padx=10, pady=(4, 2))
-        # Keep the permanent workbook actions anchored at the far left;
-        # the final empty column absorbs any spare title-bar width.
-        top.grid_columnconfigure(5, weight=1)
+        top.pack(fill="x", padx=12, pady=(7, 5))
+        top.grid_columnconfigure(0, weight=1)
 
         # Permanent raw-argument, identity-matrix, build and Sheet-count text
         # duplicated diagnostics and consumed several spreadsheet rows. Keep
@@ -32244,29 +32416,38 @@ class SowMergeApp:
             f"build={APP_BUILD_TAG}"
         )
 
-        ttk.Label(top, text="Excel 配置合并工作区", style="Title.App.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 16))
+        heading = ttk.Frame(top, style="MergeChrome.TFrame")
+        heading.grid(row=0, column=0, sticky="w")
+        ttk.Label(heading, text="Excel 配置合并工作区", style="Workspace.Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            heading,
+            text="核对文件差异，确认需要采用的修改；上方文件卡片显示当前对比路径",
+            style="Workspace.Subtitle.TLabel",
+        ).pack(anchor="w", pady=(1, 0))
+        actions = ttk.Frame(top, style="MergeChrome.TFrame")
+        actions.grid(row=0, column=1, sticky="e", padx=(18, 0))
         self.recalc_btn = ttk.Button(
-            top,
+            actions,
             text="重算并刷新",
             style="Primary.TButton",
             command=self.recalc_and_refresh,
         )
-        self.recalc_btn.grid(row=0, column=1, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="导出诊断包", style="App.TButton", command=self.export_diagnostic_bundle).grid(row=0, column=2, sticky="w", padx=(0, 8))
-        ttk.Button(top, text="复制反馈信息", style="App.TButton", command=self.copy_feedback_info).grid(row=0, column=3, sticky="w", padx=(0, 8))
-        self.update_btn = ttk.Button(top, text="检查更新", command=self._do_svn_update)
-        self.update_btn.grid(row=0, column=4, sticky="w")
+        self.recalc_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="导出诊断包", style="App.TButton", command=self.export_diagnostic_bundle).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="复制反馈信息", style="App.TButton", command=self.copy_feedback_info).pack(side="left", padx=(0, 8))
+        self.update_btn = ttk.Button(actions, text="检查更新", command=self._do_svn_update)
+        self.update_btn.pack(side="left")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=10, pady=(0, 2))
 
-        self.task_status_frame = ttk.Frame(self.root, style="MergeChrome.TFrame")
-        self.task_status_frame.pack(fill="x", padx=10, pady=(0, 2))
+        self.task_status_frame = ttk.Frame(self.root, style="Workspace.Status.TFrame")
+        self.task_status_frame.pack(fill="x", padx=12, pady=(0, 5))
         self.task_status_var = tk.StringVar(value="正在准备 Sheet 数据...")
-        ttk.Label(self.task_status_frame, textvariable=self.task_status_var, foreground="#555", style="MergeChrome.TLabel").pack(
+        ttk.Label(self.task_status_frame, textvariable=self.task_status_var, style="Workspace.Status.TLabel").pack(
             side="left", fill="x", expand=True
         )
         self.task_progress = ttk.Progressbar(self.task_status_frame, mode="indeterminate", length=240)
-        self.task_progress.pack(side="right", padx=(12, 0))
+        self.task_progress.pack(side="right", padx=(12, 8), pady=5)
         self.task_progress.start(12)
 
         # Non-modal startup/merge reminder. It is packed only when needed and

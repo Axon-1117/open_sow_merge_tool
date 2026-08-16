@@ -1096,8 +1096,6 @@ class BranchSubmitEngine:
         if not targets:
             raise ValueError("至少选择一个目标分支")
         frozen_message = str(message or "").strip()
-        if not frozen_message:
-            raise ValueError("SVN 提交说明不能为空")
         raw_selected = list(selected_files)
         if not raw_selected:
             raise ValueError("至少选择一个 Excel 变更")
@@ -1454,6 +1452,8 @@ class BranchSubmitEngine:
     def commit(self, batch: BranchSubmitBatch, *, stop_on_failure: bool = True) -> BranchSubmitBatch:
         if batch.source_status not in {"ready", "committed"}:
             raise RuntimeError(f"批次不可提交：source_status={batch.source_status}")
+        if not str(batch.message or "").strip():
+            raise RuntimeError("开始提交前必须填写 SVN 提交说明")
         pending_confirmations = [
             f"{target}/{plan.relative_path}"
             for plan in batch.files
@@ -1771,6 +1771,15 @@ class BranchSubmitWorkbench:
         style.configure("Status.App.TLabel", background=THEME.window_bg, foreground=THEME.secondary_text, padding=(4, 3))
         style.configure("Status.Error.TLabel", background=THEME.window_bg, foreground=THEME.error, padding=(4, 3), font=(THEME.font_family, 9, "bold"))
         style.configure("Danger.TButton", foreground=THEME.error, padding=(10, 5), font=(THEME.font_family, 9, "bold"))
+        style.configure("Workbench.Header.TFrame", background="#EAF3FB", relief="solid", borderwidth=1)
+        style.configure("Workbench.HeaderTitle.TLabel", background="#EAF3FB", foreground="#173A5E", font=(THEME.font_family, 14, "bold"))
+        style.configure("Workbench.HeaderSub.TLabel", background="#EAF3FB", foreground="#4E6578", font=(THEME.font_family, 9))
+        style.configure("Workbench.Step.TLabel", background="#D8EAF8", foreground="#174A7E", padding=(9, 4), font=(THEME.font_family, 9, "bold"))
+        style.configure("Workbench.Summary.TLabel", background="#EEF6FC", foreground="#174A7E", padding=(8, 5), font=(THEME.font_family, 9, "bold"))
+        style.configure("Workbench.Hint.TLabel", background=THEME.panel_bg, foreground=THEME.secondary_text, font=(THEME.font_family, 9))
+        style.configure("Workbench.Bottom.TFrame", background=THEME.panel_bg, relief="solid", borderwidth=1)
+        style.configure("Workbench.Treeview", rowheight=27, background=THEME.panel_bg, fieldbackground=THEME.panel_bg)
+        style.configure("Workbench.Treeview.Heading", font=(THEME.font_family, 9, "bold"))
 
     def _build_ui(self):
         tk, ttk = self.tk, self.ttk
@@ -1778,6 +1787,21 @@ class BranchSubmitWorkbench:
         self.root.geometry(self.settings.get("window_geometry", "1120x760"))
         self.root.minsize(900, 620)
         outer = ttk.Frame(self.root, padding=12, style="App.TFrame"); outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer, padding=(14, 10), style="Workbench.Header.TFrame")
+        header.pack(fill="x", pady=(0, 10))
+        header_copy = ttk.Frame(header, style="Workbench.Header.TFrame")
+        header_copy.pack(side="left", fill="x", expand=True)
+        ttk.Label(header_copy, text="多分支 SVN 提交", style="Workbench.HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            header_copy,
+            text="将源分支已修改内容安全同步到所选目标分支，再逐分支打开 TortoiseSVN 提交",
+            style="Workbench.HeaderSub.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+        steps = ttk.Frame(header, style="Workbench.Header.TFrame")
+        steps.pack(side="right", padx=(16, 0))
+        for text in ("1 选择内容", "2 预检查", "3 开始提交"):
+            ttk.Label(steps, text=text, style="Workbench.Step.TLabel").pack(side="left", padx=(5, 0))
+
         info = ttk.LabelFrame(outer, text="提交范围", padding=10, style="Panel.TLabelframe"); info.pack(fill="x")
         ttk.Label(info, text="源分支").grid(row=0, column=0, sticky="w")
         sources = [item.name for item in self.candidates if item.enabled]
@@ -1790,9 +1814,9 @@ class BranchSubmitWorkbench:
         info.columnconfigure(3, weight=1)
 
         paned = ttk.Panedwindow(outer, orient="horizontal"); paned.pack(fill="both", expand=True, pady=(10, 0))
-        target_box = ttk.LabelFrame(paned, text="目标分支", padding=8, style="Panel.TLabelframe"); paned.add(target_box, weight=1)
+        target_box = ttk.LabelFrame(paned, text="目标分支", padding=10, style="Panel.TLabelframe"); paned.add(target_box, weight=2)
         self.target_summary_var = tk.StringVar(value="尚未预检查 · 完成预检查后才能开始多分支提交")
-        ttk.Label(target_box, textvariable=self.target_summary_var, style="Muted.App.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(target_box, textvariable=self.target_summary_var, style="Workbench.Summary.TLabel").pack(fill="x", pady=(0, 8))
         search_row = ttk.Frame(target_box); search_row.pack(fill="x")
         ttk.Label(search_row, text="筛选").pack(side="left", padx=(0, 6))
         ttk.Entry(search_row, textvariable=self.target_search_var).pack(side="left", fill="x", expand=True)
@@ -1809,6 +1833,7 @@ class BranchSubmitWorkbench:
             show="headings",
             selectmode="browse",
             yscrollcommand=target_scroll.set,
+            style="Workbench.Treeview",
         )
         target_scroll.configure(command=self.target_tree.yview)
         for key, title, width in (("check", "✓", 34), ("favorite", "", 28), ("branch", "分支", 125), ("state", "处理状态", 90), ("changed", "最近修改", 112)):
@@ -1824,7 +1849,7 @@ class BranchSubmitWorkbench:
         self.target_tree.bind("<Double-1>", self._target_tree_double_click)
 
         main = ttk.Frame(paned, style="App.TFrame"); paned.add(main, weight=5)
-        message_box = ttk.LabelFrame(main, text="提交说明", padding=8, style="Panel.TLabelframe"); message_box.pack(fill="x")
+        message_box = ttk.LabelFrame(main, text="提交说明", padding=10, style="Panel.TLabelframe"); message_box.pack(fill="x")
         message_tools = ttk.Frame(message_box); message_tools.pack(fill="x", pady=(0, 6))
         ttk.Button(message_tools, text="最近提交消息", command=self._show_recent_messages).pack(side="left")
         ttk.Button(message_tools, text="粘贴文件名", command=self._paste_filenames).pack(side="left", padx=5)
@@ -1832,8 +1857,13 @@ class BranchSubmitWorkbench:
         self.message = tk.Text(message_box, height=5, wrap="word", font=("Segoe UI", 9), undo=True)
         self.message.pack(fill="x")
         self.message.bind("<KeyRelease>", self._message_changed)
+        ttk.Label(
+            message_box,
+            text="可先留空进行预检查；真正开始提交前必须填写。修改说明不会让预检查结果失效。",
+            style="Workbench.Hint.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
-        changes = ttk.LabelFrame(main, text="文件变更（双击查看差异）", padding=8, style="Panel.TLabelframe"); changes.pack(fill="both", expand=True, pady=(10, 0))
+        changes = ttk.LabelFrame(main, text="文件变更（双击查看差异）", padding=10, style="Panel.TLabelframe"); changes.pack(fill="both", expand=True, pady=(10, 0))
         filters = ttk.Frame(changes); filters.pack(fill="x", pady=(0, 6))
         ttk.Label(filters, text="选择：", style="Title.TLabel").pack(side="left")
         for text, mode in (("全部", "all"), ("无", "none"), ("已版本化", "versioned"), ("新增", "added"), ("删除", "deleted"), ("修改", "modified"), ("文件", "files")):
@@ -1844,7 +1874,9 @@ class BranchSubmitWorkbench:
         self.scan_stop_button.pack(side="right", padx=6)
         ttk.Button(filters, text="刷新", command=self._start_scan).pack(side="right")
         columns = ("check", "path", "extension", "status", "property", "lock", "switched", "changelist")
-        self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended", style="Workbench.Treeview")
+        self.tree.tag_configure("alternate", background=THEME.row_alt)
+        self.tree.tag_configure("not_selectable", foreground=THEME.disabled)
         headings = {"check":"✓", "path":"路径", "extension":"扩展名", "status":"状态", "property":"属性状态", "lock":"锁定", "switched":"已切换", "changelist":"变更列表"}
         widths = {"check":38, "path":390, "extension":72, "status":160, "property":105, "lock":80, "switched":70, "changelist":120}
         widths.update({key: int(value) for key, value in self.settings.get("column_widths", {}).items() if key in widths})
@@ -1881,7 +1913,7 @@ class BranchSubmitWorkbench:
         )
         self.confirmation_button.pack(side="right", padx=(12, 0))
 
-        bottom = ttk.Frame(outer); bottom.pack(fill="x", pady=(10, 0))
+        bottom = ttk.Frame(outer, padding=(10, 8), style="Workbench.Bottom.TFrame"); bottom.pack(fill="x", pady=(10, 0))
         self.bottom_bar = bottom
         self.scan_progress = ttk.Progressbar(bottom, mode="indeterminate", length=110)
         self.scan_progress.pack(side="left", padx=(0, 8))
@@ -2087,7 +2119,12 @@ class BranchSubmitWorkbench:
             if item.reason: status += f" · {item.reason}"
             iid = f"item-{index}"
             self._item_rows[iid] = item
-            self.tree.insert("", "end", iid=iid, values=(mark, item.relative_path, item.extension, status, item.prop_status, item.lock_owner or ("已锁定" if item.wc_locked else ""), "是" if item.switched else "", item.changelist))
+            tags = []
+            if index % 2:
+                tags.append("alternate")
+            if not item.selectable:
+                tags.append("not_selectable")
+            self.tree.insert("", "end", iid=iid, values=(mark, item.relative_path, item.extension, status, item.prop_status, item.lock_owner or ("已锁定" if item.wc_locked else ""), "是" if item.switched else "", item.changelist), tags=tuple(tags))
         selected = sum(item.checked for item in self.items)
         self.count_var.set(f"已选 {selected} 个，显示 {len(visible)} 个，共 {len(self.items)} 个")
         self._refresh_primary_button()
@@ -2137,10 +2174,10 @@ class BranchSubmitWorkbench:
         self._invalidate_batch(); self._render_items()
 
     def _message_changed(self, _event=None):
-        if self.current_batch is not None or self._approved_preflight_signature is not None:
-            self._invalidate_batch("提交说明已变化，请重新预检查")
-        else:
-            self._refresh_primary_button()
+        # The commit message does not affect branch/file safety analysis.
+        # Keep a valid preflight while the user writes or revises the message;
+        # the final text is frozen into the batch immediately before commit.
+        self._refresh_primary_button()
 
     def _invalidate_batch(
         self,
@@ -2179,17 +2216,9 @@ class BranchSubmitWorkbench:
         self._refresh_primary_button()
 
     def _can_preflight(self) -> bool:
-        try:
-            message = self.message.get("1.0", self.tk.END).strip()
-        except Exception:
-            message = ""
-        return bool(self.items and self._selected_items() and self._selected_targets() and message)
+        return bool(self.items and self._selected_items() and self._selected_targets())
 
     def _request_signature(self) -> tuple:
-        try:
-            message = self.message.get("1.0", self.tk.END).strip()
-        except Exception:
-            message = ""
         return (
             self.source_var.get(),
             os.path.normcase(os.path.abspath(self.scope_var.get())),
@@ -2200,7 +2229,6 @@ class BranchSubmitWorkbench:
                     for item in self._selected_items()
                 )
             ),
-            message,
         )
 
     def _has_valid_preflight(self) -> bool:
@@ -2213,10 +2241,6 @@ class BranchSubmitWorkbench:
                 return False
             if self._approved_preflight_signature != self._request_signature():
                 return False
-        try:
-            message = self.message.get("1.0", self.tk.END).strip()
-        except Exception:
-            message = ""
         if not committed_resume and (
             batch.source_branch != self.source_var.get()
             or os.path.normcase(os.path.abspath(batch.scope_path))
@@ -2224,7 +2248,6 @@ class BranchSubmitWorkbench:
             or tuple(batch.target_branches) != tuple(self._selected_targets())
             or {plan.relative_path for plan in batch.files}
             != {item.relative_path for item in self._selected_items()}
-            or batch.message.strip() != message
         ):
             return False
         if batch.source_status not in {"ready", "committed"}:
@@ -2236,8 +2259,12 @@ class BranchSubmitWorkbench:
         )
 
     def _can_start(self) -> bool:
-        """Compatibility alias: starting now means holding a valid preflight."""
-        return self._has_valid_preflight()
+        """Start requires a valid safety result plus a non-empty commit message."""
+        try:
+            message_ready = bool(self.message.get("1.0", self.tk.END).strip())
+        except Exception:
+            message_ready = False
+        return self._has_valid_preflight() and message_ready
 
     def _refresh_primary_button(self):
         if not hasattr(self, "submit_button"):
@@ -2253,7 +2280,7 @@ class BranchSubmitWorkbench:
             self.preflight_button.state(["disabled"])
         else:
             self.preflight_button.state(["!disabled"])
-        if busy or not self._has_valid_preflight():
+        if busy or not self._can_start():
             self.submit_button.state(["disabled"])
         else:
             self.submit_button.state(["!disabled"])
@@ -2671,7 +2698,7 @@ class BranchSubmitWorkbench:
                 if not needle or needle in value.lower(): listing.insert(tk.END, value)
         def use():
             if listing.curselection():
-                value=listing.get(listing.curselection()[0]); self.message.delete("1.0", tk.END); self.message.insert("1.0", value); self._invalidate_batch("提交说明已变化，请重新预检查"); win.destroy()
+                value=listing.get(listing.curselection()[0]); self.message.delete("1.0", tk.END); self.message.insert("1.0", value); self._refresh_primary_button(); win.destroy()
         query.trace_add("write", render); render(); listing.bind("<Double-1>", lambda _e: use())
         ttk.Button(frame, text="使用所选消息", command=use).pack(anchor="e", pady=(6,0))
 
@@ -2679,7 +2706,7 @@ class BranchSubmitWorkbench:
         names = "\n".join(item.relative_path for item in self._selected_items())
         if names:
             self.message.insert(self.tk.END, ("\n" if self.message.get("1.0", self.tk.END).strip() else "") + names)
-            self._invalidate_batch("提交说明已变化，请重新预检查")
+            self._refresh_primary_button()
 
     def _show_log(self):
         threading.Thread(target=lambda: self.engine.show_log(self.scope_var.get()), daemon=True).start()
@@ -2906,7 +2933,7 @@ class BranchSubmitWorkbench:
         if not self._can_preflight():
             messagebox.showwarning(
                 "无法预检查",
-                "请先选择目标分支、Excel 变更并填写提交说明。",
+                "请先选择目标分支和需要同步的 Excel 变更。\n提交说明可以在预检查完成后再填写。",
                 parent=self.root,
             )
             return
@@ -2963,7 +2990,10 @@ class BranchSubmitWorkbench:
                         f"预检查完成：可直接同步 {ready_count} 个文件，需人工确认 {confirmation_count} 个文件"
                     )
                 else:
-                    self.status_var.set(f"预检查通过：可直接同步 {ready_count} 个文件；现在可以开始提交")
+                    if self.message.get("1.0", self.tk.END).strip():
+                        self.status_var.set(f"预检查通过：可直接同步 {ready_count} 个文件；现在可以开始提交")
+                    else:
+                        self.status_var.set(f"预检查通过：可直接同步 {ready_count} 个文件；填写提交说明后可开始提交")
             else:
                 self.status_var.set(batch.error or "预检查结果未确认")
             self._refresh_primary_button()
@@ -2984,7 +3014,23 @@ class BranchSubmitWorkbench:
                 parent=self.root,
             )
             return
+        message = self.message.get("1.0", self.tk.END).strip()
+        if not message:
+            self.status_var.set("预检查已通过；填写提交说明后才能开始提交")
+            messagebox.showwarning(
+                "请填写提交说明",
+                "预检查已经完成，不需要重新检查。\n请填写 SVN 提交说明后再开始提交。",
+                parent=self.root,
+            )
+            try:
+                self.message.focus_set()
+            except Exception:
+                pass
+            return
         if not messagebox.askyesno("开始分步提交","将依次打开源分支和目标分支的 TortoiseSVN 提交窗口。\n任何取消、部分勾选或未知结果都会停止后续分支。\n\n继续吗？",parent=self.root):return
+        batch.message = message
+        batch.event("commit-message-frozen", length=len(message))
+        batch.save()
         self.submit_button.state(["disabled"])
         self.preflight_button.state(["disabled"])
         self._commit_active = True
