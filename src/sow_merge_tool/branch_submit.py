@@ -1407,7 +1407,11 @@ def _choose_recovery_action(root, batches: list[BranchSubmitBatch]):
     win = tk.Toplevel(root)
     win.title("检测到未完成的多分支提交")
     win.geometry("850x330")
-    win.transient(root)
+    # ``root`` is intentionally withdrawn during startup.  Making a dialog
+    # transient to a withdrawn owner can leave the dialog with no visible
+    # window on Windows Explorer launches, even though the process is alive.
+    # Keep it as an independent, explicitly raised recovery window instead.
+    win.resizable(True, True)
     frame = ttk.Frame(win, padding=12)
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="以下批次没有完整结束。继续或恢复前会再次核对 SVN 状态。", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 8))
@@ -1434,6 +1438,15 @@ def _choose_recovery_action(root, batches: list[BranchSubmitBatch]):
     ttk.Button(buttons, text="查看批次目录", command=lambda: os.startfile(selected().folder) if selected() else None).pack(side="left", padx=6)
     ttk.Button(buttons, text="稍后处理", command=win.destroy).pack(side="right")
     win.protocol("WM_DELETE_WINDOW", win.destroy)
+    win.update_idletasks()
+    win.deiconify()
+    win.lift()
+    try:
+        win.attributes("-topmost", True)
+        win.after(350, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+    except tk.TclError:
+        pass
+    win.focus_force()
     win.grab_set(); root.wait_window(win)
     return result["value"]
 
