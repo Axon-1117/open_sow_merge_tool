@@ -25134,7 +25134,7 @@ class SheetView:
         self._persist_only_diff_setting_debounced()
 
     def _toggle_force_align(self):
-        """Manual override for large-sheet row pairing accuracy."""
+        """Manual override for row pairing accuracy, rebuilt off the Tk thread."""
         if not self._guard_mutation_ready("重新行对齐"):
             try:
                 self.force_align_var.set(int(bool(self._force_sequence_align)))
@@ -25147,22 +25147,58 @@ class SheetView:
         except Exception:
             self._force_sequence_align = bool(self.force_align_var.get())
         self._invalidate_only_diff_snapshot_cache()
-        self._suppress_bg_apply = True
+        # Small sheets do not benefit from a worker round-trip and keeping the
+        # synchronous path preserves the immediate editing semantics used by
+        # the lightweight merge adapters.  Large sheets are the problematic
+        # case (for example Language.xlsx), so only those are moved off Tk.
+        if not bool(getattr(self, "_is_large_sheet", False)):
+            self._suppress_bg_apply = True
+            try:
+                self.refresh(row_only=None, rescan=True)
+            finally:
+                self._suppress_bg_apply = False
+            self._update_cursor_lines()
+            self._update_diff_nav_state()
+            if (
+                not bool(getattr(self, "_pair_diff_full_exact", False))
+                or (
+                    self._is_three_way_enabled()
+                    and getattr(self.app, "has_base", False)
+                    and not bool(getattr(self, "_base_diff_full_exact", False))
+                )
+            ):
+                self._start_async_large_only_diff_build()
+            self._refresh_interaction_gate()
+            return
+        # A full force-alignment scan can take several seconds on Language.xlsx.
+        # Reuse the existing background worker instead of calling refresh()
+        # synchronously from the Tk callback (which freezes the window).
+        self._data_ready = False
+        self._row_model_exact = False
+        self._pair_diff_full_exact = False
+        self._base_diff_full_exact = False
+        self._show_loading(
+            "正在后台重新行对齐…当前内容仍可查看，完成后恢复操作"
+        )
+        self._refresh_interaction_gate()
         try:
-            self.refresh(row_only=None, rescan=True)
-        finally:
-            self._suppress_bg_apply = False  # Fresh data rendered; allow bg applies again.
-        self._update_cursor_lines()
-        self._update_diff_nav_state()
-        if (
-            not bool(getattr(self, "_pair_diff_full_exact", False))
-            or (
-                self._is_three_way_enabled()
-                and getattr(self.app, "has_base", False)
-                and not bool(getattr(self, "_base_diff_full_exact", False))
+            with self.app._compute_lock:
+                self.app._sheet_compute_generation[self.sheet] = (
+                    int(self.app._sheet_compute_generation.get(self.sheet, 0)) + 1
+                )
+            self.app._enqueue_sheet(
+                self.sheet,
+                front=True,
+                exact_only_diff=bool(self.only_diff_var.get()),
+                force_recompute=True,
+                force_align=bool(self._force_sequence_align),
             )
-        ):
-            self._start_async_large_only_diff_build()
+            self.app._kick_worker()
+        except Exception as exc:
+            self._lifecycle_error = f"后台重新行对齐启动失败：{exc}"
+            self._hide_loading()
+            self._refresh_interaction_gate()
+            _dlog(f"force-align enqueue failed sheet={self.sheet}: {exc}")
         self._refresh_interaction_gate()
 
     def _flush_settings(self):
@@ -32237,6 +32273,10 @@ class SowMergeApp:
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
         self._compute_exact_only_diff_requested: set[str] = set()
+        # A force-align request is carried into the background cache builder
+        # per Sheet.  Keeping it separate from the view avoids reading Tk
+        # objects from the worker and lets the UI return immediately.
+        self._compute_force_align_requested: set[str] = set()
         self._sheet_compute_generation: dict[str, int] = {
             sheet: 0 for sheet in self.compare_sheets
         }
@@ -32254,6 +32294,7 @@ class SowMergeApp:
             front: bool = False,
             exact_only_diff: bool | None = None,
             force_recompute: bool = False,
+            force_align: bool | None = None,
         ):
             if self._is_closing:
                 return
@@ -32267,6 +32308,15 @@ class SowMergeApp:
                     )
                 if exact_only_diff:
                     self._compute_exact_only_diff_requested.add(sheet)
+                if force_align is None:
+                    queued_view = self.sheet_views.get(sheet)
+                    force_align = bool(
+                        getattr(queued_view, "_force_sequence_align", False)
+                    ) if queued_view is not None else False
+                if force_align:
+                    self._compute_force_align_requested.add(sheet)
+                else:
+                    self._compute_force_align_requested.discard(sheet)
                 if sheet in self._compute_inflight:
                     if force_recompute and sheet not in self._compute_queue:
                         if front:
@@ -32419,6 +32469,7 @@ class SowMergeApp:
             rows_cache=None,
             ws_a_edit=None,
             ws_b_edit=None,
+            force: bool = False,
         ):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
             max_row_a, max_row_b = _shared_physical_row_horizon(
@@ -32429,7 +32480,7 @@ class SowMergeApp:
                 ws_a_edit,
                 ws_b_edit,
             )
-            if not _should_auto_row_align(max_row_a, max_row_b, force=False):
+            if not _should_auto_row_align(max_row_a, max_row_b, force=force):
                 max_row = max(max_row_a, max_row_b)
                 pairs = []
                 for r in range(1, max_row + 1):
@@ -32458,6 +32509,7 @@ class SowMergeApp:
                 id(ws_b_edit),
                 int(max_row_b),
                 width_b,
+                bool(force),
             )
             if signature_cache is not None and pair_cache_key in signature_cache:
                 sig_a, sig_b = signature_cache[pair_cache_key]
@@ -32719,6 +32771,7 @@ class SowMergeApp:
             wb_base_val=None,
             wb_base_edit=None,
             need_exact_only_diff: bool = False,
+            force_sequence_align: bool = False,
         ):
             _check_bg_cancel()
             trimmed_rows_cache = {}
@@ -32766,6 +32819,7 @@ class SowMergeApp:
                 trimmed_rows_cache,
                 ws_a_edit,
                 ws_b_edit,
+                force=force_sequence_align,
             )
             row_pairs = _collapse_one_sided_blank_tail_padding(
                 row_pairs,
@@ -32805,6 +32859,7 @@ class SowMergeApp:
                         trimmed_rows_cache,
                         ws_a_edit,
                         ws_base_edit,
+                        force=force_sequence_align,
                     )
                     mine_base_pairs = _collapse_one_sided_blank_tail_padding(
                         mine_base_pairs,
@@ -32831,6 +32886,7 @@ class SowMergeApp:
                         trimmed_rows_cache,
                         ws_b_edit,
                         ws_base_edit,
+                        force=force_sequence_align,
                     )
                     theirs_base_pairs = _collapse_one_sided_blank_tail_padding(
                         theirs_base_pairs,
@@ -33621,6 +33677,8 @@ class SowMergeApp:
                             sheet in self._compute_exact_only_diff_requested
                         )
                         self._compute_exact_only_diff_requested.discard(sheet)
+                        force_sequence_align = sheet in self._compute_force_align_requested
+                        self._compute_force_align_requested.discard(sheet)
                         compute_generation = int(
                             self._sheet_compute_generation.get(sheet, 0)
                         )
@@ -33646,6 +33704,7 @@ class SowMergeApp:
                             wb_base_ro,
                             wb_base_e,
                             need_exact_only_diff=need_exact_only_diff,
+                            force_sequence_align=force_sequence_align,
                         )
                         cache["generation"] = compute_generation
                         if self._is_closing:
@@ -35125,6 +35184,7 @@ class SowMergeApp:
                 self._compute_total = max(1, len(self.compare_sheets))
                 self._compute_done = 0
                 self._sheet_cache_store.clear()
+                self._compute_force_align_requested.clear()
             for sheet, view in list(getattr(self, "sheet_views", {}).items()):
                 if view is None:
                     continue
