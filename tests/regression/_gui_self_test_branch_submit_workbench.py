@@ -84,6 +84,22 @@ def main():
             assert set(app.tree["columns"]) == {"check", "path", "extension", "status", "property", "lock", "switched", "changelist"}
             assert "预检查（必需）" in app.preflight_button.cget("text")
             assert app.submit_button.instate(["disabled"]), "multi-branch submit must be preflight-gated"
+            root.geometry("900x620")
+            root.update()
+            time.sleep(0.03)
+            root.update()
+            root_bottom = root.winfo_rooty() + root.winfo_height()
+            for button in (app.preflight_button, app.submit_button):
+                assert button.winfo_ismapped(), f"footer button is not mapped: {button.cget('text')}"
+                assert button.winfo_rooty() + button.winfo_height() <= root_bottom, (
+                    f"footer button is outside the client area: {button.cget('text')} "
+                    f"button_y={button.winfo_rooty()} button_h={button.winfo_height()} "
+                    f"root_y={root.winfo_rooty()} root_h={root.winfo_height()} "
+                    f"footer_y={app.footer_host.winfo_rooty()} footer_h={app.footer_host.winfo_height()} "
+                    f"footer_req={app.footer_host.winfo_reqheight()} "
+                    f"outer_y={app.footer_host.master.winfo_rooty()} outer_h={app.footer_host.master.winfo_height()} "
+                    f"outer_req={app.footer_host.master.winfo_reqheight()}"
+                )
             target_name = next(name for name in app.target_vars if name != "master")
             app.target_vars[target_name].set(True)
             app._target_selection[target_name] = True

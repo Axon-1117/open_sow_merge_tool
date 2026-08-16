@@ -611,15 +611,53 @@ def list_unfinished_batches() -> list[BranchSubmitBatch]:
             batch = BranchSubmitBatch.load(state_path)
         except Exception:
             continue
-        if batch.abandoned or batch.superseded_by:
-            continue
-        complete = batch.source_status == "committed" and all(
-            state in {"committed", "already_present", "skipped"}
-            for state in batch.target_status.values()
-        )
-        if not complete:
+        if batch_requires_recovery(batch):
             result.append(batch)
     return sorted(result, key=lambda item: item.updated_at, reverse=True)
+
+
+_READ_ONLY_BATCH_EVENTS = {
+    "preflight",
+    "preflight-failed",
+    "source-change-confirmed",
+    "target-file-excluded",
+    "target-preview-created",
+    "abandoned",
+}
+
+
+def batch_requires_recovery(batch: BranchSubmitBatch) -> bool:
+    """Return whether a batch may have repository or working-copy effects.
+
+    A preflight creates candidates and previews only inside the batch folder.
+    Those read-only records must not interrupt the next launch.  Recovery is
+    reserved for a batch that entered the commit flow, wrote a target working
+    copy, reached a non-preflight source state, or contains an effect-bearing
+    action left by an older state version.
+    """
+    if batch.abandoned or batch.superseded_by:
+        return False
+    complete = batch.source_status == "committed" and all(
+        state in {"committed", "already_present", "skipped"}
+        for state in batch.target_status.values()
+    )
+    if complete:
+        return False
+    if batch.source_status not in {"pending", "ready"}:
+        return True
+    event_kinds = {
+        str(entry.get("kind", "") or "")
+        for entry in batch.journal
+        if isinstance(entry, dict)
+    }
+    if any(kind and kind not in _READ_ONLY_BATCH_EVENTS for kind in event_kinds):
+        return True
+    effect_states = {"prepared", "committed", "partial", "unknown", "restored"}
+    return any(
+        action.state in effect_states
+        for plan in batch.files
+        for action in plan.actions.values()
+    )
 
 
 def list_corrupt_batch_files() -> list[str]:
@@ -1770,6 +1808,8 @@ class BranchSubmitWorkbench:
         style.configure("Panel.TLabelframe.Label", background=THEME.panel_bg, foreground=THEME.text, font=(THEME.font_family, 9, "bold"))
         style.configure("Status.App.TLabel", background=THEME.window_bg, foreground=THEME.secondary_text, padding=(4, 3))
         style.configure("Status.Error.TLabel", background=THEME.window_bg, foreground=THEME.error, padding=(4, 3), font=(THEME.font_family, 9, "bold"))
+        style.configure("Status.Footer.TLabel", background=THEME.panel_bg, foreground=THEME.secondary_text, padding=(4, 3))
+        style.configure("Status.FooterError.TLabel", background=THEME.panel_bg, foreground=THEME.error, padding=(4, 3), font=(THEME.font_family, 9, "bold"))
         style.configure("Danger.TButton", foreground=THEME.error, padding=(10, 5), font=(THEME.font_family, 9, "bold"))
         style.configure("Workbench.Header.TFrame", background="#EAF3FB", relief="solid", borderwidth=1)
         style.configure("Workbench.HeaderTitle.TLabel", background="#EAF3FB", foreground="#173A5E", font=(THEME.font_family, 14, "bold"))
@@ -1787,6 +1827,10 @@ class BranchSubmitWorkbench:
         self.root.geometry(self.settings.get("window_geometry", "1120x760"))
         self.root.minsize(900, 620)
         outer = ttk.Frame(self.root, padding=12, style="App.TFrame"); outer.pack(fill="both", expand=True)
+        # The root owns the window geometry.  Do not let the combined natural
+        # height of header, trees and footer enlarge this frame beyond the
+        # visible client area and clip bottom actions.
+        outer.pack_propagate(False)
         header = ttk.Frame(outer, padding=(14, 10), style="Workbench.Header.TFrame")
         header.pack(fill="x", pady=(0, 10))
         header_copy = ttk.Frame(header, style="Workbench.Header.TFrame")
@@ -1832,6 +1876,7 @@ class BranchSubmitWorkbench:
             columns=("check", "favorite", "branch", "state", "changed"),
             show="headings",
             selectmode="browse",
+            height=4,
             yscrollcommand=target_scroll.set,
             style="Workbench.Treeview",
         )
@@ -1854,7 +1899,7 @@ class BranchSubmitWorkbench:
         ttk.Button(message_tools, text="最近提交消息", command=self._show_recent_messages).pack(side="left")
         ttk.Button(message_tools, text="粘贴文件名", command=self._paste_filenames).pack(side="left", padx=5)
         ttk.Button(message_tools, text="显示日志", command=self._show_log).pack(side="left")
-        self.message = tk.Text(message_box, height=5, wrap="word", font=("Segoe UI", 9), undo=True)
+        self.message = tk.Text(message_box, height=4, wrap="word", font=("Segoe UI", 9), undo=True)
         self.message.pack(fill="x")
         self.message.bind("<KeyRelease>", self._message_changed)
         ttk.Label(
@@ -1874,7 +1919,7 @@ class BranchSubmitWorkbench:
         self.scan_stop_button.pack(side="right", padx=6)
         ttk.Button(filters, text="刷新", command=self._start_scan).pack(side="right")
         columns = ("check", "path", "extension", "status", "property", "lock", "switched", "changelist")
-        self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended", style="Workbench.Treeview")
+        self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended", height=4, style="Workbench.Treeview")
         self.tree.tag_configure("alternate", background=THEME.row_alt)
         self.tree.tag_configure("not_selectable", foreground=THEME.disabled)
         headings = {"check":"✓", "path":"路径", "extension":"扩展名", "status":"状态", "property":"属性状态", "lock":"锁定", "switched":"已切换", "changelist":"变更列表"}
@@ -1888,8 +1933,13 @@ class BranchSubmitWorkbench:
         self.tree.pack(side="left", fill="both", expand=True); yscroll.pack(side="right", fill="y"); xscroll.pack(side="bottom", fill="x")
         self.tree.bind("<Button-1>", self._tree_click); self.tree.bind("<Double-1>", self._tree_double_click); self.tree.bind("<Button-3>", self._tree_menu)
 
+        # Reserve a real footer before the expandable panes.  The previous
+        # packing order allowed the new header and tall trees to push the
+        # preflight/submit buttons below the client area on 768px displays.
+        self.footer_host = ttk.Frame(outer, style="App.TFrame")
+        self.footer_host.pack(side="bottom", fill="x", before=paned)
         self.confirmation_alert = tk.Frame(
-            outer,
+            self.footer_host,
             background="#FDE7E9",
             highlightbackground=THEME.error,
             highlightthickness=1,
@@ -1913,16 +1963,20 @@ class BranchSubmitWorkbench:
         )
         self.confirmation_button.pack(side="right", padx=(12, 0))
 
-        bottom = ttk.Frame(outer, padding=(10, 8), style="Workbench.Bottom.TFrame"); bottom.pack(fill="x", pady=(10, 0))
+        bottom = ttk.Frame(self.footer_host, padding=(10, 8), style="Workbench.Bottom.TFrame"); bottom.pack(side="bottom", fill="x", pady=(10, 0))
         self.bottom_bar = bottom
-        self.scan_progress = ttk.Progressbar(bottom, mode="indeterminate", length=110)
+        actions = ttk.Frame(bottom, style="Panel.TFrame")
+        actions.pack(side="right", padx=(12, 0))
+        ttk.Button(actions, text="取消", command=self._close).pack(side="right")
+        self.submit_button = ttk.Button(actions, text="② 开始提交", style="Primary.TButton", command=self._submit); self.submit_button.pack(side="right", padx=6); self.submit_button.state(["disabled"])
+        self.preflight_button = ttk.Button(actions, text="① 预检查（必需）", style="App.TButton", command=self._preflight); self.preflight_button.pack(side="right")
+        status_area = ttk.Frame(bottom, style="Panel.TFrame")
+        status_area.pack(side="left", fill="x", expand=True)
+        self.scan_progress = ttk.Progressbar(status_area, mode="indeterminate", length=110)
         self.scan_progress.pack(side="left", padx=(0, 8))
-        ttk.Label(bottom, textvariable=self.count_var).pack(side="left")
-        self.status_label = ttk.Label(bottom, textvariable=self.status_var, style="Status.App.TLabel")
-        self.status_label.pack(side="left", padx=18)
-        ttk.Button(bottom, text="取消", command=self._close).pack(side="right")
-        self.submit_button = ttk.Button(bottom, text="② 开始提交", style="Primary.TButton", command=self._submit); self.submit_button.pack(side="right", padx=6); self.submit_button.state(["disabled"])
-        self.preflight_button = ttk.Button(bottom, text="① 预检查（必需）", style="App.TButton", command=self._preflight); self.preflight_button.pack(side="right")
+        ttk.Label(status_area, textvariable=self.count_var, background=THEME.panel_bg).pack(side="left")
+        self.status_label = ttk.Label(status_area, textvariable=self.status_var, style="Status.Footer.TLabel")
+        self.status_label.pack(side="left", fill="x", expand=True, padx=(18, 0))
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _candidate_for_source(self):
@@ -2351,14 +2405,14 @@ class BranchSubmitWorkbench:
                     pady=(10, 0),
                     before=self.bottom_bar,
                 )
-            self.status_label.configure(style="Status.Error.TLabel")
+            self.status_label.configure(style="Status.FooterError.TLabel")
             self.confirmation_button.state(
                 ["disabled"] if self._confirmation_active else ["!disabled"]
             )
         else:
             if self.confirmation_alert.winfo_manager():
                 self.confirmation_alert.pack_forget()
-            self.status_label.configure(style="Status.App.TLabel")
+            self.status_label.configure(style="Status.Footer.TLabel")
 
     def _open_confirmation_dialog(self, *, preferred_target: str | None = None):
         from tkinter import messagebox
@@ -3068,6 +3122,11 @@ class BranchSubmitWorkbench:
         self.closing = True
         self.scan_cancel.set()
         self.ui_tasks.close()
+        if self.current_batch is not None and not batch_requires_recovery(self.current_batch):
+            try:
+                self.engine.abandon(self.current_batch)
+            except Exception:
+                pass
         data=dict(self.settings);data["wc_root"]=self.context.wc_root;data["window_geometry"]=self.root.geometry()
         data["column_widths"]={key:self.tree.column(key,"width") for key in self.tree["columns"]}
         data.setdefault("last_targets",{})[self.source_var.get()]=self._selected_targets()

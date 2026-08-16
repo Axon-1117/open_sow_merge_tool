@@ -318,6 +318,61 @@ def test_high_confidence_rename_is_blocked() -> None:
     finally: _cleanup(root, old)
 
 
+def test_recovery_list_ignores_read_only_preflight_batches() -> None:
+    root, old = _fixture()
+    try:
+        action = bs.BatchFileAction(
+            branch="release",
+            relative_path="config/A.xlsx",
+            operation="modify",
+            state="ready",
+        )
+        batch = bs.BranchSubmitBatch(
+            batch_id="read-only-preflight",
+            wc_root=root,
+            source_branch="develop",
+            target_branches=["release"],
+            files=[bs.FilePlan(relative_path="config/A.xlsx", actions={"release": action})],
+            message="",
+            source_status="ready",
+            target_status={"release": "ready"},
+        )
+        batch.event("preflight", source_status="ready")
+        batch.event("target-preview-created", target="release", path="config/A.xlsx")
+        assert not bs.batch_requires_recovery(batch)
+        assert bs.list_unfinished_batches() == []
+
+        batch.event("commit-message-frozen", length=4)
+        assert bs.batch_requires_recovery(batch)
+        assert [item.batch_id for item in bs.list_unfinished_batches()] == [batch.batch_id]
+
+        bs.BranchSubmitEngine.abandon(batch)
+        assert bs.list_unfinished_batches() == []
+
+        legacy = bs.BranchSubmitBatch(
+            batch_id="legacy-prepared",
+            wc_root=root,
+            source_branch="develop",
+            target_branches=["release"],
+            files=[bs.FilePlan(
+                relative_path="config/B.xlsx",
+                actions={"release": bs.BatchFileAction(
+                    branch="release",
+                    relative_path="config/B.xlsx",
+                    operation="modify",
+                    state="prepared",
+                )},
+            )],
+            message="提交",
+            source_status="ready",
+            target_status={"release": "ready"},
+        )
+        legacy.save()
+        assert bs.batch_requires_recovery(legacy), "older prepared states must remain recoverable"
+    finally:
+        _cleanup(root, old)
+
+
 def test_preflight_modify_add_delete_and_dirty_block() -> None:
     root, old = _fixture()
     try:
@@ -800,6 +855,7 @@ if __name__ == "__main__":
         test_status_xml_and_windows_abi,
         test_scan_defaults_and_blockers,
         test_high_confidence_rename_is_blocked,
+        test_recovery_list_ignores_read_only_preflight_batches,
         test_preflight_modify_add_delete_and_dirty_block,
         test_source_partial_selection_stops_propagation,
         test_server_success_beats_error_exit_code,
