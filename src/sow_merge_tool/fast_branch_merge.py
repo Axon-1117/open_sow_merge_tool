@@ -11,6 +11,7 @@ copy derived from the target workbook into the batch artifact directory.
 from __future__ import annotations
 
 import os
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 M = "{" + MAIN_NS + "}"
+_EXCEL_ESCAPE_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
 
 
 @dataclass(frozen=True)
@@ -88,10 +90,32 @@ def _text(node: ET.Element | None) -> str:
     return "".join(part.text or "" for part in node.iter(M + "t"))
 
 
+def _normalize_excel_text(value: object) -> object:
+    """Normalize equivalent text emitted by different Excel versions.
+
+    Excel may persist carriage returns either as a literal CRLF pair or as the
+    OOXML escape ``_x000D_`` followed by LF.  Treating those representations as
+    different creates a large false source delta after an otherwise harmless
+    save in another Office build.
+    """
+    if not isinstance(value, str):
+        return value
+    value = _EXCEL_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 16)), value)
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _parse_xml(payload: bytes) -> ET.Element:
+    # openpyxl can persist one logical CRLF as CR+CRLF.  XML parsers normalize
+    # both carriage returns to LF before the application sees them, creating a
+    # false blank line.  Preserve that producer-specific sequence as one CRLF
+    # without collapsing intentional consecutive newlines in user text.
+    return ET.fromstring(payload.replace(b"\r\r\n", b"&#13;&#10;"))
+
+
 def _shared_strings(payload: bytes | None) -> tuple[str, ...]:
     if not payload:
         return ()
-    root = ET.fromstring(payload)
+    root = _parse_xml(payload)
     return tuple(_text(item) for item in root.findall(M + "si"))
 
 
@@ -124,7 +148,7 @@ def _column_number(reference: str) -> int:
 
 
 def _sheet_rows(payload: bytes, strings: tuple[str, ...]) -> dict[int, FastRow]:
-    root = ET.fromstring(payload)
+    root = _parse_xml(payload)
     rows: dict[int, FastRow] = {}
     for row in root.findall(".//" + M + "row"):
         try:
@@ -140,7 +164,7 @@ def _sheet_rows(payload: bytes, strings: tuple[str, ...]) -> dict[int, FastRow]:
             if column:
                 cells[column] = _cell_value(cell, strings)
         key_cell = cells.get(1)
-        key = str(key_cell.value).strip() if key_cell and key_cell.value not in (None, "") else ""
+        key = str(_normalize_excel_text(key_cell.value)).strip() if key_cell and key_cell.value not in (None, "") else ""
         rows[number] = FastRow(number, key, cells, row.attrib.get("s", ""))
     return rows
 
@@ -190,7 +214,7 @@ def _load_cached(signature: tuple[str, int, int]) -> FastWorkbook:
             else:
                 keys[row.key] = number
         headers = tuple(
-            str(rows.get(1, FastRow(1, "", {})).cells[column].value or "")
+            str(_normalize_excel_text(rows.get(1, FastRow(1, "", {})).cells[column].value or ""))
             for column in sorted(rows.get(1, FastRow(1, "", {})).cells)
         )
         sheets[name] = FastSheet(name, member, rows, keys, duplicates, headers)
@@ -212,13 +236,25 @@ def _cell_equal(left: FastCell | None, right: FastCell | None) -> bool:
         if cell is None or (not cell.formula and cell.value in (None, "")):
             return ("blank",)
         if cell.formula:
-            return ("formula", cell.formula)
+            return ("formula", _normalize_excel_text(cell.formula))
         if cell.cell_type in {"s", "inlineStr", "str"}:
-            return ("text", cell.value)
+            return ("text", _normalize_excel_text(cell.value))
         if cell.cell_type in {"", "n"}:
             return ("number", cell.value)
         return (cell.cell_type, cell.value)
     return fingerprint(left) == fingerprint(right)
+
+
+def _sheet_semantic_equal(left: FastSheet, right: FastSheet) -> bool:
+    """Compare only cell values/formulas, ignoring save-time presentation churn."""
+    if set(left.rows) != set(right.rows):
+        return False
+    for row_number in left.rows:
+        left_row, right_row = left.rows[row_number], right.rows[row_number]
+        columns = set(left_row.cells) | set(right_row.cells)
+        if any(not _cell_equal(left_row.cells.get(column), right_row.cells.get(column)) for column in columns):
+            return False
+    return True
 
 
 def _cell_display(cell: FastCell | None) -> str:
@@ -314,72 +350,113 @@ def _schema_compatible(before: FastSheet, after: FastSheet, target: FastSheet | 
     return True
 
 
-def _xml_without_tags(payload: bytes, ignored_tags: set[str]) -> bytes:
-    """Return a stable-enough XML projection with volatile nodes removed."""
+def _xml_sections(payload: bytes, names: set[str]) -> tuple[bytes, ...]:
+    """Return only explicitly protected OOXML sections in document order."""
     root = ET.fromstring(payload)
-    for parent in root.iter():
-        for child in list(parent):
-            if child.tag.rsplit("}", 1)[-1] in ignored_tags:
-                parent.remove(child)
-    return ET.tostring(root, encoding="utf-8")
+    return tuple(
+        ET.tostring(node, encoding="utf-8")
+        for node in root.iter()
+        if node.tag.rsplit("}", 1)[-1] in names
+    )
+
+
+def _node_signature(
+    node: ET.Element,
+    *,
+    ignored_tags: set[str] | None = None,
+    ignored_attrs: set[str] | None = None,
+) -> tuple:
+    ignored_tags = ignored_tags or set()
+    ignored_attrs = ignored_attrs or set()
+    local = node.tag.rsplit("}", 1)[-1]
+    attributes = tuple(sorted(
+        (key.rsplit("}", 1)[-1], value)
+        for key, value in node.attrib.items()
+        if key.rsplit("}", 1)[-1] not in ignored_attrs
+    ))
+    children = tuple(
+        _node_signature(child, ignored_tags=ignored_tags, ignored_attrs=ignored_attrs)
+        for child in node
+        if child.tag.rsplit("}", 1)[-1] not in ignored_tags
+    )
+    return local, attributes, (node.text or "").strip(), children
+
+
+def _protected_sheet_signature(payload: bytes) -> tuple:
+    root = ET.fromstring(payload)
+    sections: list[tuple] = []
+    for node in root:
+        name = node.tag.rsplit("}", 1)[-1]
+        if name == "mergeCells":
+            sections.append((name, tuple(sorted(
+                child.attrib.get("ref", "") for child in node
+                if child.tag.rsplit("}", 1)[-1] == "mergeCell"
+            ))))
+        elif name == "dataValidations":
+            sections.append((name, _node_signature(node, ignored_attrs={"count", "uid"})))
+        elif name == "tableParts":
+            # Table definitions themselves are protected package members; the
+            # relationship id is allowed to be regenerated during save.
+            sections.append((name, len(list(node))))
+        elif name == "sheetProtection":
+            sections.append((name, _node_signature(node, ignored_attrs={"uid"})))
+        elif name == "autoFilter":
+            # Excel and WPS attach different revision/extension metadata to an
+            # otherwise identical filter range.  Preserve the range and any
+            # real filterColumn criteria, but ignore producer-specific extras.
+            sections.append((name, _node_signature(
+                node,
+                ignored_tags={"extLst"},
+                ignored_attrs={"uid", "filterBottomFollowUsedRange"},
+            )))
+    return tuple(sections)
 
 
 def _source_structure_issue(before: FastWorkbook, after: FastWorkbook) -> str:
     """Reject workbook edits that cannot be represented as record changes.
 
     Cell values and formulas are handled by the source delta.  This audit is
-    deliberately fail-closed for workbook/sheet structures: silently dropping
-    a merge, validation, comment or drawing change would produce a candidate
-    that contains only part of the user's source edit.
+    fail-closed for structures that change configuration topology or workbook
+    execution, while producer-specific presentation metadata is ignored.
     """
     before_members = set(before.members)
     after_members = set(after.members)
-    benign_members = {
-        "xl/sharedStrings.xml",
-        "xl/calcChain.xml",
-        "docProps/core.xml",
-        "docProps/app.xml",
-        "docProps/custom.xml",
-        "[Content_Types].xml",
-        "_rels/.rels",
-        "xl/_rels/workbook.xml.rels",
-    }
-    worksheet_members = {sheet.member for sheet in before.sheets.values()} | {
-        sheet.member for sheet in after.sheets.values()
-    }
-    unexplained_members = (before_members ^ after_members) - benign_members - worksheet_members
-    if unexplained_members:
-        member = sorted(unexplained_members)[0]
-        return f"工作簿新增或删除了不支持的结构：{member}"
+
+    # Only structures that affect cell topology or executable workbook
+    # semantics are protected.  Selection, view, column-width, phonetic,
+    # comments/VML, conditional-format IDs, hyperlinks and package metadata
+    # routinely churn when the same workbook is saved by another Excel build;
+    # they are not configuration changes and are intentionally ignored.
+    protected_prefixes = (
+        "xl/tables/", "xl/pivot", "xl/embeddings/", "xl/activeX/",
+        "xl/ctrlProps/", "customXml/",
+    )
+    protected_members = {"xl/vbaProject.bin", "xl/connections.xml"}
+    for member in sorted(before_members | after_members):
+        if (
+            member in protected_members or member.startswith(protected_prefixes)
+        ) and before.payloads.get(member) != after.payloads.get(member):
+            return f"工作簿包含无法按记录同步的结构变化：{member}"
 
     for name in sorted(after.sheets):
         left = before.sheets.get(name)
         right = after.sheets.get(name)
         if left is None or right is None:
             continue
-        # Values live under sheetData and the used range is recalculated after
-        # applying rows.  Everything else in a worksheet is structural.
-        if _xml_without_tags(before.payloads[left.member], {"sheetData", "dimension"}) != _xml_without_tags(
-            after.payloads[right.member], {"sheetData", "dimension"}
+        if _protected_sheet_signature(before.payloads[left.member]) != _protected_sheet_signature(
+            after.payloads[right.member]
         ):
-            return f"{name} 包含合并单元格、校验、批注或其他表结构变化"
+            return f"{name} 的合并单元格、数据校验、表格或保护结构发生变化"
 
     workbook_member = "xl/workbook.xml"
-    if workbook_member in before.payloads and workbook_member in after.payloads:
-        # Excel commonly updates calculation metadata and the last active tab
-        # while saving.  They are UI/cache state rather than configuration.
-        ignored = {"calcPr", "fileVersion", "bookViews"}
-        if _xml_without_tags(before.payloads[workbook_member], ignored) != _xml_without_tags(
-            after.payloads[workbook_member], ignored
-        ):
-            return "工作簿结构、工作表属性或定义名称发生变化"
-
-    ignored_payloads = benign_members | worksheet_members | {workbook_member}
-    for member in sorted(before_members & after_members):
-        if member in ignored_payloads:
-            continue
-        if before.payloads[member] != after.payloads[member]:
-            return f"工作簿包含无法按记录同步的结构变化：{member}"
+    if (
+        workbook_member in before.payloads
+        and workbook_member in after.payloads
+        and _xml_sections(before.payloads[workbook_member], {"definedNames"}) != _xml_sections(
+            after.payloads[workbook_member], {"definedNames"}
+        )
+    ):
+        return "工作簿结构、工作表属性或定义名称发生变化"
     return ""
 
 
@@ -396,6 +473,10 @@ def analyze_source(before_path: str, source_path: str) -> FastSourceDelta:
         return delta
     for name in sorted(after.sheets):
         left, right = before.sheets[name], after.sheets[name]
+        if before.payloads.get(left.member) == after.payloads.get(right.member):
+            continue
+        if _sheet_semantic_equal(left, right):
+            continue
         if left.duplicate_keys or right.duplicate_keys or not _schema_compatible(left, right):
             delta.unsupported_reason = f"{name} 的唯一键或字段结构无法证明稳定"
             return delta
@@ -405,30 +486,13 @@ def analyze_source(before_path: str, source_path: str) -> FastSourceDelta:
         for key in sorted(set(left.key_rows) & set(right.key_rows)):
             old = left.rows[left.key_rows[key]]
             new = right.rows[right.key_rows[key]]
-            # A direct cell projection deliberately preserves target formatting.
-            # If the source changed row/cell styles at the same time as values,
-            # copying only the value would silently lose the designer's intent.
-            if old.style != new.style:
-                delta.unsupported_reason = f"{name} 的记录行样式发生变化，无法自动同步"
-                return delta
             columns = sorted(set(old.cells) | set(new.cells))
             for column in columns:
-                old_cell, new_cell = old.cells.get(column), new.cells.get(column)
-                old_style = old_cell.style if old_cell is not None else ""
-                new_style = new_cell.style if new_cell is not None else ""
-                if old_style != new_style:
-                    delta.unsupported_reason = f"{name} 的单元格样式发生变化，无法自动同步"
-                    return delta
                 if not _cell_equal(old.cells.get(column), new.cells.get(column)):
                     changed.append({"key": key, "before_row": old.number, "after_row": new.number, "column": column})
         if added or deleted or changed:
             delta.changed_sheets[name] = {"added": added, "deleted": deleted, "changed": changed}
             delta.incoming_count += len(added) + len(deleted) + len(changed)
-        elif before.payloads.get(left.member) != after.payloads.get(right.member):
-            # A changed sheet with no provable record key cannot be treated as
-            # an empty delta.  It is unsupported, not "already applied".
-            delta.unsupported_reason = f"{name} 发生变化但没有可证明的唯一键"
-            return delta
     delta.changed_count = delta.incoming_count
     return delta
 
@@ -486,11 +550,7 @@ def analyze_target(delta: FastSourceDelta, target_path: str) -> FastTargetDecisi
                             reason="源分支新增了该记录，但目标已存在同一唯一键",
                         ))
                 continue
-            row = source_sheet.rows[source_sheet.key_rows[key]]
-            if row.style and row.style != "0" or any(cell.style and cell.style != "0" for cell in row.cells.values()):
-                return FastTargetDecision("unsupported", f"{sheet_name} 的新增记录带有样式，无法安全映射样式索引")
-            else:
-                details.append(_detail(sheet=sheet_name, key=key, kind="add"))
+            details.append(_detail(sheet=sheet_name, key=key, kind="add"))
         for key in changes["deleted"]:
             target_row = target_sheet.key_rows.get(key)
             if target_row is None:
@@ -653,14 +713,21 @@ def _target_column_for_source(source_ws: FastSheet, target_ws: FastSheet, source
 def _append_row_xml(sheet_data: ET.Element, source_ws: FastSheet, source_row: int | None, target_ws: FastSheet, target_row: int) -> None:
     if source_row is None:
         raise ValueError("源新增记录缺少唯一键行")
-    row = ET.Element(M + "row", {"r": str(target_row)})
+    template_number = max(target_ws.key_rows.values(), default=max(target_ws.rows or {1}))
+    template_row = target_ws.rows.get(template_number)
+    row_attributes = {"r": str(target_row)}
+    if template_row is not None and template_row.style and template_row.style != "0":
+        row_attributes["s"] = template_row.style
+        row_attributes["customFormat"] = "1"
+    row = ET.Element(M + "row", row_attributes)
     for column, source_cell in source_ws.rows[source_row].cells.items():
         target_column = _target_column_for_source(source_ws, target_ws, column)
         if not target_column:
             continue
         cell = ET.SubElement(row, M + "c", {"r": f"{_column_name(target_column)}{target_row}"})
-        if source_cell.style and source_cell.style != "0":
-            cell.attrib["s"] = source_cell.style
+        template_cell = template_row.cells.get(target_column) if template_row is not None else None
+        if template_cell is not None and template_cell.style and template_cell.style != "0":
+            cell.attrib["s"] = template_cell.style
         _write_cell_payload(cell, source_cell)
     sheet_data.append(row)
 

@@ -7,9 +7,8 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from unittest.mock import patch
-
 import tkinter as tk
+from unittest.mock import patch
 
 from sow_merge_tool import branch_submit as bs
 
@@ -126,6 +125,32 @@ def main():
             app._approved_preflight_signature = app._request_signature()
             app._render_target_statuses()
             root.update_idletasks()
+            matrix_probe = {}
+
+            def inspect_matrix():
+                windows = [child for child in root.winfo_children() if isinstance(child, tk.Toplevel)]
+                window = next(child for child in windows if "预检查结果" in child.title())
+
+                def descendants(widget):
+                    result = []
+                    for child in widget.winfo_children():
+                        result.append(child)
+                        result.extend(descendants(child))
+                    return result
+
+                widgets = descendants(window)
+                trees = [widget for widget in widgets if widget.winfo_class() == "Treeview"]
+                buttons = [str(widget.cget("text")) for widget in widgets if widget.winfo_class() == "TButton"]
+                matrix_probe["columns"] = tuple(trees[0]["columns"])
+                matrix_probe["buttons"] = buttons
+                matrix_probe["width"] = window.winfo_width()
+                window.destroy()
+
+            root.after(120, inspect_matrix)
+            app._matrix_dialog(app.current_batch)
+            assert matrix_probe["columns"] == ("branch", "file", "operation", "state", "reason")
+            assert "查看目标修改点" in matrix_probe["buttons"]
+            assert matrix_probe["width"] >= 860
             assert app.confirmation_alert.winfo_manager() == "pack"
             assert "内容重叠" in app.confirmation_alert_var.get()
             assert app.submit_button.instate(["disabled"]), "confirmation items must keep submit gated"

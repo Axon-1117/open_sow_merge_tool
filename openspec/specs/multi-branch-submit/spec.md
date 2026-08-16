@@ -23,12 +23,17 @@
 ## Scenario: fail closed
 
 - **WHEN** status collection fails, a selected target is dirty, conflict/switch/property/external/unsupported structure is detected, or a target changed since analysis
-- **THEN** the affected action is blocked and no commit dialog is opened for that unsafe action; the preflight matrix may open the standalone Excel comparer for inspection without treating that result as a batch candidate
+- **THEN** the affected action is blocked and no commit dialog is opened for that unsafe action
 
 ## Scenario: conservative fast path
 
-- **WHEN** a source delta is limited to value/formula changes or unique-key rows appended at the source tail, with stable headers and default styles
-- **THEN** the tool classifies the target in read-only OOXML, projects only the proven cells/rows into a target-derived candidate, preserves unrelated target content, and reports direct/already/confirmation counts
+- **WHEN** a source delta is limited to value/formula changes or unique-key rows appended at the source tail, with stable headers
+- **THEN** the tool classifies the target in read-only OOXML, projects only the proven cells/rows into a target-derived candidate using target-side styles, preserves unrelated target content, and reports direct/already/confirmation counts
+
+## Scenario: inspect actual target modification points
+
+- **WHEN** the user selects a mappable modified file in the preflight matrix and chooses “查看目标修改点”
+- **THEN** the tool lazily creates an artifact-only preview derived from the unchanged target, opens the comparer as target-before versus target-after-preview, never compares the source workbook directly as the target result, and does not modify the target working copy
 
 ## Scenario: overlapping target content requires confirmation
 
@@ -37,8 +42,13 @@
 
 ## Scenario: unsupported workbook changes remain blocked
 
-- **WHEN** rows are inserted away from the proven tail, styles or workbook structures change, or a unique record/field mapping cannot be proved
+- **WHEN** rows are inserted away from the proven tail, protected workbook structures change, or a unique record/field mapping cannot be proved
 - **THEN** the tool marks the action “安全阻断”; confirmation alone cannot convert an unsupported write into a successful synchronization
+
+## Scenario: ignore save-time presentation churn
+
+- **WHEN** Excel or WPS rewrites selection/view metadata, column widths, comment relationships, conditional-format identifiers, producer extensions, or equivalent CRLF encodings without changing configuration cell semantics
+- **THEN** the fast analyzer ignores that churn while still blocking real merge-cell, data-validation, table, protection, embedded-object, VBA, or defined-name changes
 
 ## Scenario: added, deleted, and renamed files
 

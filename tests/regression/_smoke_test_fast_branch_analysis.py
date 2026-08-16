@@ -9,6 +9,7 @@ import time
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from sow_merge_tool.fast_branch_merge import (
     analyze_source,
@@ -83,6 +84,7 @@ def main() -> None:
         confirmed_book.close()
 
         styled_source = os.path.join(root, "styled-source.xlsx")
+        styled_target = os.path.join(root, "styled-target.xlsx")
         styled_book = Workbook()
         styled_sheet = styled_book.active
         styled_sheet.title = "Data"
@@ -92,19 +94,40 @@ def main() -> None:
         styled_sheet["B3"].font = Font(bold=True)
         styled_book.save(styled_source)
         styled_book.close()
+        shutil.copy2(before, styled_target)
+        styled_target_book = load_workbook(styled_target)
+        styled_target_book["Data"]["B2"].fill = PatternFill("solid", fgColor="00FF00")
+        styled_target_book["Data"]["B2"].font = Font(italic=True)
+        styled_target_book.save(styled_target)
+        styled_target_book.close()
         styled_delta = analyze_source(before, styled_source)
-        assert analyze_target(styled_delta, target).disposition == "unsupported"
+        styled_decision = analyze_target(styled_delta, styled_target)
+        assert styled_decision.disposition == "direct", styled_decision
+        apply_source_change_plan(before, styled_source, styled_target, output, styled_decision)
+        styled_result = load_workbook(output)
+        assert styled_result["Data"]["B3"].fill.fgColor.rgb == "0000FF00"
+        assert styled_result["Data"]["B3"].font.italic
+        assert not styled_result["Data"]["B3"].font.bold
+        styled_result.close()
 
         structural_source = os.path.join(root, "structural-source.xlsx")
         structural_book = load_workbook(before)
         structural_sheet = structural_book["Data"]
         structural_sheet["B2"] = "源修改"
-        structural_sheet.sheet_properties.tabColor = "FF0000"
+        structural_sheet.merge_cells("B2:C2")
         structural_book.save(structural_source)
         structural_book.close()
         structural_delta = analyze_source(before, structural_source)
         assert structural_delta.unsupported_reason, structural_delta
-        assert "结构" in structural_delta.unsupported_reason, structural_delta.unsupported_reason
+        assert "合并单元格" in structural_delta.unsupported_reason, structural_delta.unsupported_reason
+
+        validation_source = os.path.join(root, "validation-source.xlsx")
+        validation_book = load_workbook(before)
+        validation_book["Data"].add_data_validation(DataValidation(type="whole", operator="greaterThan", formula1="0"))
+        validation_book["Data"].data_validations.dataValidation[0].add("B2")
+        validation_book.save(validation_source)
+        validation_book.close()
+        assert "数据校验" in analyze_source(before, validation_source).unsupported_reason
 
         style_only_source = os.path.join(root, "style-only-source.xlsx")
         style_only_book = load_workbook(before)
@@ -112,7 +135,24 @@ def main() -> None:
         style_only_book.save(style_only_source)
         style_only_book.close()
         style_only_delta = analyze_source(before, style_only_source)
-        assert style_only_delta.unsupported_reason, style_only_delta
+        assert not style_only_delta.unsupported_reason and style_only_delta.incoming_count == 0
+        assert analyze_target(style_only_delta, target).disposition == "already_applied"
+
+        selection_only_source = os.path.join(root, "selection-only-source.xlsx")
+        selection_book = load_workbook(before)
+        selection_book["Data"].sheet_view.selection[0].activeCell = "B2"
+        selection_book["Data"].sheet_view.selection[0].sqref = "B2"
+        selection_book.save(selection_only_source)
+        selection_book.close()
+        selection_delta = analyze_source(before, selection_only_source)
+        assert not selection_delta.unsupported_reason and selection_delta.incoming_count == 0
+
+        crlf_before = os.path.join(root, "crlf-before.xlsx")
+        crlf_after = os.path.join(root, "crlf-after.xlsx")
+        _book(crlf_before, [["ID", "文本"], ["a", "第一行\r\n第二行"]])
+        _book(crlf_after, [["ID", "文本"], ["a", "第一行_x000D_\n第二行"]])
+        crlf_delta = analyze_source(crlf_before, crlf_after)
+        assert not crlf_delta.unsupported_reason and crlf_delta.incoming_count == 0, crlf_delta
 
         large_before = os.path.join(root, "large-before.xlsx")
         large_source = os.path.join(root, "large-source.xlsx")

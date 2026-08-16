@@ -44,7 +44,7 @@ HIDDEN_BRANCH_NAMES = {".svn", "tool", "tools", "sow_merge_tool", "excel_merge_t
 TERMINAL_ACTION_STATES = {"committed", "already_applied", "excluded", "restored"}
 BLOCKING_NODE_STATES = {"conflicted", "obstructed", "replaced", "incomplete", "status-callback-failed"}
 SOURCE_CHANGE_STATES = {"modified", "added", "deleted", "missing", "unversioned"}
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 
 def _sha256(path: str) -> str:
@@ -510,6 +510,10 @@ class BatchFileAction:
     candidate_hash: str = ""
     backup_path: str = ""
     candidate_path: str = ""
+    preview_path: str = ""
+    preview_hash: str = ""
+    preview_target_hash: str = ""
+    preview_created_at: str = ""
     revision_before: int | None = None
     revision_after: int | None = None
     prepared_at: str = ""
@@ -578,7 +582,7 @@ class BranchSubmitBatch:
         with open(path, "r", encoding="utf-8") as stream:
             payload = json.load(stream)
         version = int(payload.pop("state_version", 1))
-        if version not in {2, 3, STATE_VERSION}:
+        if version not in {2, 3, 4, STATE_VERSION}:
             raise ValueError(f"批次状态版本不兼容：{version}")
         plans: list[FilePlan] = []
         for raw in payload.pop("files", []):
@@ -742,16 +746,92 @@ class BranchSubmitEngine:
         plan: FilePlan,
         target: str,
     ) -> None:
-        """Open the standalone Excel comparer without joining it to the batch."""
+        """Compare target-before with a target-derived after preview.
+
+        The source workbook is never used as one side of this comparison.  A
+        preview answers the product question directly: which cells would be
+        changed in this target branch if the source delta were accepted?
+        """
         target_path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
-        source_path = plan.source_after or plan.source_before
-        if not os.path.isfile(target_path) or not source_path or not os.path.isfile(source_path):
-            raise RuntimeError(f"{target}/{plan.relative_path}：缺少可对比的源文件或目标文件")
+        preview_path = self.ensure_target_preview(batch, plan, target)
+        if not os.path.isfile(target_path) or not os.path.isfile(preview_path):
+            raise RuntimeError(f"{target}/{plan.relative_path}：缺少目标修改前文件或修改后预览")
         command = [sys.executable]
         if not getattr(sys, "frozen", False):
             command.extend(("-m", "sow_merge_tool"))
-        command.extend((target_path, source_path))
+        command.extend((target_path, preview_path))
         subprocess.Popen(command)
+
+    def ensure_target_preview(
+        self,
+        batch: BranchSubmitBatch,
+        plan: FilePlan,
+        target: str,
+    ) -> str:
+        """Materialize an artifact-only target-after preview on demand."""
+        if plan.operation != "modify":
+            raise RuntimeError("只有修改文件支持查看目标修改点")
+        action = plan.actions.get(target)
+        if action is None:
+            raise RuntimeError(f"预检查结果中不存在 {target}/{plan.relative_path}")
+        if action.state in {"blocked", "excluded", "unknown", "failed"}:
+            raise RuntimeError(action.reason or "该项未通过安全检查，不能生成修改预览")
+        target_path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
+        if not os.path.isfile(target_path):
+            raise RuntimeError(f"{target}/{plan.relative_path}：目标文件不存在")
+        status_map = records_by_path(self.status_scanner(os.path.join(batch.wc_root, target)))
+        record = _status_for_exact_path(batch.wc_root, target_path, status_map)
+        reason = _status_block_reason(record, require_clean=True)
+        if reason or not record.versioned or record.node_status != "normal":
+            raise RuntimeError(f"{target}/{plan.relative_path}：{reason or '目标文件不是干净的已版本化文件'}")
+        if _has_conflict(self._load_core(), target_path):
+            raise RuntimeError(f"{target}/{plan.relative_path}：目标文件存在 SVN 冲突或冲突残留")
+        current_hash = _sha256(target_path)
+        if action.target_before_hash and current_hash != action.target_before_hash:
+            raise RuntimeError(f"{target}/{plan.relative_path}：预检查后目标内容已变化，请重新预检查")
+        if (
+            action.preview_path
+            and action.preview_target_hash == current_hash
+            and os.path.isfile(action.preview_path)
+            and action.preview_hash
+            and _sha256(action.preview_path) == action.preview_hash
+        ):
+            return action.preview_path
+        cache_key = (plan.source_before, plan.source_after)
+        delta = self._fast_delta_cache.get(cache_key)
+        if delta is None:
+            delta = fast_analyze_source(plan.source_before, plan.source_after)
+            self._fast_delta_cache[cache_key] = delta
+        decision = fast_analyze_target(delta, target_path)
+        plan.target_summaries[target] = dict(decision.summary)
+        plan.target_details[target] = list(decision.details)
+        if decision.disposition == "already_applied":
+            raise RuntimeError("目标已经包含全部源修改，没有新的目标修改点")
+        if decision.disposition == "unsupported":
+            raise RuntimeError(decision.reason or "无法安全生成目标修改预览")
+        preview = _artifact_path(batch.folder, os.path.join("previews", target), plan.relative_path)
+        apply_source_change_plan(
+            plan.source_before,
+            plan.source_after,
+            target_path,
+            preview,
+            decision,
+            # The preview is hypothetical and is specifically used to decide
+            # whether an overlapping source change should be accepted.
+            confirmed=decision.disposition == "confirmation_required",
+        )
+        action.preview_path = preview
+        action.preview_hash = _sha256(preview)
+        action.preview_target_hash = current_hash
+        action.preview_created_at = datetime.now().isoformat(timespec="seconds")
+        batch.event(
+            "target-preview-created",
+            target=target,
+            path=plan.relative_path,
+            target_hash=current_hash,
+            preview_hash=action.preview_hash,
+        )
+        return preview
 
     def _update(self, paths: list[str]) -> None:
         if paths and self._tortoise("update", sorted(dict.fromkeys(paths))) != 0:
@@ -1270,14 +1350,23 @@ class BranchSubmitEngine:
                 action.confirmation_target_hash = ""
             else:
                 candidate_copy = _artifact_path(batch.folder, os.path.join("candidates", target), plan.relative_path)
-                apply_source_change_plan(
-                    plan.source_before,
-                    plan.source_after,
-                    target_path,
-                    candidate_copy,
-                    decision,
-                    confirmed=decision.disposition == "confirmation_required",
-                )
+                if (
+                    action.preview_path
+                    and action.preview_target_hash == current_hash
+                    and action.preview_hash
+                    and os.path.isfile(action.preview_path)
+                    and _sha256(action.preview_path) == action.preview_hash
+                ):
+                    _safe_copy(action.preview_path, candidate_copy)
+                else:
+                    apply_source_change_plan(
+                        plan.source_before,
+                        plan.source_after,
+                        target_path,
+                        candidate_copy,
+                        decision,
+                        confirmed=decision.disposition == "confirmation_required",
+                    )
                 action.candidate_path, action.candidate_hash = candidate_copy, _sha256(candidate_copy)
                 action.state = "ready"
                 if decision.disposition == "confirmation_required":
@@ -2597,46 +2686,218 @@ class BranchSubmitWorkbench:
 
     def _matrix_dialog(self, batch: BranchSubmitBatch) -> bool:
         tk, ttk = self.tk, self.ttk
-        result={"ok":False}; win=tk.Toplevel(self.root); win.title("多分支提交预检查"); win.geometry("920x520"); win.transient(self.root)
-        frame=ttk.Frame(win,padding=10); frame.pack(fill="both",expand=True)
-        ttk.Label(frame,text=f"批次 {batch.batch_id} · 这是一组可恢复的分步提交，不是跨分支原子事务。",style="Title.TLabel").pack(anchor="w",pady=(0,8))
-        tree=ttk.Treeview(frame,columns=("branch","file","operation","state","reason"),show="headings")
-        for key,title,width in (("branch","目标分支",100),("file","文件",310),("operation","动作",80),("state","状态",110),("reason","说明",260)):
-            tree.heading(key,text=title);tree.column(key,width=width,anchor="w")
+        result = {"ok": False}
+        win = tk.Toplevel(self.root)
+        win.title("多分支提交 · 预检查结果")
+        win.geometry("1080x650")
+        win.minsize(860, 560)
+        win.configure(background=THEME.window_bg)
+        win.transient(self.root)
+        frame = ttk.Frame(win, padding=14, style="App.TFrame")
+        frame.pack(fill="both", expand=True)
+
+        header = ttk.Frame(frame, style="App.TFrame")
+        header.pack(fill="x")
+        ttk.Label(header, text="预检查结果", style="Title.App.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text=f"批次 {batch.batch_id}  ·  提交按分支依次执行，可中断、可恢复",
+            style="Muted.App.TLabel",
+        ).pack(anchor="w", pady=(3, 10))
+
+        states = [action.state for plan in batch.files for action in plan.actions.values()]
+        summary_bar = tk.Frame(frame, background=THEME.window_bg)
+        summary_bar.pack(fill="x", pady=(0, 10))
+        summary_items = (
+            ("目标分支", len(batch.target_branches), "#E8F1FB", THEME.accent),
+            ("文件", len(batch.files), "#EEF0F2", THEME.text),
+            ("可直接同步", states.count("ready"), "#E7F4E4", THEME.success),
+            ("需人工确认", states.count("confirmation_required"), "#FFF4CE", THEME.warning),
+            ("安全阻断", states.count("blocked"), "#FDE7E9", THEME.error),
+        )
+        for label, value, background, foreground in summary_items:
+            chip = tk.Label(
+                summary_bar,
+                text=f"  {label}  {value}  ",
+                background=background,
+                foreground=foreground,
+                font=(THEME.font_family, 9, "bold"),
+                padx=4,
+                pady=5,
+            )
+            chip.pack(side="left", padx=(0, 8))
+
+        result_box = ttk.LabelFrame(frame, text="目标分支 × 文件", padding=8, style="Panel.TLabelframe")
+        result_box.pack(fill="both", expand=True)
+        tree_holder = ttk.Frame(result_box, style="Panel.TFrame")
+        tree_holder.pack(fill="both", expand=True)
+        tree = ttk.Treeview(
+            tree_holder,
+            columns=("branch", "file", "operation", "state", "reason"),
+            show="headings",
+            selectmode="browse",
+        )
+        columns = (
+            ("branch", "目标分支", 135, False),
+            ("file", "文件", 270, True),
+            ("operation", "动作", 72, False),
+            ("state", "处理状态", 115, False),
+            ("reason", "说明", 390, True),
+        )
+        for key, title, width, stretch in columns:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=60, stretch=stretch, anchor="w")
+        yscroll = ttk.Scrollbar(tree_holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=yscroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+        tree.tag_configure("ready", foreground=THEME.success, background="#F3FAF1")
+        tree.tag_configure("confirmation", foreground=THEME.error, background="#FDE7E9", font=(THEME.font_family, 9, "bold"))
+        tree.tag_configure("blocked", foreground=THEME.error, background="#FFF3F3")
+        tree.tag_configure("already", foreground=THEME.secondary_text, background=THEME.row_alt)
+        tree.tag_configure("excluded", foreground=THEME.disabled, background=THEME.row_alt)
+
         state_labels = {
             "ready": "可直接同步", "confirmation_required": "需人工确认",
-            "excluded": "已移除", "already_applied": "已同步",
+            "excluded": "已移除", "already_applied": "已包含修改",
             "blocked": "安全阻断", "prepared": "已准备", "committed": "已提交",
         }
-        tree.tag_configure("confirmation", foreground=THEME.error, background="#FDE7E9")
-        tree.tag_configure("blocked", foreground=THEME.error)
+        operation_labels = {"modify": "修改", "add": "新增", "delete": "删除"}
         row_map: dict[str, tuple[str, FilePlan]] = {}
-        row_index = 0
-        for plan in batch.files:
-            for target in batch.target_branches:
-                action=plan.actions[target]; summary=plan.target_summaries.get(target,{})
-                reason=action.reason or (f"可直接同步 {summary.get('direct',0)} 项" if plan.operation=="modify" else "")
-                tag = "confirmation" if action.state == "confirmation_required" else "blocked" if action.state == "blocked" else ""
-                iid=f"matrix-{row_index}";row_index+=1;row_map[iid]=(target,plan)
-                tree.insert("","end",iid=iid,values=(target,plan.relative_path,plan.operation,state_labels.get(action.state, action.state),reason),tags=(tag,))
-        tree.pack(fill="both",expand=True)
-        buttons=ttk.Frame(frame);buttons.pack(fill="x",pady=(8,0))
-        def accept():result["ok"]=True;win.destroy()
-        def compare_selected(_event=None):
+        for row_index, (plan, target) in enumerate(
+            pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches)
+        ):
+            action = plan.actions[target]
+            summary = plan.target_summaries.get(target, {})
+            reason = action.reason or (
+                f"将修改 {summary.get('direct', 0)} 项，保留目标分支其他内容"
+                if plan.operation == "modify" else ""
+            )
+            tag = {
+                "ready": "ready", "confirmation_required": "confirmation",
+                "blocked": "blocked", "already_applied": "already", "excluded": "excluded",
+            }.get(action.state, "")
+            iid = f"matrix-{row_index}"
+            row_map[iid] = (target, plan)
+            tree.insert(
+                "", "end", iid=iid,
+                values=(
+                    target, plan.relative_path, operation_labels.get(plan.operation, plan.operation),
+                    state_labels.get(action.state, action.state), reason,
+                ),
+                tags=(tag,),
+            )
+
+        detail_box = ttk.LabelFrame(frame, text="所选项", padding=9, style="Panel.TLabelframe")
+        detail_box.pack(fill="x", pady=(10, 0))
+        detail_var = tk.StringVar(value="选择一项查看判断依据。")
+        ttk.Label(detail_box, textvariable=detail_var, style="App.TLabel", wraplength=1000).pack(anchor="w")
+        compare_hint = ttk.Label(
+            detail_box,
+            text="查看内容：目标修改前  ↔  应用源分支修改后的目标预览（不会修改工作副本）",
+            foreground=THEME.accent,
+        )
+        compare_hint.pack(anchor="w", pady=(5, 0))
+
+        footer = ttk.Frame(frame, style="App.TFrame")
+        footer.pack(fill="x", pady=(10, 0))
+        preview_status = tk.StringVar(value="")
+        ttk.Label(footer, textvariable=preview_status, style="Muted.App.TLabel").pack(side="left", padx=(0, 10))
+        preview_button = ttk.Button(footer, text="查看目标修改点", style="App.TButton")
+        preview_button.pack(side="left")
+        preview_busy = {"value": False}
+        preview_results: queue.Queue = queue.Queue()
+
+        def selected_entry() -> tuple[str, FilePlan] | None:
+            selection = tree.selection()
+            return row_map.get(selection[0]) if selection else None
+
+        def update_selection(_event=None) -> None:
+            entry = selected_entry()
+            if not entry:
+                detail_var.set("选择一项查看判断依据。")
+                preview_button.state(["disabled"])
+                return
+            target, plan = entry
+            action = plan.actions[target]
+            item_summary = plan.target_summaries.get(target, {})
+            counts = " · ".join(
+                text for text in (
+                    f"直接 {item_summary.get('direct', 0)}" if item_summary.get("direct") else "",
+                    f"已包含 {item_summary.get('already', 0)}" if item_summary.get("already") else "",
+                    f"需确认 {item_summary.get('confirmation', 0)}" if item_summary.get("confirmation") else "",
+                ) if text
+            )
+            detail_var.set(
+                f"{target} / {plan.relative_path}  ·  {state_labels.get(action.state, action.state)}"
+                f"{('  ·  ' + counts) if counts else ''}\n{action.reason or '未提供补充说明'}"
+            )
+            can_preview = plan.operation == "modify" and action.state in {"ready", "confirmation_required"}
+            preview_button.state(["!disabled"] if can_preview and not preview_busy["value"] else ["disabled"])
+
+        def compare_selected(_event=None) -> None:
             from tkinter import messagebox
-            selection=tree.selection()
-            if not selection:return
-            target,plan=row_map[selection[0]]
-            try:self.engine.open_excel_comparison(batch,plan,target)
-            except Exception as exc:messagebox.showwarning("无法打开 Excel 对比",str(exc),parent=win)
-        def open_confirmations():
-            win.destroy();self.root.after_idle(self._open_confirmation_dialog)
-        ttk.Button(buttons,text="关闭",command=win.destroy).pack(side="right")
-        if batch.source_status=="ready":ttk.Button(buttons,text="关闭并保留结果",command=accept).pack(side="right",padx=6)
-        if self._confirmation_entries():ttk.Button(buttons,text="查看人工确认",style="Danger.TButton",command=open_confirmations).pack(side="right",padx=6)
-        ttk.Button(buttons,text="打开 Excel 对比",command=compare_selected).pack(side="left")
-        tree.bind("<Double-1>",compare_selected)
-        win.grab_set();self.root.wait_window(win);return result["ok"]
+            entry = selected_entry()
+            if not entry or preview_busy["value"]:
+                return
+            target, plan = entry
+            action = plan.actions[target]
+            if plan.operation != "modify" or action.state not in {"ready", "confirmation_required"}:
+                return
+            preview_busy["value"] = True
+            preview_button.state(["disabled"])
+            preview_status.set("正在生成目标修改后预览…")
+
+            def worker() -> None:
+                error = None
+                try:
+                    self.engine.open_excel_comparison(batch, plan, target)
+                except Exception as exc:  # noqa: BLE001 - surfaced on the Tk thread
+                    error = exc
+                preview_results.put(error)
+
+            def poll_result() -> None:
+                try:
+                    error = preview_results.get_nowait()
+                except queue.Empty:
+                    if preview_busy["value"] and win.winfo_exists():
+                        win.after(40, poll_result)
+                    return
+                preview_busy["value"] = False
+                if error:
+                    preview_status.set("预览生成失败")
+                    messagebox.showwarning("无法查看目标修改点", str(error), parent=win)
+                else:
+                    preview_status.set("已打开：目标修改前 ↔ 目标修改后预览")
+                update_selection()
+
+            threading.Thread(target=worker, name="sow-target-preview", daemon=True).start()
+            win.after(40, poll_result)
+
+        def accept() -> None:
+            result["ok"] = True
+            win.destroy()
+
+        def open_confirmations() -> None:
+            win.destroy()
+            self.root.after_idle(self._open_confirmation_dialog)
+
+        preview_button.configure(command=compare_selected)
+        ttk.Button(footer, text="关闭", command=win.destroy).pack(side="right")
+        if batch.source_status == "ready":
+            ttk.Button(footer, text="保留预检查结果", style="Primary.TButton", command=accept).pack(side="right", padx=6)
+        if self._confirmation_entries():
+            ttk.Button(footer, text="处理人工确认", style="Danger.TButton", command=open_confirmations).pack(side="right", padx=6)
+        tree.bind("<<TreeviewSelect>>", update_selection)
+        tree.bind("<Double-1>", compare_selected)
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0])
+            tree.focus(first[0])
+            update_selection()
+        win.grab_set()
+        self.root.wait_window(win)
+        return result["ok"]
 
     def _preflight(self, *, auto_start: bool = False):
         from tkinter import messagebox

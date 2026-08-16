@@ -88,7 +88,7 @@ foreach ($path in $contextPaths) {
   New-Item -ItemType Directory -Force -Path $path | Out-Null
   Set-Item -LiteralPath $path -Value $label
   New-ItemProperty -LiteralPath $path -Name Icon -PropertyType String -Value ($quote + $tool + $quote + ',0') -Force | Out-Null
-  Remove-ItemProperty -LiteralPath $path -Name Position -ErrorAction SilentlyContinue
+  New-ItemProperty -LiteralPath $path -Name Position -PropertyType String -Value Top -Force | Out-Null
   if ($path -like '*SystemFileAssociations*') { New-ItemProperty -LiteralPath $path -Name MultiSelectModel -PropertyType String -Value Player -Force | Out-Null }
   $token = if ($path -like '*Background*') { '%V' } else { '%1' }
   $commandPath = Join-Path $path 'command'

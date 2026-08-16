@@ -473,6 +473,12 @@ def test_confirmed_candidate_is_target_derived_and_deferred() -> None:
         plan=batch.files[0];action=plan.actions["release"]
         assert action.state=="confirmation_required"
         target_hash=bs._sha256(target)
+        preview = engine.ensure_target_preview(batch, plan, "release")
+        assert bs._sha256(target) == target_hash
+        preview_book = load_workbook(preview, read_only=True, data_only=False)
+        assert preview_book["Data"]["B2"].value == 9
+        assert preview_book["Data"]["C2"].value == "keep"
+        preview_book.close()
         prepared=engine.confirm_source_changes(batch,"release",plan.relative_path)
         assert bs._sha256(target)==target_hash,"confirmation must not dirty the target working copy"
         assert prepared.state=="ready" and prepared.confirmed
@@ -481,6 +487,7 @@ def test_confirmed_candidate_is_target_derived_and_deferred() -> None:
         refreshed=engine._fresh_target_action(batch,plan,"release",status_map)
         assert refreshed is prepared and refreshed.state=="ready"
         assert os.path.isfile(prepared.candidate_path)
+        assert prepared.candidate_hash == prepared.preview_hash
         candidate=load_workbook(prepared.candidate_path,read_only=True,data_only=False)
         assert candidate["Data"]["B2"].value==9
         assert candidate["Data"]["C2"].value=="keep"
@@ -491,6 +498,61 @@ def test_confirmed_candidate_is_target_derived_and_deferred() -> None:
         assert prepared.backup_path and bs._sha256(prepared.backup_path)==target_hash
         assert bs._sha256(target)!=bs._sha256(plan.source_after)
     finally:_cleanup(root,old)
+
+
+def test_preview_is_target_before_vs_target_after_and_never_writes_wc() -> None:
+    root, old = _fixture()
+    try:
+        scanner = FixtureScanner(root)
+        source = os.path.join(root, "develop", "config", "A.xlsx")
+        target = os.path.join(root, "release", "config", "A.xlsx")
+        _book(source, 9)
+        _book(source + ".pristine.xlsx", 1)
+        _book(target, 1)
+        target_book = load_workbook(target)
+        target_book["Data"]["C1"] = "target_only"
+        target_book["Data"]["C2"] = "keep"
+        target_book.save(target)
+        target_book.close()
+        shutil.copy2(target, target + ".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+            _insert_node(conn, "develop/config/A.xlsx")
+            _insert_node(conn, "release/config/A.xlsx")
+        for branch in ("sandbox", "master"):
+            _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
+        engine = bs.BranchSubmitEngine(root, status_scanner=scanner)
+        engine.core = FakeCore
+        batch = engine.preflight(
+            "develop", ["release"], [_item(source, root, "modified")],
+            "目标修改点", scope_path=os.path.dirname(source),
+        )
+        plan = batch.files[0]
+        action = plan.actions["release"]
+        target_hash = bs._sha256(target)
+        preview = engine.ensure_target_preview(batch, plan, "release")
+        assert os.path.isfile(preview) and bs._sha256(target) == target_hash
+        preview_book = load_workbook(preview, read_only=True, data_only=False)
+        assert preview_book["Data"]["B2"].value == 9
+        assert preview_book["Data"]["C2"].value == "keep"
+        preview_book.close()
+        assert action.preview_target_hash == target_hash
+        assert action.preview_hash == bs._sha256(preview)
+        reloaded = bs.BranchSubmitBatch.load(batch.state_path)
+        assert reloaded.files[0].actions["release"].preview_hash == action.preview_hash
+        with patch.object(bs.subprocess, "Popen") as popen:
+            engine.open_excel_comparison(batch, plan, "release")
+        command = popen.call_args.args[0]
+        assert command[-2:] == [target, preview], command
+        assert plan.source_after not in command
+        _book(target, 2)
+        try:
+            engine.ensure_target_preview(batch, plan, "release")
+        except RuntimeError as exc:
+            assert "变化" in str(exc) or "不干净" in str(exc)
+        else:
+            raise AssertionError("stale target preview was reused after target mutation")
+    finally:
+        _cleanup(root, old)
 
 
 def test_confirmation_invalidates_after_target_update() -> None:
@@ -703,6 +765,7 @@ def test_entrypoint_registry_scope_and_real_status_child() -> None:
     assert "install-state.json" in install and "install-state.json" in uninstall
     assert "外部修改" in uninstall
     assert "MultiSelectModel" in install
+    assert "-Name Position -PropertyType String -Value Top" in install
     real_wc=r"C:\sow_main\excel"
     if os.environ.get("SOW_SKIP_REAL_WC_TESTS") == "1":
         print("SKIP real working-copy status scan (set by synthetic test profile)")
@@ -735,6 +798,7 @@ if __name__ == "__main__":
         test_server_success_beats_error_exit_code,
         test_conflicting_source_change_requires_confirmation,
         test_confirmed_candidate_is_target_derived_and_deferred,
+        test_preview_is_target_before_vs_target_after_and_never_writes_wc,
         test_confirmation_invalidates_after_target_update,
         test_excluded_conflict_never_writes_target,
         test_diverged_delete_requires_confirmation,

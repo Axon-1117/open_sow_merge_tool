@@ -46,8 +46,8 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-16.update83"
-APP_BUILD_TAG = "source-change-projection"
+APP_VERSION = "2026-08-16.update84"
+APP_BUILD_TAG = "target-change-preview-fastpath"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -10491,6 +10491,7 @@ def _run_startup_progress_task(title: str, message: str, fn):
     root.protocol("WM_DELETE_WINDOW", lambda: None)
     root.deiconify()
 
+    fast_candidate = None
     try:
         root.configure(bg=THEME.window_bg)
     except Exception:
@@ -11136,6 +11137,67 @@ def _cross_branch_source_delta_premerge(
     conflict_cells_by_sheet: dict = {}
     workbooks = []
     prepared_paths: list[tuple[str, str]] = []
+
+    # Large configuration workbooks spend most of the legacy path opening six
+    # openpyxl models and repeatedly normalizing every cell.  The OOXML planner
+    # can prove and materialize direct source deltas in one pass.  Keep the
+    # mature legacy path as the conservative fallback for overlaps and unusual
+    # structures, and use the fast path only where its startup win is material.
+    try:
+        large_xlsx = (
+            all(_workbook_ext(str(path)) == ".xlsx" for path in (
+                source_before_path, target_working_path, source_after_path
+            ))
+            and max(os.path.getsize(path) for path in (
+                source_before_path, target_working_path, source_after_path
+            )) >= 256 * 1024
+        )
+        if large_xlsx:
+            from .fast_branch_merge import analyze_source as _fast_analyze_source
+            from .fast_branch_merge import analyze_target as _fast_analyze_target
+            from .fast_branch_merge import apply_source_change_plan as _fast_apply_source_change_plan
+
+            fast_delta = _fast_analyze_source(source_before_path, source_after_path)
+            fast_decision = _fast_analyze_target(fast_delta, target_working_path)
+            if fast_decision.disposition in {"direct", "already_applied"}:
+                candidate = _create_startup_candidate_copy(target_working_path, "mine")
+                fast_candidate = candidate
+                if fast_decision.disposition == "direct":
+                    _fast_apply_source_change_plan(
+                        source_before_path,
+                        source_after_path,
+                        target_working_path,
+                        candidate,
+                        fast_decision,
+                    )
+                direct_count = int(fast_decision.summary.get("direct", 0))
+                already_count = int(fast_decision.summary.get("already", 0))
+                summary.update({
+                    "incoming_count": int(fast_delta.incoming_count),
+                    "applied_count": direct_count,
+                    "already_present_count": already_count,
+                    "merged_count": direct_count,
+                })
+                classified = direct_count + already_count
+                if classified != summary["incoming_count"]:
+                    raise RuntimeError(
+                        "fast source-delta accounting mismatch: "
+                        f"incoming={summary['incoming_count']} classified={classified}"
+                    )
+                _LAST_SEMANTIC_PREMERGE_SUMMARY = dict(summary)
+                _dlog(
+                    "CROSS_BRANCH_SOURCE_DELTA_FAST "
+                    f"incoming={summary['incoming_count']} applied={summary['applied_count']} "
+                    f"already={summary['already_present_count']}"
+                )
+                return [], candidate, {}, dict(summary), None
+    except Exception as exc:
+        if fast_candidate:
+            try:
+                os.remove(fast_candidate)
+            except OSError:
+                pass
+        _dlog(f"CROSS_BRANCH_SOURCE_DELTA_FAST_FALLBACK reason={exc}")
 
     def _record_conflict(sheet: str, row: int, col: int, target_value, source_value):
         conflicts.append((sheet, int(row), int(col), target_value, source_value))
