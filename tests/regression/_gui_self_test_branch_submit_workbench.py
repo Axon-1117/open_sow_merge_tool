@@ -83,6 +83,53 @@ def main():
             assert len(app.tree.get_children()) == 200
             assert int(root.winfo_width()) >= 900 and int(root.winfo_height()) >= 620
             assert set(app.tree["columns"]) == {"check", "path", "extension", "status", "property", "lock", "switched", "changelist"}
+            assert "预检查（必需）" in app.preflight_button.cget("text")
+            assert app.submit_button.instate(["disabled"]), "multi-branch submit must be preflight-gated"
+            target_name = next(name for name in app.target_vars if name != "master")
+            app.target_vars[target_name].set(True)
+            app._target_selection[target_name] = True
+            app.message.insert("1.0", "GUI 门禁测试")
+            app._refresh_primary_button()
+            assert app.preflight_button.instate(["!disabled"])
+            assert app.submit_button.instate(["disabled"]), "selection alone must not enable submit"
+            for item in app.items:
+                item.checked = item.relative_path == "配置_001.xlsx"
+            action = bs.BatchFileAction(
+                branch=target_name,
+                relative_path="配置_001.xlsx",
+                operation="modify",
+                state="manual",
+                reason="目标分支同一单元格已有独立修改",
+            )
+            plan = bs.FilePlan(
+                relative_path="配置_001.xlsx",
+                operation="modify",
+                actions={target_name: action},
+            )
+            app.current_batch = bs.BranchSubmitBatch(
+                batch_id="gui-manual",
+                wc_root=fixture,
+                source_branch="develop",
+                target_branches=[target_name],
+                files=[plan],
+                message="GUI 门禁测试",
+                scope_path=os.path.join(fixture, "develop"),
+                source_status="ready",
+                target_status={target_name: "ready"},
+            )
+            app._approved_preflight_signature = app._request_signature()
+            app._render_target_statuses()
+            root.update_idletasks()
+            assert app.manual_alert.winfo_manager() == "pack"
+            assert "需人工合并" in app.manual_alert_var.get()
+            assert app.submit_button.instate(["disabled"]), "manual items must keep submit gated"
+            action.state = "ready"
+            action.manual_result = "saved"
+            app._render_target_statuses()
+            app._refresh_primary_button()
+            root.update_idletasks()
+            assert not app.manual_alert.winfo_manager()
+            assert app.submit_button.instate(["!disabled"]), "resolved manual items may pass the gate"
             hold = float(os.environ.get("SOW_GUI_TEST_HOLD", "0") or 0)
             deadline = time.time() + hold
             while time.time() < deadline:

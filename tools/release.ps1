@@ -1,6 +1,6 @@
 param(
   [string]$DeployPath = 'C:\sow_main\excel\excel_merge_tool',
-  [string]$Version = '2026-08-14.update80',
+  [string]$Version = '2026-08-16.update81',
   [switch]$SkipDeploy
 )
 

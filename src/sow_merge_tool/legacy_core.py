@@ -46,8 +46,8 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-14.update80"
-APP_BUILD_TAG = "ui-refresh-performance"
+APP_VERSION = "2026-08-16.update81"
+APP_BUILD_TAG = "mandatory-preflight-manual-merge"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)

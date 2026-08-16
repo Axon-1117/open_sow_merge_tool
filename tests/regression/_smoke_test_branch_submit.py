@@ -437,6 +437,40 @@ def test_manual_merge_fallback_is_durable() -> None:
     finally:_cleanup(root,old)
 
 
+def test_manual_candidate_keeps_target_clean_until_submit() -> None:
+    root, old = _fixture()
+    try:
+        scanner=FixtureScanner(root)
+        source=os.path.join(root,"develop","config","A.xlsx");target=os.path.join(root,"release","config","A.xlsx")
+        _book(source,9);_book(source+".pristine.xlsx",1);_book(target,7);shutil.copy2(target,target+".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root,".svn","wc.db")) as conn:
+            _insert_node(conn,"develop/config/A.xlsx");_insert_node(conn,"release/config/A.xlsx")
+        for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
+        engine=bs.BranchSubmitEngine(root,status_scanner=scanner);engine.core=FakeCore
+        batch=engine.preflight("develop",["release"],[_item(source,root,"modified")],"人工合并候选",scope_path=os.path.dirname(source))
+        plan=batch.files[0];action=plan.actions["release"]
+        assert action.state=="manual"
+        target_hash=bs._sha256(target)
+        def fake_manual(_batch,_plan,target_path,merged_path=None):
+            assert target_path==target and merged_path
+            shutil.copy2(_plan.source_after,merged_path)
+            return 0
+        engine._launch_manual_merge=fake_manual
+        prepared=engine.prepare_manual_candidate(batch,"release",plan.relative_path)
+        assert bs._sha256(target)==target_hash,"manual entry must not dirty the target working copy"
+        assert prepared.state=="ready" and prepared.manual_result=="saved"
+        assert os.path.isfile(prepared.candidate_path)
+        status_map=bs.records_by_path(scanner(os.path.join(root,"release")))
+        refreshed=engine._fresh_target_action(batch,plan,"release",status_map)
+        assert refreshed is prepared and refreshed.state=="ready"
+        candidate_hash=prepared.candidate_hash
+        engine._prepare_target_action(batch,plan,"release")
+        assert prepared.state=="prepared" and bs._sha256(target)==candidate_hash
+        assert prepared.backup_path and bs._sha256(prepared.backup_path)==target_hash
+        assert any(event["kind"]=="manual-candidate-saved" for event in batch.journal)
+    finally:_cleanup(root,old)
+
+
 def test_target_partial_and_restore_guard() -> None:
     root, old = _fixture()
     try:
@@ -585,6 +619,7 @@ if __name__ == "__main__":
         test_source_partial_selection_stops_propagation,
         test_server_success_beats_error_exit_code,
         test_manual_merge_fallback_is_durable,
+        test_manual_candidate_keeps_target_clean_until_submit,
         test_target_partial_and_restore_guard,
         test_resume_reconciles_commits_before_reopening_dialog,
         test_write_intent_crash_restore_and_corrupt_state_detection,
