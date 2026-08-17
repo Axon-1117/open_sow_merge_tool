@@ -1,4 +1,0 @@
-schema: spec-driven
-created: 2026-07-31
-goal: Preserve Chinese workbook content through 2-way and 3-way saves and
-  eliminate false difference markers caused by diagnostic comparison state

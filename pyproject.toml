@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sow-merge-tool"
+version = "2026.08.17.90"
+description = "Excel semantic merge and recoverable multi-branch SVN submission tool"
+requires-python = ">=3.11"
+dependencies = [
+  "openpyxl==3.1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "pytest-timeout>=2,<3",
+  "ruff>=0.9,<1",
+  "pyinstaller==6.22.0",
+]
+
+[project.scripts]
+sow-merge-tool = "sow_merge_tool.cli:run"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "native: requires Excel or TortoiseSVN",
+  "adversarial: fault-injection and recovery tests",
+  "performance: throughput and latency benchmarks",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["tmp", "artifacts", "release", "dist", "build"]

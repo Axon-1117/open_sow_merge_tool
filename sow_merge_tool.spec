@@ -1,15 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_root = Path(SPECPATH).resolve()
+src_root = project_root / "src"
 
 a = Analysis(
-    ['sow_merge_tool.py'],
-    pathex=[],
+    [str(src_root / "sow_merge_tool" / "__main__.py")],
+    pathex=[str(src_root)],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        "sow_merge_tool.legacy_core",
+        "sow_merge_tool.branch_submit",
+        "sow_merge_tool.svn_status_provider",
+        "sow_merge_tool.ui_foundation",
+    ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
     excludes=[],
     noarchive=False,
     optimize=0,
@@ -22,11 +30,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='sow_merge_tool',
+    name="sow_merge_tool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
