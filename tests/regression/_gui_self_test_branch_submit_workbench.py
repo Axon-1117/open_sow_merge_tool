@@ -82,8 +82,18 @@ def main():
             assert len(app.tree.get_children()) == 200
             assert int(root.winfo_width()) >= 900 and int(root.winfo_height()) >= 620
             assert set(app.tree["columns"]) == {"check", "path", "handling", "extension", "status", "property", "lock", "switched", "changelist"}
-            assert "预检查（必需）" in app.preflight_button.cget("text")
-            assert app.submit_button.instate(["disabled"]), "multi-branch submit must be preflight-gated"
+            assert "预检查" in app.preflight_button.cget("text")
+            assert app.preflight_button.instate(["disabled"]), "without targets, multi-branch preflight is not applicable"
+            assert app.submit_button.instate(["!disabled"]), "without targets, native single-branch submit must be available"
+            assert app.submit_button.cget("text") == "SVN 单分支提交"
+            direct_calls = []
+            app.engine._tortoise = lambda command, paths, **kwargs: direct_calls.append((command, list(paths), kwargs)) or 0
+            app._submit_single_branch()
+            deadline = time.time() + 5
+            while (app._commit_active or not direct_calls) and time.time() < deadline:
+                root.update(); time.sleep(0.02)
+            assert direct_calls and direct_calls[0][0] == "commit"
+            assert direct_calls[0][1] and direct_calls[0][2].get("message") is None
             root.geometry("900x620")
             root.update()
             time.sleep(0.03)
@@ -106,6 +116,7 @@ def main():
             app._refresh_primary_button()
             assert app.preflight_button.instate(["!disabled"]), "empty commit message must not block preflight"
             assert app.submit_button.instate(["disabled"]), "empty commit message must still block commit"
+            assert app.submit_button.cget("text") == "② 开始提交"
             app.message.insert("1.0", "GUI 门禁测试")
             app._refresh_primary_button()
             assert app.preflight_button.instate(["!disabled"])

@@ -2498,6 +2498,18 @@ class BranchSubmitWorkbench:
             or self._scan_active
             or self.closing
         )
+        selected_targets = self._selected_targets()
+        if not selected_targets:
+            self.preflight_button.configure(text="① 预检查（多分支）")
+            self.submit_button.configure(text="SVN 单分支提交")
+            self.preflight_button.state(["disabled"])
+            if busy or not self._selected_items():
+                self.submit_button.state(["disabled"])
+            else:
+                self.submit_button.state(["!disabled"])
+            return
+        self.preflight_button.configure(text="① 预检查（必需）")
+        self.submit_button.configure(text="② 开始提交")
         if busy or not self._can_preflight():
             self.preflight_button.state(["disabled"])
         else:
@@ -2537,7 +2549,11 @@ class BranchSubmitWorkbench:
         self.target_summary_var.set(
             f"已选 {len(selected)} · 可直接 {counts['可直接同步']} · 待确认 {counts['需人工确认']} · 阻断 {counts['安全阻断']}"
         )
-        if self.current_batch is None:
+        if not selected:
+            self.target_summary_var.set(
+                "未选目标分支 · 将直接打开源分支 TortoiseSVN 提交，不执行多分支预检查"
+            )
+        elif self.current_batch is None:
             self.target_summary_var.set(
                 f"已选 {len(selected)} · 尚未预检查 · 完成预检查后才能开始多分支提交"
             )
@@ -3275,6 +3291,9 @@ class BranchSubmitWorkbench:
 
     def _submit(self):
         from tkinter import messagebox
+        if not self._selected_targets():
+            self._submit_single_branch()
+            return
         batch=self.current_batch
         if self._commit_active:return
         if not batch or not self._has_valid_preflight():
@@ -3330,6 +3349,53 @@ class BranchSubmitWorkbench:
             self._refresh_primary_button()
 
         self.ui_tasks.submit(lambda _cancel_event: self.engine.commit(batch), done)
+
+    def _submit_single_branch(self):
+        """Use the native TortoiseSVN commit path when no target is selected."""
+        from tkinter import messagebox
+        if self._commit_active or self._preflight_active or self._confirmation_active:
+            return
+        selected = list(self._selected_items())
+        if not selected:
+            messagebox.showwarning("请选择文件", "请先选择要提交的文件。", parent=self.root)
+            return
+        source_paths = [item.path for item in selected]
+        message = self.message.get("1.0", self.tk.END).strip()
+        self.current_batch = None
+        self._approved_preflight_signature = None
+        self._commit_active = True
+        self.submit_button.state(["disabled"])
+        self.preflight_button.state(["disabled"])
+        self.status_var.set("正在打开源分支原生 TortoiseSVN 提交窗口…")
+        self.root.update_idletasks()
+
+        def worker(cancel_event):
+            if cancel_event.is_set():
+                return None
+            return self.engine._tortoise(
+                "commit",
+                source_paths,
+                message=message or None,
+            )
+
+        def done(exit_code, error, _generation):
+            self._commit_active = False
+            if error:
+                self.status_var.set(str(error))
+                messagebox.showerror("单分支提交失败", str(error), parent=self.root)
+                self._refresh_primary_button()
+                return
+            if exit_code is None:
+                self.status_var.set("单分支提交已取消")
+            elif exit_code == 0:
+                self.status_var.set("原生 SVN 提交窗口已关闭；正在刷新源分支状态…")
+            else:
+                self.status_var.set(
+                    f"原生 SVN 提交窗口已关闭（退出码 {exit_code}）；正在刷新状态…"
+                )
+            self._start_scan(preserve_batch=False)
+
+        self.ui_tasks.submit(worker, done)
 
     def _close(self):
         if self._commit_active:

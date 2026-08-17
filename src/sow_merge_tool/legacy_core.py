@@ -46,8 +46,8 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-17.update89"
-APP_BUILD_TAG = "headless-svn-e2e"
+APP_VERSION = "2026-08-17.update90"
+APP_BUILD_TAG = "single-branch-native-commit"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
