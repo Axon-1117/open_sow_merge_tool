@@ -462,6 +462,9 @@ def run_real_repository_partial_selection_and_dirty_target(root: Path) -> None:
 def main() -> None:
     test_root = Path(os.environ.get("SOW_TEST_TMPDIR") or tempfile.gettempdir())
     test_root.mkdir(parents=True, exist_ok=True)
+    # Never write branch-submit recovery journals to the user's real profile.
+    os.environ["LOCALAPPDATA"] = os.fspath(test_root / "appdata")
+    (test_root / "appdata").mkdir(parents=True, exist_ok=True)
     with _temporary_test_dir(test_root) as root:
         run_all_naturally_reproducible_svn_states(root / "states")
         print("PASS real SVN status inventory")

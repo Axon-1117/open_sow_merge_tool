@@ -5,6 +5,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$managedEnvironmentNames = @(
+  'LOCALAPPDATA', 'SOW_TEST_TMPDIR', 'PYTHONUTF8', 'SOW_SKIP_REAL_WC_TESTS', 'SOW_SVN_BIN'
+)
+$originalEnvironment = @{}
+$originalEnvironmentPresent = @{}
+foreach ($name in $managedEnvironmentNames) {
+  $item = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+  $originalEnvironmentPresent[$name] = $null -ne $item
+  $originalEnvironment[$name] = if ($item) { $item.Value } else { $null }
+}
+
+try {
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
 $repo = (Get-Location).Path
@@ -18,6 +30,9 @@ if (-not (Test-Path -LiteralPath $python)) {
 # fixtures there changes the behavior the tests are meant to observe.
 $testRoot = Join-Path $repo 'tmp\test_tmp'
 New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+$testAppData = Join-Path $testRoot 'appdata'
+New-Item -ItemType Directory -Force -Path $testAppData | Out-Null
+$env:LOCALAPPDATA = $testAppData
 $env:SOW_TEST_TMPDIR = $testRoot
 $env:PYTHONUTF8 = '1'
 $env:SOW_SKIP_REAL_WC_TESTS = if ($Profile -eq 'Native') { '0' } else { '1' }
@@ -33,6 +48,7 @@ function Invoke-PythonFile {
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
   $psi.Environment['SOW_TEST_TMPDIR'] = $testRoot
+  $psi.Environment['LOCALAPPDATA'] = $testAppData
   $psi.Environment['PYTHONUTF8'] = '1'
   $psi.Environment['SOW_SKIP_REAL_WC_TESTS'] = $env:SOW_SKIP_REAL_WC_TESTS
   if ($env:SOW_SVN_BIN) { $psi.Environment['SOW_SVN_BIN'] = $env:SOW_SVN_BIN }
@@ -115,3 +131,12 @@ if ($Profile -eq 'Native') {
 }
 
 Write-Host "Test profile $Profile passed." -ForegroundColor Green
+} finally {
+  foreach ($name in $managedEnvironmentNames) {
+    if ($originalEnvironmentPresent[$name]) {
+      Set-Item -LiteralPath "Env:$name" -Value $originalEnvironment[$name]
+    } else {
+      Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
+  }
+}
