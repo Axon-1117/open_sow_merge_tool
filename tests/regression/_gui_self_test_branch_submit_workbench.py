@@ -81,7 +81,7 @@ def main():
             assert "master" in app.target_vars and not app.target_vars["master"].get()
             assert len(app.tree.get_children()) == 200
             assert int(root.winfo_width()) >= 900 and int(root.winfo_height()) >= 620
-            assert set(app.tree["columns"]) == {"check", "path", "extension", "status", "property", "lock", "switched", "changelist"}
+            assert set(app.tree["columns"]) == {"check", "path", "handling", "extension", "status", "property", "lock", "switched", "changelist"}
             assert "预检查（必需）" in app.preflight_button.cget("text")
             assert app.submit_button.instate(["disabled"]), "multi-branch submit must be preflight-gated"
             root.geometry("900x620")

@@ -44,7 +44,30 @@ HIDDEN_BRANCH_NAMES = {".svn", "tool", "tools", "sow_merge_tool", "excel_merge_t
 TERMINAL_ACTION_STATES = {"committed", "already_applied", "excluded", "restored"}
 BLOCKING_NODE_STATES = {"conflicted", "obstructed", "replaced", "incomplete", "status-callback-failed"}
 SOURCE_CHANGE_STATES = {"modified", "added", "deleted", "missing", "unversioned"}
-STATE_VERSION = 5
+SOURCE_ONLY_MISSING = "source_only_missing"
+STATE_VERSION = 6
+
+SVN_OPERATION_POLICIES = (
+    ("modified", "默认勾选", "同步源分支的单元格修改", "保留目标分支其他内容"),
+    ("added", "默认勾选", "目标路径不存在时新增", "目标已有不同文件则阻断"),
+    ("unversioned", "默认不勾选", "用户勾选后按新增处理", "目标已有文件则阻断"),
+    ("deleted", "默认勾选", "同步明确的 SVN 删除", "目标有独立内容时需人工确认"),
+    ("missing", "默认勾选", "仅交给源分支 TortoiseSVN", "不更新、不写入任何目标分支"),
+    ("conflicted / obstructed / replaced", "不可勾选", "安全阻断", "先在 TortoiseSVN 中修复状态"),
+    ("switched / external / 属性修改", "不可勾选", "安全阻断", "避免跨工作副本或属性误提交"),
+)
+
+
+def _multi_branch_policy_text(node_status: str, reason: str = "") -> str:
+    if reason:
+        return "不进入批次"
+    return {
+        "modified": "同步修改到目标",
+        "added": "在目标新增文件",
+        "unversioned": "勾选后在目标新增",
+        "deleted": "同步删除到目标",
+        "missing": "仅源分支；目标不变",
+    }.get(node_status, "不进入批次")
 
 
 def _sha256(path: str) -> str:
@@ -360,6 +383,8 @@ def _record_reason(record: SvnStatusRecord, extension: str) -> str:
         return "存在 SVN 冲突"
     if record.node_status in BLOCKING_NODE_STATES:
         return f"不支持的 SVN 状态：{record.node_status}"
+    if record.wc_locked:
+        return "SVN 工作副本被锁定，请先执行 TortoiseSVN Cleanup"
     if record.switched:
         return "路径已 switched，禁止自动跨分支提交"
     if record.file_external or record.node_status == "external":
@@ -582,7 +607,7 @@ class BranchSubmitBatch:
         with open(path, "r", encoding="utf-8") as stream:
             payload = json.load(stream)
         version = int(payload.pop("state_version", 1))
-        if version not in {2, 3, 4, STATE_VERSION}:
+        if version not in {2, 3, 4, 5, STATE_VERSION}:
             raise ValueError(f"批次状态版本不兼容：{version}")
         plans: list[FilePlan] = []
         for raw in payload.pop("files", []):
@@ -621,6 +646,7 @@ _READ_ONLY_BATCH_EVENTS = {
     "preflight-failed",
     "target-update-start",
     "target-update-complete",
+    "target-update-skipped",
     "source-change-confirmed",
     "target-file-excluded",
     "target-preview-created",
@@ -705,6 +731,8 @@ def _status_block_reason(record: SvnStatusRecord, *, require_clean: bool) -> str
         return "存在 SVN 冲突"
     if record.node_status in BLOCKING_NODE_STATES:
         return f"不支持的 SVN 状态：{record.node_status}"
+    if record.wc_locked:
+        return "SVN 工作副本被锁定，请先执行 TortoiseSVN Cleanup"
     if record.switched:
         return "路径已 switched"
     if record.file_external or record.node_status == "external":
@@ -890,6 +918,8 @@ class BranchSubmitEngine:
         result: list[str] = []
         seen: set[str] = set()
         for plan in batch.files:
+            if plan.operation == SOURCE_ONLY_MISSING:
+                continue
             target_path = os.path.join(
                 batch.wc_root, target, *plan.relative_path.split("/")
             )
@@ -1022,15 +1052,20 @@ class BranchSubmitEngine:
             operation = "modify"
         elif item.node_status in {"added", "unversioned"}:
             operation = "add"
-        elif item.node_status in {"deleted", "missing"}:
+        elif item.node_status == "deleted":
             operation = "delete"
+        elif item.node_status == "missing":
+            operation = SOURCE_ONLY_MISSING
         else:
             raise RuntimeError(f"{relative}：不支持的源状态 {item.node_status}")
         plan = FilePlan(relative_path=relative, operation=operation, source_revision=item.revision)
-        if operation in {"modify", "delete"}:
+        if operation in {"modify", "delete", SOURCE_ONLY_MISSING}:
             before = core._try_export_svn_base_from_working_copy(source_path)
             if not before:
-                raise RuntimeError(f"{relative}：无法读取源文件 SVN pristine")
+                raise RuntimeError(
+                    f"{relative}：无法读取源文件 SVN pristine；"
+                    "请先执行 TortoiseSVN Cleanup，并检查工作副本基线是否完整"
+                )
             plan.source_before = _artifact_path(batch.folder, "source-before", relative)
             _safe_copy(before, plan.source_before)
             plan.source_before_hash = _sha256(plan.source_before)
@@ -1045,7 +1080,10 @@ class BranchSubmitEngine:
     @staticmethod
     def _detect_rename_pairs(plans: list[FilePlan]) -> None:
         added = [plan for plan in plans if plan.operation == "add"]
-        deleted = [plan for plan in plans if plan.operation == "delete"]
+        deleted = [
+            plan for plan in plans
+            if plan.operation in {"delete", SOURCE_ONLY_MISSING}
+        ]
         for old in deleted:
             for new in added:
                 if _semantic_equal(old.source_before, new.source_after):
@@ -1065,6 +1103,11 @@ class BranchSubmitEngine:
         target_path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
         record = _status_for_exact_path(batch.wc_root, target_path, status_map)
         action = BatchFileAction(branch=target, relative_path=plan.relative_path, operation=plan.operation)
+        if plan.operation == SOURCE_ONLY_MISSING:
+            action.state = "excluded"
+            action.disposition = "source_only"
+            action.reason = "源文件为 missing：仅由源分支 TortoiseSVN 处理，目标分支保持不变"
+            return action
         reason = _status_block_reason(record, require_clean=plan.operation != "add" or record.versioned)
         if reason:
             action.state, action.reason = "blocked", reason
@@ -1212,6 +1255,14 @@ class BranchSubmitEngine:
             for target in targets:
                 target_scope = os.path.join(self.wc_root, target)
                 update_paths = self._target_update_paths(batch, target)
+                if not update_paths:
+                    target_maps[target] = {}
+                    batch.event(
+                        "target-update-skipped",
+                        target=target,
+                        reason="所选文件仅需源分支处理",
+                    )
+                    continue
                 before_update = records_by_path(self.status_scanner(target_scope))
                 self._verify_target_update_scope_clean(target, update_paths, before_update)
                 batch.event("target-update-start", target=target, paths=len(update_paths))
@@ -1258,8 +1309,10 @@ class BranchSubmitEngine:
                 valid = os.path.isfile(path) and _sha256(path) == plan.source_after_hash and record.node_status == "modified"
             elif plan.operation == "add":
                 valid = os.path.isfile(path) and _sha256(path) == plan.source_after_hash and record.node_status in {"added", "unversioned"}
+            elif plan.operation == SOURCE_ONLY_MISSING:
+                valid = not os.path.exists(path) and record.node_status == "missing"
             else:
-                valid = not os.path.exists(path) and record.node_status in {"deleted", "missing"}
+                valid = not os.path.exists(path) and record.node_status == "deleted"
             if not valid:
                 raise RuntimeError(f"源文件已偏离预检查结果：{plan.relative_path}")
 
@@ -1315,7 +1368,12 @@ class BranchSubmitEngine:
         child_status = {}
         for target in batch.target_branches:
             states = {plan.actions[target].state for plan in committed_plans}
-            child_status[target] = "already_present" if states == {"already_applied"} else "ready"
+            if states <= {"excluded"}:
+                child_status[target] = "skipped"
+            elif states <= {"already_applied", "excluded"}:
+                child_status[target] = "already_present"
+            else:
+                child_status[target] = "ready"
         child = BranchSubmitBatch(
             batch_id=child_id, wc_root=batch.wc_root, source_branch=batch.source_branch,
             target_branches=list(batch.target_branches), files=committed_plans,
@@ -1514,7 +1572,7 @@ class BranchSubmitEngine:
         core = self._load_core()
         for plan in batch.files:
             action = plan.actions[target]
-            if action.state in {"already_applied", "excluded", "restored"}:
+            if action.state != "prepared":
                 continue
             path = os.path.join(batch.wc_root, target, *plan.relative_path.split("/"))
             record = _status_for_exact_path(batch.wc_root, path, status_map)
@@ -1693,6 +1751,16 @@ class BranchSubmitEngine:
     def restore_uncommitted(self, batch: BranchSubmitBatch) -> BranchSubmitBatch:
         """Restore only target files still proven to be this batch's candidate."""
         self._audit_incomplete_intents(batch)
+        # A client may have stopped after the server accepted the commit but
+        # before batch.json was updated.  Reconcile first so recovery never
+        # creates a reverse local change for content already in the repository.
+        for target in batch.target_branches:
+            if any(
+                plan.actions.get(target) is not None
+                and plan.actions[target].state == "prepared"
+                for plan in batch.files
+            ):
+                self._reconcile_target(batch, target)
         for plan in batch.files:
             for target, action in plan.actions.items():
                 if action.state != "prepared":
@@ -1706,13 +1774,41 @@ class BranchSubmitEngine:
                     elif plan.operation == "delete":
                         if os.path.exists(path) or not os.path.isfile(action.backup_path):
                             raise RuntimeError("删除现场已变化或备份缺失")
-                        _safe_copy(action.backup_path, path)
+                        status_map = records_by_path(
+                            self.status_scanner(os.path.dirname(path))
+                        )
+                        status = _status_for_exact_path(batch.wc_root, path, status_map)
+                        if status.node_status == "deleted":
+                            if self._tortoise("revert", [path]) != 0:
+                                raise RuntimeError("SVN 删除计划未撤销；请在 TortoiseSVN 中 Revert")
+                        elif status.node_status != "missing":
+                            raise RuntimeError(
+                                f"删除现场 SVN 状态为 {status.node_status}，不能自动恢复"
+                            )
+                        if not os.path.isfile(path):
+                            _safe_copy(action.backup_path, path)
+                        restored_status = _status_for_exact_path(
+                            batch.wc_root,
+                            path,
+                            records_by_path(self.status_scanner(os.path.dirname(path))),
+                        )
+                        if (
+                            restored_status.node_status != "normal"
+                            or _sha256(path) != action.target_before_hash
+                        ):
+                            raise RuntimeError("撤销删除后未恢复为原始干净文件")
                     else:
                         if not os.path.isfile(path) or _sha256(path) != action.candidate_hash:
                             raise RuntimeError("新增文件不再等于候选")
                         status = _status_for_exact_path(batch.wc_root, path, records_by_path(self.status_scanner(os.path.dirname(path))))
                         if status.node_status == "added":
-                            raise RuntimeError("文件已被 SVN add；请在 TortoiseSVN 中 Undo Add")
+                            if self._tortoise("revert", [path]) != 0:
+                                raise RuntimeError("SVN Add 未撤销；请在 TortoiseSVN 中 Undo Add")
+                            status = _status_for_exact_path(
+                                batch.wc_root,
+                                path,
+                                records_by_path(self.status_scanner(os.path.dirname(path))),
+                            )
                         if status.node_status != "unversioned":
                             raise RuntimeError(f"新增文件状态为 {status.node_status}，不能自动移除")
                         os.remove(path)
@@ -1971,16 +2067,17 @@ class BranchSubmitWorkbench:
         for text, mode in (("全部", "all"), ("无", "none"), ("已版本化", "versioned"), ("新增", "added"), ("删除", "deleted"), ("修改", "modified"), ("文件", "files")):
             label = tk.Label(filters, text=text, fg="#0645ad", cursor="hand2", font=("Segoe UI", 9, "underline"))
             label.pack(side="left", padx=(8, 0)); label.bind("<Button-1>", lambda _e, value=mode: self._quick_check(value))
+        ttk.Button(filters, text="处理规则…", command=self._show_operation_policies).pack(side="right", padx=(6, 0))
         ttk.Checkbutton(filters, text="显示未版本化文件", variable=self.show_unversioned_var, command=self._render_items).pack(side="right")
         self.scan_stop_button = ttk.Button(filters, text="停止扫描", command=self._stop_scan)
         self.scan_stop_button.pack(side="right", padx=6)
         ttk.Button(filters, text="刷新", command=self._start_scan).pack(side="right")
-        columns = ("check", "path", "extension", "status", "property", "lock", "switched", "changelist")
+        columns = ("check", "path", "handling", "extension", "status", "property", "lock", "switched", "changelist")
         self.tree = ttk.Treeview(changes, columns=columns, show="headings", selectmode="extended", height=4, style="Workbench.Treeview")
         self.tree.tag_configure("alternate", background=THEME.row_alt)
         self.tree.tag_configure("not_selectable", foreground=THEME.disabled)
-        headings = {"check":"✓", "path":"路径", "extension":"扩展名", "status":"状态", "property":"属性状态", "lock":"锁定", "switched":"已切换", "changelist":"变更列表"}
-        widths = {"check":38, "path":390, "extension":72, "status":160, "property":105, "lock":80, "switched":70, "changelist":120}
+        headings = {"check":"✓", "path":"路径", "handling":"多分支处理", "extension":"扩展名", "status":"状态", "property":"属性状态", "lock":"锁定", "switched":"已切换", "changelist":"变更列表"}
+        widths = {"check":38, "path":320, "handling":170, "extension":72, "status":150, "property":105, "lock":80, "switched":70, "changelist":120}
         widths.update({key: int(value) for key, value in self.settings.get("column_widths", {}).items() if key in widths})
         for key in columns:
             self.tree.heading(key, text=headings[key]); self.tree.column(key, width=widths[key], stretch=key == "path", anchor="w" if key != "check" else "center")
@@ -2235,7 +2332,21 @@ class BranchSubmitWorkbench:
                 tags.append("alternate")
             if not item.selectable:
                 tags.append("not_selectable")
-            self.tree.insert("", "end", iid=iid, values=(mark, item.relative_path, item.extension, status, item.prop_status, item.lock_owner or ("已锁定" if item.wc_locked else ""), "是" if item.switched else "", item.changelist), tags=tuple(tags))
+            self.tree.insert(
+                "", "end", iid=iid,
+                values=(
+                    mark,
+                    item.relative_path,
+                    _multi_branch_policy_text(item.node_status, item.reason),
+                    item.extension,
+                    status,
+                    item.prop_status,
+                    item.lock_owner or ("已锁定" if item.wc_locked else ""),
+                    "是" if item.switched else "",
+                    item.changelist,
+                ),
+                tags=tuple(tags),
+            )
         selected = sum(item.checked for item in self.items)
         self.count_var.set(f"已选 {selected} 个，显示 {len(visible)} 个，共 {len(self.items)} 个")
         self._refresh_primary_button()
@@ -2404,7 +2515,7 @@ class BranchSubmitWorkbench:
         labels = {
             "ready": "可直接同步", "confirmation_required": "需人工确认", "blocked": "安全阻断",
             "already_present": "已同步", "committed": "已提交", "partial": "部分成功",
-            "skipped": "已移除", "unknown": "未知", "cancelled": "已取消",
+            "skipped": "目标不处理", "unknown": "未知", "cancelled": "已取消",
             "failed": "失败", "pending": "待处理",
         }
         self._target_status_map = {}
@@ -2795,6 +2906,50 @@ class BranchSubmitWorkbench:
     def _selected_items(self):
         return [item for item in self.items if item.checked and item.selectable]
 
+    def _show_operation_policies(self):
+        """Show the exact source-status to target-operation contract."""
+        tk, ttk = self.tk, self.ttk
+        win = tk.Toplevel(self.root)
+        win.title("多分支提交 · SVN 状态处理规则")
+        win.geometry("900x430")
+        win.minsize(760, 360)
+        win.transient(self.root)
+        frame = ttk.Frame(win, padding=14, style="App.TFrame")
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="SVN 状态处理规则", style="Title.App.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="源分支仍由原生 TortoiseSVN 提交；下表只决定是否以及如何传播到目标分支。",
+            style="Muted.App.TLabel",
+        ).pack(anchor="w", pady=(3, 10))
+        tree = ttk.Treeview(
+            frame,
+            columns=("status", "selection", "target", "safety"),
+            show="headings",
+            selectmode="browse",
+            style="Workbench.Treeview",
+        )
+        for key, title, width in (
+            ("status", "源 SVN 状态", 200),
+            ("selection", "默认选择", 105),
+            ("target", "目标分支动作", 265),
+            ("safety", "安全规则", 300),
+        ):
+            tree.heading(key, text=title)
+            tree.column(key, width=width, anchor="w", stretch=key in {"target", "safety"})
+        for index, values in enumerate(SVN_OPERATION_POLICIES):
+            tree.insert("", "end", values=values, tags=("alternate",) if index % 2 else ())
+        tree.tag_configure("alternate", background=THEME.row_alt)
+        tree.pack(fill="both", expand=True)
+        note = (
+            "重点：missing 只表示工作文件在磁盘上缺失，并不等于已经执行 SVN Delete。"
+            "因此工具不会更新或修改任何目标分支；如需跨分支删除，请先在源分支明确执行 TortoiseSVN → Delete。"
+        )
+        ttk.Label(frame, text=note, style="Workbench.Hint.TLabel", wraplength=850).pack(
+            anchor="w", pady=(10, 0)
+        )
+        ttk.Button(frame, text="关闭", command=win.destroy).pack(anchor="e", pady=(10, 0))
+
     def _show_recent_messages(self):
         tk, ttk = self.tk, self.ttk
         try: _root_url, repo_uuid = repository_metadata(self.context.wc_root); messages = read_recent_messages(repo_uuid)
@@ -2897,10 +3052,15 @@ class BranchSubmitWorkbench:
 
         state_labels = {
             "ready": "可直接同步", "confirmation_required": "需人工确认",
-            "excluded": "已移除", "already_applied": "已包含修改",
+            "excluded": "目标不处理", "already_applied": "已包含修改",
             "blocked": "安全阻断", "prepared": "已准备", "committed": "已提交",
         }
-        operation_labels = {"modify": "修改", "add": "新增", "delete": "删除"}
+        operation_labels = {
+            "modify": "修改",
+            "add": "新增",
+            "delete": "删除",
+            SOURCE_ONLY_MISSING: "仅源分支",
+        }
         row_map: dict[str, tuple[str, FilePlan]] = {}
         for row_index, (plan, target) in enumerate(
             pair for plan in batch.files for pair in ((plan, target) for target in batch.target_branches)

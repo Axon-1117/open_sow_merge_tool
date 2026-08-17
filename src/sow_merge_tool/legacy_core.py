@@ -46,8 +46,8 @@ from .ui_foundation import THEME, UiTrace, configure_ttk_style
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-16.update87"
-APP_BUILD_TAG = "preflight-target-update"
+APP_VERSION = "2026-08-17.update88"
+APP_BUILD_TAG = "svn-operation-policy"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -9853,49 +9853,72 @@ def _svn_author_for_source_identity(
 
 
 def _copy_wc_pristine_local(path: str | None) -> str | None:
-    """Copy the target WC pristine blob without SVN CLI/Tortoise GUI fallback."""
-    if not path or not os.path.isfile(path):
-        _dlog(f"target pristine unavailable: target path missing {path!r}")
+    """Copy a WC pristine blob without requiring the working file to exist.
+
+    A ``missing`` or scheduled-deleted file has no working-path file by
+    definition, but its BASE checksum and pristine blob remain in ``wc.db``.
+    Requiring ``os.path.isfile(path)`` therefore made every legitimate missing
+    file impossible to preflight.
+    """
+    if not path:
+        _dlog("wc pristine unavailable: empty path")
         return None
-    wc_root = _find_svn_wc_root_for_path(path)
+    absolute_path = os.path.abspath(path)
+    wc_root = _find_svn_wc_root_for_path(absolute_path)
     if not wc_root:
-        _dlog(f"target pristine unavailable: wc.db not found for {path}")
+        _dlog(f"wc pristine unavailable: wc.db not found for {absolute_path}")
         return None
-    relpath = os.path.relpath(os.path.abspath(path), wc_root).replace("\\", "/")
+    relpath = os.path.relpath(absolute_path, wc_root).replace("\\", "/")
     db_path = os.path.join(wc_root, ".svn", "wc.db")
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
             row = conn.execute(
                 """
-                select checksum from NODES
-                where local_relpath = ? and op_depth = 0 and kind = 'file'
-                  and presence = 'normal'
+                select n.checksum, p.size
+                from NODES n left join PRISTINE p on p.checksum = n.checksum
+                where n.local_relpath = ? and n.op_depth = 0 and n.kind = 'file'
+                  and n.presence = 'normal'
                 limit 1
                 """,
                 (relpath,),
             ).fetchone()
         checksum = row[0] if row else None
+        expected_size = int(row[1]) if row and row[1] is not None else None
         match = re.match(r"^\$sha1\$([0-9a-fA-F]{40})$", str(checksum or ""))
         if not match:
-            _dlog(f"target pristine unavailable: no checksum for {relpath}")
+            _dlog(f"wc pristine unavailable: no checksum for {relpath}")
             return None
         sha1 = match.group(1).lower()
         pristine = os.path.join(wc_root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
         if not os.path.isfile(pristine):
-            _dlog(f"target pristine unavailable: pristine blob missing {pristine}")
+            _dlog(f"wc pristine unavailable: pristine blob missing {pristine}")
             return None
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        actual_size = os.path.getsize(pristine)
+        if expected_size is not None and actual_size != expected_size:
+            _dlog(
+                f"wc pristine unavailable: size mismatch {pristine} "
+                f"expected={expected_size} actual={actual_size}"
+            )
+            return None
+        digest = hashlib.sha1()
+        with open(pristine, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest().lower() != sha1:
+            _dlog(f"wc pristine unavailable: checksum mismatch {pristine}")
+            return None
+        ts = f"{datetime.now():%Y%m%d_%H%M%S}_{time.time_ns()}"
         target = os.path.join(
             tempfile.gettempdir(),
-            f"{APP_NAME}_target_pristine_{os.getpid()}_{ts}_{os.path.basename(path)}",
+            f"{APP_NAME}_target_pristine_{os.getpid()}_{ts}_{os.path.basename(absolute_path)}",
         )
-        if not target.lower().endswith(_workbook_ext(path)):
-            target += _workbook_ext(path)
+        if not target.lower().endswith(_workbook_ext(absolute_path)):
+            target += _workbook_ext(absolute_path)
         shutil.copyfile(pristine, target)
         if _workbook_package_ready(target):
-            _dlog(f"target pristine copied from wc.db: {path} -> {target}")
+            _dlog(f"wc pristine copied from wc.db: {absolute_path} -> {target}")
             return target
-        _dlog(f"target pristine copy invalid package: {target}")
+        _dlog(f"wc pristine copy invalid package: {target}")
     except Exception as exc:
         _dlog(f"target pristine copy failed: {exc}")
     return None

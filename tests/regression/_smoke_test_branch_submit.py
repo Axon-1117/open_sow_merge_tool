@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -50,6 +52,10 @@ def _create_wc(root: str, branches=("develop", "release", "sandbox", "master")) 
               tree_conflict_data text, conflict_data blob, older_checksum text,
               left_checksum text, right_checksum text
             );
+            create table PRISTINE (
+              checksum text primary key, compression integer, size integer,
+              refcount integer, md5_checksum text
+            );
             insert into REPOSITORY values (1, 'file:///repo', 'fixture-uuid');
             """
         )
@@ -92,6 +98,25 @@ def _ensure_node(root: str, path: str, revision: int = 200) -> None:
             conn.execute("update NODES set revision=?,changed_revision=? where local_relpath=?", (revision, revision, rel))
         else:
             _insert_node(conn, rel, "file", revision)
+
+
+def _install_wc_pristine(root: str, path: str, source: str) -> str:
+    with open(source, "rb") as stream:
+        payload = stream.read()
+    sha1 = hashlib.sha1(payload).hexdigest()
+    checksum = "$sha1$" + sha1
+    pristine = os.path.join(root, ".svn", "pristine", sha1[:2], sha1 + ".svn-base")
+    os.makedirs(os.path.dirname(pristine), exist_ok=True)
+    with open(pristine, "wb") as stream:
+        stream.write(payload)
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+        conn.execute("update NODES set checksum=? where local_relpath=? and op_depth=0", (checksum, rel))
+        conn.execute(
+            "insert or replace into PRISTINE(checksum,compression,size,refcount,md5_checksum) values (?,0,?,1,null)",
+            (checksum, len(payload)),
+        )
+    return pristine
 
 
 class FakeCore:
@@ -277,6 +302,7 @@ def test_scan_defaults_and_blockers() -> None:
             "modified": os.path.join(scope, "中文修改.xlsx"),
             "unversioned": os.path.join(scope, "New.xlsx"),
             "property": os.path.join(scope, "Prop.xlsx"),
+            "wc_locked": os.path.join(scope, "Locked.xlsx"),
             "other": os.path.join(scope, "readme.txt"),
         }
         for path in paths.values():
@@ -286,6 +312,7 @@ def test_scan_defaults_and_blockers() -> None:
             sp.SvnStatusRecord(path=paths["modified"], node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True),
             sp.SvnStatusRecord(path=paths["unversioned"], node_kind="file", node_status="unversioned", versioned=False),
             sp.SvnStatusRecord(path=paths["property"], node_kind="file", node_status="modified", text_status="modified", prop_status="modified", versioned=True),
+            sp.SvnStatusRecord(path=paths["wc_locked"], node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True, wc_locked=True),
             sp.SvnStatusRecord(path=paths["other"], node_kind="file", node_status="modified", text_status="modified", prop_status="normal", versioned=True),
         ]
         with patch.object(bs, "scan_status", lambda *_args, **_kwargs: records):
@@ -294,6 +321,7 @@ def test_scan_defaults_and_blockers() -> None:
         assert by_name["中文修改.xlsx"].checked and by_name["中文修改.xlsx"].selectable
         assert not by_name["New.xlsx"].checked and by_name["New.xlsx"].selectable
         assert not by_name["Prop.xlsx"].selectable and "属性修改" in by_name["Prop.xlsx"].reason
+        assert not by_name["Locked.xlsx"].selectable and "Cleanup" in by_name["Locked.xlsx"].reason
         assert not by_name["readme.txt"].selectable
     finally: _cleanup(root, old)
 
@@ -321,6 +349,77 @@ def test_high_confidence_rename_is_blocked() -> None:
         else:
             raise AssertionError("high-confidence rename was not blocked")
     finally: _cleanup(root, old)
+
+
+def test_missing_file_can_read_real_wc_pristine() -> None:
+    root, old = _fixture()
+    exported = None
+    try:
+        missing = os.path.join(root, "develop", "config", "Missing.xlsx")
+        baseline = os.path.join(root, "baseline.xlsx")
+        _book(baseline, 17)
+        with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+            _insert_node(conn, "develop/config/Missing.xlsx")
+        pristine = _install_wc_pristine(root, missing, baseline)
+        assert not os.path.exists(missing) and os.path.isfile(pristine)
+        exported = smt._try_export_svn_base_from_working_copy(missing)
+        assert exported and os.path.isfile(exported)
+        assert bs._sha256(exported) == bs._sha256(baseline)
+
+        with open(pristine, "ab") as stream:
+            stream.write(b"corrupt")
+        assert smt._try_export_svn_base_from_working_copy(missing) is None
+    finally:
+        if exported and os.path.isfile(exported):
+            os.remove(exported)
+        _cleanup(root, old)
+
+
+def test_missing_is_source_only_and_never_touches_target() -> None:
+    root, old = _fixture()
+    try:
+        scanner = FixtureScanner(root)
+        source = os.path.join(root, "develop", "config", "Missing.xlsx")
+        target = os.path.join(root, "release", "config", "Missing.xlsx")
+        _book(source + ".pristine.xlsx", 6)
+        _book(target, 8)
+        shutil.copy2(target, target + ".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+            _insert_node(conn, "develop/config/Missing.xlsx")
+            _insert_node(conn, "release/config/Missing.xlsx")
+        for branch in ("sandbox", "master"):
+            _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
+        calls = []
+        engine = bs.BranchSubmitEngine(
+            root,
+            runner=lambda args, **_kwargs: calls.append(args) or SimpleNamespace(returncode=0),
+            status_scanner=scanner,
+        )
+        engine.core = FakeCore
+        target_hash = bs._sha256(target)
+        batch = engine.preflight(
+            "develop", ["release"], [_item(source, root, "missing")], "仅源分支",
+            scope_path=os.path.dirname(source),
+        )
+        plan = batch.files[0]
+        action = plan.actions["release"]
+        assert plan.operation == bs.SOURCE_ONLY_MISSING
+        assert action.state == "excluded" and action.disposition == "source_only"
+        assert batch.target_status["release"] == "skipped"
+        assert not calls, "source-only missing must not open target SVN Update"
+        assert bs._sha256(target) == target_hash
+        assert any(event["kind"] == "target-update-skipped" for event in batch.journal)
+        scanner.overrides[source] = sp.SvnStatusRecord(
+            path=source, node_kind="file", node_status="deleted", versioned=True,
+        )
+        try:
+            engine._verify_source_before_commit(batch)
+        except RuntimeError as exc:
+            assert "偏离预检查结果" in str(exc)
+        else:
+            raise AssertionError("missing changed to deleted must require a fresh preflight")
+    finally:
+        _cleanup(root, old)
 
 
 def test_recovery_list_ignores_read_only_preflight_batches() -> None:
@@ -374,6 +473,12 @@ def test_recovery_list_ignores_read_only_preflight_batches() -> None:
         )
         legacy.save()
         assert bs.batch_requires_recovery(legacy), "older prepared states must remain recoverable"
+        with open(legacy.state_path, "r", encoding="utf-8") as stream:
+            version5_payload = json.load(stream)
+        version5_payload["state_version"] = 5
+        with open(legacy.state_path, "w", encoding="utf-8") as stream:
+            json.dump(version5_payload, stream, ensure_ascii=False)
+        assert bs.BranchSubmitBatch.load(legacy.state_path).batch_id == legacy.batch_id
     finally:
         _cleanup(root, old)
 
@@ -392,14 +497,24 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
         _book(src_a, 5); items.append(_item(src_a, root, "unversioned", False))
         # delete
         src_d = os.path.join(root, "develop", "config", "D.xlsx")
-        _book(src_d + ".pristine.xlsx", 3); items.append(_item(src_d, root, "missing"))
+        _book(src_d + ".pristine.xlsx", 3); items.append(_item(src_d, root, "deleted"))
+        # missing is not an explicit SVN delete and must never touch targets
+        src_missing = os.path.join(root, "develop", "config", "Missing.xlsx")
+        _book(src_missing + ".pristine.xlsx", 4)
+        items.append(_item(src_missing, root, "missing"))
         with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
-            for rel in ("develop/config/M.xlsx", "develop/config/D.xlsx", "release/config/M.xlsx", "release/config/D.xlsx"):
+            for rel in (
+                "develop/config/M.xlsx", "develop/config/D.xlsx", "develop/config/Missing.xlsx",
+                "release/config/M.xlsx", "release/config/D.xlsx", "release/config/Missing.xlsx",
+            ):
                 _insert_node(conn, rel)
         release_m = os.path.join(root, "release", "config", "M.xlsx")
         release_d = os.path.join(root, "release", "config", "D.xlsx")
+        release_missing = os.path.join(root, "release", "config", "Missing.xlsx")
         _book(release_m, 1); shutil.copy2(release_m, release_m + ".pristine.xlsx")
         _book(release_d, 3); shutil.copy2(release_d, release_d + ".pristine.xlsx")
+        _book(release_missing, 4); shutil.copy2(release_missing, release_missing + ".pristine.xlsx")
+        release_missing_hash = bs._sha256(release_missing)
         # Make all candidate branch roots discoverable.
         _book(os.path.join(root, "sandbox", "config", "seed.xlsx"), 1)
         _book(os.path.join(root, "master", "config", "seed.xlsx"), 1)
@@ -415,10 +530,12 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
         batch = engine.preflight("develop", ["release"], items, "", scope_path=os.path.join(root, "develop", "config"))
         assert batch.source_status == "ready", batch.error
         assert batch.message == "", "empty commit message must be accepted during preflight"
-        assert [plan.operation for plan in batch.files] == ["modify", "add", "delete"]
+        assert [plan.operation for plan in batch.files] == [
+            "modify", "add", "delete", bs.SOURCE_ONLY_MISSING,
+        ]
         assert all(
             plan.actions["release"].state
-            in {"planned", "ready", "confirmation_required", "blocked"}
+            in {"planned", "ready", "confirmation_required", "blocked", "excluded"}
             for plan in batch.files
         )
         svn_updates = [args for args in update_calls if "/command:update" in args]
@@ -428,6 +545,11 @@ def test_preflight_modify_add_delete_and_dirty_block() -> None:
             os.path.abspath(release_d),
             os.path.abspath(os.path.dirname(release_m)),
         }
+        missing_plan = batch.files[-1]
+        assert missing_plan.actions["release"].state == "excluded"
+        assert missing_plan.actions["release"].disposition == "source_only"
+        assert bs._sha256(release_missing) == release_missing_hash
+        assert os.path.abspath(release_missing) not in set(updated_path_batches[0])
         journal_kinds = [event["kind"] for event in batch.journal]
         assert journal_kinds.index("target-update-start") < journal_kinds.index("target-update-complete") < journal_kinds.index("preflight")
         assert not bs.batch_requires_recovery(batch)
@@ -716,7 +838,7 @@ def test_diverged_delete_requires_confirmation() -> None:
             _insert_node(conn,"develop/config/D.xlsx");_insert_node(conn,"release/config/D.xlsx")
         for branch in ("sandbox","master"):_book(os.path.join(root,branch,"config","seed.xlsx"),1)
         engine=bs.BranchSubmitEngine(root,runner=_ok_runner,status_scanner=scanner);engine.core=FakeCore
-        batch=engine.preflight("develop",["release"],[_item(source,root,"missing")],"删除确认",scope_path=os.path.dirname(source))
+        batch=engine.preflight("develop",["release"],[_item(source,root,"deleted")],"删除确认",scope_path=os.path.dirname(source))
         plan=batch.files[0];action=plan.actions["release"]
         assert action.state=="confirmation_required"
         engine.confirm_source_changes(batch,"release",plan.relative_path)
@@ -782,6 +904,101 @@ def test_target_partial_and_restore_guard() -> None:
         assert pending.actions["release"].state=="restored"
         assert bs._sha256(target)==original_hash
     finally:_cleanup(root,old)
+
+
+def test_restore_reconciles_server_success_before_rollback() -> None:
+    root, old = _fixture()
+    try:
+        scanner = FixtureScanner(root)
+        source = os.path.join(root, "develop", "config", "A.xlsx")
+        target = os.path.join(root, "release", "config", "A.xlsx")
+        _book(source, 9); _book(source + ".pristine.xlsx", 1)
+        _book(target, 1); shutil.copy2(target, target + ".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+            _insert_node(conn, "develop/config/A.xlsx")
+            _insert_node(conn, "release/config/A.xlsx")
+        for branch in ("sandbox", "master"):
+            _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
+        engine = bs.BranchSubmitEngine(root, runner=_ok_runner, status_scanner=scanner)
+        engine.core = FakeCore
+        batch = engine.preflight(
+            "develop", ["release"], [_item(source, root, "modified")], "服务端已提交",
+            scope_path=os.path.dirname(source),
+        )
+        plan = batch.files[0]
+        status_map = bs.records_by_path(scanner(os.path.join(root, "release")))
+        engine._fresh_target_action(batch, plan, "release", status_map)
+        engine._prepare_target_action(batch, plan, "release")
+        candidate_hash = plan.actions["release"].candidate_hash
+        _commit_fixture_paths(root, [target])
+        engine.restore_uncommitted(batch)
+        assert plan.actions["release"].state == "committed"
+        assert bs._sha256(target) == candidate_hash, "recovery must not reverse a server commit"
+    finally:
+        _cleanup(root, old)
+
+
+def test_restore_undoes_scheduled_add_and_delete() -> None:
+    root, old = _fixture()
+    try:
+        scanner = FixtureScanner(root)
+        source_add = os.path.join(root, "develop", "config", "Add.xlsx")
+        source_delete = os.path.join(root, "develop", "config", "Delete.xlsx")
+        target_add = os.path.join(root, "release", "config", "Add.xlsx")
+        target_delete = os.path.join(root, "release", "config", "Delete.xlsx")
+        _book(source_add, 5)
+        _book(source_delete + ".pristine.xlsx", 7)
+        _book(target_delete, 7); shutil.copy2(target_delete, target_delete + ".pristine.xlsx")
+        with sqlite3.connect(os.path.join(root, ".svn", "wc.db")) as conn:
+            _insert_node(conn, "develop/config/Delete.xlsx")
+            _insert_node(conn, "release/config/Delete.xlsx")
+        for branch in ("sandbox", "master"):
+            _book(os.path.join(root, branch, "config", "seed.xlsx"), 1)
+        revert_calls = []
+        delete_backup = {"path": ""}
+
+        def runner(args, **_kwargs):
+            if "/command:revert" in args:
+                paths = _commit_paths(args)
+                revert_calls.extend(paths)
+                for path in paths:
+                    scanner.overrides.pop(path, None)
+                    if os.path.normcase(path) == os.path.normcase(target_delete):
+                        shutil.copy2(delete_backup["path"], target_delete)
+            return SimpleNamespace(returncode=0)
+
+        engine = bs.BranchSubmitEngine(root, runner=runner, status_scanner=scanner)
+        engine.core = FakeCore
+        items = [
+            _item(source_add, root, "unversioned", False),
+            _item(source_delete, root, "deleted"),
+        ]
+        batch = engine.preflight(
+            "develop", ["release"], items, "恢复计划状态",
+            scope_path=os.path.join(root, "develop", "config"),
+        )
+        status_map = bs.records_by_path(scanner(os.path.join(root, "release")))
+        for plan in batch.files:
+            engine._fresh_target_action(batch, plan, "release", status_map)
+            engine._prepare_target_action(batch, plan, "release")
+        delete_plan = next(plan for plan in batch.files if plan.operation == "delete")
+        delete_backup["path"] = delete_plan.actions["release"].backup_path
+        scanner.overrides[target_add] = sp.SvnStatusRecord(
+            path=target_add, node_kind="file", node_status="added", versioned=True,
+        )
+        scanner.overrides[target_delete] = sp.SvnStatusRecord(
+            path=target_delete, node_kind="file", node_status="deleted", versioned=True,
+        )
+        engine.restore_uncommitted(batch)
+        assert not os.path.exists(target_add)
+        assert os.path.isfile(target_delete)
+        assert bs._sha256(target_delete) == delete_plan.actions["release"].target_before_hash
+        assert all(plan.actions["release"].state == "restored" for plan in batch.files)
+        assert {os.path.normcase(path) for path in revert_calls} == {
+            os.path.normcase(target_add), os.path.normcase(target_delete),
+        }
+    finally:
+        _cleanup(root, old)
 
 
 def test_resume_reconciles_commits_before_reopening_dialog() -> None:
@@ -897,6 +1114,8 @@ if __name__ == "__main__":
         test_status_xml_and_windows_abi,
         test_scan_defaults_and_blockers,
         test_high_confidence_rename_is_blocked,
+        test_missing_file_can_read_real_wc_pristine,
+        test_missing_is_source_only_and_never_touches_target,
         test_recovery_list_ignores_read_only_preflight_batches,
         test_preflight_modify_add_delete_and_dirty_block,
         test_source_partial_selection_stops_propagation,
@@ -909,6 +1128,8 @@ if __name__ == "__main__":
         test_diverged_delete_requires_confirmation,
         test_modify_has_no_whole_file_fallback,
         test_target_partial_and_restore_guard,
+        test_restore_reconciles_server_success_before_rollback,
+        test_restore_undoes_scheduled_add_and_delete,
         test_resume_reconciles_commits_before_reopening_dialog,
         test_write_intent_crash_restore_and_corrupt_state_detection,
         test_entrypoint_registry_scope_and_real_status_child,
