@@ -389,14 +389,14 @@ def _record_reason(record: SvnStatusRecord, extension: str) -> str:
         return "路径已 switched，禁止自动跨分支提交"
     if record.file_external or record.node_status == "external":
         return "svn:externals 不进入批次"
-    if record.prop_status not in {"none", "normal"}:
+    if record.prop_status not in {"none", "normal"} and record.node_status != "added":
         return f"存在属性修改：{record.prop_status}"
     if extension not in SUPPORTED_EXTENSIONS:
         return "仅显示，不支持提交此文件类型"
     if os.path.basename(record.path).startswith("~$"):
         return "Excel 临时锁文件不可提交"
-    if record.node_kind == "dir":
-        return "目录仅显示，不作为 Excel 提交项"
+    if record.node_kind != "file":
+        return "仅普通文件可进入批次；目录、符号链接和未知节点只显示"
     if record.node_status not in SOURCE_CHANGE_STATES:
         return f"不是可提交的 Excel 变更：{record.node_status}"
     return ""
@@ -737,7 +737,7 @@ def _status_block_reason(record: SvnStatusRecord, *, require_clean: bool) -> str
         return "路径已 switched"
     if record.file_external or record.node_status == "external":
         return "路径属于 svn:externals"
-    if record.prop_status not in {"none", "normal"}:
+    if record.prop_status not in {"none", "normal"} and record.node_status != "added":
         return f"存在属性修改：{record.prop_status}"
     if require_clean and record.node_status not in {"normal", "none"}:
         return f"目标工作副本不干净：{record.node_status}"

@@ -13,6 +13,7 @@ Windows Excel 合并与多分支 SVN 提交工具，最终交付物为
 ```powershell
 .\tools\bootstrap.ps1
 .\tools\test.ps1 -Profile Fast
+.\tools\test.ps1 -Profile Integration
 .\tools\release.ps1 -DeployPath 'C:\sow_main\excel\excel_merge_tool'
 ```
 
