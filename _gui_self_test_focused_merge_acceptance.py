@@ -103,41 +103,133 @@ def _construct_app(
     context: smt.MergeLaunchContext,
     outcome: smt.StartupMergeOutcome | None = None,
     conflict_map: dict | None = None,
+    startup_owned_paths: set[str] | None = None,
+    startup_inputs_prepared: bool = False,
+    initial_sheet: str | None = None,
 ) -> smt.SowMergeApp:
-    for role in ("base", "mine", "theirs"):
-        identity = context.identity_for(role)
-        if identity is not None and identity.path and not identity.stable_path:
-            identity.stable_path = smt._ensure_xlsx_copy(identity.path)
-    base_identity = context.identity_for("base")
-    mine_identity = context.identity_for("mine")
-    theirs_identity = context.identity_for("theirs")
-    assert base_identity and mine_identity and theirs_identity
-    ui_mine = (
-        outcome.candidate_path
-        if outcome is not None and outcome.candidate_path
-        else mine_identity.effective_path
-    )
-    app = smt.SowMergeApp(
-        str(ui_mine),
-        str(theirs_identity.effective_path),
-        merge_mode=True,
-        merged_path=merged,
-        base_path=str(base_identity.effective_path),
-        merge_conflict_cells_by_sheet=conflict_map or {},
-        # Production main() deliberately keeps every real Sheet available.
-        merge_conflict_mode=False,
-        raw_base=base,
-        raw_mine=mine,
-        raw_theirs=theirs,
-        launch_context=context,
-        startup_outcome=outcome,
-    )
-    app.root.deiconify()
-    _pump(app.root, 0.15)
-    app.root.state("normal")
-    app.root.geometry("1450x860")
-    _pump(app.root, 0.15)
-    return app
+    owned_paths = startup_owned_paths if startup_owned_paths is not None else set()
+    app = None
+    try:
+        for role in ("base", "mine", "theirs"):
+            identity = context.identity_for(role)
+            if identity is not None and identity.path and not identity.stable_path:
+                identity.stable_path = smt._ensure_xlsx_copy(
+                    identity.path,
+                    owned_paths=owned_paths,
+                )
+        base_identity = context.identity_for("base")
+        mine_identity = context.identity_for("mine")
+        theirs_identity = context.identity_for("theirs")
+        assert base_identity and mine_identity and theirs_identity
+        ui_mine = (
+            outcome.candidate_path
+            if outcome is not None and outcome.candidate_path
+            else mine_identity.effective_path
+        )
+        app = smt.SowMergeApp(
+            str(ui_mine),
+            str(theirs_identity.effective_path),
+            merge_mode=True,
+            merged_path=merged,
+            base_path=str(base_identity.effective_path),
+            merge_conflict_cells_by_sheet=conflict_map or {},
+            # Production main() deliberately keeps every real Sheet available.
+            merge_conflict_mode=False,
+            raw_base=base,
+            raw_mine=mine,
+            raw_theirs=theirs,
+            launch_context=context,
+            startup_outcome=outcome,
+            startup_owned_paths=owned_paths,
+            startup_inputs_prepared=startup_inputs_prepared,
+            initial_sheet=initial_sheet,
+        )
+        app.root.deiconify()
+        _pump(app.root, 0.15)
+        app.root.state("normal")
+        app.root.geometry("1450x860")
+        _pump(app.root, 0.15)
+        return app
+    except BaseException as primary:
+        cleanup_errors = []
+        expected_owned = {
+            os.path.normcase(os.path.abspath(path)) for path in owned_paths
+        }
+        if app is not None:
+            try:
+                app._shutdown_root()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
+                registry = set(getattr(app, "_owned_startup_temp_paths", ()))
+                evidence = list(
+                    getattr(app, "_owned_startup_temp_cleanup_evidence", ())
+                )
+                evidence_paths = {
+                    os.path.normcase(os.path.abspath(item.get("path", "")))
+                    for item in evidence
+                }
+                invalid = [
+                    item
+                    for item in evidence
+                    if not item.get("removed")
+                    or item.get("exists_after")
+                    or item.get("error")
+                ]
+                if registry or evidence_paths != expected_owned or invalid:
+                    cleanup_errors.append(
+                        AssertionError(
+                            "focused acceptance app cleanup evidence invalid: "
+                            + repr(
+                                {
+                                    "registry": sorted(registry),
+                                    "expected": sorted(expected_owned),
+                                    "actual": sorted(evidence_paths),
+                                    "invalid": invalid,
+                                }
+                            )
+                        )
+                    )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if owned_paths:
+            try:
+                remaining_expected = {
+                    os.path.normcase(os.path.abspath(path)) for path in owned_paths
+                }
+                evidence = smt._cleanup_unclaimed_startup_temp_paths(
+                    owned_paths,
+                    reason="focused acceptance app initialization failed",
+                )
+                evidence_paths = {
+                    os.path.normcase(os.path.abspath(item.get("path", "")))
+                    for item in evidence
+                }
+                invalid = [
+                    item
+                    for item in evidence
+                    if not item.get("removed")
+                    or item.get("exists_after")
+                    or item.get("error")
+                ]
+                if evidence_paths != remaining_expected or invalid:
+                    cleanup_errors.append(
+                        AssertionError(
+                            "focused acceptance unclaimed cleanup evidence invalid: "
+                            + repr(
+                                {
+                                    "expected": sorted(remaining_expected),
+                                    "actual": sorted(evidence_paths),
+                                    "invalid": invalid,
+                                }
+                            )
+                        )
+                    )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        for exc in cleanup_errors:
+            primary.add_note(f"focused acceptance cleanup failure: {exc!r}")
+        raise
 
 
 def _sha256(path: str) -> str:

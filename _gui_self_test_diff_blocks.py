@@ -414,8 +414,10 @@ def _test_large_cross_render_limit_navigation(root_dir):
         elapsed = time.perf_counter() - started
         assert view.selected_pair_idx == 1799, view.selected_pair_idx
         assert 1799 in view.row_to_line
-        assert view.display_rows == [1799, 1800], view.display_rows
-        assert len(view.display_rows) <= mod._LARGE_DIFF_NAV_PREVIEW_ROWS
+        # Fixed virtual windows retain a bounded logical context before the
+        # target instead of materialising a special two-row preview.
+        assert view.display_rows[-2:] == [1799, 1800], view.display_rows
+        assert len(view.display_rows) <= mod._VIRTUAL_VIEWPORT_MAX_ROWS
         assert True not in rescan_calls, rescan_calls
         assert abs(float(view.left.xview()[0]) - saved_x) < 0.02, (saved_x, view.left.xview())
         assert "3/3" in view.diff_block_status_var.get(), view.diff_block_status_var.get()
@@ -500,8 +502,8 @@ def _test_three_way_cached_base_navigation_no_workbook_reads(root_dir):
             counters.update(cell=0, iter_rows=0, rescan=0)
             view._goto_full_diff_block(2)
             assert view.selected_pair_idx == 1799, view.selected_pair_idx
-            assert view.display_rows == [1799, 1800], view.display_rows
-            assert len(view.display_rows) <= mod._LARGE_DIFF_NAV_PREVIEW_ROWS
+            assert view.display_rows[-2:] == [1799, 1800], view.display_rows
+            assert len(view.display_rows) <= mod._VIRTUAL_VIEWPORT_MAX_ROWS
             assert view._base_row_for_pair(1799) == 1800
             target_line = view.row_to_line[1799]
             assert view.base.get(f"{target_line}.0", f"{target_line}.end") == view.pair_text_base[1799]

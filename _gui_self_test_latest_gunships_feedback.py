@@ -7,7 +7,11 @@ the startup candidate held by the GUI and are never saved.
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
+import subprocess
+import tempfile
+import time
 import traceback
 from contextlib import contextmanager
 
@@ -25,16 +29,138 @@ from _gui_self_test_focused_merge_acceptance import (
 )
 
 
-REAL_INPUTS = (
-    GUNSHIPS_TARGET,
-    GUNSHIPS_SOURCE_BEFORE,
-    GUNSHIPS_SOURCE_AFTER,
+GUNSHIPS_RELEASE_SOURCE = (
+    r"C:\GM15\design\sheets\release\Gunships护山神兽.xlsx"
 )
+_GUNSHIPS_TARGET_REVISION = 36737
+_GUNSHIPS_REVISIONS = (_GUNSHIPS_TARGET_REVISION, 37347, 37348)
+_GUNSHIPS_REVISION_SHA256 = {
+    36737: "b2d4ecc4abdd34a48d734453bf1b9491a45fdc0b9afe27cf7667ee4e5cc500ac",
+    37347: "a400769abefabfb1d93b79ca44a955501f247b71615ed0bce53d0079c4e80293",
+    37348: "a165cbd2f890f64bcdccc5dceea98ccc5ff8abced94735b51971e9b9492030de",
+}
 
 
 def _require_real_inputs() -> None:
-    missing = [path for path in REAL_INPUTS if not os.path.isfile(path)]
+    required = (GUNSHIPS_TARGET, GUNSHIPS_RELEASE_SOURCE)
+    missing = [path for path in required if not os.path.isfile(path)]
     assert not missing, f"real Gunships r37348 fixture unavailable: {missing}"
+    for path in required:
+        stat_result = os.lstat(path)
+        assert not os.path.islink(path), path
+        assert not (
+            getattr(stat_result, "st_file_attributes", 0) & 0x400
+        ), f"real Gunships fixture must not be a reparse point: {path}"
+
+
+def _remaining_seconds(deadline: float, stage: str) -> float:
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"90-second Gunships deadline expired during {stage}")
+    return remaining
+
+
+def _export_gunships_revision(
+    revision: int,
+    destination: str,
+    *,
+    deadline: float,
+) -> None:
+    assert revision in _GUNSHIPS_REVISIONS, revision
+    assert not os.path.lexists(destination), destination
+    source_path = (
+        GUNSHIPS_TARGET
+        if revision == _GUNSHIPS_TARGET_REVISION
+        else GUNSHIPS_RELEASE_SOURCE
+    )
+    executable = smt._find_tortoise_proc_exe()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    process = subprocess.Popen(
+        [
+            executable,
+            "/command:cat",
+            f"/path:{source_path}",
+            f"/revision:{revision}",
+            f"/savepath:{destination}",
+            "/closeonend:1",
+        ],
+        creationflags=creationflags,
+    )
+    try:
+        process.wait(timeout=_remaining_seconds(deadline, f"r{revision} export"))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise TimeoutError(f"TortoiseSVN export timed out for r{revision}")
+    assert process.returncode == 0, (revision, process.returncode)
+    assert smt._wait_for_complete_workbook(
+        destination,
+        timeout_seconds=_remaining_seconds(deadline, f"r{revision} package completion"),
+    ), destination
+    stat_result = os.lstat(destination)
+    assert os.path.isfile(destination) and not os.path.islink(destination), destination
+    assert not (
+        getattr(stat_result, "st_file_attributes", 0) & 0x400
+    ), f"revision export must not be a reparse point: {destination}"
+    assert _sha256(destination) == _GUNSHIPS_REVISION_SHA256[revision], (
+        revision,
+        destination,
+        _sha256(destination),
+    )
+
+
+@contextmanager
+def _owned_real_inputs(*, absolute_deadline: float | None = None):
+    _require_real_inputs()
+    deadline = (
+        float(absolute_deadline)
+        if absolute_deadline is not None
+        else time.monotonic() + 90.0
+    )
+    target_sha = _sha256(GUNSHIPS_TARGET)
+    source_sha = _sha256(GUNSHIPS_RELEASE_SOURCE)
+    root = tempfile.mkdtemp(prefix="sow_section10_gunships_")
+    target = os.path.join(root, os.path.basename(GUNSHIPS_TARGET))
+    base = os.path.join(root, os.path.basename(GUNSHIPS_SOURCE_BEFORE))
+    theirs = os.path.join(root, os.path.basename(GUNSHIPS_SOURCE_AFTER))
+    primary = None
+    export_hashes = None
+    try:
+        _export_gunships_revision(_GUNSHIPS_TARGET_REVISION, target, deadline=deadline)
+        _export_gunships_revision(37347, base, deadline=deadline)
+        _export_gunships_revision(37348, theirs, deadline=deadline)
+        export_hashes = {
+            target: _sha256(target),
+            base: _sha256(base),
+            theirs: _sha256(theirs),
+        }
+        assert len(set(export_hashes.values())) == 3, export_hashes
+        yield target, base, theirs, deadline
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup_errors = []
+        try:
+            assert _sha256(GUNSHIPS_TARGET) == target_sha
+            assert _sha256(GUNSHIPS_RELEASE_SOURCE) == source_sha
+            if export_hashes is not None:
+                assert {path: _sha256(path) for path in export_hashes} == export_hashes
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            shutil.rmtree(root)
+            assert not os.path.lexists(root), root
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            if primary is not None:
+                for exc in cleanup_errors:
+                    primary.add_note(f"Gunships fixture cleanup failure: {exc!r}")
+            else:
+                raise AssertionError(
+                    f"Gunships fixture cleanup failed: {cleanup_errors!r}"
+                )
 
 
 def _all_column_buttons(view):
@@ -229,64 +355,142 @@ def _assert_split_and_diff_children_visible(view) -> None:
 
 
 @contextmanager
-def _real_gunships_app():
-    _require_real_inputs()
-    hashes_before = {path: _sha256(path) for path in REAL_INPUTS}
-    context = smt.build_merge_launch_context(
-        GUNSHIPS_SOURCE_BEFORE,
-        GUNSHIPS_TARGET,
-        GUNSHIPS_SOURCE_AFTER,
-        GUNSHIPS_TARGET,
-    )
-    analysis = smt.run_startup_merge_analysis(context)
-    candidate_path = analysis.outcome.candidate_path
-    app = None
-    try:
-        with _quiet_dialogs():
-            app = _construct_app(
-                GUNSHIPS_TARGET,
-                GUNSHIPS_SOURCE_AFTER,
-                base=GUNSHIPS_SOURCE_BEFORE,
-                merged=GUNSHIPS_TARGET,
-                context=context,
-                outcome=analysis.outcome,
-                conflict_map=analysis.conflict_cells_by_sheet,
+def _real_gunships_app(*, absolute_deadline: float | None = None):
+    with _owned_real_inputs(absolute_deadline=absolute_deadline) as (
+        target,
+        base,
+        theirs,
+        deadline,
+    ):
+        ledger: set[str] = set()
+        app = None
+        primary = None
+        try:
+            _remaining_seconds(deadline, "startup analysis")
+            context = smt.build_merge_launch_context(base, target, theirs, target)
+            base_identity = context.identity_for("base")
+            mine_identity = context.identity_for("mine")
+            theirs_identity = context.identity_for("theirs")
+            assert (
+                base_identity is not None
+                and mine_identity is not None
+                and theirs_identity is not None
             )
-            app.nb.select(app._sheet_containers[GUNSHIPS_SHEET])
-            _wait_until(
-                app.root,
-                lambda: (
-                    app.sheet_views.get(GUNSHIPS_SHEET) is not None
-                    and bool(
-                        getattr(
-                            app.sheet_views[GUNSHIPS_SHEET],
-                            "_data_ready",
-                            False,
+            base_identity.repository_identity = "sheets/release/Gunships护山神兽.xlsx"
+            base_identity.revision = 37347
+            mine_identity.repository_identity = "sheets/develop/Gunships护山神兽.xlsx"
+            mine_identity.revision = _GUNSHIPS_TARGET_REVISION
+            theirs_identity.repository_identity = "sheets/release/Gunships护山神兽.xlsx"
+            theirs_identity.revision = 37348
+            analysis = smt.run_startup_merge_analysis(
+                context,
+                owned_startup_paths=ledger,
+            )
+            _remaining_seconds(deadline, "app construction")
+            with _quiet_dialogs():
+                app = _construct_app(
+                    target,
+                    theirs,
+                    base=base,
+                    merged=target,
+                    context=context,
+                    outcome=analysis.outcome,
+                    conflict_map=analysis.conflict_cells_by_sheet,
+                    startup_owned_paths=ledger,
+                    startup_inputs_prepared=True,
+                    initial_sheet=GUNSHIPS_SHEET,
+                )
+                assert app._owned_startup_temp_paths is ledger
+                app.nb.select(app._sheet_containers[GUNSHIPS_SHEET])
+                _wait_until(
+                    app.root,
+                    lambda: (
+                        app.sheet_views.get(GUNSHIPS_SHEET) is not None
+                        and app.selected_sheet == GUNSHIPS_SHEET
+                        and app.nb.tab(app.nb.select(), "text") == GUNSHIPS_SHEET
+                        and app._is_sheet_exact_current(GUNSHIPS_SHEET)
+                        and bool(
+                            app._sheet_exact_entry(GUNSHIPS_SHEET).get(
+                                "full_detail_terminal",
+                                False,
+                            )
                         )
+                        and bool(
+                            getattr(
+                                app.sheet_views[GUNSHIPS_SHEET],
+                                "_data_ready",
+                                False,
+                            )
+                        )
+                        and app.sheet_views[
+                            GUNSHIPS_SHEET
+                        ]._derive_lifecycle_state()
+                        == "EDIT_DEFERRED"
+                        and not app._edit_workbooks_ready()
+                        and bool(
+                            getattr(
+                                app.sheet_views[GUNSHIPS_SHEET],
+                                "_prepared_complete",
+                                False,
+                            )
+                        )
+                        and not bool(
+                            getattr(
+                                app.sheet_views[GUNSHIPS_SHEET],
+                                "_pending_exact_render",
+                                False,
+                            )
+                        )
+                        and app.sheet_views[
+                            GUNSHIPS_SHEET
+                        ].selected_column_logical_range
+                        == (14, 14)
+                    ),
+                    "real GunshipsModify did not reach full exact EDIT_DEFERRED at automatic L14",
+                    timeout=_remaining_seconds(deadline, "full exact EDIT_DEFERRED at L14"),
+                )
+                yield app, app.sheet_views[GUNSHIPS_SHEET], analysis
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            cleanup_errors = []
+            try:
+                expected_owned = {
+                    os.path.normcase(os.path.abspath(path)) for path in ledger
+                }
+                if app is not None:
+                    app._shutdown_root()
+                    cleanup_evidence = tuple(app._owned_startup_temp_cleanup_evidence)
+                elif ledger:
+                    cleanup_evidence = smt._cleanup_unclaimed_startup_temp_paths(
+                        ledger,
+                        reason="real Gunships app construction failed",
                     )
-                    and app.sheet_views[
-                        GUNSHIPS_SHEET
-                    ]._derive_lifecycle_state()
-                    == "READY"
-                    and app.sheet_views[
-                        GUNSHIPS_SHEET
-                    ].selected_column_logical_range
-                    == (14, 14)
-                ),
-                "real GunshipsModify did not reach READY at automatic L14",
-                timeout=120.0,
-            )
-            yield app, app.sheet_views[GUNSHIPS_SHEET], analysis
-    finally:
-        if app is not None:
-            app._shutdown_root()
-        if (
-            candidate_path
-            and candidate_path not in REAL_INPUTS
-            and os.path.isfile(candidate_path)
-        ):
-            os.remove(candidate_path)
-        assert {path: _sha256(path) for path in REAL_INPUTS} == hashes_before
+                else:
+                    cleanup_evidence = ()
+                assert not ledger, ledger
+                assert {item.get("path") for item in cleanup_evidence} == expected_owned
+                assert all(
+                    item.get("removed") is True
+                    and item.get("exists_after") is False
+                    and not item.get("error")
+                    for item in cleanup_evidence
+                ), cleanup_evidence
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if primary is None and not cleanup_errors and time.monotonic() > deadline:
+                cleanup_errors.append(
+                    TimeoutError("90-second Gunships deadline expired after final cleanup")
+                )
+            if cleanup_errors:
+                if primary is not None:
+                    for exc in cleanup_errors:
+                        primary.add_note(f"Gunships app cleanup failure: {exc!r}")
+                else:
+                    raise AssertionError(
+                        f"Gunships app cleanup failed: {cleanup_errors!r}"
+                    )
 
 
 def test_column_buttons_win_over_long_status_at_1450_and_narrow_width() -> None:
@@ -404,19 +608,24 @@ def _release_wc_revision_and_author() -> tuple[int, str | None]:
 
 
 def test_real_gunships_authors_survive_release_wc_advancing_past_r37348() -> None:
-    _require_real_inputs()
-    hashes_before = {path: _sha256(path) for path in REAL_INPUTS}
-    try:
+    with _owned_real_inputs() as (target, base, theirs, deadline):
         release_revision, _release_author = _release_wc_revision_and_author()
         assert release_revision > 37348, release_revision
 
         context = smt.build_merge_launch_context(
-            GUNSHIPS_SOURCE_BEFORE,
-            GUNSHIPS_TARGET,
-            GUNSHIPS_SOURCE_AFTER,
-            GUNSHIPS_TARGET,
+            base,
+            target,
+            theirs,
+            target,
         )
-        smt.resolve_cross_branch_source_metadata(context)
+        base_identity = context.identity_for("base")
+        theirs_identity = context.identity_for("theirs")
+        assert base_identity is not None and theirs_identity is not None
+        base_identity.repository_identity = "sheets/release/Gunships护山神兽.xlsx"
+        base_identity.revision = 37347
+        theirs_identity.repository_identity = "sheets/release/Gunships护山神兽.xlsx"
+        theirs_identity.revision = 37348
+        _remaining_seconds(deadline, "author metadata")
         identities = smt.resolve_svn_author_metadata(context)
         source_before = identities["base"]
         source_after = identities["theirs"]
@@ -433,8 +642,6 @@ def test_real_gunships_authors_survive_release_wc_advancing_past_r37348() -> Non
         assert source_after.author_source.startswith(
             ("tortoise-svn-revprop-author:", "svn-author-memory-cache:")
         ), source_after.author_source
-    finally:
-        assert {path: _sha256(path) for path in REAL_INPUTS} == hashes_before
 
 
 def main() -> None:

@@ -1,382 +1,616 @@
-"""GUI self-test: C-area hover tooltip shows full cell content.
+"""B3 GUI regression: current exact C-area hover is snapshot-only and deduplicated."""
 
-Validates:
-- 2-way mode: tooltip contains A/B full text lines.
-- 3-way mode: tooltip contains BASE/A/B full text lines.
-- real hover event path updates fixed hover-compare panel content.
-- hover panel persists after leave and supports pin/clear + shift-wheel horizontal scroll.
-"""
-
+import argparse
+from contextlib import contextmanager
+import hashlib
+import json
 import os
+import tempfile
+import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from openpyxl import Workbook
 
-import sow_merge_tool as mod
-from _test_temp_utils import make_temp_dir
+import sow_merge_tool as sm
 
 
-def _make_xlsx(path: str, rows):
+_CASES = ("two-way", "three-way")
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_snapshot(path: Path) -> tuple[bool, bytes | None]:
+    return (True, path.read_bytes()) if path.exists() else (False, None)
+
+
+def _canonical(value):
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                ((_canonical(key), _canonical(item)) for key, item in value.items()),
+                key=repr,
+            )
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
+        values = tuple(_canonical(item) for item in value)
+        return tuple(sorted(values, key=repr)) if isinstance(value, (set, frozenset)) else values
+    return repr(value)
+
+
+def _fingerprint(value) -> str:
+    return hashlib.sha256(repr(_canonical(value)).encode("utf-8")).hexdigest()
+
+
+def _hard_mutation_snapshot(app, view, sheet: str, input_paths) -> dict:
+    overlays = getattr(app, "sheet_operation_overlays", {}) or {}
+    overlay = overlays.get(sheet)
+    edit_handles = tuple(
+        (
+            name,
+            id(getattr(app, name, None)),
+            type(getattr(app, name, None)).__name__,
+            getattr(getattr(app, name, None), "read_only", None),
+        )
+        for name in ("_wb_a_edit", "_wb_b_edit", "_wb_base_edit")
+    )
+    return {
+        "input_hashes": tuple(sorted((name, _sha256(path)) for name, path in input_paths.items())),
+        "manual": _fingerprint(
+            {
+                name: getattr(app, name, None)
+                for name in (
+                    "manual_a_cell_ops", "manual_b_cell_ops",
+                    "manual_a_formula_cache_ops", "manual_b_formula_cache_ops",
+                    "manual_a_row_ops", "manual_b_row_ops",
+                    "manual_a_column_ops", "manual_b_column_ops",
+                    "manual_sheet_ops", "auto_sheet_ops",
+                )
+            }
+        ),
+        "undo_redo": _fingerprint((getattr(app, "undo_stack", ()), getattr(app, "redo_stack", ()))),
+        "modified": _canonical(
+            (
+                getattr(app, "modified_a", None), getattr(app, "modified_b", None),
+                getattr(app, "modified_sheets_a", None), getattr(app, "modified_sheets_b", None),
+                getattr(app, "user_touched_conflicts", None), getattr(view, "touched_rows", None),
+            )
+        ),
+        "overlay": _fingerprint(
+            {
+                name: (
+                    getattr(item, "topology_generation", None),
+                    getattr(item, "mutation_generation", None),
+                    getattr(item, "cells", None),
+                )
+                for name, item in overlays.items()
+            }
+        ),
+        "prepared": _fingerprint(
+            {
+                "raw_a": getattr(view, "pair_raw_parts_a", None),
+                "raw_b": getattr(view, "pair_raw_parts_b", None),
+                "raw_base": getattr(view, "pair_raw_parts_base", None),
+                "row_pairs": getattr(view, "row_pairs", None),
+                "maps": (
+                    getattr(view, "row_a_to_pair_idx", None),
+                    getattr(view, "row_b_to_pair_idx", None),
+                    getattr(view, "mine_to_base_row", None),
+                    getattr(view, "theirs_to_base_row", None),
+                    getattr(view, "pair_base_row_override", None),
+                ),
+                "diffs": (
+                    getattr(view, "pair_diff_cols", None),
+                    getattr(view, "pair_base_diff_cols", None),
+                ),
+            }
+        ),
+        "generations": (
+            getattr(app, "_sheet_compute_generation", {}).get(sheet),
+            getattr(view, "_row_model_version", None),
+            getattr(view, "_column_model_version", None),
+            getattr(view, "_row_model_exact", None),
+            getattr(view, "_column_projection_generation", None),
+            getattr(view, "_virtual_column_window_generation", None),
+            getattr(overlay, "topology_generation", None),
+            getattr(overlay, "mutation_generation", None),
+        ),
+        "edit_handles": edit_handles,
+    }
+
+
+def _render_cache_version(view) -> int:
+    return int(getattr(view, "_data_version", -1))
+
+
+def _snapshot_value_summary(value) -> dict:
+    canonical = _canonical(value)
+    preview = repr(canonical)
+    try:
+        length = len(value)
+    except Exception:
+        length = None
+    return {
+        "type": type(value).__name__,
+        "len": length,
+        "hash": _fingerprint(value),
+        "preview": preview[:240] + ("..." if len(preview) > 240 else ""),
+    }
+
+
+def _recursive_field_diffs(before, after, path: str = "hard") -> list[dict]:
+    if before == after:
+        return []
+    if isinstance(before, dict) and isinstance(after, dict):
+        diffs = []
+        keys = sorted(set(before) | set(after), key=repr)
+        for key in keys:
+            child_path = f"{path}[{key!r}]"
+            if key not in before or key not in after:
+                diffs.append(
+                    {
+                        "path": child_path,
+                        "before": _snapshot_value_summary(before.get(key)),
+                        "after": _snapshot_value_summary(after.get(key)),
+                    }
+                )
+            else:
+                diffs.extend(_recursive_field_diffs(before[key], after[key], child_path))
+        return diffs
+    if isinstance(before, (tuple, list)) and isinstance(after, (tuple, list)):
+        diffs = []
+        if len(before) != len(after):
+            diffs.append(
+                {
+                    "path": f"{path}.len",
+                    "before": _snapshot_value_summary(before),
+                    "after": _snapshot_value_summary(after),
+                }
+            )
+        for index, (left, right) in enumerate(zip(before, after)):
+            diffs.extend(_recursive_field_diffs(left, right, f"{path}[{index}]"))
+        return diffs
+    return [
+        {
+            "path": path,
+            "before": _snapshot_value_summary(before),
+            "after": _snapshot_value_summary(after),
+        }
+    ]
+
+
+def _assert_hard_mutation_unchanged(before, after, *, action: str) -> None:
+    diffs = _recursive_field_diffs(before, after)
+    assert not diffs, f"{action}: forbidden hard mutation drift: {json.dumps(diffs, ensure_ascii=False, sort_keys=True)}"
+
+
+def _make_book(path: str, *, side: str) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "S"
-    for r_idx, row in enumerate(rows, start=1):
-        for c_idx, v in enumerate(row, start=1):
-            ws.cell(row=r_idx, column=c_idx).value = v
+    ws.append(["id@id", "value"])
+    ws.append(["int32", "string"])
+    long_value = f"{side}_FULL_" + (side.lower()[0] * 90)
+    ws.append([1, long_value])
+    ws.append([2, f"{side}_NEXT_" + (side.lower()[-1] * 20)])
     wb.save(path)
     wb.close()
 
 
-def _ensure_view(app: mod.SowMergeApp):
-    sheet = app.common_sheets[0]
-    view = app.sheet_views.get(sheet)
-    if view is None:
-        app.nb.select(app._sheet_containers[sheet])
+def _pump(app, deadline: float) -> None:
+    while time.monotonic() < deadline:
         app.root.update_idletasks()
         app.root.update()
-        view = app.sheet_views[sheet]
-    return view
+        time.sleep(0.005)
 
 
-def _c_tooltip_text_by_col(view, c_line: int, col: int) -> str:
+def _wait(app, predicate, *, deadline: float, stage: str) -> None:
+    while time.monotonic() < deadline:
+        _pump(app, min(deadline, time.monotonic() + 0.05))
+        if predicate():
+            return
+        view = app.sheet_views.get("S")
+        if view is not None and view._derive_lifecycle_state() in {
+            "FAILED",
+            "UNRESOLVED",
+            "CANCELED",
+            "CLOSING",
+        }:
+            raise AssertionError(
+                f"{stage} failed: {view._derive_lifecycle_state()} "
+                f"{getattr(view, '_lifecycle_error', None)!r}"
+            )
+    raise AssertionError(
+        f"timeout {stage}: {app._sheet_exact_entry('S')!r}"
+    )
+
+
+def _shutdown(app) -> None:
+    if app is None:
+        return
+    for view in tuple(getattr(app, "sheet_views", {}).values()):
+        if view is None:
+            continue
+        for attr in ("_settings_save_id", "_hover_debounce_id"):
+            after_id = getattr(view, attr, None)
+            if after_id:
+                try:
+                    view.frame.after_cancel(after_id)
+                finally:
+                    setattr(view, attr, None)
+    app._shutdown_root()
+
+
+@contextmanager
+def _forbid_view_only_access(app, view):
+    hits = []
+    originals = []
+
+    def _forbidden(label):
+        def _raise(*_args, **_kwargs):
+            hits.append(label)
+            raise AssertionError(f"hover route accessed {label}")
+
+        return _raise
+
+    targets = (
+        (app, "ws_a_val"),
+        (app, "ws_b_val"),
+        (app, "ws_base_val"),
+        (app, "ws_a_edit"),
+        (app, "ws_b_edit"),
+        (app, "ws_base_edit"),
+        (app, "_request_edit_preload"),
+        (app, "_ensure_edit_loaded"),
+        (app, "_load_edit_workbooks_owned"),
+        (app, "_atomic_save"),
+        (app, "_atomic_save_with_retry"),
+        (app, "_atomic_replace_file_with_retry"),
+        (app, "_try_alt_save"),
+        (sm, "_atomic_save_wb"),
+        (app, "build_manual_b_output_file"),
+        (app, "save_a_inplace"),
+        (app, "save_b_inplace"),
+        (app, "save_merged_and_exit"),
+        (view, "_run_copy_action_by_mode"),
+        (view, "_apply_global_sheet_overwrite"),
+        (view, "_apply_selected_column_block"),
+    )
+    try:
+        for owner, name in targets:
+            if hasattr(owner, name):
+                originals.append((owner, name, getattr(owner, name)))
+                setattr(owner, name, _forbidden(f"{type(owner).__name__}.{name}"))
+        yield hits
+    finally:
+        for owner, name, original in reversed(originals):
+            setattr(owner, name, original)
+
+
+def _event_for_logical_cell(widget, view, line: int, logical_col: int):
     spans = view._spans_for_line()
-    assert col in spans, f"Column {col} not found in spans: {spans}"
-    s, e = spans[col]
-    char_pos = s + 1 if (e - s) > 1 else s
-    payload = view._cursor_cmp_tooltip_payload(char_pos)
-    assert payload is not None, f"Expected tooltip payload for c_line={c_line}, col={col}, span=({s},{e})"
-    txt, _key = payload
-    return str(txt)
-
-
-def _main_tooltip_text_by_col(view, line_no: int, col: int) -> str:
-    pair_idx = view._pair_idx_for_line(line_no)
-    assert pair_idx is not None, f"Expected pair for line {line_no}"
-    payload = view._cmp_tooltip_payload_by_pair_col(pair_idx, col)
-    assert payload is not None, f"Expected main tooltip payload for line={line_no}, col={col}"
-    txt, _key = payload
-    return str(txt)
+    assert logical_col in spans, (logical_col, spans)
+    start, end = spans[logical_col]
+    char = start + 1 if end - start > 1 else start
+    index = f"{line}.{max(0, int(char))}"
+    widget.see(index)
+    widget.update_idletasks()
+    widget.update()
+    bbox = widget.bbox(index)
+    assert bbox is not None, (index, widget.index("@0,0"))
+    x, y, width, height = bbox
+    event = SimpleNamespace(
+        x=int(x + max(1, width // 2)),
+        y=int(y + max(1, height // 2)),
+        x_root=int(widget.winfo_rootx() + x + max(1, width // 2)),
+        y_root=int(widget.winfo_rooty() + y + max(1, height // 2)),
+    )
+    target_line, target_col = map(int, str(widget.index(f"@{event.x},{event.y}")).split("."))
+    assert target_line == int(line), (target_line, line)
+    assert start <= target_col < max(end, start + 1), (target_col, start, end)
+    return event
 
 
 def _panel_text(view) -> str:
+    return str(view.hover_cmp_text.get("1.0", "end-1c"))
+
+
+@contextmanager
+def _observe_cached_only_diff_publisher(app, view):
+    """Record real cache-only publications while delegating to production."""
+    calls = []
+    original = view._publish_prepared_cache_surface
+
+    def _state():
+        entry = dict(app._sheet_exact_entry(view.sheet) or {})
+        return {
+            "sheet": str(view.sheet),
+            "selected_sheet": str(getattr(app, "selected_sheet", "") or ""),
+            "compute_generation": int(
+                (getattr(app, "_sheet_compute_generation", {}) or {}).get(view.sheet, -1)
+            ),
+            "exact_generation": int(entry.get("generation", -1)),
+            "exact_state": str(entry.get("state") or ""),
+            "mode_switch_seq": int(getattr(view, "_mode_switch_seq", -1)),
+            "mode_switch_requested": getattr(view, "_mode_switch_requested_value", None),
+            "mode_switch_pending": bool(getattr(view, "_mode_switch_pending", False)),
+            "only_diff_build_seq": int(getattr(view, "_only_diff_async_build_seq", -1)),
+            "only_diff_building": bool(getattr(view, "_only_diff_async_building", False)),
+        }
+
+    def _wrapped(*args, **kwargs):
+        rows = tuple(int(pair_idx) for pair_idx in (kwargs.get("prepared_rows") or ()))
+        record = {
+            "before": _state(),
+            "prepared_rows": rows,
+            "prepared_rows_digest": _fingerprint(rows),
+        }
+        calls.append(record)
+        try:
+            result = original(*args, **kwargs)
+        except Exception as exc:
+            record["exception"] = f"{type(exc).__name__}: {exc}"
+            record["after"] = _state()
+            raise
+        record["result"] = result
+        record["after"] = _state()
+        return result
+
+    view._publish_prepared_cache_surface = _wrapped
     try:
-        return str(view.hover_cmp_text.get("1.0", "end-1c"))
-    except Exception:
-        return ""
+        yield calls
+    finally:
+        view._publish_prepared_cache_surface = original
 
 
-def _panel_title(view) -> str:
+def _assert_single_cached_publication(
+    calls,
+    *,
+    app,
+    view,
+    action: str,
+    expected_rows,
+    requested_value: int,
+    expected_mode_switch_seq: int,
+    expected_compute_generation: int,
+    expected_exact_generation: int,
+    expected_async_build_seq: int | None = None,
+) -> None:
+    assert len(calls) == 1, (action, calls)
+    call = calls[0]
+    before = dict(call.get("before") or {})
+    rows = tuple(int(pair_idx) for pair_idx in (expected_rows or ()))
+    assert call.get("result") is True, (action, call)
+    assert tuple(call.get("prepared_rows") or ()) == rows, (action, call, rows)
+    assert call.get("prepared_rows_digest") == _fingerprint(rows), (action, call, rows)
+    assert before["sheet"] == str(view.sheet), (action, before)
+    assert before["selected_sheet"] == str(view.sheet), (action, before)
+    assert before["compute_generation"] == int(expected_compute_generation), (action, before)
+    assert before["exact_generation"] == int(expected_exact_generation), (action, before)
+    assert before["mode_switch_seq"] == int(expected_mode_switch_seq), (action, before)
+    assert before["mode_switch_requested"] == int(requested_value), (action, before)
+    assert before["mode_switch_pending"] is True, (action, before)
+    if expected_async_build_seq is not None:
+        assert int(before["only_diff_build_seq"]) == int(expected_async_build_seq), (
+            action, before, expected_async_build_seq
+        )
+        assert not bool(before["only_diff_building"]), (action, before)
+
+
+def _run_case(case_name: str) -> None:
+    original_settings_path = sm._SETTINGS_PATH
+    user_settings = Path(original_settings_path)
+    user_settings_before = _path_snapshot(user_settings)
+    environment_before = {
+        key: value for key, value in os.environ.items() if key.startswith("SOW_")
+    }
+    app = None
+    root_path = None
     try:
-        return str(view.hover_cmp_title_var.get())
-    except Exception:
-        return ""
+        with tempfile.TemporaryDirectory(prefix=f"sow_c_hover_{case_name}_") as root:
+            root_path = Path(root)
+            mine = str(root_path / "mine.xlsx")
+            theirs = str(root_path / "theirs.xlsx")
+            base = str(root_path / "base.xlsx")
+            _make_book(mine, side="MINE")
+            _make_book(theirs, side="THEIRS")
+            input_paths = {"mine": mine, "theirs": theirs}
+            if case_name == "three-way":
+                _make_book(base, side="BASE")
+                input_paths["base"] = base
+            input_hashes = {name: _sha256(path) for name, path in input_paths.items()}
+            settings_path = root_path / "settings.json"
+            settings_path.write_text(json.dumps({"only_diff": 0}), encoding="utf-8")
+            sm._SETTINGS_PATH = str(settings_path)
+            deadline = time.monotonic() + 90.0
+            print(f"C_HOVER_STAGE open-current-exact mode={case_name}", flush=True)
+            if case_name == "three-way":
+                app = sm.SowMergeApp(
+                    mine,
+                    theirs,
+                    merge_mode=True,
+                    base_path=base,
+                    initial_sheet="S",
+                )
+            else:
+                app = sm.SowMergeApp(mine, theirs, initial_sheet="S")
+            view = app.sheet_views["S"]
+            _wait(
+                app,
+                lambda: (
+                    app._is_sheet_exact_current("S")
+                    and bool(app._sheet_exact_entry("S").get("full_detail_terminal"))
+                    and bool(view._prepared_complete)
+                    and bool(view._data_ready)
+                    and not bool(view._pending_exact_render)
+                ),
+                deadline=deadline,
+                stage="selected exact prepared surface",
+            )
+            assert not bool(view.only_diff_var.get())
+            assert view._is_exact_immutable_view_ready()
+            pair_idx = view.row_a_to_pair_idx.get(3)
+            next_pair_idx = view.row_a_to_pair_idx.get(4)
+            assert pair_idx is not None and next_pair_idx is not None
+            line = view.row_to_line.get(pair_idx)
+            next_line = view.row_to_line.get(next_pair_idx)
+            assert line is not None and next_line is not None
+            widget = view.base if case_name == "three-way" else view.left
+            side = "BASE" if case_name == "three-way" else "A"
+            event = _event_for_logical_cell(widget, view, line, 2)
+            next_event = _event_for_logical_cell(widget, view, next_line, 2)
+
+            payload_calls = 0
+            c_area_renders = 0
+            original_payload = view._cmp_tooltip_payload_by_pair_col
+            original_update_cursor = view._update_cursor_lines
+
+            def _count_payload(*args, **kwargs):
+                nonlocal payload_calls
+                payload_calls += 1
+                return original_payload(*args, **kwargs)
+
+            def _count_c_area_render(*args, **kwargs):
+                nonlocal c_area_renders
+                c_area_renders += 1
+                return original_update_cursor(*args, **kwargs)
+
+            view._cmp_tooltip_payload_by_pair_col = _count_payload
+            view._update_cursor_lines = _count_c_area_render
+            hard_before_hover = _hard_mutation_snapshot(app, view, "S", input_paths)
+            render_before_hover = _render_cache_version(view)
+            try:
+                print(f"C_HOVER_STAGE bound-main-hover mode={case_name}", flush=True)
+                with _forbid_view_only_access(app, view) as hits, _observe_cached_only_diff_publisher(app, view) as hover_publications:
+                    # The widget binding is the production lambda route; do not
+                    # call the handler directly in this regression.
+                    widget.event_generate("<Motion>", x=event.x, y=event.y)
+                    _wait(
+                        app,
+                        lambda: bool(_panel_text(view)) and view.hover_pair_idx == pair_idx,
+                        deadline=deadline,
+                        stage="first bound hover panel",
+                    )
+                    _pump(app, min(deadline, time.monotonic() + 0.05))
+                    _assert_hard_mutation_unchanged(
+                        hard_before_hover,
+                        _hard_mutation_snapshot(app, view, "S", input_paths),
+                        action="bound hover event",
+                    )
+                    assert _render_cache_version(view) == render_before_hover
+                    first_panel = _panel_text(view)
+                    first_c_key = getattr(view, "_c_area_last_render_key", None)
+                    widget.event_generate("<Motion>", x=event.x, y=event.y)
+                    _pump(app, min(deadline, time.monotonic() + 0.05))
+                    _assert_hard_mutation_unchanged(
+                        hard_before_hover,
+                        _hard_mutation_snapshot(app, view, "S", input_paths),
+                        action="bound hover event",
+                    )
+                    assert _render_cache_version(view) == render_before_hover
+                    assert payload_calls == 1 and c_area_renders == 1
+                    assert getattr(view, "_c_area_last_render_key", None) == first_c_key
+                    widget.event_generate("<Leave>")
+                    _pump(app, min(deadline, time.monotonic() + 0.05))
+                    _assert_hard_mutation_unchanged(
+                        hard_before_hover,
+                        _hard_mutation_snapshot(app, view, "S", input_paths),
+                        action="bound hover event",
+                    )
+                    assert _render_cache_version(view) == render_before_hover
+                    assert _panel_text(view) == first_panel
+                    widget.event_generate("<Motion>", x=next_event.x, y=next_event.y)
+                    _wait(
+                        app,
+                        lambda: (
+                            payload_calls == 2
+                            and c_area_renders == 2
+                            and view.hover_pair_idx == next_pair_idx
+                        ),
+                        deadline=deadline,
+                        stage="new-row bound hover panel",
+                    )
+                    _pump(app, min(deadline, time.monotonic() + 0.05))
+                    _assert_hard_mutation_unchanged(
+                        hard_before_hover,
+                        _hard_mutation_snapshot(app, view, "S", input_paths),
+                        action="bound hover event",
+                    )
+                    assert _render_cache_version(view) == render_before_hover
+                assert not hits, hits
+                assert hover_publications == [], hover_publications
+                _assert_hard_mutation_unchanged(
+                    hard_before_hover,
+                    _hard_mutation_snapshot(app, view, "S", input_paths),
+                    action="bound hover sequence",
+                )
+                assert _render_cache_version(view) == render_before_hover
+            finally:
+                view._cmp_tooltip_payload_by_pair_col = original_payload
+                view._update_cursor_lines = original_update_cursor
+
+            assert payload_calls == 2, payload_calls
+            assert c_area_renders == 2, c_area_renders
+            assert "MINE_FULL_" in first_panel and "THEIRS_FULL_" in first_panel, first_panel
+            if case_name == "three-way":
+                assert "BASE_FULL_" in first_panel, first_panel
+                assert view._is_three_way_enabled()
+                assert bool(view._base_diff_full_exact)
+            else:
+                assert "BASE_FULL_" not in first_panel, first_panel
+            assert view.hover_pair_idx == next_pair_idx and int(view.hover_col_idx) == 2
+            assert {name: _sha256(path) for name, path in input_paths.items()} == input_hashes
+            assert not app._edit_workbooks_ready()
+            environment_after = {
+                key: value for key, value in os.environ.items() if key.startswith("SOW_")
+            }
+            assert environment_after == environment_before
+            assert time.monotonic() <= deadline
+            print(
+                "GUI_SELF_TEST_C_HOVER_TOOLTIP_OK "
+                + json.dumps(
+                    {
+                        "case": case_name,
+                        "deadline_seconds": 90,
+                        "payload_calls": payload_calls,
+                        "c_area_render_calls": c_area_renders,
+                        "input_hashes": input_hashes,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+    finally:
+        _shutdown(app)
+        sm._SETTINGS_PATH = original_settings_path
+        assert _path_snapshot(user_settings) == user_settings_before
+        if root_path is not None:
+            assert not root_path.exists(), root_path
 
 
-def _has_tag(view, tag_name: str) -> bool:
-    try:
-        return len(view.hover_cmp_text.tag_ranges(tag_name)) >= 2
-    except Exception:
-        return False
-
-
-def _motion_event_for_cell(text_widget, line_no: int, char_pos: int):
-    index = f"{line_no}.{max(0, int(char_pos))}"
-    # The Sheet-wide fixed-width model can place later logical columns outside
-    # the initial viewport. Drive the same visibility step a user would get
-    # from horizontal navigation before asking Tk for viewport coordinates.
-    text_widget.see(index)
-    text_widget.update_idletasks()
-    text_widget.update()
-    box = text_widget.bbox(index)
-    assert box is not None, f"bbox is None for line={line_no}, char={char_pos}"
-    x, y, w, h = box
-    px = int(x + max(1, w // 2))
-    py = int(y + max(1, h // 2))
-    return SimpleNamespace(
-        x=px,
-        y=py,
-        x_root=int(text_widget.winfo_rootx() + px),
-        y_root=int(text_widget.winfo_rooty() + py),
-    )
-
-
-def _drive_main_hover(view, line_no: int, col: int, side: str = "A"):
-    spans = view._spans_for_line()
-    assert col in spans, f"Column {col} not found in spans: {spans}"
-    s, e = spans[col]
-    char_pos = s + 1 if (e - s) > 1 else s
-    widget = view.left if side == "A" else (view.base if side == "BASE" else view.right)
-    ev = _motion_event_for_cell(widget, line_no=line_no, char_pos=char_pos)
-    view._on_cell_hover_tooltip(widget, ev, side)
-    view.app.root.update_idletasks()
-    view.app.root.update()
-
-
-def _drive_c_hover(view, line_no: int, col: int):
-    spans = view._spans_for_line()
-    assert col in spans, f"Column {col} not found in spans: {spans}"
-    s, e = spans[col]
-    char_pos = s + 1 if (e - s) > 1 else s
-    ev = _motion_event_for_cell(view.cursor_cmp, line_no=line_no, char_pos=char_pos)
-    view._on_cursor_cmp_hover_tooltip(ev)
-    view.app.root.update_idletasks()
-    view.app.root.update()
-
-
-def _run_2way():
-    td_a = make_temp_dir(prefix="sow_c_tip_2a_")
-    td_b = make_temp_dir(prefix="sow_c_tip_2b_")
-    fa = os.path.join(td_a, "same.xlsx")
-    fb = os.path.join(td_b, "same.xlsx")
-    long_a = "A_FULL_" + ("x" * 80)
-    long_b = "B_FULL_" + ("y" * 90)
-    rows_a = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_a]]
-    rows_b = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_b]]
-    _make_xlsx(fa, rows_a)
-    _make_xlsx(fb, rows_b)
-
-    app = mod.SowMergeApp(fa, fb)
-    view = _ensure_view(app)
-    view.only_diff_var.set(0)
-    view.refresh(row_only=None, rescan=True)
-    view.left.mark_set("insert", "2.0")
-    view.right.mark_set("insert", "2.0")
-    view._update_cursor_lines()
-    app.root.update_idletasks()
-    app.root.update()
-
-    txt = _c_tooltip_text_by_col(view, c_line=1, col=5)
-    assert "base[" in txt and "mine[" in txt, txt
-    assert "theirs[" not in txt, txt
-    assert long_a in txt and long_b in txt, txt
-    txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
-    assert "base[" in txt_main and "mine[" in txt_main, txt_main
-    assert long_a in txt_main and long_b in txt_main, txt_main
-
-    # Short, non-truncated cells should still update the fixed hover panel.
-    _drive_main_hover(view, line_no=2, col=2, side="A")
-    panel_short = _panel_text(view)
-    assert "base[2]: 2" in panel_short and "mine[2]: 2" in panel_short, panel_short
-
-    _drive_main_hover(view, line_no=2, col=5, side="A")
-    panel = _panel_text(view)
-    assert "base[" in panel and "mine[" in panel, panel
-    assert long_a in panel and long_b in panel, panel
-    assert (
-        "Col: E(5)" in _panel_title(view)
-        or "列 E(5)" in _panel_title(view)
-    ), _panel_title(view)
-    assert _has_tag(view, "hover_side_base"), "expected BASE-like row background in 2-way hover panel"
-    assert _has_tag(view, "hover_side_mine"), "expected MINE-like row background in 2-way hover panel"
-    assert _has_tag(view, "hover_diffchar"), "expected diff-char highlight in hover panel"
-
-    _drive_c_hover(view, line_no=1, col=5)
-    panel = _panel_text(view)
-    assert "base[" in panel and "mine[" in panel, panel
-    assert long_a in panel and long_b in panel, panel
-    keep_panel = panel
-
-    # Leave should not clear panel anymore (allow manual horizontal review).
-    view._on_hover_compare_leave()
-    view.app.root.update_idletasks()
-    view.app.root.update()
-    assert _panel_text(view) == keep_panel, _panel_text(view)
-
-    # F4 hotkey toggles pin on/off (both direct handler and root key event).
-    assert int(view.hover_cmp_pin_var.get()) == 0
-    view._on_hover_compare_f4_toggle()
-    assert int(view.hover_cmp_pin_var.get()) == 1
-    view._on_hover_compare_f4_toggle()
-    assert int(view.hover_cmp_pin_var.get()) == 0
-    view.app.root.event_generate("<F4>")
-    view.app.root.update_idletasks()
-    view.app.root.update()
-    assert int(view.hover_cmp_pin_var.get()) == 1
-    view.app.root.event_generate("<F4>")
-    view.app.root.update_idletasks()
-    view.app.root.update()
-    assert int(view.hover_cmp_pin_var.get()) == 0
-
-    # Pin mode freezes auto updates.
-    view.hover_cmp_pin_var.set(1)
-    view._on_hover_compare_pin_toggle()
-    view._set_hover_compare_panel(
-        "base[9]: SHOULD_NOT_APPLY\nmine[9]: SHOULD_NOT_APPLY",
-        ("S", "CMP", 999, 9, ("SHOULD_NOT_APPLY", "SHOULD_NOT_APPLY")),
-    )
-    assert _panel_text(view) == keep_panel, _panel_text(view)
-
-    # Shift+wheel should move horizontal viewport.
-    x0 = float((view.hover_cmp_text.xview() or (0.0, 1.0))[0])
-    view._on_hover_cmp_shift_wheel(SimpleNamespace(delta=-120, state=0x1))
-    view.app.root.update_idletasks()
-    view.app.root.update()
-    x1 = float((view.hover_cmp_text.xview() or (0.0, 1.0))[0])
-    assert x1 >= x0, (x0, x1)
-
-    # Clear button should clear even when pinned.
-    view._on_hover_compare_clear_click()
-    view.app.root.update_idletasks()
-    view.app.root.update()
-    assert _panel_text(view) == "", _panel_text(view)
-
-    # Unpin then next update should apply.
-    view.hover_cmp_pin_var.set(0)
-    view._on_hover_compare_pin_toggle()
-    _drive_main_hover(view, line_no=2, col=5, side="A")
-    panel = _panel_text(view)
-    assert "base[" in panel and "mine[" in panel, panel
-
-    try:
-        view._cancel_hover_compare_clear()
-        app._shutdown_root()
-    except Exception:
-        pass
-
-
-def _run_3way():
-    td_base = make_temp_dir(prefix="sow_c_tip_3base_")
-    td_mine = make_temp_dir(prefix="sow_c_tip_3mine_")
-    td_theirs = make_temp_dir(prefix="sow_c_tip_3theirs_")
-    fbase = os.path.join(td_base, "same.xlsx")
-    fmine = os.path.join(td_mine, "same.xlsx")
-    ftheirs = os.path.join(td_theirs, "same.xlsx")
-    long_base = "BASE_FULL_" + ("b" * 70)
-    long_mine = "MINE_FULL_" + ("m" * 75)
-    long_theirs = "THEIRS_FULL_" + ("t" * 85)
-    rows_base = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_base]]
-    rows_mine = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_mine]]
-    rows_theirs = [["h1", "h2", "h3", "h4", "h5"], [1, 2, 3, 4, long_theirs]]
-    _make_xlsx(fbase, rows_base)
-    _make_xlsx(fmine, rows_mine)
-    _make_xlsx(ftheirs, rows_theirs)
-
-    app = mod.SowMergeApp(fmine, ftheirs, merge_mode=True, base_path=fbase)
-    view = _ensure_view(app)
-    view.only_diff_var.set(0)
-    view.refresh(row_only=None, rescan=True)
-    view.left.mark_set("insert", "2.0")
-    view.base.mark_set("insert", "2.0")
-    view.right.mark_set("insert", "2.0")
-    view._update_cursor_lines()
-    app.root.update_idletasks()
-    app.root.update()
-
-    txt = _c_tooltip_text_by_col(view, c_line=2, col=5)
-    assert "base[" in txt and "mine[" in txt and "theirs[" in txt, txt
-    assert long_base in txt and long_mine in txt and long_theirs in txt, txt
-    assert int(view.hover_cmp_text.cget("height")) >= 4, view.hover_cmp_text.cget("height")
-    actual_h = int(view.hover_cmp_text.winfo_height())
-    req_h = int(view.hover_cmp_text.winfo_reqheight())
-    assert actual_h >= max(40, req_h - 20), (actual_h, req_h)
-    txt_main = _main_tooltip_text_by_col(view, line_no=2, col=5)
-    assert "base[" in txt_main and "mine[" in txt_main and "theirs[" in txt_main, txt_main
-    assert long_base in txt_main and long_mine in txt_main and long_theirs in txt_main, txt_main
-
-    _drive_main_hover(view, line_no=2, col=2, side="BASE")
-    panel_short = _panel_text(view)
-    assert "base[2]: 2" in panel_short and "mine[2]: 2" in panel_short and "theirs[2]: 2" in panel_short, panel_short
-
-    _drive_main_hover(view, line_no=2, col=5, side="BASE")
-    panel = _panel_text(view)
-    assert "base[" in panel and "mine[" in panel and "theirs[" in panel, panel
-    assert long_base in panel and long_mine in panel and long_theirs in panel, panel
-    assert (
-        "Col: E(5)" in _panel_title(view)
-        or "列 E(5)" in _panel_title(view)
-    ), _panel_title(view)
-    assert _has_tag(view, "hover_side_base"), "expected BASE row background in 3-way hover panel"
-    assert _has_tag(view, "hover_side_mine"), "expected MINE row background in 3-way hover panel"
-    assert _has_tag(view, "hover_side_theirs"), "expected THEIRS row background in 3-way hover panel"
-    assert _has_tag(view, "hover_diffchar"), "expected diff-char highlight in hover panel"
-
-    _drive_c_hover(view, line_no=2, col=5)
-    panel = _panel_text(view)
-    assert "base[" in panel and "mine[" in panel and "theirs[" in panel, panel
-    assert long_base in panel and long_mine in panel and long_theirs in panel, panel
-
-    try:
-        view._cancel_hover_compare_clear()
-        app._shutdown_root()
-    except Exception:
-        pass
-
-
-def _run_f4_routes_to_active_sheet():
-    td_a = make_temp_dir(prefix="sow_c_tip_f4_a_")
-    td_b = make_temp_dir(prefix="sow_c_tip_f4_b_")
-    fa = os.path.join(td_a, "same.xlsx")
-    fb = os.path.join(td_b, "same.xlsx")
-
-    wb_a = Workbook()
-    ws = wb_a.active
-    ws.title = "S1"
-    ws["A1"] = "A1"
-    ws2 = wb_a.create_sheet("S2")
-    ws2["A1"] = "A2"
-    wb_a.save(fa)
-    wb_a.close()
-
-    wb_b = Workbook()
-    ws = wb_b.active
-    ws.title = "S1"
-    ws["A1"] = "B1"
-    ws2 = wb_b.create_sheet("S2")
-    ws2["A1"] = "B2"
-    wb_b.save(fb)
-    wb_b.close()
-
-    app = mod.SowMergeApp(fa, fb)
-    assert len(app.common_sheets) >= 2, app.common_sheets
-    s1, s2 = app.common_sheets[0], app.common_sheets[1]
-
-    app.nb.select(app._sheet_containers[s1])
-    app.root.update_idletasks()
-    app.root.update()
-    v1 = app.sheet_views[s1]
-
-    app.nb.select(app._sheet_containers[s2])
-    app.root.update_idletasks()
-    app.root.update()
-    v2 = app.sheet_views[s2]
-
-    assert int(v1.hover_cmp_pin_var.get()) == 0
-    assert int(v2.hover_cmp_pin_var.get()) == 0
-
-    # Deterministic route check via app-level F4 handler.
-    app._on_global_f4(None)
-    app.root.update_idletasks()
-    app.root.update()
-    assert int(v1.hover_cmp_pin_var.get()) == 0, "inactive sheet should not be toggled by F4"
-    assert int(v2.hover_cmp_pin_var.get()) == 1, "active sheet should be toggled by F4"
-
-    # Also verify real key-event path.
-    try:
-        app.root.focus_force()
-    except Exception:
-        pass
-    app.root.focus_set()
-    app.root.update_idletasks()
-    app.root.update()
-    app.root.event_generate("<F4>")
-    app.root.update_idletasks()
-    app.root.update()
-    assert int(v1.hover_cmp_pin_var.get()) == 0, "inactive sheet should remain unchanged"
-    assert int(v2.hover_cmp_pin_var.get()) == 0, "active sheet should toggle back on second F4"
-
-    try:
-        v1._cancel_hover_compare_clear()
-        v2._cancel_hover_compare_clear()
-        app._shutdown_root()
-    except Exception:
-        pass
-
-
-def main():
-    _run_2way()
-    _run_3way()
-    _run_f4_routes_to_active_sheet()
-    print("GUI_SELF_TEST_C_HOVER_TOOLTIP_OK")
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list-cases", action="store_true")
+    parser.add_argument("--case", choices=_CASES)
+    args = parser.parse_args(argv)
+    if args.list_cases:
+        if args.case:
+            parser.error("--list-cases cannot be combined with --case")
+        for case_name in _CASES:
+            print(case_name, flush=True)
+        return
+    selected = (args.case,) if args.case else _CASES
+    for case_name in selected:
+        _run_case(case_name)
+    print(f"GUI_SELF_TEST_C_HOVER_TOOLTIP_SUITE_OK ({len(selected)} cases)", flush=True)
 
 
 if __name__ == "__main__":

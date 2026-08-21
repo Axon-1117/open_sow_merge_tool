@@ -1,0 +1,90 @@
+{
+  "fixture": "synthetic-3001",
+  "fresh_process": true,
+  "phases": {
+    "cached_revisit": {
+      "errors": [],
+      "p50_ms": 64.362,
+      "p95_ms": 64.362,
+      "samples": [
+        {
+          "fixture": "synthetic-3001",
+          "phase": "cached_revisit",
+          "pid": 35936,
+          "rss_after_bytes": 86888448,
+          "rss_delta_bytes": 27017216,
+          "sheet": "S1",
+          "status": "ok",
+          "timings_ms": {
+            "cached_revisit": 64.362,
+            "selected_ready": 906.104,
+            "startup": 692.781
+          }
+        }
+      ]
+    },
+    "scroll": {
+      "errors": [],
+      "p50_ms": 122.178,
+      "p95_ms": 122.178,
+      "samples": [
+        {
+          "fixture": "synthetic-3001",
+          "phase": "scroll",
+          "pid": 35596,
+          "rss_after_bytes": 86953984,
+          "rss_delta_bytes": 27140096,
+          "sheet": "S1",
+          "status": "ok",
+          "timings_ms": {
+            "scroll": 122.178,
+            "selected_ready": 936.334,
+            "startup": 694.408
+          }
+        }
+      ]
+    },
+    "selected_ready": {
+      "errors": [],
+      "p50_ms": 929.188,
+      "p95_ms": 929.188,
+      "samples": [
+        {
+          "fixture": "synthetic-3001",
+          "phase": "selected_ready",
+          "pid": 41680,
+          "rss_after_bytes": 88731648,
+          "rss_delta_bytes": 28692480,
+          "sheet": "S1",
+          "status": "ok",
+          "timings_ms": {
+            "selected_ready": 929.188,
+            "startup": 704.393
+          }
+        }
+      ]
+    },
+    "startup": {
+      "errors": [],
+      "p50_ms": 701.351,
+      "p95_ms": 701.351,
+      "samples": [
+        {
+          "fixture": "synthetic-3001",
+          "phase": "startup",
+          "pid": 7204,
+          "rss_after_bytes": 87715840,
+          "rss_delta_bytes": 27906048,
+          "sheet": "S1",
+          "status": "ok",
+          "timings_ms": {
+            "selected_ready": 920.909,
+            "startup": 701.351
+          }
+        }
+      ]
+    }
+  },
+  "runs": 1,
+  "schema": "large-sheet-phase-baseline-v1"
+}

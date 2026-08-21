@@ -11,10 +11,14 @@ against openpyxl state rather than mocks.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import time
+from contextlib import contextmanager
 import hashlib
 import gc
+import sys
+import tempfile
 import weakref
 from dataclasses import fields
 from types import SimpleNamespace
@@ -29,6 +33,17 @@ from openpyxl.xml.functions import tostring
 
 import sow_merge_tool as smt
 from _test_temp_utils import make_temp_dir
+
+
+@contextmanager
+def _noninteractive_formula_cache_prompt():
+    """Suppress the production modal only for this headless test process."""
+    original = smt.SowMergeApp._schedule_formula_cache_prompt
+    smt.SowMergeApp._schedule_formula_cache_prompt = lambda _self: None
+    try:
+        yield
+    finally:
+        smt.SowMergeApp._schedule_formula_cache_prompt = original
 
 
 _GUIDE_ORIGINAL = r"C:\tmp\column_alignment_baseline\Guide\original.xlsx"
@@ -336,9 +351,38 @@ def _wait_for_view(app, sheet="Sheet1", timeout=12.0):
     while time.time() < deadline:
         _pump(app.root)
         view = app.sheet_views.get(sheet)
-        if view is not None and getattr(view, "_data_ready", False):
+        if (
+            view is not None
+            and getattr(view, "_data_ready", False)
+            and app._is_sheet_exact_current(sheet)
+        ):
             return view
-    raise AssertionError(f"column action GUI view did not become ready: {view!r}")
+    raise AssertionError(
+        f"column action GUI view did not reach exact readiness: {view!r}; "
+        f"state={app._sheet_exact_entry(sheet)!r}"
+    )
+
+
+def _wait_for_operation_ready(app, sheet="Sheet1", timeout=30.0):
+    """Test-only demand/setup for cases asserting completed mutations."""
+    deadline = time.time() + timeout
+    view = None
+    while time.time() < deadline:
+        app._request_edit_preload()
+        _pump(app.root)
+        view = app.sheet_views.get(sheet)
+        if (
+            view is not None
+            and getattr(view, "_data_ready", False)
+            and app._is_sheet_exact_current(sheet)
+            and app._edit_workbooks_ready()
+            and view._derive_lifecycle_state() == "READY"
+        ):
+            return view
+    raise AssertionError(
+        f"column action GUI view did not reach operation readiness: {view!r}; "
+        f"exact={app._sheet_exact_entry(sheet)!r} edit={app._edit_workbooks_ready()!r}"
+    )
 
 
 def _force_full_view(view):
@@ -388,21 +432,34 @@ def _sha256(path: str):
     return digest.hexdigest()
 
 
-def _populate_action_sheet(ws, headers, *, decorated=()):
+def _populate_action_sheet(ws, headers, *, decorated=(), typed_schema=False):
+    """Populate the shared action fixture.
+
+    The default remains the compact legacy fixture.  The fidelity wrapper
+    explicitly requests ``typed_schema`` so current exact comparison can use
+    a declared, stable row identity without changing the other GUI checks.
+    """
     decorated = set(int(value) for value in decorated)
+    data_start = 3 if typed_schema else 2
+    data_stop = data_start + 8
     for col, header in enumerate(headers, start=1):
         ws.cell(1, col).value = header
-        for row in range(2, 10):
+        if typed_schema:
+            ws.cell(2, col).value = "string" if col == 1 else "formula"
+        for row in range(data_start, data_stop):
             cell = ws.cell(row, col)
             # Keep the formula structurally identical across retained columns;
             # physical-reference shifts would intentionally trigger the
             # conservative alignment fallback before this action test begins.
-            cell.value = "=1+ROW()" if row == 3 else f"{header}-{row}"
+            if col == 1 and typed_schema:
+                cell.value = f"action-id-{row - data_start + 1:04d}"
+            else:
+                cell.value = "=1+ROW()" if row == 3 else f"{header}-{row}"
         if col in decorated:
             letter = get_column_letter(col)
             ws.column_dimensions[letter].width = 17.0 + col
             ws.column_dimensions[letter].hidden = (col % 2 == 0)
-            target = ws.cell(2, col)
+            target = ws.cell(data_start, col)
             target.fill = PatternFill("solid", fgColor="33AA77")
             target.font = Font(name="Calibri", bold=True, color="FFFFFF")
             target.alignment = Alignment(horizontal="center")
@@ -413,20 +470,250 @@ def _populate_action_sheet(ws, headers, *, decorated=()):
             validation = DataValidation(type="list", formula1='"one,two,three"', allow_blank=True)
             validation.error = f"error-{header}"
             validation.errorTitle = f"title-{header}"
-            validation.add(f"{letter}2:{letter}9")
+            validation.add(f"{letter}{data_start}:{letter}{data_stop - 1}")
             ws.add_data_validation(validation)
             ws.conditional_formatting.add(
-                f"{letter}2:{letter}9",
+                f"{letter}{data_start}:{letter}{data_stop - 1}",
                 CellIsRule(operator="equal", formula=["1"], fill=PatternFill("solid", fgColor="FFFF00")),
             )
 
 
-def _write_action_book(path: str, headers, *, decorated=()):
+def _write_action_book(path: str, headers, *, decorated=(), typed_schema=False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Sheet1"
-    _populate_action_sheet(ws, headers, decorated=decorated)
+    _populate_action_sheet(
+        ws,
+        headers,
+        decorated=decorated,
+        typed_schema=typed_schema,
+    )
     wb.save(path)
+
+
+@contextmanager
+def _typed_action_case(prefix: str):
+    """Own settings, inputs, and app lifetime for fidelity-only typed cases."""
+    original_settings_path = smt._SETTINGS_PATH
+    original_settings_exists = os.path.lexists(original_settings_path)
+    original_settings_bytes = (
+        open(original_settings_path, "rb").read()
+        if original_settings_exists
+        else None
+    )
+    temporary = tempfile.TemporaryDirectory(prefix=prefix)
+    root_dir = temporary.name
+    isolated_settings_path = os.path.join(root_dir, "settings.json")
+    with open(isolated_settings_path, "w", encoding="utf-8") as stream:
+        json.dump({"only_diff": 0}, stream)
+    state = SimpleNamespace(
+        app=None,
+        input_hashes={},
+        root_dir=root_dir,
+        temporary=temporary,
+    )
+    original_formula_cache_prompt = smt.SowMergeApp._schedule_formula_cache_prompt
+    smt._SETTINGS_PATH = isolated_settings_path
+    smt.SowMergeApp._schedule_formula_cache_prompt = lambda _self: None
+    primary = None
+    try:
+        yield state
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup_errors = []
+        app = state.app
+        if app is not None:
+            try:
+                for candidate in (app, *getattr(app, "sheet_views", {}).values()):
+                    if candidate is None:
+                        continue
+                    after_id = getattr(candidate, "_settings_save_id", None)
+                    if after_id is not None:
+                        app.root.after_cancel(after_id)
+                        candidate._settings_save_id = None
+                app._shutdown_root()
+            except BaseException as exc:
+                cleanup_errors.append(f"shutdown: {exc!r}")
+        try:
+            smt._SETTINGS_PATH = original_settings_path
+            smt.SowMergeApp._schedule_formula_cache_prompt = original_formula_cache_prompt
+            if original_settings_exists:
+                with open(original_settings_path, "rb") as stream:
+                    assert stream.read() == original_settings_bytes
+            else:
+                assert not os.path.lexists(original_settings_path)
+        except BaseException as exc:
+            cleanup_errors.append(f"settings restore: {exc!r}")
+        for path, before_hash in state.input_hashes.items():
+            try:
+                assert _sha256(path) == before_hash, path
+            except BaseException as exc:
+                cleanup_errors.append(f"input SHA {path!r}: {exc!r}")
+        try:
+            temporary.cleanup()
+            assert not os.path.lexists(root_dir), root_dir
+        except BaseException as exc:
+            cleanup_errors.append(f"owned temporary root: {exc!r}")
+        if cleanup_errors:
+            message = "typed action fixture cleanup failed: " + "; ".join(cleanup_errors)
+            if primary is not None:
+                primary.add_note(message)
+            else:
+                raise AssertionError(message)
+
+
+def _capture_typed_action_inputs(state, *paths: str):
+    state.input_hashes = {path: _sha256(path) for path in paths}
+
+
+_ACCEPTED_COMMON_MARKERS = ("__UX_INS1_R1", "__UX_INS2_R1")
+_ACCEPTED_COMMON_CONTROL = "__UX_ROLLBACK_CTRL_R1"
+
+
+def _accepted_common_fixture_headers():
+    """Guide-shaped anchors with two independently actionable insert blocks."""
+    anchors = tuple(f"H{index:02d}" for index in range(2, 20))
+    mine_headers = ("id@id",) + anchors
+    # The primary pair follows ten stable anchors, matching the Guide shape
+    # where its physical B coordinates are 12/13.  A separate control marker
+    # later in the row lets the test inject a second real rollback after the
+    # primary pair has become an accepted common insertion.
+    theirs_headers = (
+        ("id@id",)
+        + anchors[:10]
+        + _ACCEPTED_COMMON_MARKERS
+        + anchors[10:14]
+        + (_ACCEPTED_COMMON_CONTROL,)
+        + anchors[14:]
+    )
+    return mine_headers, theirs_headers
+
+
+def _accepted_common_fixture_rows(headers):
+    """Return deterministic literal rows with unique record keys.
+
+    This intentionally avoids the broad, repeated values used by the generic
+    column-action fixture.  The three-way snapshot must be able to prove the
+    two independent B-side insertions before an action test is allowed to
+    mutate a workbook.
+    """
+    headers = tuple(headers)
+    rows = [headers]
+
+    def _record_values(row):
+        values = []
+        for header in headers:
+            if header == "id@id":
+                values.append(f"unique-key-{row:02d}")
+            else:
+                values.append(f"{header}-value-{row:02d}")
+        return tuple(values)
+
+    for row in range(2, 12):
+        rows.append(_record_values(row))
+    return tuple(rows)
+
+
+def _write_accepted_common_fixture_book(path: str, headers):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    for row in _accepted_common_fixture_rows(headers):
+        ws.append(row)
+    wb.save(path)
+    wb.close()
+
+
+def _assert_accepted_common_fixture_snapshot():
+    """Gate the real rollback test on an exact, physically explained model."""
+    mine_headers, theirs_headers = _accepted_common_fixture_headers()
+    mine_rows = _accepted_common_fixture_rows(mine_headers)
+    theirs_rows = _accepted_common_fixture_rows(theirs_headers)
+    cache = _cache_3way("Sheet1", mine_rows, mine_rows, theirs_rows)
+    assert not cache.unresolved_cols, cache.unresolved_cols
+
+    def _slot_for_theirs_header(header):
+        return next(
+            slot for slot in cache.model.slots
+            if slot.theirs_col is not None
+            and theirs_headers[int(slot.theirs_col) - 1] == header
+        )
+
+    marker_slots = tuple(_slot_for_theirs_header(header) for header in _ACCEPTED_COMMON_MARKERS)
+    assert [slot.logical_idx + 1 for slot in marker_slots] == [12, 13]
+    assert [slot.theirs_col for slot in marker_slots] == [12, 13]
+    assert all(
+        slot.state == "inserted"
+        and slot.mine_col is None
+        and slot.base_col is None
+        and slot.origin_side == "theirs"
+        and not slot.confidence.ambiguous
+        for slot in marker_slots
+    ), marker_slots
+    control_slot = _slot_for_theirs_header(_ACCEPTED_COMMON_CONTROL)
+    assert (
+        control_slot.logical_idx + 1,
+        control_slot.mine_col,
+        control_slot.base_col,
+        control_slot.theirs_col,
+        control_slot.state,
+    ) == (18, None, None, 18, "inserted")
+
+    # Check the primary Guide-like physical action target before constructing
+    # Tk.  The later control action is re-derived after the primary mutation.
+    view = _fake_action_view(cache, three_way=True)
+    selected = view._select_column_block_by_logical_col(12, "B")
+    assert selected is not None and tuple(selected.slot_indices) == (11, 12)
+    plan = view._plan_selected_column_block_action("B", "A")
+    assert plan.action_kind == "insert_copy"
+    assert plan.unresolved is False
+    assert plan.logical_start == 12 and plan.logical_end == 13
+    assert plan.source_physical_cols == (12, 13)
+    assert plan.target_physical_cols == ()
+    assert plan.target_physical_anchor == 12
+    return mine_headers, theirs_headers
+
+
+def _assert_accepted_common_fixture_stream_snapshot(mine_path, base_path, theirs_path):
+    """Prove the exact stream result that the real app will receive."""
+    mine = smt._stream_selected_sheet_snapshot(mine_path, mine_path, "Sheet1", "mine")
+    base = smt._stream_selected_sheet_snapshot(base_path, base_path, "Sheet1", "base")
+    theirs = smt._stream_selected_sheet_snapshot(theirs_path, theirs_path, "Sheet1", "theirs")
+    result = smt._compare_selected_sheet_snapshots(mine, theirs, base)
+    assert not result.unresolved, result
+    assert not result.column_cache.unresolved_cols, (
+        "stream result may only feed the real operation test when every "
+        f"logical column is physically explained: {result.column_cache.unresolved_cols!r}"
+    )
+    assert result.row_pairs == tuple((row, row) for row in range(1, 12)), result.row_pairs
+    return result
+
+
+def _real_accepted_common_fixture_app():
+    mine_headers, theirs_headers = _assert_accepted_common_fixture_snapshot()
+    dir_mine = make_temp_dir("sow_accepted_common_mine_")
+    dir_base = make_temp_dir("sow_accepted_common_base_")
+    dir_theirs = make_temp_dir("sow_accepted_common_theirs_")
+    mine_path = os.path.join(dir_mine, "accepted_common.xlsx")
+    base_path = os.path.join(dir_base, "accepted_common.xlsx")
+    theirs_path = os.path.join(dir_theirs, "accepted_common.xlsx")
+    _write_accepted_common_fixture_book(mine_path, mine_headers)
+    _write_accepted_common_fixture_book(base_path, mine_headers)
+    _write_accepted_common_fixture_book(theirs_path, theirs_headers)
+    _assert_accepted_common_fixture_stream_snapshot(mine_path, base_path, theirs_path)
+    app = smt.SowMergeApp(
+        mine_path,
+        theirs_path,
+        merge_mode=True,
+        base_path=base_path,
+        raw_mine=mine_path,
+        raw_base=base_path,
+        raw_theirs=theirs_path,
+    )
+    view = _force_full_view(_wait_for_view(app))
+    return app, _wait_for_operation_ready(app, view.sheet)
 
 
 def _write_formula_cache_asymmetry_book(path: str, headers, *, cached_formula=None):
@@ -514,23 +801,48 @@ def _append_action_sheet(path: str, sheet: str, headers, *, decorated=()):
     wb.save(path)
 
 
-def _real_two_way_app(*, decorated_a=(), decorated_b=(2, 3)):
-    dir_a = make_temp_dir("sow_column_action_a_")
-    dir_b = make_temp_dir("sow_column_action_b_")
+def _real_two_way_app(
+    *,
+    decorated_a=(),
+    decorated_b=(2, 3),
+    typed_schema=False,
+    owned_root=None,
+    input_capture=None,
+):
+    if typed_schema:
+        assert owned_root is not None
+        dir_a = os.path.join(owned_root, "mine")
+        dir_b = os.path.join(owned_root, "theirs")
+        os.makedirs(dir_a, exist_ok=False)
+        os.makedirs(dir_b, exist_ok=False)
+        mine_headers = ("id@id", "B", "C", "D", "E", "F")
+        theirs_headers = ("id@id", "X", "Y", "B", "D", "E", "F")
+    else:
+        dir_a = make_temp_dir("sow_column_action_a_")
+        dir_b = make_temp_dir("sow_column_action_b_")
+        mine_headers = ("A", "B", "C", "D", "E", "F")
+        theirs_headers = ("A", "X", "Y", "B", "D", "E", "F")
     path_a = os.path.join(dir_a, "same.xlsx")
     path_b = os.path.join(dir_b, "same.xlsx")
     _write_action_book(
         path_a,
-        ("A", "B", "C", "D", "E", "F"),
+        mine_headers,
         decorated=decorated_a,
+        typed_schema=typed_schema,
     )
     _write_action_book(
         path_b,
-        ("A", "X", "Y", "B", "D", "E", "F"),
+        theirs_headers,
         decorated=decorated_b,
+        typed_schema=typed_schema,
     )
+    if input_capture is not None:
+        _capture_typed_action_inputs(input_capture, path_a, path_b)
     app = smt.SowMergeApp(path_a, path_b)
-    return app, _force_full_view(_wait_for_view(app))
+    if input_capture is not None:
+        input_capture.app = app
+    view = _force_full_view(_wait_for_view(app))
+    return app, _wait_for_operation_ready(app, view.sheet)
 
 
 def _real_three_way_app(
@@ -1012,21 +1324,28 @@ def test_formula_cache_asymmetry_keeps_identity_rows_and_column_only_diff_action
         app._shutdown_root()
 
 
-def test_real_gui_cell_apply_and_undo_reuse_mapping_without_full_scan():
-    root_dir = make_temp_dir("sow_nonstructural_cell_fastpath_")
+def test_real_gui_cell_apply_and_undo_reuse_mapping_without_full_scan(*, typed_schema=False):
+    typed_case = _typed_action_case("sow_nonstructural_cell_fastpath_") if typed_schema else None
+    owned = typed_case.__enter__() if typed_case is not None else None
+    root_dir = owned.root_dir if owned is not None else make_temp_dir("sow_nonstructural_cell_fastpath_")
     mine = os.path.join(root_dir, "mine.xlsx")
     theirs = os.path.join(root_dir, "theirs.xlsx")
-    headers = ("A", "B", "C", "D")
-    _write_action_book(mine, headers)
-    _write_action_book(theirs, headers)
-    wb = load_workbook(theirs, data_only=False)
-    wb["Sheet1"]["B3"] = "theirs-edited"
-    wb.save(theirs)
-    wb.close()
-
-    app = smt.SowMergeApp(mine, theirs)
+    headers = ("id@id", "B", "C", "D") if typed_schema else ("A", "B", "C", "D")
+    app = None
     try:
+        _write_action_book(mine, headers, typed_schema=typed_schema)
+        _write_action_book(theirs, headers, typed_schema=typed_schema)
+        wb = load_workbook(theirs, data_only=False)
+        wb["Sheet1"]["B3"] = "theirs-edited"
+        wb.save(theirs)
+        wb.close()
+        if owned is not None:
+            _capture_typed_action_inputs(owned, mine, theirs)
+        app = smt.SowMergeApp(mine, theirs)
+        if owned is not None:
+            owned.app = app
         view = _force_full_view(_wait_for_view(app))
+        view = _wait_for_operation_ready(app, view.sheet)
         _wait_for_stable_projection(view)
         view._suppress_bg_apply = True
         view.only_diff_var.set(0)
@@ -1134,25 +1453,35 @@ def test_real_gui_cell_apply_and_undo_reuse_mapping_without_full_scan():
         assert refresh_calls and all(not rescan for _row, rescan in refresh_calls), refresh_calls
         assert view._column_mapping_is_current()
     finally:
-        app._shutdown_root()
+        if typed_case is not None:
+            typed_case.__exit__(*sys.exc_info())
+        elif app is not None:
+            app._shutdown_root()
 
 
-def test_real_gui_region_apply_and_undo_reuse_mapping_without_full_scan():
-    root_dir = make_temp_dir("sow_nonstructural_region_fastpath_")
+def test_real_gui_region_apply_and_undo_reuse_mapping_without_full_scan(*, typed_schema=False):
+    typed_case = _typed_action_case("sow_nonstructural_region_fastpath_") if typed_schema else None
+    owned = typed_case.__enter__() if typed_case is not None else None
+    root_dir = owned.root_dir if owned is not None else make_temp_dir("sow_nonstructural_region_fastpath_")
     mine = os.path.join(root_dir, "mine.xlsx")
     theirs = os.path.join(root_dir, "theirs.xlsx")
-    headers = ("A", "B", "C", "D")
-    _write_action_book(mine, headers)
-    _write_action_book(theirs, headers)
-    workbook = load_workbook(theirs, data_only=False)
-    workbook["Sheet1"]["B3"] = "theirs-region-3"
-    workbook["Sheet1"]["B4"] = "theirs-region-4"
-    workbook.save(theirs)
-    workbook.close()
-
-    app = smt.SowMergeApp(mine, theirs)
+    headers = ("id@id", "B", "C", "D") if typed_schema else ("A", "B", "C", "D")
+    app = None
     try:
+        _write_action_book(mine, headers, typed_schema=typed_schema)
+        _write_action_book(theirs, headers, typed_schema=typed_schema)
+        workbook = load_workbook(theirs, data_only=False)
+        workbook["Sheet1"]["B3"] = "theirs-region-3"
+        workbook["Sheet1"]["B4"] = "theirs-region-4"
+        workbook.save(theirs)
+        workbook.close()
+        if owned is not None:
+            _capture_typed_action_inputs(owned, mine, theirs)
+        app = smt.SowMergeApp(mine, theirs)
+        if owned is not None:
+            owned.app = app
         view = _force_full_view(_wait_for_view(app))
+        view = _wait_for_operation_ready(app, view.sheet)
         _wait_for_stable_projection(view)
         view._suppress_bg_apply = True
         view.only_diff_var.set(0)
@@ -1283,7 +1612,10 @@ def test_real_gui_region_apply_and_undo_reuse_mapping_without_full_scan():
         assert refresh_calls and all(not rescan for _row, rescan in refresh_calls)
         assert view._column_mapping_is_current()
     finally:
-        app._shutdown_root()
+        if typed_case is not None:
+            typed_case.__exit__(*sys.exc_info())
+        elif app is not None:
+            app._shutdown_root()
 
 
 def test_live_formula_references_follow_excel_insert_delete_and_undo_exactly():
@@ -2013,9 +2345,18 @@ def test_ordinary_cell_action_rejects_missing_or_unresolved_slot():
     _raises_runtime(lambda: view._action_physical_columns("B2A", 2), "映射待确认")
 
 
-def test_real_gui_insert_block_and_one_step_undo_full_fidelity():
-    app, view = _real_two_way_app()
+def test_real_gui_insert_block_and_one_step_undo_full_fidelity(*, typed_schema=False):
+    typed_case = _typed_action_case("sow_column_action_insert_") if typed_schema else None
+    owned = typed_case.__enter__() if typed_case is not None else None
+    app = None
     try:
+        app, view = _real_two_way_app(
+            typed_schema=typed_schema,
+            owned_root=owned.root_dir if owned is not None else None,
+            input_capture=owned,
+        )
+        if owned is not None:
+            owned.app = app
         before_a_edit = _worksheet_snapshot(app.ws_a_edit("Sheet1"))
         before_a_value = _worksheet_snapshot(app.ws_a_val("Sheet1"))
         before_b_edit = _worksheet_snapshot(app.ws_b_edit("Sheet1"))
@@ -2043,7 +2384,7 @@ def test_real_gui_insert_block_and_one_step_undo_full_fidelity():
         plan = view._apply_selected_column_block("B", "A")
         assert plan.action_kind == "insert_copy"
         assert [app.ws_a_edit("Sheet1").cell(1, col).value for col in range(1, 9)] == [
-            "A", "X", "Y", "B", "C", "D", "E", "F",
+            "id@id" if typed_schema else "A", "X", "Y", "B", "C", "D", "E", "F",
         ]
         assert _column_snapshot(app.ws_a_edit("Sheet1"), 2) == source_x
         assert _column_snapshot(app.ws_a_edit("Sheet1"), 3) == source_y
@@ -2052,8 +2393,9 @@ def test_real_gui_insert_block_and_one_step_undo_full_fidelity():
         assert app.ws_a_edit("Sheet1").cell(3, 2).value == "=1+ROW()"
         assert app.ws_a_edit("Sheet1").column_dimensions["B"].width == 19.0
         assert app.ws_a_edit("Sheet1").column_dimensions["B"].hidden is True
-        assert app.ws_a_edit("Sheet1").cell(2, 2).comment.text == "comment-X"
-        assert app.ws_a_edit("Sheet1").cell(2, 2).hyperlink.target.endswith("/X")
+        metadata_row = 3 if typed_schema else 2
+        assert app.ws_a_edit("Sheet1").cell(metadata_row, 2).comment.text == "comment-X"
+        assert app.ws_a_edit("Sheet1").cell(metadata_row, 2).hyperlink.target.endswith("/X")
         assert len(app.ws_a_edit("Sheet1").data_validations.dataValidation) == 2
 
         recorded = app.manual_a_column_ops[len(before_ops):]
@@ -2091,12 +2433,25 @@ def test_real_gui_insert_block_and_one_step_undo_full_fidelity():
         assert _selection_snapshot(view) == selected_before_action
         assert _model_snapshot(view) == before_model
     finally:
-        app._shutdown_root()
+        if typed_case is not None:
+            typed_case.__exit__(*sys.exc_info())
+        elif app is not None:
+            app._shutdown_root()
 
 
-def test_real_gui_delete_block_preserves_adjacent_columns_and_undo():
-    app, view = _real_two_way_app(decorated_a=(2, 3, 4))
+def test_real_gui_delete_block_preserves_adjacent_columns_and_undo(*, typed_schema=False):
+    typed_case = _typed_action_case("sow_column_action_delete_") if typed_schema else None
+    owned = typed_case.__enter__() if typed_case is not None else None
+    app = None
     try:
+        app, view = _real_two_way_app(
+            decorated_a=(2, 3, 4),
+            typed_schema=typed_schema,
+            owned_root=owned.root_dir if owned is not None else None,
+            input_capture=owned,
+        )
+        if owned is not None:
+            owned.app = app
         before_edit = _worksheet_snapshot(app.ws_a_edit("Sheet1"))
         before_value = _worksheet_snapshot(app.ws_a_val("Sheet1"))
         before_model = _model_snapshot(view)
@@ -2110,7 +2465,7 @@ def test_real_gui_delete_block_preserves_adjacent_columns_and_undo():
         assert plan.action_kind == "delete"
         assert plan.target_physical_anchor == 3 and plan.count == 1
         assert [app.ws_a_edit("Sheet1").cell(1, col).value for col in range(1, 6)] == [
-            "A", "B", "D", "E", "F",
+            "id@id" if typed_schema else "A", "B", "D", "E", "F",
         ]
         assert _column_snapshot(app.ws_a_edit("Sheet1"), 2) == left_neighbor
         assert _column_snapshot(app.ws_a_edit("Sheet1"), 3) == right_neighbor
@@ -2126,12 +2481,24 @@ def test_real_gui_delete_block_preserves_adjacent_columns_and_undo():
         assert _selection_snapshot(view) == selection_before
         assert _model_snapshot(view) == before_model
     finally:
-        app._shutdown_root()
+        if typed_case is not None:
+            typed_case.__exit__(*sys.exc_info())
+        elif app is not None:
+            app._shutdown_root()
 
 
-def test_real_gui_failure_injection_is_atomic_at_every_mutating_stage():
-    app, view = _real_two_way_app()
+def test_real_gui_failure_injection_is_atomic_at_every_mutating_stage(*, typed_schema=False):
+    typed_case = _typed_action_case("sow_column_action_failure_") if typed_schema else None
+    owned = typed_case.__enter__() if typed_case is not None else None
+    app = None
     try:
+        app, view = _real_two_way_app(
+            typed_schema=typed_schema,
+            owned_root=owned.root_dir if owned is not None else None,
+            input_capture=owned,
+        )
+        if owned is not None:
+            owned.app = app
         before_a_edit = _worksheet_snapshot(app.ws_a_edit("Sheet1"))
         before_a_value = _worksheet_snapshot(app.ws_a_val("Sheet1"))
         before_b_edit = _worksheet_snapshot(app.ws_b_edit("Sheet1"))
@@ -2172,6 +2539,95 @@ def test_real_gui_failure_injection_is_atomic_at_every_mutating_stage():
             ) == before_flags
             assert _selection_snapshot(view) == selection_before
             assert _model_snapshot(view) == before_model
+    finally:
+        if typed_case is not None:
+            typed_case.__exit__(*sys.exc_info())
+        elif app is not None:
+            app._shutdown_root()
+
+
+def test_real_gui_three_way_accepted_common_rollback_rebuilds_equality_cache():
+    """Rollback restores accepted common-insertion proofs only after cleanup."""
+    app, view = _real_accepted_common_fixture_app()
+    try:
+        # The primary Guide-like marker block is B physical 12/13 and is
+        # copied into A at anchor 12, creating an accepted common insertion.
+        view._select_column_block_by_logical_col(12, "B")
+        adopted = view._apply_selected_column_block("B", "A")
+        assert adopted.action_kind == "insert_copy"
+        assert adopted.source_physical_cols == (12, 13)
+        assert adopted.target_physical_anchor == 12
+        accepted_before = dict(view._accepted_common_insert_sources)
+        assert accepted_before == {12: "B", 13: "B"}
+        projection_after_x = view._active_column_projection()
+        cache_after_x = view._active_column_comparison_cache()
+        assert not cache_after_x.unresolved_cols, (
+            "post-action refresh must preserve the exact stream mapping: "
+            f"{cache_after_x.unresolved_cols!r}"
+        )
+        for logical_col in sorted(accepted_before):
+            assert projection_after_x.physical_col("A", logical_col) == logical_col
+            assert projection_after_x.physical_col("B", logical_col) == logical_col
+        proved_pairs = {
+            logical_col: tuple(
+                pair_idx
+                for pair_idx in range(len(view.row_pairs))
+                if view._accepted_common_insertion_row_is_unchanged(
+                    pair_idx, logical_col, source_side
+                )
+            )
+            for logical_col, source_side in accepted_before.items()
+        }
+        assert all(proved_pairs.values()), (
+            "successful accepted insertion must publish immutable equality "
+            f"proofs: {proved_pairs!r}"
+        )
+        assert view._accepted_common_insertion_equalities
+        before_a_edit = _worksheet_snapshot(app.ws_a_edit("Sheet1"))
+        before_a_value = _worksheet_snapshot(app.ws_a_val("Sheet1"))
+        before_b_edit = _worksheet_snapshot(app.ws_b_edit("Sheet1"))
+        before_b_value = _worksheet_snapshot(app.ws_b_val("Sheet1"))
+        before_projection = tuple(view._active_column_projection().model.slots)
+
+        # The remote control insertion gives a second real structural action.
+        # Its failure occurs after refresh, so rollback must restore workbook
+        # bytes, projection and the former common-insertion proof map.
+        control_physical = next(
+            col
+            for col in range(1, app.ws_b_edit("Sheet1").max_column + 1)
+            if app.ws_b_edit("Sheet1").cell(1, col).value == _ACCEPTED_COMMON_CONTROL
+        )
+        control_logical = view._logical_col_for_physical("B", control_physical)
+        assert control_logical is not None
+        view._select_column_block_by_logical_col(control_logical, "B")
+
+        def fail_after_refresh(stage, _plan):
+            if stage == "after_refresh":
+                raise RuntimeError("injected-accepted-common-rollback")
+
+        _raises_runtime(
+            lambda: view._apply_selected_column_block(
+                "B", "A", _failure_injector=fail_after_refresh
+            ),
+            "injected-accepted-common-rollback",
+        )
+        assert _worksheet_snapshot(app.ws_a_edit("Sheet1")) == before_a_edit
+        assert _worksheet_snapshot(app.ws_a_val("Sheet1")) == before_a_value
+        assert _worksheet_snapshot(app.ws_b_edit("Sheet1")) == before_b_edit
+        assert _worksheet_snapshot(app.ws_b_val("Sheet1")) == before_b_value
+        assert dict(view._accepted_common_insert_sources) == accepted_before
+        assert tuple(view._active_column_projection().model.slots) == before_projection
+        assert view._accepted_common_insertion_equality_error is None
+        assert view._accepted_common_insertion_equalities
+        for logical_col, source_side in accepted_before.items():
+            assert all(
+                view._accepted_common_insertion_row_is_unchanged(
+                    pair_idx, logical_col, source_side
+                )
+                for pair_idx in proved_pairs[logical_col]
+            )
+            assert view._physical_col_for_logical("A", logical_col) is not None
+            assert view._physical_col_for_logical("B", logical_col) is not None
     finally:
         app._shutdown_root()
 
@@ -2811,6 +3267,7 @@ def main():
         test_real_gui_insert_block_and_one_step_undo_full_fidelity,
         test_real_gui_delete_block_preserves_adjacent_columns_and_undo,
         test_real_gui_failure_injection_is_atomic_at_every_mutating_stage,
+        test_real_gui_three_way_accepted_common_rollback_rebuilds_equality_cache,
         test_real_gui_repeated_adopt_undo_has_no_state_drift,
         test_column_snapshot_is_released_and_repeated_cycles_have_bounded_rss,
         test_real_gui_three_way_adopt_mine_theirs_and_retain,
@@ -2823,9 +3280,21 @@ def main():
         test_real_guide_projection_stays_bounded_across_apply_and_undo,
         test_real_gui_cross_sheet_column_undo_routes_to_action_sheet,
     ]
-    for test in tests:
-        test()
-        print(f"PASS: {test.__name__}")
+    requested = str(os.environ.get("SOW_LOGICAL_ACTION_TEST_ONLY", "") or "").strip()
+    if requested:
+        tests = [test for test in tests if test.__name__ == requested]
+        if len(tests) != 1:
+            raise AssertionError(f"unknown logical action focused test: {requested}")
+    with open(__file__, "rb") as test_file:
+        test_sha256 = hashlib.sha256(test_file.read()).hexdigest().upper()
+    print(
+        "LOGICAL_COLUMN_ACTION_CONFIG "
+        f"test_only={requested or 'all'} test_sha256={test_sha256}"
+    )
+    with _noninteractive_formula_cache_prompt():
+        for test in tests:
+            test()
+            print(f"PASS: {test.__name__}")
     print(f"PASS: logical column action regression ({len(tests)} tests)")
 
 

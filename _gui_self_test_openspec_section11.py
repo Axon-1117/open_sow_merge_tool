@@ -9,15 +9,16 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import re
 import time
-import traceback
 
 import tkinter as tk
 import tkinter.font as tkfont
 from openpyxl.utils import get_column_letter
 
 import sow_merge_tool as smt
+import _gui_self_test_openspec_section10 as section10
 from _gui_diagnose_gunships_pixel_alignment import (
     _document_xpixels,
     _pixel_boundary_records,
@@ -376,17 +377,31 @@ def test_real_gunships_combined_action_row_is_centered_or_collision_safe():
             ):
                 assert bool(child.winfo_ismapped())
                 assert _contains(nav, _widget_rect(child), tolerance=1)
-            if geometry.startswith("1450"):
+            centered_left = (
+                shared_rect[0]
+                + (
+                    (shared_rect[2] - shared_rect[0])
+                    - (nav[2] - nav[0])
+                )
+                // 2
+            )
+            centered_right = centered_left + (nav[2] - nav[0])
+            if centered_right + 10 <= structural[0]:
                 assert abs(
                     (nav[0] + nav[2]) - (shared_rect[0] + shared_rect[2])
                 ) <= 4, (geometry, nav, shared_rect)
             else:
                 assert nav[0] >= shared_rect[0]
-                assert nav[2] <= structural[0] - 6
+                assert 8 <= structural[0] - nav[2] <= 12, (
+                    geometry,
+                    nav,
+                    structural,
+                )
 
 
 def test_real_gunships_root_utilities_are_left_aligned_in_stable_order():
-    with _real_gunships_app() as (app, view, _analysis):
+    deadline = time.monotonic() + 90.0
+    with _real_gunships_app(absolute_deadline=deadline) as (app, view, _analysis):
         snapshots = {}
         for phase in ("before", "after"):
             snapshots[phase] = {}
@@ -402,16 +417,54 @@ def test_real_gunships_root_utilities_are_left_aligned_in_stable_order():
                     assert 7 <= gap <= 9, (previous, current, gap)
                 snapshots[phase][geometry] = inventory
             if phase == "before":
-                plan = view._apply_selected_column_block("BASE", "A")
-                assert plan.logical_start == plan.logical_end == 14
+                assert view._derive_lifecycle_state() == "EDIT_DEFERRED"
+                assert not app._edit_workbooks_ready()
+                assert view.selected_column_logical_range == (14, 14)
+                undo_before = len(app.undo_stack)
+                preload_calls = []
+                original_preload = app._request_edit_preload
+
+                def _tracked_preload(*args, **kwargs):
+                    preload_calls.append((args, dict(kwargs)))
+                    return original_preload(*args, **kwargs)
+
+                app._request_edit_preload = _tracked_preload
+                try:
+                    view.use_base_col_btn.invoke()
+                    assert preload_calls == [
+                        (
+                            (),
+                            {
+                                "reason": "mutation:列结构操作",
+                                "caller": "SheetView._guard_mutation_ready",
+                            },
+                        )
+                    ], preload_calls
+                    assert view.selected_column_logical_range == (14, 14)
+                    assert len(app.undo_stack) == undo_before
+                    _wait_until(
+                        app.root,
+                        lambda: (
+                            app._edit_workbooks_ready()
+                            and view._derive_lifecycle_state() == "READY"
+                            and view.selected_column_logical_range == (14, 14)
+                        ),
+                        "Gunships public column action did not reach edit READY",
+                        timeout=max(0.001, deadline - time.monotonic()),
+                    )
+                    view.use_base_col_btn.invoke()
+                finally:
+                    app._request_edit_preload = original_preload
+                assert len(preload_calls) == 1, preload_calls
                 _wait_until(
                     app.root,
                     lambda: (
                         view._derive_lifecycle_state() == "READY"
                         and view.selected_column_logical_range == (20, 20)
+                        and len(app.undo_stack) == undo_before + 1
                     ),
                     "Gunships did not reach its second structural block",
-                    timeout=35.0,
+                    timeout=max(0.001, deadline - time.monotonic()),
                 )
         for geometry in snapshots["before"]:
             before = snapshots["before"][geometry]
@@ -421,6 +474,7 @@ def test_real_gunships_root_utilities_are_left_aligned_in_stable_order():
                 before,
                 after,
             )
+        assert time.monotonic() <= deadline
 
 
 def _mapped_guidance_texts(view):
@@ -459,7 +513,10 @@ def _assert_no_visible_l_notation(texts) -> None:
 
 def _excel_label_rows():
     headers = tuple(
-        f"field_{get_column_letter(index)}"
+        (
+            f"field_{get_column_letter(index)}"
+            f"{'@id' if index == 2 else '@pm'}"
+        )
         for index in range(1, 28)
     )
     base = [
@@ -485,6 +542,9 @@ def _excel_label_rows():
             if index not in (1, 26, 27)
         ),
     ]
+    assert base[0][0].endswith("@pm") and base[0][1].endswith("@id")
+    assert mine[0][0] == "field_B@id"
+    assert sum(field.endswith("@id") for field in mine[0]) == 1
     return mine, base, [list(row) for row in base]
 
 
@@ -563,7 +623,8 @@ def test_visible_column_guidance_uses_excel_a_z_aa_without_l_notation():
             assert label in conflict_text, conflict_text
 
     ordinary_right = [list(row) for row in base]
-    ordinary_right[1][1] = "theirs-B"
+    assert str(base[0][2]).endswith("@pm")
+    ordinary_right[1][2] = "theirs-C"
     with _synthetic_view(
         base,
         ordinary_right,
@@ -597,28 +658,53 @@ def test_visible_column_guidance_uses_excel_a_z_aa_without_l_notation():
         assert label in combined
 
 
-def main() -> None:
-    tests = (
-        test_real_gunships_a1_a5_pixels_match_headers_panes_and_tags,
-        test_real_gunships_combined_action_row_is_centered_or_collision_safe,
-        test_real_gunships_root_utilities_are_left_aligned_in_stable_order,
-        test_visible_column_guidance_uses_excel_a_z_aa_without_l_notation,
+_CASES = (
+    ("gunships-header-pane-pixels", test_real_gunships_a1_a5_pixels_match_headers_panes_and_tags),
+    ("gunships-combined-action-row", test_real_gunships_combined_action_row_is_centered_or_collision_safe),
+    ("gunships-root-utility-layout", test_real_gunships_root_utilities_are_left_aligned_in_stable_order),
+    ("excel-column-guidance", test_visible_column_guidance_uses_excel_a_z_aa_without_l_notation),
+)
+
+
+def _list_cases() -> None:
+    for case_id, _test in _CASES:
+        print(case_id)
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list-cases", action="store_true")
+    parser.add_argument("--case", choices=tuple(case_id for case_id, _ in _CASES))
+    args = parser.parse_args(argv)
+    if args.list_cases:
+        _list_cases()
+        return
+    selected = tuple(
+        (case_id, test)
+        for case_id, test in _CASES
+        if args.case is None or case_id == args.case
     )
-    failures = []
-    for test in tests:
+    # Default-suite execution remains serial and fail-fast.  A test exception
+    # is deliberately re-raised instead of being accumulated and masked.
+    for case_id, test in selected:
         started = time.perf_counter()
+        case_deadline = time.monotonic() + 90.0
+        previous_deadline = section10._ACTIVE_CASE_DEADLINE
+        section10._ACTIVE_CASE_DEADLINE = case_deadline
         try:
             test()
-            print(
-                f"PASS {test.__name__} "
-                f"elapsed_sec={time.perf_counter() - started:.3f}"
+            assert time.monotonic() <= case_deadline, (
+                case_id,
+                case_deadline,
+                time.monotonic(),
             )
         except Exception:
-            failures.append(test.__name__)
-            traceback.print_exc()
-    if failures:
-        raise SystemExit(f"OPENSPEC_SECTION11_FAILED: {failures}")
-    print(f"PASS: OpenSpec section 11 acceptance ({len(tests)} tests)")
+            print(f"FAIL {case_id}", flush=True)
+            raise
+        finally:
+            section10._ACTIVE_CASE_DEADLINE = previous_deadline
+        print(f"PASS {case_id} elapsed_sec={time.perf_counter() - started:.3f}")
+    print(f"PASS: OpenSpec section 11 acceptance ({len(selected)} case(s))")
 
 
 if __name__ == "__main__":

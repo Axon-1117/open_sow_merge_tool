@@ -536,8 +536,10 @@ def _test_single_owner_edit_preload(metrics: dict):
     call_lock = threading.Lock()
 
     class _Workbook:
-        def __init__(self, path):
+        def __init__(self, path, *, data_only=False):
             self.path = path
+            self.data_only = bool(data_only)
+            self.read_only = False
             self.marker = "pristine"
             self.closed = False
 
@@ -547,21 +549,26 @@ def _test_single_owner_edit_preload(metrics: dict):
     original_load = mod.load_workbook
 
     def _fake_load(path, *, data_only=False):
-        assert data_only is False
         with call_lock:
-            calls.append(path)
+            calls.append((path, bool(data_only)))
         time.sleep(0.03)
-        return _Workbook(path)
+        return _Workbook(path, data_only=data_only)
 
     app = object.__new__(mod.SowMergeApp)
     app.file_a = "mine.xlsx"
     app.file_b = "theirs.xlsx"
     app.base_path = None
+    app._file_a_val_path = "mine-cache.xlsx"
+    app._file_b_val_path = "theirs-cache.xlsx"
+    app._file_base_val_path = None
     app.has_base = False
     app._is_closing = False
     app._wb_a_edit = None
     app._wb_b_edit = None
     app._wb_base_edit = None
+    app._wb_a_val = None
+    app._wb_b_val = None
+    app._wb_base_val = None
     app._edit_fallback_lock = threading.Lock()
     app._edit_preload_active_event = threading.Event()
     results = []
@@ -583,7 +590,13 @@ def _test_single_owner_edit_preload(metrics: dict):
         assert not any(worker.is_alive() for worker in workers)
         assert not errors, errors
         assert results == [True, True], results
-        assert calls == ["mine.xlsx", "theirs.xlsx"], calls
+        expected_calls = [
+            ("mine.xlsx", False),
+            ("theirs.xlsx", False),
+            ("mine-cache.xlsx", True),
+            ("theirs-cache.xlsx", True),
+        ]
+        assert calls == expected_calls, calls
 
         mine = app._wb_a_edit
         theirs = app._wb_b_edit
@@ -591,7 +604,7 @@ def _test_single_owner_edit_preload(metrics: dict):
         assert app._load_edit_workbooks_owned() is True
         assert app._wb_a_edit is mine and app._wb_a_edit.marker == "user-edited"
         assert app._wb_b_edit is theirs
-        assert calls == ["mine.xlsx", "theirs.xlsx"], calls
+        assert calls == expected_calls, calls
         assert not app._edit_preload_active_event.is_set()
     finally:
         mod.load_workbook = original_load

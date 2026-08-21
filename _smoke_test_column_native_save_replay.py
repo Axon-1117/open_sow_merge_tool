@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from types import SimpleNamespace
 from xml.etree import ElementTree as ET
 
@@ -34,7 +35,6 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 import sow_merge_tool as smt
-from _test_temp_utils import make_temp_dir
 
 
 _RUN_REAL_EXCEL = os.environ.get("SOW_RUN_REAL_EXCEL_COLUMN_REPLAY", "").strip() == "1"
@@ -49,6 +49,62 @@ def _sha256(path: str) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+@dataclass
+class _OwnedFixture:
+    temporary: tempfile.TemporaryDirectory
+    root: str
+    mine: str
+    theirs: str
+    expected: str | None
+    input_hashes: dict[str, str]
+
+
+def _finish_cleanup(primary: BaseException | None, errors: list[str]) -> None:
+    if not errors:
+        return
+    detail = "; ".join(errors)
+    if primary is not None:
+        primary.add_note(f"cleanup failure: {detail}")
+        return
+    raise AssertionError(f"cleanup failure: {detail}")
+
+
+def _cleanup_owned_fixture(
+    fixture: _OwnedFixture,
+    primary: BaseException | None,
+    *,
+    reader_closers=(),
+    restore=None,
+) -> None:
+    """Keep fixture cleanup deterministic without masking a test failure."""
+    errors: list[str] = []
+    for label, closer in reader_closers:
+        try:
+            closer()
+        except BaseException as error:
+            errors.append(f"{label} close: {error!r}")
+    if restore is not None:
+        try:
+            restore()
+        except BaseException as error:
+            errors.append(f"restore monkeypatch: {error!r}")
+    try:
+        actual = {path: _sha256(path) for path in fixture.input_hashes}
+        if actual != fixture.input_hashes:
+            errors.append(
+                f"fixture input SHA changed: expected={fixture.input_hashes!r}, actual={actual!r}"
+            )
+    except BaseException as error:
+        errors.append(f"input SHA check: {error!r}")
+    try:
+        fixture.temporary.cleanup()
+    except BaseException as error:
+        errors.append(f"temporary cleanup: {error!r}")
+    if os.path.lexists(fixture.root):
+        errors.append(f"temporary root remains: {fixture.root!r}")
+    _finish_cleanup(primary, errors)
 
 
 def _close_workbook(workbook):
@@ -278,31 +334,53 @@ def _fake_app(file_a: str, file_b: str):
 
 
 def _fixture_set(extension=".xlsx"):
-    root = make_temp_dir("sow_native_column_replay_")
+    temporary = tempfile.TemporaryDirectory(prefix="sow_native_column_replay_")
+    root = temporary.name
     include_vba = extension.lower() == ".xlsm"
     mine = os.path.join(root, "mine" + extension)
     theirs = os.path.join(root, "theirs" + extension)
     expected = os.path.join(root, "expected" + extension)
-    _make_fidelity_book(mine, ("A", "B", "C", "D"), include_vba=include_vba)
-    _make_fidelity_book(
-        theirs,
-        ("A", "X", "Y", "B", "D"),
-        decorated=(2, 3),
-        include_vba=include_vba,
-    )
-    _make_fidelity_book(
-        expected,
-        ("A", "X", "Y", "B", "D"),
-        decorated=(2, 3),
-        include_vba=include_vba,
-    )
-    workbook = load_workbook(expected, data_only=False, keep_vba=include_vba)
-    workbook["S1"]["E5"] = "pre-structure-edit"
-    workbook.save(expected)
-    _close_workbook(workbook)
-    _inject_advanced_formula_records(expected, include_vba=include_vba)
-    _transplant_untouched_parts(mine, expected, include_vba=include_vba)
-    return root, mine, theirs, expected
+    try:
+        _make_fidelity_book(mine, ("A", "B", "C", "D"), include_vba=include_vba)
+        _make_fidelity_book(
+            theirs,
+            ("A", "X", "Y", "B", "D"),
+            decorated=(2, 3),
+            include_vba=include_vba,
+        )
+        _make_fidelity_book(
+            expected,
+            ("A", "X", "Y", "B", "D"),
+            decorated=(2, 3),
+            include_vba=include_vba,
+        )
+        workbook = load_workbook(expected, data_only=False, keep_vba=include_vba)
+        try:
+            workbook["S1"]["E5"] = "pre-structure-edit"
+            workbook.save(expected)
+        finally:
+            _close_workbook(workbook)
+        _inject_advanced_formula_records(expected, include_vba=include_vba)
+        _transplant_untouched_parts(mine, expected, include_vba=include_vba)
+        inputs = (mine, theirs, expected)
+        return _OwnedFixture(
+            temporary=temporary,
+            root=root,
+            mine=mine,
+            theirs=theirs,
+            expected=expected,
+            input_hashes={path: _sha256(path) for path in inputs},
+        )
+    except BaseException as error:
+        errors: list[str] = []
+        try:
+            temporary.cleanup()
+        except BaseException as cleanup_error:
+            errors.append(f"fixture construction cleanup: {cleanup_error!r}")
+        if os.path.lexists(root):
+            errors.append(f"fixture construction root remains: {root!r}")
+        _finish_cleanup(error, errors)
+        raise
 
 
 def _real_excel_fixture_set():
@@ -313,21 +391,41 @@ def _real_excel_fixture_set():
     ordinary openpyxl workbooks so a malformed synthetic source cannot be
     mistaken for a native column-replay failure.
     """
-    root = make_temp_dir("sow_native_column_replay_real_")
+    temporary = tempfile.TemporaryDirectory(prefix="sow_native_column_replay_real_")
+    root = temporary.name
     mine = os.path.join(root, "mine.xlsx")
     theirs = os.path.join(root, "theirs.xlsx")
-    _make_fidelity_book(
-        mine,
-        ("A", "B", "C", "D"),
-        inject_advanced=False,
-    )
-    _make_fidelity_book(
-        theirs,
-        ("A", "X", "Y", "B", "D"),
-        decorated=(2, 3),
-        inject_advanced=False,
-    )
-    return root, mine, theirs
+    try:
+        _make_fidelity_book(
+            mine,
+            ("A", "B", "C", "D"),
+            inject_advanced=False,
+        )
+        _make_fidelity_book(
+            theirs,
+            ("A", "X", "Y", "B", "D"),
+            decorated=(2, 3),
+            inject_advanced=False,
+        )
+        inputs = (mine, theirs)
+        return _OwnedFixture(
+            temporary=temporary,
+            root=root,
+            mine=mine,
+            theirs=theirs,
+            expected=None,
+            input_hashes={path: _sha256(path) for path in inputs},
+        )
+    except BaseException as error:
+        errors: list[str] = []
+        try:
+            temporary.cleanup()
+        except BaseException as cleanup_error:
+            errors.append(f"real fixture construction cleanup: {cleanup_error!r}")
+        if os.path.lexists(root):
+            errors.append(f"real fixture construction root remains: {root!r}")
+        _finish_cleanup(error, errors)
+        raise
 
 
 def _assert_fidelity_output(path: str, source: str, *, include_vba=False):
@@ -404,9 +502,10 @@ def _ops_path_from_powershell(script: str) -> str:
 def _capture_native_payload(*, row_first: bool):
     signature = inspect.signature(smt._build_manual_merge_output_with_excel)
     assert "column_ops" in signature.parameters, signature
-    _root, mine, theirs, _expected = _fixture_set(".xlsx")
+    fixture = _fixture_set(".xlsx")
+    mine, theirs = fixture.mine, fixture.theirs
     output = os.path.join(
-        os.path.dirname(mine),
+        fixture.root,
         "payload-row-first.xlsx" if row_first else "payload-column-first.xlsx",
     )
     captured = {}
@@ -453,8 +552,9 @@ def _capture_native_payload(*, row_first: bool):
             "order": 4,
         }]
 
-    smt.subprocess.run = fake_run
+    primary = None
     try:
+        smt.subprocess.run = fake_run
         ok = smt._build_manual_merge_output_with_excel(
             mine,
             output,
@@ -463,10 +563,17 @@ def _capture_native_payload(*, row_first: bool):
             column_ops=column_ops,
             source_paths={"B": theirs, "BASE": mine},
         )
+        assert ok is True
+        return captured, row_ops, column_ops
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        smt.subprocess.run = original_run
-    assert ok is True
-    return captured, row_ops, column_ops
+        _cleanup_owned_fixture(
+            fixture,
+            primary,
+            restore=lambda: setattr(smt.subprocess, "run", original_run),
+        )
 
 
 def _assert_native_payload_order(*, row_first: bool):
@@ -544,7 +651,9 @@ def test_action_time_column_remap_produces_final_save_coordinate():
 
 
 def _run_public_route(extension: str):
-    _root, mine, theirs, expected = _fixture_set(extension)
+    fixture = _fixture_set(extension)
+    mine, theirs, expected = fixture.mine, fixture.theirs, fixture.expected
+    assert expected is not None
     app = _fake_app(mine, theirs)
     app.manual_a_column_ops = _column_operations("A")
     # The live row action has already shifted r4 -> r5 and the column action
@@ -578,22 +687,25 @@ def _run_public_route(extension: str):
         shutil.copy2(expected, out)
         return True
 
-    hashes = ("", "")
-    smt._build_manual_merge_output_with_excel = fake_builder
-    smt._excel_reopen_validate = lambda _path: True
+    primary = None
     try:
-        hashes = (_sha256(mine), _sha256(theirs))
+        smt._build_manual_merge_output_with_excel = fake_builder
+        smt._excel_reopen_validate = lambda _path: True
         output = smt.SowMergeApp.build_manual_merge_output_file(app)
+        assert captured["src"] == mine
+        assert captured["column_ops"] == _column_operations("A")
+        assert captured["source_paths"]["B"] == theirs
+        assert captured["manual_ops"] == {("S1", 5, 5): "pre-structure-edit"}
+        assert captured["row_ops"] == app.manual_a_row_ops
+        _assert_fidelity_output(output, mine, include_vba=extension == ".xlsm")
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        smt._build_manual_merge_output_with_excel = original_builder
-        smt._excel_reopen_validate = original_reopen
-    assert captured["src"] == mine
-    assert captured["column_ops"] == _column_operations("A")
-    assert captured["source_paths"]["B"] == theirs
-    assert captured["manual_ops"] == {("S1", 5, 5): "pre-structure-edit"}
-    assert captured["row_ops"] == app.manual_a_row_ops
-    assert (_sha256(mine), _sha256(theirs)) == hashes
-    _assert_fidelity_output(output, mine, include_vba=extension == ".xlsm")
+        def restore():
+            smt._build_manual_merge_output_with_excel = original_builder
+            smt._excel_reopen_validate = original_reopen
+        _cleanup_owned_fixture(fixture, primary, restore=restore)
 
 
 def test_public_xlsx_route_preserves_fidelity_and_remaps_mixed_coordinates():
@@ -605,7 +717,9 @@ def test_public_xlsm_route_preserves_macro_and_untouched_zip_parts():
 
 
 def test_native_failure_never_replaces_target_and_same_batch_can_retry():
-    root, mine, theirs, expected = _fixture_set(".xlsx")
+    fixture = _fixture_set(".xlsx")
+    root, mine, theirs, expected = fixture.root, fixture.mine, fixture.theirs, fixture.expected
+    assert expected is not None
     app = _fake_app(mine, theirs)
     app.manual_a_column_ops = _column_operations("A")
     user_target = os.path.join(root, "user-target.xlsx")
@@ -634,10 +748,11 @@ def test_native_failure_never_replaces_target_and_same_batch_can_retry():
     def forbidden_fallback(*_args, **_kwargs):
         raise AssertionError("column replay must never use the openpyxl structural fallback")
 
-    smt._build_manual_merge_output_with_excel = fake_native
-    smt._build_manual_merge_output_with_openpyxl = forbidden_fallback
-    smt._excel_reopen_validate = lambda _path: True
+    primary = None
     try:
+        smt._build_manual_merge_output_with_excel = fake_native
+        smt._build_manual_merge_output_with_openpyxl = forbidden_fallback
+        smt._excel_reopen_validate = lambda _path: True
         try:
             smt.SowMergeApp.build_manual_merge_output_file(app)
         except RuntimeError as exc:
@@ -655,14 +770,21 @@ def test_native_failure_never_replaces_target_and_same_batch_can_retry():
         )
         assert _sha256(user_target) == _sha256(expected)
         _assert_fidelity_output(user_target, mine)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        smt._build_manual_merge_output_with_excel = original_native
-        smt._build_manual_merge_output_with_openpyxl = original_fallback
-        smt._excel_reopen_validate = original_reopen
+        def restore():
+            smt._build_manual_merge_output_with_excel = original_native
+            smt._build_manual_merge_output_with_openpyxl = original_fallback
+            smt._excel_reopen_validate = original_reopen
+        _cleanup_owned_fixture(fixture, primary, restore=restore)
 
 
 def test_reopen_validation_failure_removes_artifact_and_fails_closed():
-    root, mine, theirs, expected = _fixture_set(".xlsx")
+    fixture = _fixture_set(".xlsx")
+    root, mine, theirs, expected = fixture.root, fixture.mine, fixture.theirs, fixture.expected
+    assert expected is not None
     app = _fake_app(mine, theirs)
     app.manual_a_column_ops = _column_operations("A")
     user_target = os.path.join(root, "validation-target.xlsx")
@@ -694,9 +816,10 @@ def test_reopen_validation_failure_removes_artifact_and_fails_closed():
     def forbidden_fallback(*_args, **_kwargs):
         raise AssertionError("failed native validation must not use openpyxl fallback")
 
-    smt._build_manual_merge_output_with_excel = fake_native
-    smt._build_manual_merge_output_with_openpyxl = forbidden_fallback
+    primary = None
     try:
+        smt._build_manual_merge_output_with_excel = fake_native
+        smt._build_manual_merge_output_with_openpyxl = forbidden_fallback
         try:
             smt.SowMergeApp.build_manual_merge_output_file(app)
         except RuntimeError as exc:
@@ -707,30 +830,43 @@ def test_reopen_validation_failure_removes_artifact_and_fails_closed():
         assert not os.path.exists(captured["out"])
         assert _sha256(user_target) == target_hash
         assert app.manual_a_column_ops == _column_operations("A")
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        smt._build_manual_merge_output_with_excel = original_native
-        smt._build_manual_merge_output_with_openpyxl = original_fallback
-        smt._excel_reopen_validate = original_reopen
+        def restore():
+            smt._build_manual_merge_output_with_excel = original_native
+            smt._build_manual_merge_output_with_openpyxl = original_fallback
+            smt._excel_reopen_validate = original_reopen
+        _cleanup_owned_fixture(fixture, primary, restore=restore)
 
 
 def test_real_excel_native_column_replay_optional():
     if not _RUN_REAL_EXCEL:
         return "skipped"
-    _root, mine, theirs = _real_excel_fixture_set()
-    assert smt._excel_reopen_validate(mine), "Excel cannot reopen pristine mine fixture"
-    assert smt._excel_reopen_validate(theirs), "Excel cannot reopen pristine theirs fixture"
-    output = os.path.join(os.path.dirname(mine), "real-excel-output.xlsx")
-    ok = smt._build_manual_merge_output_with_excel(
-        mine,
-        output,
-        {("S1", 5, 5): "pre-structure-edit"},
-        row_ops=[],
-        column_ops=_column_operations("A"),
-        source_paths={"B": theirs},
-    )
-    assert ok is True, "real Excel native column replay failed"
-    assert smt._excel_reopen_validate(output), "Excel cannot reopen native replay output"
-    _assert_real_excel_output(output, mine)
+    fixture = _real_excel_fixture_set()
+    mine, theirs = fixture.mine, fixture.theirs
+    primary = None
+    try:
+        assert smt._excel_reopen_validate(mine), "Excel cannot reopen pristine mine fixture"
+        assert smt._excel_reopen_validate(theirs), "Excel cannot reopen pristine theirs fixture"
+        output = os.path.join(fixture.root, "real-excel-output.xlsx")
+        ok = smt._build_manual_merge_output_with_excel(
+            mine,
+            output,
+            {("S1", 5, 5): "pre-structure-edit"},
+            row_ops=[],
+            column_ops=_column_operations("A"),
+            source_paths={"B": theirs},
+        )
+        assert ok is True, "real Excel native column replay failed"
+        assert smt._excel_reopen_validate(output), "Excel cannot reopen native replay output"
+        _assert_real_excel_output(output, mine)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        _cleanup_owned_fixture(fixture, primary)
 
 
 def main():

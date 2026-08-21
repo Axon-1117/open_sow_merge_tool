@@ -1,0 +1,11 @@
+{
+  "schema": "terra-live-source-rehash-v1",
+  "source_root": "C:\\GM15\\design\\sheets\\develop",
+  "expected_count": 193,
+  "live_supported_count": 193,
+  "mismatch_count": 0,
+  "mismatches": [],
+  "source_unchanged": true,
+  "compared_against": "large_sheet_corpus_exact_run6_final.json",
+  "production_sha256": "02C7392F5EB888490C4683D6B453374AE8F7B5E7CD84880B632E81C561022089"
+}

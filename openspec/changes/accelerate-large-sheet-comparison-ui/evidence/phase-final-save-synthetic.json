@@ -1,0 +1,78 @@
+{
+  "fixture": "synthetic-3001",
+  "fresh_process": true,
+  "phases": {
+    "save": {
+      "errors": [],
+      "heartbeat_max_gap_p95_ms": 59.593,
+      "p50_ms": 82.495,
+      "p95_ms": 82.61,
+      "rss_peak_p95_bytes": 93593600,
+      "samples": [
+        {
+          "fixture": "synthetic-3001",
+          "phase": "save",
+          "pid": 43908,
+          "rss_after_bytes": 92942336,
+          "rss_delta_bytes": 32067584,
+          "rss_peak_bytes": 92942336,
+          "sheet": "S1",
+          "snapshot_metrics_ms": {},
+          "status": "ok",
+          "timings_ms": {
+            "save": 82.61,
+            "save_action": 9.115,
+            "selected_ready": 1007.259,
+            "startup": 608.571
+          },
+          "ui_heartbeat_max_gap_ms": 59.593,
+          "virtual_publish_ms": 0.0,
+          "virtual_publish_phases_ms": {}
+        },
+        {
+          "fixture": "synthetic-3001",
+          "phase": "save",
+          "pid": 27640,
+          "rss_after_bytes": 93544448,
+          "rss_delta_bytes": 32714752,
+          "rss_peak_bytes": 93544448,
+          "sheet": "S1",
+          "snapshot_metrics_ms": {},
+          "status": "ok",
+          "timings_ms": {
+            "save": 82.495,
+            "save_action": 9.317,
+            "selected_ready": 1022.643,
+            "startup": 623.525
+          },
+          "ui_heartbeat_max_gap_ms": 53.938,
+          "virtual_publish_ms": 0.0,
+          "virtual_publish_phases_ms": {}
+        },
+        {
+          "fixture": "synthetic-3001",
+          "phase": "save",
+          "pid": 34660,
+          "rss_after_bytes": 93593600,
+          "rss_delta_bytes": 32407552,
+          "rss_peak_bytes": 93593600,
+          "sheet": "S1",
+          "snapshot_metrics_ms": {},
+          "status": "ok",
+          "timings_ms": {
+            "save": 81.173,
+            "save_action": 9.676,
+            "selected_ready": 999.38,
+            "startup": 617.987
+          },
+          "ui_heartbeat_max_gap_ms": 59.519,
+          "virtual_publish_ms": 0.0,
+          "virtual_publish_phases_ms": {}
+        }
+      ],
+      "viewport_publish_p95_ms": 0.0
+    }
+  },
+  "runs": 3,
+  "schema": "large-sheet-phase-baseline-v1"
+}

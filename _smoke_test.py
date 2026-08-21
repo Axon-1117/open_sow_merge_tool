@@ -41,6 +41,7 @@ assert view._data_ready, 'refresh(rescan=True) should set _data_ready'
 
 # Mutations are intentionally gated until the formula-aware editable
 # workbooks and the exact comparison generation are ready.
+app._request_edit_preload()
 deadline = time.time() + 15.0
 while time.time() < deadline and view._derive_lifecycle_state() != "READY":
     try:
@@ -66,5 +67,5 @@ view._copy_selected_row('A2B')
 assert not view.pair_diff_cols.get(pair_idx_r1), \
     f'merge did not clear diff; pair_diff_cols[{pair_idx_r1}]={view.pair_diff_cols.get(pair_idx_r1)}'
 
-app.root.destroy()
+app._shutdown_root()
 print('SMOKE_TEST_OK')

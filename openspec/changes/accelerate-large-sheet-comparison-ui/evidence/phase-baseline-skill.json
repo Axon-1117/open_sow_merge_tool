@@ -1,0 +1,66 @@
+{
+  "fixture": "Skill",
+  "fresh_process": true,
+  "phases": {
+    "cached_revisit": {
+      "errors": [],
+      "p50_ms": 54.32,
+      "p95_ms": 54.32,
+      "samples": [
+        {
+          "fixture": "Skill",
+          "phase": "cached_revisit",
+          "pid": 33188,
+          "rss_after_bytes": 874913792,
+          "rss_delta_bytes": 802279424,
+          "sheet": "SkillLogicBuff@design",
+          "status": "ok",
+          "timings_ms": {
+            "cached_revisit": 54.32,
+            "selected_ready": 10109.314,
+            "startup": 3451.937
+          }
+        }
+      ]
+    },
+    "scroll": {
+      "errors": [],
+      "p50_ms": 133.859,
+      "p95_ms": 133.859,
+      "samples": [
+        {
+          "fixture": "Skill",
+          "phase": "scroll",
+          "pid": 42976,
+          "rss_after_bytes": 873046016,
+          "rss_delta_bytes": 800780288,
+          "sheet": "SkillLogicBuff@design",
+          "status": "ok",
+          "timings_ms": {
+            "scroll": 133.859,
+            "selected_ready": 10166.519,
+            "startup": 3517.833
+          }
+        }
+      ]
+    },
+    "selected_ready": {
+      "errors": [
+        "Command '['C:\\\\Python314\\\\python.exe', 'D:\\\\Tools\\\\sow_merge_tool_proj\\\\_performance_large_sheet_phases.py', '--worker', '--phase', 'selected_ready', '--rows', '20000', '--timeout', '120.0', '--real', 'Skill']' returned non-zero exit status 1."
+      ],
+      "p50_ms": null,
+      "p95_ms": null,
+      "samples": []
+    },
+    "startup": {
+      "errors": [
+        "Command '['C:\\\\Python314\\\\python.exe', 'D:\\\\Tools\\\\sow_merge_tool_proj\\\\_performance_large_sheet_phases.py', '--worker', '--phase', 'startup', '--rows', '20000', '--timeout', '120.0', '--real', 'Skill']' returned non-zero exit status 1."
+      ],
+      "p50_ms": null,
+      "p95_ms": null,
+      "samples": []
+    }
+  },
+  "runs": 1,
+  "schema": "large-sheet-phase-baseline-v1"
+}

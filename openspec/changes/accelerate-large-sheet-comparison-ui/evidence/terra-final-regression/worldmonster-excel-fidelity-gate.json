@@ -1,0 +1,212 @@
+{
+  "fixtures": [
+    {
+      "fixture": "WorldMonster",
+      "operations": {
+        "actual_app_cell_row_region_column_undo_redo": "not_covered",
+        "atomic_failure_retry": "not_covered",
+        "manual_targets": [
+          "('WorldMonsterSurvivor@design', 5, 2)",
+          "('WorldMonsterSurvivor@design', 6, 2)",
+          "('WorldMonsterSurvivor@design', 7, 2)"
+        ],
+        "native": "requires actual app-operation/native replay gate",
+        "output": "D:\\Tools\\sow_merge_tool_proj\\tmp\\test_tmp\\sow_large_sheet_excel_fidelity_0d1606bd\\WorldMonster\\operations\\operations-output.xlsx",
+        "overlay_generation": 4,
+        "overlay_unit": "ok",
+        "package": {
+          "comment_parts": [],
+          "excel_reopen": "not_requested",
+          "external_link_parts": [],
+          "parts": 18,
+          "relationship_parts": [
+            "_rels/.rels",
+            "xl/_rels/workbook.xml.rels",
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "xl/worksheets/_rels/sheet2.xml.rels",
+            "xl/worksheets/_rels/sheet3.xml.rels"
+          ],
+          "sheets": [
+            {
+              "cols": 24,
+              "column_dimensions": 10,
+              "comments": 0,
+              "formulas": 58267,
+              "hyperlinks": 2,
+              "row_dimensions": 578,
+              "rows": 3747,
+              "sheet": "WorldMonster@design"
+            },
+            {
+              "cols": 10,
+              "column_dimensions": 9,
+              "comments": 0,
+              "formulas": 10343,
+              "hyperlinks": 2,
+              "row_dimensions": 1,
+              "rows": 18434,
+              "sheet": "WorldMonsterSurvivor@design"
+            },
+            {
+              "cols": 16,
+              "column_dimensions": 13,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 1,
+              "row_dimensions": 150,
+              "rows": 185,
+              "sheet": "state@design"
+            },
+            {
+              "cols": 10,
+              "column_dimensions": 4,
+              "comments": 0,
+              "formulas": 38,
+              "hyperlinks": 0,
+              "row_dimensions": 10,
+              "rows": 38,
+              "sheet": "test@pm"
+            },
+            {
+              "cols": 6,
+              "column_dimensions": 1,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 0,
+              "row_dimensions": 6,
+              "rows": 39,
+              "sheet": "icon辅助配表@pm"
+            },
+            {
+              "cols": 56,
+              "column_dimensions": 4,
+              "comments": 0,
+              "formulas": 5396,
+              "hyperlinks": 0,
+              "row_dimensions": 0,
+              "rows": 1004,
+              "sheet": "战力参考对比@pm"
+            }
+          ],
+          "vba": false,
+          "zip_valid": true
+        },
+        "structural_record": "not_executed",
+        "zip_cell_patch": "ok"
+      },
+      "sheet": "WorldMonsterSurvivor@design",
+      "source": "C:\\GM15\\design\\sheets\\develop\\WorldMonster.xlsx",
+      "variants": [
+        {
+          "kind": "value",
+          "mine_target": {
+            "col": 2,
+            "kind": "value",
+            "marker": "__SOW_FIDELITY_WorldMonster_value_MINE__",
+            "row": 5
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "value",
+            "marker": "__SOW_FIDELITY_WorldMonster_value_THEIRS__",
+            "row": 5
+          },
+          "three_way": "exact-frozen-legacy",
+          "three_way_conflicts": 1,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "formula_cache",
+          "mine_target": {
+            "col": 2,
+            "kind": "formula_cache",
+            "marker": "__SOW_FIDELITY_WorldMonster_formula_cache_MINE__",
+            "row": 5
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "formula_cache",
+            "marker": "__SOW_FIDELITY_WorldMonster_formula_cache_THEIRS__",
+            "row": 5
+          },
+          "three_way": "exact-frozen-legacy",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "row",
+          "mine_target": {
+            "col": 2,
+            "kind": "row",
+            "marker": "__SOW_FIDELITY_WorldMonster_row_MINE__",
+            "row": 18435
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "row",
+            "marker": "__SOW_FIDELITY_WorldMonster_row_THEIRS__",
+            "row": 18435
+          },
+          "three_way": "exact-frozen-legacy",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "column",
+          "mine_target": null,
+          "theirs_target": {
+            "col": 11,
+            "kind": "column",
+            "marker": "__SOW_FIDELITY_WorldMonster_column_THEIRS__",
+            "row": 5
+          },
+          "three_way": "exact-frozen-legacy",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        }
+      ]
+    }
+  ],
+  "no_op_corpus": [],
+  "real_excel_requested": false,
+  "root": "D:\\Tools\\sow_merge_tool_proj\\tmp\\test_tmp\\sow_large_sheet_excel_fidelity_0d1606bd",
+  "schema": "large-sheet-excel-fidelity-gate-v2",
+  "special_formulas": {
+    "array_copy": "rejected",
+    "cache_only_save": "ok",
+    "candidate_three_way_conflicts": 0,
+    "legacy_three_way_conflicts": 0,
+    "package": {
+      "comment_parts": [],
+      "excel_reopen": "not_requested",
+      "external_link_parts": [],
+      "parts": 9,
+      "relationship_parts": [
+        "_rels/.rels",
+        "xl/_rels/workbook.xml.rels"
+      ],
+      "sheets": [
+        {
+          "cols": 4,
+          "column_dimensions": 0,
+          "comments": 0,
+          "formulas": 1,
+          "hyperlinks": 0,
+          "row_dimensions": 0,
+          "rows": 6,
+          "sheet": "Special"
+        }
+      ],
+      "vba": false,
+      "zip_valid": true
+    },
+    "three_way": "exact-frozen-legacy",
+    "two_way": "exact-direct"
+  },
+  "stable_identity_contract": "ok",
+  "status": "ok"
+}

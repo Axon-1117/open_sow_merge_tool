@@ -1,0 +1,272 @@
+{
+  "fixtures": [
+    {
+      "fixture": "Skill",
+      "operations": {
+        "atomic_recovery": "ok",
+        "cell": "ok",
+        "manual_targets": [
+          "('SkillLogicBuff@design', 5, 2)",
+          "('SkillLogicBuff@design', 6, 2)",
+          "('SkillLogicBuff@design', 7, 2)"
+        ],
+        "native": "requires existing native replay smoke/optional Excel gate",
+        "output": "D:\\Tools\\sow_merge_tool_proj\\tmp\\test_tmp\\sow_large_sheet_excel_fidelity_88cbbe2c\\Skill\\operations\\operations-output.xlsx",
+        "overlay_generation": 4,
+        "package": {
+          "comment_parts": [],
+          "excel_reopen": "not_requested",
+          "external_link_parts": [],
+          "parts": 27,
+          "relationship_parts": [
+            "_rels/.rels",
+            "xl/_rels/workbook.xml.rels",
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "xl/worksheets/_rels/sheet10.xml.rels",
+            "xl/worksheets/_rels/sheet4.xml.rels",
+            "xl/worksheets/_rels/sheet7.xml.rels"
+          ],
+          "sheets": [
+            {
+              "cols": 38,
+              "column_dimensions": 23,
+              "comments": 0,
+              "formulas": 13097,
+              "hyperlinks": 1,
+              "row_dimensions": 2768,
+              "rows": 2768,
+              "sheet": "Skill@design"
+            },
+            {
+              "cols": 33,
+              "column_dimensions": 8,
+              "comments": 0,
+              "formulas": 7890,
+              "hyperlinks": 0,
+              "row_dimensions": 3928,
+              "rows": 3928,
+              "sheet": "SkillTimeline@design"
+            },
+            {
+              "cols": 10,
+              "column_dimensions": 7,
+              "comments": 0,
+              "formulas": 6421,
+              "hyperlinks": 0,
+              "row_dimensions": 576,
+              "rows": 3497,
+              "sheet": "SkillLogicExecuter@design"
+            },
+            {
+              "cols": 31,
+              "column_dimensions": 21,
+              "comments": 0,
+              "formulas": 21999,
+              "hyperlinks": 2,
+              "row_dimensions": 3461,
+              "rows": 3461,
+              "sheet": "SkillLogicBuff@design"
+            },
+            {
+              "cols": 14,
+              "column_dimensions": 8,
+              "comments": 0,
+              "formulas": 14812,
+              "hyperlinks": 0,
+              "row_dimensions": 43,
+              "rows": 2369,
+              "sheet": "LogicParam@pm"
+            },
+            {
+              "cols": 7,
+              "column_dimensions": 7,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 0,
+              "row_dimensions": 24,
+              "rows": 38,
+              "sheet": "DamageConfig@design"
+            },
+            {
+              "cols": 10,
+              "column_dimensions": 8,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 3,
+              "row_dimensions": 28,
+              "rows": 80,
+              "sheet": "SkillBenefit@design"
+            },
+            {
+              "cols": 14,
+              "column_dimensions": 2,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 0,
+              "row_dimensions": 21,
+              "rows": 24,
+              "sheet": "AttrType@enum"
+            },
+            {
+              "cols": 14,
+              "column_dimensions": 2,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 0,
+              "row_dimensions": 21,
+              "rows": 24,
+              "sheet": "BuffEffectType@enum"
+            },
+            {
+              "cols": 3,
+              "column_dimensions": 3,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 3,
+              "row_dimensions": 4,
+              "rows": 19,
+              "sheet": "LogicTypeFormula@design"
+            },
+            {
+              "cols": 3,
+              "column_dimensions": 2,
+              "comments": 0,
+              "formulas": 12,
+              "hyperlinks": 0,
+              "row_dimensions": 29,
+              "rows": 32,
+              "sheet": "TargetType@enum"
+            },
+            {
+              "cols": 14,
+              "column_dimensions": 2,
+              "comments": 0,
+              "formulas": 0,
+              "hyperlinks": 0,
+              "row_dimensions": 19,
+              "rows": 22,
+              "sheet": "LogicType@pm"
+            },
+            {
+              "cols": 37,
+              "column_dimensions": 18,
+              "comments": 0,
+              "formulas": 11389,
+              "hyperlinks": 0,
+              "row_dimensions": 2406,
+              "rows": 2406,
+              "sheet": "SkillLogic@pm"
+            },
+            {
+              "cols": 37,
+              "column_dimensions": 18,
+              "comments": 0,
+              "formulas": 11374,
+              "hyperlinks": 0,
+              "row_dimensions": 26,
+              "rows": 2407,
+              "sheet": "SKill_test@pm"
+            }
+          ],
+          "vba": false,
+          "zip_valid": true
+        },
+        "redo": "ok",
+        "region": "ok",
+        "save": "ok",
+        "structural_record": {
+          "count": 1,
+          "kind": "insert_rows",
+          "row": 5,
+          "sheet": "SkillLogicBuff@design"
+        },
+        "undo": "ok"
+      },
+      "sheet": "SkillLogicBuff@design",
+      "source": "C:\\GM15\\design\\sheets\\develop\\Skill.xlsx",
+      "variants": [
+        {
+          "kind": "value",
+          "mine_target": {
+            "col": 2,
+            "kind": "value",
+            "marker": "__SOW_FIDELITY_Skill_value_MINE__",
+            "row": 5
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "value",
+            "marker": "__SOW_FIDELITY_Skill_value_THEIRS__",
+            "row": 5
+          },
+          "three_way": "composed-direct",
+          "three_way_conflicts": 1,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "formula_cache",
+          "mine_target": {
+            "col": 2,
+            "kind": "formula_cache",
+            "marker": "__SOW_FIDELITY_Skill_formula_cache_MINE__",
+            "row": 5
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "formula_cache",
+            "marker": "__SOW_FIDELITY_Skill_formula_cache_THEIRS__",
+            "row": 5
+          },
+          "three_way": "composed-direct",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "row",
+          "mine_target": {
+            "col": 2,
+            "kind": "row",
+            "marker": "__SOW_FIDELITY_Skill_row_MINE__",
+            "row": 3462
+          },
+          "theirs_target": {
+            "col": 2,
+            "kind": "row",
+            "marker": "__SOW_FIDELITY_Skill_row_THEIRS__",
+            "row": 3462
+          },
+          "three_way": "composed-direct",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        },
+        {
+          "kind": "column",
+          "mine_target": {
+            "col": 32,
+            "kind": "column",
+            "marker": "__SOW_FIDELITY_Skill_column_MINE__",
+            "row": 5
+          },
+          "theirs_target": {
+            "col": 32,
+            "kind": "column",
+            "marker": "__SOW_FIDELITY_Skill_column_THEIRS__",
+            "row": 5
+          },
+          "three_way": "composed-direct",
+          "three_way_conflicts": 0,
+          "two_way": "exact-direct",
+          "two_way_conflicts": 0
+        }
+      ]
+    }
+  ],
+  "no_op_corpus": [],
+  "real_excel_requested": false,
+  "root": "D:\\Tools\\sow_merge_tool_proj\\tmp\\test_tmp\\sow_large_sheet_excel_fidelity_88cbbe2c",
+  "schema": "large-sheet-excel-fidelity-gate-v1",
+  "status": "ok"
+}

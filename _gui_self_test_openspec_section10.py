@@ -11,11 +11,14 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
+import itertools
+import json
 import os
+import shutil
 import time
-import traceback
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -32,9 +35,11 @@ from _test_temp_utils import make_temp_dir
 DEVELOP_ROOT = r"C:\GM15\design\sheets\develop"
 RELEASE_ROOT = r"C:\GM15\design\sheets\release"
 REAL_REPLAY_CANDIDATES = (
+    "ActivitySelectCard自选周卡.xlsx",
     "ActivityCWPuzzle纵横拼图.xlsx",
     "ActivityInfinite幸运无限礼包.xlsx",
 )
+_ACTIVE_CASE_DEADLINE = None
 
 
 def _pump(root, seconds: float = 0.08) -> None:
@@ -46,9 +51,12 @@ def _pump(root, seconds: float = 0.08) -> None:
 
 
 def _wait_until(root, predicate, message: str, timeout: float = 20.0) -> None:
-    deadline = time.time() + timeout
+    deadline = min(
+        time.monotonic() + timeout,
+        float(getattr(root, "_section10_test_deadline", float("inf"))),
+    )
     last_error = None
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         _pump(root, 0.03)
         try:
             if predicate():
@@ -59,14 +67,50 @@ def _wait_until(root, predicate, message: str, timeout: float = 20.0) -> None:
     raise AssertionError(f"{message}{suffix}")
 
 
+def _typed_rows(rows):
+    source = [tuple(row) for row in rows]
+    assert len(source) >= 2, source
+    width = len(source[0])
+    assert width > 0 and all(len(row) == width for row in source), source
+    declarations = []
+    types = []
+    for column, raw_name in enumerate(source[0], start=1):
+        name = str(raw_name)
+        declarations.append(
+            name if "@" in name else f"{name}{'@id' if column == 1 else '@pm'}"
+        )
+        populated = [
+            row[column - 1]
+            for row in source[1:]
+            if row[column - 1] not in (None, "")
+        ]
+        types.append(
+            "int32"
+            if populated
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in populated)
+            else "string"
+        )
+    return [tuple(declarations), tuple(types), *source[1:]]
+
+
 def _write_book(path: str, rows, *, sheet: str = "Data") -> None:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = sheet
-    for row in rows:
+    for row in _typed_rows(rows):
         worksheet.append(list(row))
     workbook.save(path)
     workbook.close()
+
+
+def _shift_conflict_map_for_typed_schema(conflict_map):
+    shifted = {}
+    for sheet, rows in copy.deepcopy(conflict_map or {}).items():
+        shifted[str(sheet)] = {
+            int(row) + 1: set(columns)
+            for row, columns in rows.items()
+        }
+    return shifted
 
 
 @contextmanager
@@ -109,31 +153,58 @@ def _synthetic_view(
     conflict_mode: bool = False,
     geometry: str = "1100x780",
 ):
+    case_deadline = (
+        float(_ACTIVE_CASE_DEADLINE)
+        if _ACTIVE_CASE_DEADLINE is not None
+        else time.monotonic() + 90.0
+    )
     root_dir = make_temp_dir("sow_openspec_section10_")
+    assert os.path.isabs(root_dir)
+    assert os.path.basename(root_dir).startswith("sow_openspec_section10_")
     mine_path = os.path.join(root_dir, "mine.xlsx")
     theirs_path = os.path.join(root_dir, "theirs.xlsx")
     base_path = os.path.join(root_dir, "base.xlsx")
     merged_path = os.path.join(root_dir, "merged.xlsx")
-    _write_book(mine_path, mine_rows)
-    _write_book(theirs_path, theirs_rows)
-    if base_rows is not None:
-        _write_book(base_path, base_rows)
-
     app = None
+    primary = None
+    previous_settings_path = smt._SETTINGS_PATH
+    settings_path = os.path.join(root_dir, "settings.json")
+    input_hashes = None
+    startup_ledger = set()
     with _quiet_dialogs() as dialogs:
         try:
+            _write_book(mine_path, mine_rows)
+            _write_book(theirs_path, theirs_rows)
+            if base_rows is not None:
+                _write_book(base_path, base_rows)
+            input_paths = [mine_path, theirs_path]
+            if base_rows is not None:
+                input_paths.append(base_path)
+            input_hashes = {
+                path: _sha256(path, absolute_deadline=case_deadline)
+                for path in input_paths
+            }
+            with open(settings_path, "w", encoding="utf-8") as stream:
+                json.dump({"only_diff": 0}, stream)
+            smt._SETTINGS_PATH = settings_path
             app = smt.SowMergeApp(
                 mine_path,
                 theirs_path,
                 merge_mode=base_rows is not None,
                 merged_path=merged_path if base_rows is not None else None,
                 base_path=base_path if base_rows is not None else None,
-                merge_conflict_cells_by_sheet=copy.deepcopy(conflict_map or {}),
+                merge_conflict_cells_by_sheet=_shift_conflict_map_for_typed_schema(
+                    conflict_map
+                ),
                 merge_conflict_mode=bool(conflict_mode),
                 raw_mine=mine_path if base_rows is not None else None,
                 raw_base=base_path if base_rows is not None else None,
                 raw_theirs=theirs_path if base_rows is not None else None,
+                initial_sheet="Data",
+                startup_owned_paths=startup_ledger,
             )
+            assert app._owned_startup_temp_paths is startup_ledger
+            app.root._section10_test_deadline = case_deadline
             app.root.deiconify()
             app.root.state("normal")
             app.root.geometry(geometry)
@@ -141,33 +212,192 @@ def _synthetic_view(
             _wait_until(
                 app.root,
                 lambda: (
-                    app.sheet_views.get("Data") is not None
+                    app.nb.tab(app.nb.select(), "text") == "Data"
+                    and app.selected_sheet == "Data"
+                    and app._is_sheet_exact_current("Data")
+                    and bool(
+                        app._sheet_exact_entry("Data").get(
+                            "full_detail_terminal", False
+                        )
+                    )
+                    and app.sheet_views.get("Data") is not None
+                    and bool(
+                        getattr(
+                            app.sheet_views["Data"], "_prepared_complete", False
+                        )
+                    )
                     and bool(getattr(app.sheet_views["Data"], "_data_ready", False))
+                    and bool(getattr(app.sheet_views["Data"], "_row_model_exact", False))
+                    and not bool(
+                        getattr(
+                            app.sheet_views["Data"], "_pending_exact_render", False
+                        )
+                    )
+                    and app.sheet_views["Data"]._derive_lifecycle_state()
+                    == "EDIT_DEFERRED"
+                    and not app._edit_workbooks_ready()
                 ),
-                "Data view did not load",
+                "Data view did not reach current full-exact EDIT_DEFERRED",
+                timeout=45.0,
             )
             view = app.sheet_views["Data"]
-            view._suppress_bg_apply = True
-            view.only_diff_var.set(0)
-            view._last_only_diff_value = 0
-            view.refresh(row_only=None, rescan=True)
+            expected_only_diff = 1 if conflict_mode else 0
+            assert int(view.only_diff_var.get()) == expected_only_diff
+            if conflict_mode:
+                assert str(view.only_diff_cb.cget("state")) == "disabled"
+            before_guard = (
+                tuple(app.undo_stack),
+                copy.deepcopy(app.manual_a_cell_ops),
+                copy.deepcopy(app.manual_b_cell_ops),
+                copy.deepcopy(app.manual_a_row_ops),
+                copy.deepcopy(app.manual_b_row_ops),
+                copy.deepcopy(app.manual_a_column_ops),
+                copy.deepcopy(app.manual_b_column_ops),
+            )
+            preload_calls = []
+            original_preload = app._request_edit_preload
+
+            def _tracked_preload(*args, **kwargs):
+                preload_calls.append((args, dict(kwargs)))
+                return original_preload(*args, **kwargs)
+
+            app._request_edit_preload = _tracked_preload
+            try:
+                assert not view._guard_mutation_ready(
+                    "Section10 synthetic operation setup", notify=False
+                )
+            finally:
+                app._request_edit_preload = original_preload
+            assert len(preload_calls) == 1, preload_calls
+            assert preload_calls[0] == (
+                (),
+                {
+                    "reason": "mutation:Section10 synthetic operation setup",
+                    "caller": "SheetView._guard_mutation_ready",
+                },
+            ), preload_calls
+            assert (
+                tuple(app.undo_stack),
+                app.manual_a_cell_ops,
+                app.manual_b_cell_ops,
+                app.manual_a_row_ops,
+                app.manual_b_row_ops,
+                app.manual_a_column_ops,
+                app.manual_b_column_ops,
+            ) == before_guard
             _wait_until(
                 app.root,
-                lambda: view._derive_lifecycle_state() == "READY",
-                "Data view did not reach READY",
+                lambda: app._edit_workbooks_ready()
+                and view._derive_lifecycle_state() == "READY",
+                "Data edit backend did not reach READY after guarded demand",
+                timeout=45.0,
             )
             yield app, view, dialogs
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            if app is not None:
-                app._shutdown_root()
+            cleanup_errors = []
+            try:
+                expected_owned = {
+                    os.path.normcase(os.path.abspath(path))
+                    for path in startup_ledger
+                }
+                if app is not None:
+                    app._shutdown_root()
+                    evidence = tuple(app._owned_startup_temp_cleanup_evidence)
+                    assert not startup_ledger
+                    assert not app._owned_startup_temp_paths
+                elif startup_ledger:
+                    evidence = smt._cleanup_unclaimed_startup_temp_paths(
+                        startup_ledger,
+                        reason="Section10 synthetic app construction failed",
+                    )
+                    assert not startup_ledger
+                else:
+                    evidence = ()
+                assert {
+                    os.path.normcase(os.path.abspath(item.get("path", "")))
+                    for item in evidence
+                } == expected_owned, (evidence, expected_owned)
+                assert all(
+                    item.get("removed") is True
+                    and item.get("exists_after") is False
+                    and not item.get("error")
+                    for item in evidence
+                ), evidence
+            except BaseException as exc:
+                cleanup_errors.append(f"shutdown/ledger: {exc!r}")
+            try:
+                with open(settings_path, "r", encoding="utf-8") as stream:
+                    assert json.load(stream) == {"only_diff": 0}
+            except BaseException as exc:
+                cleanup_errors.append(f"temporary settings: {exc!r}")
+            try:
+                smt._SETTINGS_PATH = previous_settings_path
+            except BaseException as exc:
+                cleanup_errors.append(f"settings restore: {exc!r}")
+            if input_hashes is not None:
+                try:
+                    after_hashes = {path: _sha256(path) for path in input_hashes}
+                    assert after_hashes == input_hashes, (input_hashes, after_hashes)
+                except BaseException as exc:
+                    cleanup_errors.append(f"input hash: {exc!r}")
+            try:
+                if os.path.isdir(root_dir):
+                    shutil.rmtree(root_dir)
+                assert not os.path.lexists(root_dir), root_dir
+            except BaseException as exc:
+                cleanup_errors.append(f"owned root cleanup: {exc!r}")
+            if (
+                primary is None
+                and not cleanup_errors
+                and time.monotonic() > case_deadline
+            ):
+                cleanup_errors.append(
+                    "case deadline exceeded after final cleanup: "
+                    f"deadline={case_deadline:.6f} now={time.monotonic():.6f}"
+                )
+            if cleanup_errors:
+                detail = "Section10 synthetic cleanup failed: " + "; ".join(cleanup_errors)
+                if primary is not None:
+                    primary.add_note(detail)
+                else:
+                    raise AssertionError(detail)
 
 
 @contextmanager
 def _existing_view(path_a: str, path_b: str, sheet: str):
+    case_deadline = (
+        float(_ACTIVE_CASE_DEADLINE)
+        if _ACTIVE_CASE_DEADLINE is not None
+        else time.monotonic() + 90.0
+    )
+    root_dir = make_temp_dir("sow_openspec_section10_real_")
+    assert os.path.isabs(root_dir)
+    assert os.path.basename(root_dir).startswith("sow_openspec_section10_real_")
+    settings_path = os.path.join(root_dir, "settings.json")
+    previous_settings_path = smt._SETTINGS_PATH
+    input_hashes = {
+        path: _sha256(path, absolute_deadline=case_deadline)
+        for path in (path_a, path_b)
+    }
+    startup_ledger = set()
     app = None
+    primary = None
     with _quiet_dialogs() as dialogs:
         try:
-            app = smt.SowMergeApp(path_a, path_b)
+            with open(settings_path, "w", encoding="utf-8") as stream:
+                json.dump({"only_diff": 0}, stream)
+            smt._SETTINGS_PATH = settings_path
+            app = smt.SowMergeApp(
+                path_a,
+                path_b,
+                initial_sheet=sheet,
+                startup_owned_paths=startup_ledger,
+            )
+            assert app._owned_startup_temp_paths is startup_ledger
+            app.root._section10_test_deadline = case_deadline
             app.root.deiconify()
             app.root.state("normal")
             app.root.geometry("1100x780")
@@ -175,27 +405,139 @@ def _existing_view(path_a: str, path_b: str, sheet: str):
             _wait_until(
                 app.root,
                 lambda: (
-                    app.sheet_views.get(sheet) is not None
+                    app.nb.tab(app.nb.select(), "text") == sheet
+                    and app.selected_sheet == sheet
+                    and app._is_sheet_exact_current(sheet)
+                    and bool(
+                        app._sheet_exact_entry(sheet).get(
+                            "full_detail_terminal", False
+                        )
+                    )
+                    and app.sheet_views.get(sheet) is not None
+                    and bool(
+                        getattr(
+                            app.sheet_views[sheet], "_prepared_complete", False
+                        )
+                    )
                     and bool(getattr(app.sheet_views[sheet], "_data_ready", False))
+                    and bool(getattr(app.sheet_views[sheet], "_row_model_exact", False))
+                    and not bool(
+                        getattr(
+                            app.sheet_views[sheet], "_pending_exact_render", False
+                        )
+                    )
+                    and app.sheet_views[sheet]._derive_lifecycle_state()
+                    == "EDIT_DEFERRED"
+                    and not app._edit_workbooks_ready()
                 ),
-                f"real replay Sheet did not load: {sheet}",
+                f"real replay Sheet did not reach full exact EDIT_DEFERRED: {sheet}",
                 timeout=45.0,
             )
             view = app.sheet_views[sheet]
-            view._suppress_bg_apply = True
-            view.only_diff_var.set(0)
-            view._last_only_diff_value = 0
-            view.refresh(row_only=None, rescan=True)
+            assert int(view.only_diff_var.get()) == 0
+            preload_calls = []
+            original_preload = app._request_edit_preload
+
+            def _tracked_preload(*args, **kwargs):
+                preload_calls.append((args, dict(kwargs)))
+                return original_preload(*args, **kwargs)
+
+            app._request_edit_preload = _tracked_preload
+            try:
+                assert not view._guard_mutation_ready(
+                    "Section10 real replay setup", notify=False
+                )
+            finally:
+                app._request_edit_preload = original_preload
+            assert preload_calls == [
+                (
+                    (),
+                    {
+                        "reason": "mutation:Section10 real replay setup",
+                        "caller": "SheetView._guard_mutation_ready",
+                    },
+                )
+            ], preload_calls
             _wait_until(
                 app.root,
-                lambda: view._derive_lifecycle_state() == "READY",
-                f"real replay Sheet did not reach READY: {sheet}",
+                lambda: app._edit_workbooks_ready()
+                and view._derive_lifecycle_state() == "READY",
+                f"real replay edit backend did not reach READY: {sheet}",
                 timeout=45.0,
             )
             yield app, view, dialogs
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            if app is not None:
-                app._shutdown_root()
+            cleanup_errors = []
+            try:
+                expected_owned = {
+                    os.path.normcase(os.path.abspath(path))
+                    for path in startup_ledger
+                }
+                if app is not None:
+                    app._shutdown_root()
+                    evidence = tuple(app._owned_startup_temp_cleanup_evidence)
+                    assert not startup_ledger
+                    assert not app._owned_startup_temp_paths
+                elif startup_ledger:
+                    evidence = smt._cleanup_unclaimed_startup_temp_paths(
+                        startup_ledger,
+                        reason="Section10 real replay app construction failed",
+                    )
+                    assert not startup_ledger
+                else:
+                    evidence = ()
+                assert {
+                    os.path.normcase(os.path.abspath(item.get("path", "")))
+                    for item in evidence
+                } == expected_owned, (evidence, expected_owned)
+                assert all(
+                    item.get("removed") is True
+                    and item.get("exists_after") is False
+                    and not item.get("error")
+                    for item in evidence
+                ), evidence
+            except BaseException as exc:
+                cleanup_errors.append(f"shutdown/ledger: {exc!r}")
+            try:
+                with open(settings_path, "r", encoding="utf-8") as stream:
+                    assert json.load(stream) == {"only_diff": 0}
+            except BaseException as exc:
+                cleanup_errors.append(f"temporary settings: {exc!r}")
+            try:
+                smt._SETTINGS_PATH = previous_settings_path
+            except BaseException as exc:
+                cleanup_errors.append(f"settings restore: {exc!r}")
+            try:
+                after_hashes = {path: _sha256(path) for path in input_hashes}
+                assert after_hashes == input_hashes, (input_hashes, after_hashes)
+            except BaseException as exc:
+                cleanup_errors.append(f"input hash: {exc!r}")
+            try:
+                if os.path.isdir(root_dir):
+                    shutil.rmtree(root_dir)
+                assert not os.path.lexists(root_dir), root_dir
+            except BaseException as exc:
+                cleanup_errors.append(f"owned root cleanup: {exc!r}")
+            if (
+                primary is None
+                and not cleanup_errors
+                and time.monotonic() > case_deadline
+            ):
+                cleanup_errors.append(
+                    "case deadline exceeded after final cleanup: "
+                    f"deadline={case_deadline:.6f} now={time.monotonic():.6f}"
+                )
+            if cleanup_errors:
+                detail = "Section10 real replay cleanup failed: " + "; ".join(
+                    cleanup_errors
+                )
+                if primary is not None:
+                    primary.add_note(detail)
+                else:
+                    raise AssertionError(detail)
 
 
 def _worksheet_state(worksheet):
@@ -472,18 +814,59 @@ def _assert_rich_t_status_immediately_before_buttons(view) -> None:
 
 
 def test_centered_navigation_and_compact_rich_t_status_at_1450_and_1024():
-    with _real_gunships_app() as (app, view, _analysis):
+    deadline = time.monotonic() + 90.0
+    with _real_gunships_app(absolute_deadline=deadline) as (app, view, _analysis):
         assert view.selected_column_logical_range == (14, 14)
-        result = view._apply_selected_column_block("BASE", "A")
-        assert result.logical_start == result.logical_end == 14
+        assert view._derive_lifecycle_state() == "EDIT_DEFERRED"
+        assert not app._edit_workbooks_ready()
+        before_structural = frozenset(view.column_comparison_cache.structural_diff_cols)
+        before_unresolved = frozenset(view.column_comparison_cache.unresolved_cols)
+        before_undo = len(app.undo_stack)
+        preload_calls = []
+        original_preload = app._request_edit_preload
+
+        def tracked_preload(*args, **kwargs):
+            preload_calls.append((args, dict(kwargs)))
+            return original_preload(*args, **kwargs)
+
+        app._request_edit_preload = tracked_preload
+        try:
+            view.use_base_col_btn.invoke()
+            assert len(preload_calls) == 1, preload_calls
+            assert preload_calls[0] == (
+                (),
+                {
+                    "reason": "mutation:列结构操作",
+                    "caller": "SheetView._guard_mutation_ready",
+                },
+            ), preload_calls
+            assert view.selected_column_logical_range == (14, 14)
+            assert frozenset(view.column_comparison_cache.structural_diff_cols) == before_structural
+            assert frozenset(view.column_comparison_cache.unresolved_cols) == before_unresolved
+            assert len(app.undo_stack) == before_undo
+            _wait_until(
+                app.root,
+                lambda: (
+                    app._edit_workbooks_ready()
+                    and view._derive_lifecycle_state() == "READY"
+                    and view.selected_column_logical_range == (14, 14)
+                ),
+                "real Gunships first public column action did not reach edit READY",
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+            view.use_base_col_btn.invoke()
+        finally:
+            app._request_edit_preload = original_preload
+        assert len(preload_calls) == 1, preload_calls
         _wait_until(
             app.root,
             lambda: (
                 view._derive_lifecycle_state() == "READY"
                 and view.selected_column_logical_range == (20, 20)
+                and len(app.undo_stack) == before_undo + 1
             ),
             "real Gunships did not advance from L14 to L20",
-            timeout=35.0,
+            timeout=max(0.001, deadline - time.monotonic()),
         )
         assert view.column_action_status_var.get() == "待处理 T 已自动选｜可执行"
 
@@ -537,6 +920,7 @@ def test_centered_navigation_and_compact_rich_t_status_at_1450_and_1024():
                     - (action_row[0] + action_row[2])
                 ) <= 4, (geometry, action_row, nav_group)
             _assert_rich_t_status_immediately_before_buttons(view)
+        assert time.monotonic() <= deadline
 
 
 def _ordinary_global_rows():
@@ -587,6 +971,8 @@ def test_global_mode_both_menus_full_sheet_only_diff_independent_and_one_undo():
                 lambda: _app_mutation_state(app) == before,
                 "one undo did not restore the exact pre-Global state",
             )
+            if only_diff:
+                _set_only_diff(view, False)
     assert applied_states[0] == applied_states[1]
 
 
@@ -971,24 +1357,49 @@ def test_sheet_wide_uniform_width_is_stable_and_c_headers_are_a_through_aa():
         assert dict(view.col_char_widths) == width_state[0]
 
 
-def _sha256(path: str) -> str:
+def _assert_before_deadline(absolute_deadline: float, stage: str) -> None:
+    if time.monotonic() >= float(absolute_deadline):
+        raise TimeoutError(f"Section10 deadline expired during {stage}")
+
+
+def _sha256(path: str, *, absolute_deadline: float | None = None) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if absolute_deadline is not None:
+                _assert_before_deadline(
+                    absolute_deadline,
+                    f"SHA-256 {os.path.basename(path)}",
+                )
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def _choose_real_cell_only_replay():
+def _choose_real_cell_only_replay(*, absolute_deadline: float):
     for name in REAL_REPLAY_CANDIDATES:
+        _assert_before_deadline(absolute_deadline, f"candidate ingress {name}")
         develop_path = os.path.join(DEVELOP_ROOT, name)
         release_path = os.path.join(RELEASE_ROOT, name)
         if not os.path.isfile(develop_path) or not os.path.isfile(release_path):
             continue
+        _assert_before_deadline(
+            absolute_deadline,
+            f"candidate open develop {name}",
+        )
         develop = load_workbook(develop_path, read_only=True, data_only=False)
-        release = load_workbook(release_path, read_only=True, data_only=False)
+        release = None
         try:
+            _assert_before_deadline(
+                absolute_deadline,
+                f"candidate open release {name}",
+            )
+            release = load_workbook(release_path, read_only=True, data_only=False)
+            _assert_before_deadline(absolute_deadline, f"candidate reopen {name}")
             for sheet in develop.sheetnames:
+                _assert_before_deadline(
+                    absolute_deadline,
+                    f"candidate sheet {name}:{sheet}",
+                )
                 if sheet not in release.sheetnames:
                     continue
                 ws_develop = develop[sheet]
@@ -998,18 +1409,33 @@ def _choose_real_cell_only_replay():
                     or ws_develop.max_column != ws_release.max_column
                 ):
                     continue
-                diffs = []
-                for row in range(1, ws_develop.max_row + 1):
-                    for column in range(1, ws_develop.max_column + 1):
-                        left = ws_release.cell(row=row, column=column).value
-                        right = ws_develop.cell(row=row, column=column).value
+                for row, (develop_values, release_values) in enumerate(
+                    zip(
+                        ws_develop.iter_rows(values_only=True),
+                        ws_release.iter_rows(values_only=True),
+                    ),
+                    start=1,
+                ):
+                    if row == 1 or row % 64 == 0:
+                        _assert_before_deadline(
+                            absolute_deadline,
+                            f"candidate rows {name}:{sheet}:{row}",
+                        )
+                    for column, (right, left) in enumerate(
+                        itertools.zip_longest(develop_values, release_values),
+                        start=1,
+                    ):
                         if left != right:
-                            diffs.append((row, column, left, right))
-                if diffs:
-                    return develop_path, release_path, sheet, tuple(diffs)
+                            return (
+                                develop_path,
+                                release_path,
+                                sheet,
+                                ((row, column, left, right),),
+                            )
         finally:
             develop.close()
-            release.close()
+            if release is not None:
+                release.close()
     raise AssertionError(
         "no cell-only develop/release replay candidate is available: "
         f"{REAL_REPLAY_CANDIDATES!r}"
@@ -1017,12 +1443,24 @@ def _choose_real_cell_only_replay():
 
 
 def test_real_develop_release_global_replay_is_read_only_and_hash_guarded():
-    develop_path, release_path, sheet, diffs = _choose_real_cell_only_replay()
-    hashes_before = {
-        develop_path: _sha256(develop_path),
-        release_path: _sha256(release_path),
-    }
+    deadline = float(_ACTIVE_CASE_DEADLINE)
+    develop_path = release_path = None
+    hashes_before = None
+    primary = None
     try:
+        develop_path, release_path, sheet, diffs = _choose_real_cell_only_replay(
+            absolute_deadline=deadline
+        )
+        hashes_before = {
+            develop_path: _sha256(
+                develop_path,
+                absolute_deadline=deadline,
+            ),
+            release_path: _sha256(
+                release_path,
+                absolute_deadline=deadline,
+            ),
+        }
         with _existing_view(release_path, develop_path, sheet) as (app, view, _dialogs):
             _assert_global_menu(view)
             before = _app_mutation_state(app, sheet)
@@ -1045,36 +1483,77 @@ def test_real_develop_release_global_replay_is_read_only_and_hash_guarded():
                 lambda: _app_mutation_state(app, sheet) == before,
                 "real replay one-step undo did not restore the in-memory candidate",
             )
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        hashes_after = {
-            develop_path: _sha256(develop_path),
-            release_path: _sha256(release_path),
-        }
-        assert hashes_after == hashes_before, (hashes_before, hashes_after)
+        if hashes_before is not None:
+            try:
+                # Input integrity is cleanup evidence and must complete even if
+                # the functional deadline has already expired.
+                hashes_after = {
+                    develop_path: _sha256(develop_path),
+                    release_path: _sha256(release_path),
+                }
+                assert hashes_after == hashes_before, (hashes_before, hashes_after)
+            except BaseException as exc:
+                if primary is not None:
+                    primary.add_note(f"real replay input hash cleanup failed: {exc!r}")
+                else:
+                    raise
 
 
-def main() -> None:
-    tests = (
-        test_centered_navigation_and_compact_rich_t_status_at_1450_and_1024,
-        test_global_mode_both_menus_full_sheet_only_diff_independent_and_one_undo,
-        test_three_way_global_left_is_base_and_right_is_theirs_not_mine,
-        test_global_merge_conflict_mode_apply_undo_and_failure_restore_metadata,
-        test_global_structural_ambiguity_stale_and_mid_commit_failure_are_zero_write,
-        test_global_many_small_conflict_blocks_refreshes_once_and_stays_atomic,
-        test_sheet_wide_uniform_width_is_stable_and_c_headers_are_a_through_aa,
-        test_real_develop_release_global_replay_is_read_only_and_hash_guarded,
+_CASES = (
+    ("centered-navigation", test_centered_navigation_and_compact_rich_t_status_at_1450_and_1024),
+    ("global-mode-only-diff-undo", test_global_mode_both_menus_full_sheet_only_diff_independent_and_one_undo),
+    ("three-way-global-base-layout", test_three_way_global_left_is_base_and_right_is_theirs_not_mine),
+    ("global-merge-conflict-atomicity", test_global_merge_conflict_mode_apply_undo_and_failure_restore_metadata),
+    ("global-structural-zero-write", test_global_structural_ambiguity_stale_and_mid_commit_failure_are_zero_write),
+    ("global-conflict-block-batching", test_global_many_small_conflict_blocks_refreshes_once_and_stays_atomic),
+    ("sheet-wide-excel-headers", test_sheet_wide_uniform_width_is_stable_and_c_headers_are_a_through_aa),
+    ("real-replay-readonly-hash", test_real_develop_release_global_replay_is_read_only_and_hash_guarded),
+)
+
+
+def _list_cases() -> None:
+    for case_id, _test in _CASES:
+        print(case_id)
+
+
+def main(argv=None) -> None:
+    global _ACTIVE_CASE_DEADLINE
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list-cases", action="store_true")
+    parser.add_argument("--case", choices=tuple(case_id for case_id, _ in _CASES))
+    args = parser.parse_args(argv)
+    if args.list_cases:
+        _list_cases()
+        return
+    selected = tuple(
+        (case_id, test)
+        for case_id, test in _CASES
+        if args.case is None or case_id == args.case
     )
-    failures = []
-    for test in tests:
+    # The default suite intentionally remains available, but execution is
+    # strict serial fail-fast: a case exception leaves a non-zero process and
+    # cannot be diluted by later successes.
+    for case_id, test in selected:
+        started = time.perf_counter()
+        _ACTIVE_CASE_DEADLINE = time.monotonic() + 90.0
         try:
             test()
-            print(f"PASS {test.__name__}")
+            assert time.monotonic() <= _ACTIVE_CASE_DEADLINE, (
+                case_id,
+                _ACTIVE_CASE_DEADLINE,
+                time.monotonic(),
+            )
         except Exception:
-            failures.append(test.__name__)
-            traceback.print_exc()
-    if failures:
-        raise SystemExit(f"OPENSPEC_SECTION10_FAILED: {failures}")
-    print(f"PASS: OpenSpec section 10 acceptance ({len(tests)} tests)")
+            print(f"FAIL {case_id}", flush=True)
+            raise
+        finally:
+            _ACTIVE_CASE_DEADLINE = None
+        print(f"PASS {case_id} elapsed_sec={time.perf_counter() - started:.3f}")
+    print(f"PASS: OpenSpec section 10 acceptance ({len(selected)} case(s))")
 
 
 if __name__ == "__main__":

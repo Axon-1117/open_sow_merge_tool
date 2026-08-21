@@ -15,6 +15,7 @@ import ctypes
 import math
 from itertools import zip_longest
 from functools import lru_cache
+from contextlib import closing
 from datetime import date, datetime, time as datetime_time, timedelta
 import time
 import stat
@@ -24,6 +25,7 @@ import posixpath
 import platform
 import xml.etree.ElementTree as ET
 import unicodedata
+from collections import OrderedDict, deque
 from urllib.parse import quote
 from dataclasses import dataclass, field
 from enum import Enum
@@ -32,7 +34,10 @@ import sqlite3
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import json
+import dataclasses
 import threading
+import multiprocessing
+import pickle
 
 from openpyxl import load_workbook as _openpyxl_load_workbook, Workbook
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
@@ -45,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-13.update72"
-APP_BUILD_TAG = "new149-missing-dimension-diff-fix"
+APP_VERSION = "2026-08-20.update76"
+APP_BUILD_TAG = "new153-dynamic-full-height-viewport"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -65,7 +70,10 @@ _FAST_SAVE_VALUES_ONLY = False
 _FAST_OPEN_ENABLED = True
 # Global mode: compare and save cached values only (ignore formulas)
 _USE_CACHED_VALUES_ONLY = True
-# When cached values are missing for formulas, try to recalc via Excel (if available)
+# Formula-cache refresh is deliberately user-confirmed.  The app scans for
+# missing cached results after the fast initial load, then offers to calculate
+# private temporary copies through desktop Excel.  This keeps ordinary opens
+# fast and avoids an unexpected, potentially long Excel launch.
 _AUTO_RECALC_MISSING_CACHE = False
 _AUTO_RECALC_FORMULAS_ALWAYS = False
 # Recalculation is explicit. Automatic Excel recalculation is both expensive on
@@ -74,7 +82,52 @@ _AUTO_RECALC_FORMULAS_ALWAYS = False
 _AUTO_RECALC_ON_OPEN = False
 _EXCEL_NATIVE_SAVE_ON_MERGE = True
 _CACHE_CHECK_MAX_CELLS = 3000
-# Render performance: limit initial rows rendered (user can load full)
+# Large result sets use a fixed logical viewport.  This is independent of the
+# old fast-open prefix limit: scrolling a 20,000-row difference set must not
+# make a Tk Text document grow without bound.
+_LARGE_SHEET_VIRTUALIZATION_ENABLED = True
+# The pure snapshot comparator is intentionally dark until the frozen legacy
+# Oracle approves every supported 2-way and 3-way fixture.
+# Selected large Sheets use immutable paired streams after direct Oracle parity
+# on Skill/WorldMonster.  Ambiguous snapshots still take the legacy path.
+_LARGE_SHEET_SNAPSHOT_ENGINE_ENABLED = True
+# Process isolation is the default for changed large snapshots: openpyxl can
+# hold the interpreter's GIL across ZIP/XML work even when invoked from a
+# Python thread. Set to 0 only for an explicit diagnostic rollback.
+_ISOLATED_SNAPSHOT_PROCESS_ENABLED = os.environ.get(
+    "SOW_ISOLATED_SNAPSHOT_PROCESS", "1"
+).strip().lower() not in ("0", "false", "off", "no")
+_UI_CALLBACK_TIMING_DIAGNOSTIC = os.environ.get(
+    "SOW_CALLBACK_TIMING_DIAGNOSTIC", "0"
+).strip().lower() in ("1", "true", "on", "yes")
+_ISOLATED_SNAPSHOT_CHILD_TIMEOUT_SEC = 60.0
+# Fallback while the Text widgets have not completed their first layout. Once
+# their height is known, each virtual surface uses exactly enough logical rows
+# to cover its visible area (see ``_virtual_viewport_row_capacity``).
+# Keeping this initial value small avoids a costly first paint before Tk has
+# reported the real geometry.
+_VIRTUAL_VIEWPORT_MAX_ROWS = 20
+# Staged first-surface chunks retain a short cooperative frame delay.
+_VIRTUAL_SCROLL_COALESCE_MS = 4
+# Dense wide sheets need a bounded *column* window as well as a bounded row
+# window.  These are display limits only: immutable raw fragments, logical
+# field IDs, physical mappings, and Base mappings always retain every column.
+_WIDE_COLUMN_VIRTUALIZATION_THRESHOLD = 48
+# Eight full-width logical columns fit a normal pane without clipping.  The
+# complete projection/raw model remains available; this only bounds the Tk
+# surface during wide-table horizontal navigation.
+_VIRTUAL_VIEWPORT_MAX_COLUMNS = 8
+# Hidden-Sheet comparison is useful only when it cannot steal the foreground.
+# Keep a human-scale quiet window before opportunistic work starts, then yield
+# it again as soon as the user resumes inspecting the current Sheet.
+_BACKGROUND_SHEET_QUIET_WINDOW_SEC = 1.2
+_BACKGROUND_ACTIVITY_YIELD_SEC = 0.20
+# A request that was genuinely foreground at a confirmed Notebook selection
+# keeps this original clock even if it is cooperatively preempted while the
+# user looks at another Sheet.  This is a scheduling deadline only: it never
+# converts an incomplete result into an exact/terminal result.
+_FOREGROUND_EXACT_DEADLINE_SEC = 15.0
+# Render performance: limit initial rows rendered (legacy/small views only)
 _FAST_RENDER_ROW_LIMIT = 800
 _FAST_RENDER_BATCH = 500
 _LARGE_SHEET_ROW_THRESHOLD = 2000
@@ -92,6 +145,702 @@ _FAST_TABMARK_SCAN_SKIP_MB = 25
 _FAST_TABMARK_ENABLED = True
 _FAST_TABMARK_PHASE2_ENABLED = False
 _SVN_EXPORT_TIMEOUT_SECS = 15
+
+# A workbook-level exact-result state is intentionally separate from a
+# SheetView's local rendering lifecycle. A local view can be constructed,
+# hidden, or waiting for editable workbooks without making a comparison result
+# exact. Only these two terminal states may be shown as final data or used as
+# an operation target.
+_SHEET_EXACT_PENDING = 'PENDING'
+_SHEET_EXACT_CALCULATING = 'CALCULATING'
+_SHEET_EXACT_SAME = 'EXACT_SAME'
+_SHEET_EXACT_CHANGED = 'EXACT_CHANGED'
+_SHEET_EXACT_UNRESOLVED = 'UNRESOLVED'
+_SHEET_EXACT_FAILED = 'FAILED'
+_SHEET_EXACT_TERMINAL = frozenset((_SHEET_EXACT_SAME, _SHEET_EXACT_CHANGED))
+
+
+def _selected_sheet_is_runnable_queue_front(selected_sheet, compute_queue) -> bool:
+    """Whether the selected Sheet is actual worker work, not merely CALCULATING.
+
+    A completed snapshot can be waiting in the main-thread UI queue while its
+    registry state remains ``CALCULATING``.  That state must not repeatedly
+    preempt hidden work: only a selected item at the worker queue front can be
+    run by the sole comparison worker next.
+    """
+    selected_sheet = str(selected_sheet or "")
+    return bool(
+        selected_sheet
+        and compute_queue
+        and str(compute_queue[0]) == selected_sheet
+    )
+
+
+def _selected_sheet_should_preempt_background(
+    active_sheet,
+    selected_sheet,
+    selected_exact_state,
+    compute_queue,
+) -> bool:
+    """Return true only for an actually runnable selected comparison request."""
+    return bool(
+        active_sheet
+        and selected_sheet
+        and str(active_sheet) != str(selected_sheet)
+        and selected_exact_state in (
+            _SHEET_EXACT_PENDING,
+            _SHEET_EXACT_CALCULATING,
+        )
+        and _selected_sheet_is_runnable_queue_front(selected_sheet, compute_queue)
+    )
+
+
+def _hidden_interrupt_must_defer(selected_exact_state, selected_is_queue_front) -> bool:
+    """Keep a hidden preemption from hot-spinning unless selected work is next."""
+    return not bool(
+        selected_exact_state in (
+            _SHEET_EXACT_PENDING,
+            _SHEET_EXACT_CALCULATING,
+        )
+        and selected_is_queue_front
+    )
+
+
+@dataclass(frozen=True)
+class _ForegroundResumeRequest:
+    """One user-confirmed, still-incomplete exact request.
+
+    The request token belongs to the generation, whereas ``tab_seq`` records
+    the most recent real Notebook confirmation.  Keeping them separate lets a
+    repeated tab visit retain the original deadline while still winning a
+    deadline tie deterministically.
+    """
+
+    sheet: str
+    generation: int
+    request_started_at: float
+    request_token: int
+    tab_seq: int
+
+    @property
+    def deadline_at(self) -> float:
+        return float(self.request_started_at) + _FOREGROUND_EXACT_DEADLINE_SEC
+
+
+@dataclass(frozen=True)
+class _ForegroundResumeVisit:
+    """A confirmed Notebook visit, retained before the request clock exists."""
+
+    sheet: str
+    generation: int
+    tab_seq: int
+    confirmed_at: float
+    visit_token: int
+
+
+@dataclass(frozen=True)
+class _ForegroundResumeTicket:
+    """Epoch-fenced main-thread priority hand-off to the one compute worker."""
+
+    epoch: int
+    ticket_seq: int
+    request: _ForegroundResumeRequest
+
+
+class _ForegroundResumeLedger:
+    """Pure, lock-free foreground-request ledger.
+
+    ``SowMergeApp`` owns synchronization around this object.  Keeping the
+    selection/deadline rules here makes the race gates deterministic to test
+    without a Tk interpreter, worker, workbook, or parser child.
+    """
+
+    def __init__(self):
+        self.visits: dict[tuple[str, int], _ForegroundResumeVisit] = {}
+        self.entries: dict[tuple[str, int], _ForegroundResumeRequest] = {}
+        self.epoch = 0
+        self._tab_seq = 0
+        self._visit_seq = 0
+        self._request_seq = 0
+        self._ticket_seq = 0
+        self._priority_ticket: _ForegroundResumeTicket | None = None
+
+    @staticmethod
+    def _is_incomplete(entry: dict | None, generation: int) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if int(entry.get("generation", -1)) != int(generation):
+            return False
+        if bool(entry.get("full_detail_terminal", False)):
+            return False
+        return str(entry.get("state") or "") in (
+            _SHEET_EXACT_PENDING,
+            _SHEET_EXACT_CALCULATING,
+        )
+
+    @staticmethod
+    def _key(sheet: str, generation: int) -> tuple[str, int]:
+        return str(sheet or ""), int(generation)
+
+    def _release_invalid_ticket(self) -> None:
+        ticket = self._priority_ticket
+        if ticket is None:
+            return
+        request = ticket.request
+        if self.entries.get(self._key(request.sheet, request.generation)) != request:
+            self._priority_ticket = None
+            self.epoch += 1
+
+    def _invalidate_ticket(self, ticket: _ForegroundResumeTicket | None) -> None:
+        if ticket is not None and self._priority_ticket == ticket:
+            self._priority_ticket = None
+            self.epoch += 1
+
+    def confirm_selection(
+        self,
+        sheet: str,
+        generation: int,
+        entry: dict | None,
+        *,
+        confirmed_at: float | None = None,
+    ) -> _ForegroundResumeVisit | None:
+        """Record a visit even when a PENDING request has no clock yet."""
+        del entry  # Eligibility is established only when the request starts.
+        self.invalidate_priority()
+        self._tab_seq += 1
+        self._visit_seq += 1
+        sheet = str(sheet or "")
+        generation = int(generation)
+        if not sheet:
+            return None
+        visit = _ForegroundResumeVisit(
+            sheet=sheet,
+            generation=generation,
+            tab_seq=int(self._tab_seq),
+            confirmed_at=float(time.monotonic() if confirmed_at is None else confirmed_at),
+            visit_token=int(self._visit_seq),
+        )
+        key = self._key(sheet, generation)
+        self.visits[key] = visit
+        request = self.entries.get(key)
+        if request is not None:
+            self.entries[key] = _ForegroundResumeRequest(
+                sheet=request.sheet,
+                generation=request.generation,
+                request_started_at=request.request_started_at,
+                request_token=request.request_token,
+                tab_seq=visit.tab_seq,
+            )
+        return visit
+
+    def record_request_started(
+        self,
+        sheet: str,
+        generation: int,
+        entry: dict | None,
+    ) -> _ForegroundResumeRequest | None:
+        """Attach the first request clock only to an already confirmed visit."""
+        sheet = str(sheet or "")
+        generation = int(generation)
+        key = self._key(sheet, generation)
+        visit = self.visits.get(key)
+        if visit is None or not self._is_incomplete(entry, generation):
+            self.entries.pop(key, None)
+            return None
+        started = entry.get("request_started_at") if isinstance(entry, dict) else None
+        if not isinstance(started, (int, float)):
+            self.entries.pop(key, None)
+            return None
+        previous = self.entries.get(key)
+        if previous is not None:
+            request_started_at = float(previous.request_started_at)
+            request_token = int(previous.request_token)
+        else:
+            self._request_seq += 1
+            request_started_at = float(started)
+            request_token = int(self._request_seq)
+        request = _ForegroundResumeRequest(
+            sheet=sheet,
+            generation=generation,
+            request_started_at=request_started_at,
+            request_token=request_token,
+            tab_seq=int(visit.tab_seq),
+        )
+        self.entries[key] = request
+        return request
+
+    def clear(
+        self,
+        sheet: str | None = None,
+        generation: int | None = None,
+    ) -> None:
+        """Invalidate tickets and discard one request or the complete ledger."""
+        self.invalidate_priority()
+        if sheet is None:
+            self.entries.clear()
+            self.visits.clear()
+            return
+        sheet = str(sheet or "")
+        for key in tuple(self.visits):
+            if key[0] == sheet and (generation is None or key[1] == int(generation)):
+                self.visits.pop(key, None)
+                self.entries.pop(key, None)
+
+    def invalidate_priority(self) -> int:
+        """Revoke queued/firing tickets without discarding valid away requests."""
+        self.epoch += 1
+        self._priority_ticket = None
+        return int(self.epoch)
+
+    def discard_stale(
+        self,
+        entries_by_sheet: dict[str, dict],
+        generations_by_sheet: dict[str, int],
+    ) -> None:
+        for key, visit in tuple(self.visits.items()):
+            sheet, generation = key
+            entry = entries_by_sheet.get(sheet)
+            if int(generations_by_sheet.get(sheet, -1)) != int(generation):
+                self.visits.pop(key, None)
+                self.entries.pop(key, None)
+                continue
+            state = str((entry or {}).get("state") or "")
+            if state in _SHEET_EXACT_TERMINAL or state in (
+                _SHEET_EXACT_UNRESOLVED,
+                _SHEET_EXACT_FAILED,
+            ):
+                self.visits.pop(key, None)
+                self.entries.pop(key, None)
+        for key, request in tuple(self.entries.items()):
+            if not self._is_incomplete(
+                entries_by_sheet.get(key[0]), request.generation
+            ):
+                self.entries.pop(key, None)
+        self._release_invalid_ticket()
+
+    def select_after_selected_full_detail(
+        self,
+        selected_sheet: str,
+        selected_entry: dict | None,
+        entries_by_sheet: dict[str, dict],
+        generations_by_sheet: dict[str, int],
+        *,
+        closing: bool,
+    ) -> _ForegroundResumeRequest | None:
+        """Choose the oldest deadline after the current selected view is full.
+
+        Ties prefer the most recently confirmed Notebook tab.  The selected
+        Sheet itself is deliberately excluded: this method is a hand-off to a
+        previously foreground request, not a second worker for the current tab.
+        """
+        self.discard_stale(entries_by_sheet, generations_by_sheet)
+        if closing or not isinstance(selected_entry, dict):
+            return None
+        if str(selected_entry.get("state") or "") not in _SHEET_EXACT_TERMINAL:
+            return None
+        if not bool(selected_entry.get("full_detail_terminal", False)):
+            return None
+        selected_sheet = str(selected_sheet or "")
+        candidates = [
+            request
+            for (_sheet, _generation), request in self.entries.items()
+            if _sheet != selected_sheet
+            and self._is_incomplete(entries_by_sheet.get(_sheet), request.generation)
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda request: (
+                float(request.deadline_at),
+                -int(request.tab_seq),
+                str(request.sheet),
+            ),
+        )
+
+    def reserve_priority(
+        self, request: _ForegroundResumeRequest | None
+    ) -> _ForegroundResumeTicket | None:
+        self._release_invalid_ticket()
+        if request is None or self.entries.get(
+            self._key(request.sheet, request.generation)
+        ) != request:
+            return None
+        if self._priority_ticket is not None:
+            return None
+        self._ticket_seq += 1
+        ticket = _ForegroundResumeTicket(
+            epoch=int(self.epoch),
+            ticket_seq=int(self._ticket_seq),
+            request=request,
+        )
+        self._priority_ticket = ticket
+        return ticket
+
+    def ticket_is_current(
+        self,
+        ticket: _ForegroundResumeTicket | None,
+        entries_by_sheet: dict[str, dict],
+        generations_by_sheet: dict[str, int],
+        *,
+        closing: bool,
+    ) -> bool:
+        valid = not closing and ticket is not None and self._priority_ticket == ticket
+        if not valid:
+            if closing:
+                self._invalidate_ticket(ticket)
+            return False
+        if int(ticket.epoch) != int(self.epoch):
+            self._invalidate_ticket(ticket)
+            return False
+        request = ticket.request
+        if self.entries.get(self._key(request.sheet, request.generation)) != request:
+            self._invalidate_ticket(ticket)
+            return False
+        if int(generations_by_sheet.get(request.sheet, -1)) != int(request.generation):
+            self._invalidate_ticket(ticket)
+            return False
+        valid = self._is_incomplete(
+            entries_by_sheet.get(request.sheet), request.generation
+        )
+        if not valid:
+            self._invalidate_ticket(ticket)
+        return valid
+
+    def release_priority(self, ticket: _ForegroundResumeTicket | None = None) -> None:
+        if ticket is None or self._priority_ticket == ticket:
+            self._priority_ticket = None
+
+    def snapshot(self) -> tuple[_ForegroundResumeRequest, ...]:
+        return tuple(
+            sorted(
+                self.entries.values(),
+                key=lambda request: (request.sheet, request.generation),
+            )
+        )
+
+    def visit_snapshot(self) -> tuple[_ForegroundResumeVisit, ...]:
+        return tuple(
+            sorted(
+                self.visits.values(),
+                key=lambda visit: (visit.sheet, visit.generation),
+            )
+        )
+
+
+class _ForegroundResumeCoordinator:
+    """Injectable timer/epoch coordinator shared by Tk and fake-root tests.
+
+    The class owns every priority/quiet timer identifier and all epoch fences.
+    The application provides only current-state snapshots and side-effect
+    callbacks (``after``, front-queue, and the single-worker kick), so tests do
+    not reproduce a second scheduling implementation.
+    """
+
+    def __init__(self, ledger: _ForegroundResumeLedger | None = None):
+        self.lock = threading.RLock()
+        self.ledger = ledger or _ForegroundResumeLedger()
+        self.priority_after_id = None
+        self.quiet_after_id = None
+        self.quiet_install_token = None
+        self.quiet_after_token = None
+        self.active_ticket: _ForegroundResumeTicket | None = None
+        self._quiet_seq = 0
+
+    @staticmethod
+    def _cancel_ids(after_cancel, after_ids) -> None:
+        for after_id in tuple(after_ids or ()):
+            if after_id is None:
+                continue
+            try:
+                after_cancel(after_id)
+            except Exception:
+                pass
+
+    def _take_timers_locked(self) -> tuple[object | None, object | None]:
+        ids = self.priority_after_id, self.quiet_after_id
+        self.priority_after_id = None
+        self.quiet_after_id = None
+        self.quiet_install_token = None
+        self.quiet_after_token = None
+        self.active_ticket = None
+        return ids
+
+    def cancel_timers(
+        self,
+        after_cancel,
+        *,
+        invalidate_ledger: bool,
+        release_priority: bool = True,
+    ) -> tuple[object | None, object | None]:
+        with self.lock:
+            if invalidate_ledger:
+                self.ledger.invalidate_priority()
+            elif release_priority:
+                self.ledger.release_priority()
+            after_ids = self._take_timers_locked()
+        self._cancel_ids(after_cancel, after_ids)
+        return after_ids
+
+    def confirm_selection(self, sheet, generation, entry, *, after_cancel, confirmed_at=None):
+        with self.lock:
+            visit = self.ledger.confirm_selection(
+                sheet, generation, entry, confirmed_at=confirmed_at
+            )
+            after_ids = self._take_timers_locked()
+        self._cancel_ids(after_cancel, after_ids)
+        return visit
+
+    def clear(self, sheet=None, generation=None, *, after_cancel=None):
+        with self.lock:
+            self.ledger.clear(sheet, generation)
+            after_ids = self._take_timers_locked()
+        if callable(after_cancel):
+            self._cancel_ids(after_cancel, after_ids)
+        return after_ids
+
+    def note_request_started(self, sheet, generation, entry):
+        with self.lock:
+            return self.ledger.record_request_started(sheet, generation, entry)
+
+    def has_pending_request(self, entries_by_sheet, generations_by_sheet) -> bool:
+        with self.lock:
+            self.ledger.discard_stale(entries_by_sheet, generations_by_sheet)
+            return bool(self.ledger.entries)
+
+    def ticket_is_active(self, sheet, generation, entries_by_sheet, generations_by_sheet, *, closing):
+        with self.lock:
+            self.ledger.discard_stale(entries_by_sheet, generations_by_sheet)
+            ticket = self.active_ticket
+            valid = self.ledger.ticket_is_current(
+                ticket, entries_by_sheet, generations_by_sheet, closing=closing
+            )
+            if not valid:
+                self.active_ticket = None
+            return bool(
+                valid
+                and ticket is not None
+                and ticket.request.sheet == str(sheet)
+                and int(ticket.request.generation) == int(generation)
+            )
+
+    def request_priority_after_terminal(
+        self,
+        selected_sheet,
+        selected_entry,
+        *,
+        snapshot,
+        closing,
+        selected_is_full,
+        after,
+        after_cancel,
+        enqueue_front,
+        kick_worker,
+        emit,
+    ):
+        entries, generations = snapshot()
+        with self.lock:
+            request = self.ledger.select_after_selected_full_detail(
+                selected_sheet,
+                selected_entry,
+                entries,
+                generations,
+                closing=bool(closing()),
+            )
+            ticket = self.ledger.reserve_priority(request)
+            if ticket is None:
+                return None
+            after_ids = self._take_timers_locked()
+            # _take_timers_locked clears the active worker turn, not the
+            # reserved ticket held by the ledger for this new after(0).
+        self._cancel_ids(after_cancel, after_ids)
+
+        def _fire(ticket=ticket):
+            self.fire_priority(
+                ticket,
+                snapshot=snapshot,
+                closing=closing,
+                selected_is_full=selected_is_full,
+                enqueue_front=enqueue_front,
+                kick_worker=kick_worker,
+                emit=emit,
+            )
+
+        after_id = after(0, _fire)
+        if after_id is None:
+            with self.lock:
+                self.ledger.release_priority(ticket)
+            emit("priority-bail", ticket=ticket, reason="after-unavailable")
+            return None
+        entries, generations = snapshot()
+        with self.lock:
+            valid = self.ledger.ticket_is_current(
+                ticket, entries, generations, closing=bool(closing())
+            )
+            if valid:
+                self.priority_after_id = after_id
+            else:
+                self._cancel_ids(after_cancel, (after_id,))
+                emit("priority-bail", ticket=ticket, reason="stale-before-install")
+                return None
+        emit(
+            "priority-queued",
+            ticket=ticket,
+            reason="selected-full-terminal",
+            after_id=after_id,
+            after_delay_ms=0,
+        )
+        return ticket
+
+    def fire_priority(
+        self,
+        ticket,
+        *,
+        snapshot,
+        closing,
+        selected_is_full,
+        enqueue_front,
+        kick_worker,
+        emit,
+    ) -> bool:
+        entries, generations = snapshot()
+        with self.lock:
+            self.priority_after_id = None
+            valid = self.ledger.ticket_is_current(
+                ticket, entries, generations, closing=bool(closing())
+            )
+        if not valid or not bool(selected_is_full()):
+            emit(
+                "priority-bail",
+                ticket=ticket,
+                reason="stale-ticket" if not valid else "current-not-full",
+            )
+            return False
+        enqueue_front(ticket.request.sheet)
+        entries, generations = snapshot()
+        with self.lock:
+            if not self.ledger.ticket_is_current(
+                ticket, entries, generations, closing=bool(closing())
+            ):
+                emit("priority-bail", ticket=ticket, reason="lost-owner")
+                return False
+            self.active_ticket = ticket
+        emit(
+            "priority-fire",
+            ticket=ticket,
+            reason="selected-full-terminal",
+            after_delay_ms=0,
+            queue_front=True,
+            worker_kicked=True,
+        )
+        kick_worker()
+        return True
+
+    def claim_quiet_install(self):
+        with self.lock:
+            if self.quiet_after_id is not None or self.quiet_install_token is not None:
+                return None
+            self._quiet_seq += 1
+            token = (int(self.ledger.epoch), int(self._quiet_seq))
+            self.quiet_install_token = token
+            return token
+
+    def abandon_quiet_install(self, token) -> bool:
+        with self.lock:
+            if self.quiet_install_token != token:
+                return False
+            self.quiet_install_token = None
+            return True
+
+    def install_quiet_timer(
+        self,
+        token,
+        delay_ms,
+        *,
+        snapshot,
+        closing,
+        after,
+        after_cancel,
+        kick_worker,
+        emit,
+    ):
+        entries, generations = snapshot()
+        with self.lock:
+            owns = self.quiet_install_token == token
+            if owns:
+                self.quiet_install_token = None
+            self.ledger.discard_stale(entries, generations)
+            epoch_current = int(token[0]) == int(self.ledger.epoch)
+            pending = bool(self.ledger.entries)
+        if not owns or not epoch_current or bool(closing()) or pending:
+            emit("quiet-bail", reason="foreground-ledger" if pending else "stale-install", token=token)
+            return None
+        holder = {"id": None}
+
+        def _fire(token=token):
+            self.fire_quiet(
+                token,
+                holder.get("id"),
+                snapshot=snapshot,
+                closing=closing,
+                kick_worker=kick_worker,
+                emit=emit,
+            )
+
+        after_id = after(int(delay_ms), _fire)
+        holder["id"] = after_id
+        if after_id is None:
+            return None
+        entries, generations = snapshot()
+        with self.lock:
+            self.ledger.discard_stale(entries, generations)
+            valid = (
+                int(token[0]) == int(self.ledger.epoch)
+                and not bool(closing())
+                and not self.ledger.entries
+                and self.quiet_after_id is None
+            )
+            if valid:
+                self.quiet_after_id = after_id
+                self.quiet_after_token = token
+            else:
+                self._cancel_ids(after_cancel, (after_id,))
+                emit("quiet-bail", reason="stale-before-install", token=token)
+                return None
+        emit("quiet-schedule", reason="hidden-resume", token=token, after_id=after_id, delay_ms=int(delay_ms))
+        return after_id
+
+    def fire_quiet(self, token, after_id, *, snapshot, closing, kick_worker, emit) -> bool:
+        entries, generations = snapshot()
+        with self.lock:
+            owns = self.quiet_after_id == after_id and self.quiet_after_token == token
+            if owns:
+                self.quiet_after_id = None
+                self.quiet_after_token = None
+            self.ledger.discard_stale(entries, generations)
+            epoch_current = int(token[0]) == int(self.ledger.epoch)
+            pending = bool(self.ledger.entries)
+        if not owns or not epoch_current or bool(closing()) or pending:
+            emit("quiet-bail", reason="foreground-ledger" if pending else "stale-fire", token=token)
+            return False
+        emit("quiet-fire", reason="hidden-resume", token=token)
+        kick_worker()
+        return True
+
+    def release_worker_turn(self, sheet, generation, *, emit) -> None:
+        with self.lock:
+            ticket = self.active_ticket
+            if (
+                ticket is None
+                or ticket.request.sheet != str(sheet)
+                or int(ticket.request.generation) != int(generation)
+            ):
+                return
+            self.active_ticket = None
+            self.ledger.release_priority(ticket)
+        emit("priority-worker-release", ticket=ticket, reason="worker-turn-complete")
+
+
 # Grid display: max chars shown per cell before truncation, and column separator
 _COL_MAX_DISPLAY_WIDTH = 30
 # Logical sheet panes deliberately use one content-independent width. Keeping
@@ -804,26 +1553,6 @@ def _row_signatures_from_unique_column_anchors(
         if candidate_score > anchor_score:
             anchors = candidate_anchors
             anchor_score = candidate_score
-    if not anchors:
-        return (
-            [
-                _row_alignment_signature(
-                    row,
-                    left_edit_rows[idx] if idx < len(left_edit_rows) else None,
-                    left_width,
-                )
-                for idx, row in enumerate(left_rows)
-            ],
-            [
-                _row_alignment_signature(
-                    row,
-                    right_edit_rows[idx] if idx < len(right_edit_rows) else None,
-                    right_width,
-                )
-                for idx, row in enumerate(right_rows)
-            ],
-        )
-
     def _literal_identity_token(row, edit_row, width: int, offsets):
         if isinstance(offsets, int):
             offsets = (offsets,)
@@ -1121,6 +1850,90 @@ def _row_signatures_from_unique_column_anchors(
             right_offsets,
         )
 
+    def _declared_composite_identity_offsets(rows, width: int):
+        """Return a one-to-one declared ``@id``/``@const`` field map.
+
+        This deliberately mirrors immutable snapshot field semantics: marker
+        detection considers the declaration and its type row, while field
+        identity strips only the explicit marker from the declaration and
+        case-folds both components.  Duplicate or unnamed declared identities
+        are not evidence and therefore decline this fast preference.
+        """
+        if len(rows) < 2 or int(width) <= 0:
+            return None
+        declarations = _pad_row_values(rows[0], width)
+        type_declarations = _pad_row_values(rows[1], width)
+        offsets = {}
+        duplicate_identities = set()
+        for offset in range(int(width)):
+            declaration = str(declarations[offset] or "")
+            type_declaration = str(type_declarations[offset] or "")
+            marker_text = (declaration + " " + type_declaration).lower()
+            if "@id" not in marker_text and "@const" not in marker_text:
+                continue
+            identity = (
+                re.sub(
+                    r"@(id|const)\b",
+                    "",
+                    declaration,
+                    flags=re.I,
+                ).strip().casefold(),
+                type_declaration.strip().casefold(),
+            )
+            if not identity[0]:
+                return None
+            if identity in offsets:
+                duplicate_identities.add(identity)
+            else:
+                offsets[identity] = offset
+        if duplicate_identities or len(offsets) < 2:
+            return None
+        return offsets
+
+    declared_identity_candidate = None
+    left_declared_identities = _declared_composite_identity_offsets(
+        left_rows,
+        left_width,
+    )
+    right_declared_identities = _declared_composite_identity_offsets(
+        right_rows,
+        right_width,
+    )
+    if (
+        left_declared_identities is not None
+        and right_declared_identities is not None
+        and set(left_declared_identities) == set(right_declared_identities)
+    ):
+        declared_identities = tuple(left_declared_identities)
+        declared_identity_candidate = _identity_candidate(
+            tuple(left_declared_identities[identity] for identity in declared_identities),
+            tuple(right_declared_identities[identity] for identity in declared_identities),
+            position_priority=min(
+                right_declared_identities[identity]
+                for identity in declared_identities
+            ),
+        )
+
+    if not anchors and declared_identity_candidate is None:
+        return (
+            [
+                _row_alignment_signature(
+                    row,
+                    left_edit_rows[idx] if idx < len(left_edit_rows) else None,
+                    left_width,
+                )
+                for idx, row in enumerate(left_rows)
+            ],
+            [
+                _row_alignment_signature(
+                    row,
+                    right_edit_rows[idx] if idx < len(right_edit_rows) else None,
+                    right_width,
+                )
+                for idx, row in enumerate(right_rows)
+            ],
+        )
+
     # Prefer a single, mutually unique literal key only when it explains most
     # populated records on both sides.  Item-like tables commonly have a stable
     # ID in column A while formula columns legitimately change text after a row
@@ -1144,8 +1957,8 @@ def _row_signatures_from_unique_column_anchors(
     # strong leading single ID is the common large-sheet path and avoids the
     # combinatorial scan; a later S001/S002 slot candidate cannot suppress an
     # earlier composite key.
-    leading_anchor = min(right for _left, right in anchors)
-    has_leading_candidate = any(
+    leading_anchor = min((right for _left, right in anchors), default=None)
+    has_leading_candidate = leading_anchor is not None and any(
         -int(candidate[1]) == leading_anchor
         for candidate in identity_candidates
     )
@@ -1168,7 +1981,7 @@ def _row_signatures_from_unique_column_anchors(
                         break
             if found_leading_composite:
                 break
-        has_leading_candidate = any(
+        has_leading_candidate = leading_anchor is not None and any(
             -int(candidate[1]) == leading_anchor
             for candidate in identity_candidates
         )
@@ -1199,6 +2012,13 @@ def _row_signatures_from_unique_column_anchors(
                     break
             if found_leading_composite:
                 break
+    # Exact declared composite identities have already passed the same
+    # uniqueness, overlap, and order proof as inferred anchors.  Preserve the
+    # current single/composite/triple discovery as a complete fallback, but
+    # never let an incidental header anchor displace an explicit proven key.
+    if declared_identity_candidate is not None:
+        identity_candidates = [declared_identity_candidate]
+
     def _project(rows, edit_rows, width: int, offsets):
         signatures = []
         for idx, row in enumerate(rows):
@@ -1222,8 +2042,8 @@ def _row_signatures_from_unique_column_anchors(
         ) = max(
             identity_candidates
         )
-        fallback_left_offsets = [left for left, _right in anchors]
-        fallback_right_offsets = [right for _left, right in anchors]
+        fallback_left_offsets = [left for left, _right in anchors] or list(left_key_offsets)
+        fallback_right_offsets = [right for _left, right in anchors] or list(right_key_offsets)
         selected_left_counts = _unique_literal_counts(
             left_rows,
             left_edit_rows,
@@ -4141,6 +4961,87 @@ def _build_pair_base_row_overrides(
     return overrides
 
 
+def _copy_cell_presentation_metadata(src_cell, dst_cell):
+    """Copy cell presentation without leaking a foreign workbook style id.
+
+    ``openpyxl`` stores ``Cell._style`` as indexes into the owning workbook's
+    font/fill/border/number-format tables.  A shallow copy is consequently
+    valid only when both cells belong to the *same* workbook; assigning it
+    across workbooks can make a later ``cell.font`` access, or even save and
+    reopen, raise ``IndexError``.  Structural row replay frequently copies
+    from a separately loaded source workbook, so use the public style
+    descriptors there.  They are registered by the destination workbook as
+    they are assigned.
+
+    The same-workbook branch is retained for undo/redo and in-place work: it
+    is materially faster and its style-array indexes remain valid.
+    """
+    if src_cell is None or dst_cell is None:
+        return
+    try:
+        same_workbook = src_cell.parent.parent is dst_cell.parent.parent
+    except Exception:
+        same_workbook = False
+    if same_workbook:
+        dst_cell._style = copy.copy(src_cell._style)
+    else:
+        # Always assign every public style component, including defaults.  In
+        # addition to avoiding a foreign StyleArray, this clears a preexisting
+        # destination style when a source cell has no explicit formatting.
+        for attr in (
+            "font", "fill", "border", "alignment", "number_format",
+            "protection", "quotePrefix", "pivotButton",
+        ):
+            try:
+                setattr(dst_cell, attr, copy.copy(getattr(src_cell, attr)))
+            except Exception:
+                # quotePrefix/pivotButton differ between openpyxl releases;
+                # the portable components above must still be copied.
+                continue
+    dst_cell.comment = (
+        copy.copy(src_cell.comment) if src_cell.comment is not None else None
+    )
+    dst_cell._hyperlink = (
+        copy.copy(src_cell.hyperlink) if src_cell.hyperlink is not None else None
+    )
+
+
+def _copy_row_dimension_metadata(src_ws, dst_ws, src_row: int, dst_row: int):
+    """Copy row properties while keeping any style table workbook-local."""
+    src_dim = src_ws.row_dimensions.get(src_row)
+    if src_dim is None:
+        return
+    try:
+        same_workbook = src_ws.parent is dst_ws.parent
+    except Exception:
+        same_workbook = False
+    if same_workbook:
+        dst_dim = copy.copy(src_dim)
+        try:
+            dst_dim.index = dst_row
+        except Exception:
+            pass
+        dst_ws.row_dimensions[dst_row] = dst_dim
+        return
+
+    # ``RowDimension`` is also styleable.  Do not copy its private style or
+    # raw ``style_id`` across workbooks for the same reason as Cell._style.
+    dst_dim = dst_ws.row_dimensions[dst_row]
+    for attr in (
+        "height", "hidden", "outlineLevel", "collapsed", "thickTop",
+        "thickBot", "quotePrefix", "pivotButton",
+    ):
+        try:
+            setattr(dst_dim, attr, copy.copy(getattr(src_dim, attr)))
+        except Exception:
+            continue
+    for attr in ("font", "fill", "border", "alignment", "number_format", "protection"):
+        try:
+            setattr(dst_dim, attr, copy.copy(getattr(src_dim, attr)))
+        except Exception:
+            continue
+
+
 def _copy_sheet_basic(src_ws, dst_ws):
     """Copy enough worksheet structure for merge/save fallback paths."""
     for row in src_ws.iter_rows():
@@ -4151,31 +5052,14 @@ def _copy_sheet_basic(src_ws, dst_ws):
                 if src_cell.data_type == "s" and isinstance(src_value, str) and src_value.startswith("="):
                     src_value = _LiteralText(src_value)
                 _assign_edit_cell_value(dst_cell, src_value)
-                if src_cell.has_style:
-                    dst_cell._style = copy.copy(src_cell._style)
-                if src_cell.number_format:
-                    dst_cell.number_format = src_cell.number_format
-                if src_cell.font:
-                    dst_cell.font = copy.copy(src_cell.font)
-                if src_cell.fill:
-                    dst_cell.fill = copy.copy(src_cell.fill)
-                if src_cell.border:
-                    dst_cell.border = copy.copy(src_cell.border)
-                if src_cell.alignment:
-                    dst_cell.alignment = copy.copy(src_cell.alignment)
-                if src_cell.protection:
-                    dst_cell.protection = copy.copy(src_cell.protection)
-                if src_cell.comment is not None:
-                    dst_cell.comment = copy.copy(src_cell.comment)
-                if src_cell.hyperlink is not None:
-                    dst_cell._hyperlink = copy.copy(src_cell.hyperlink)
+                _copy_cell_presentation_metadata(src_cell, dst_cell)
             except Exception as exc:
                 raise RuntimeError(
                     f"复制 Sheet 单元格失败：{src_ws.title}!{src_cell.coordinate}: {exc}"
                 ) from exc
     try:
-        for key, dim in src_ws.row_dimensions.items():
-            dst_ws.row_dimensions[key] = copy.copy(dim)
+        for key in src_ws.row_dimensions:
+            _copy_row_dimension_metadata(src_ws, dst_ws, int(key), int(key))
     except Exception:
         pass
     try:
@@ -4253,20 +5137,8 @@ def _copy_row_metadata(src_ws, dst_ws, src_row: int, dst_row: int, max_col: int)
     for col in range(1, max(1, int(max_col)) + 1):
         src_cell = src_ws.cell(row=src_row, column=col)
         dst_cell = dst_ws.cell(row=dst_row, column=col)
-        if src_cell.has_style:
-            dst_cell._style = copy.copy(src_cell._style)
-        if src_cell.comment is not None:
-            dst_cell.comment = copy.copy(src_cell.comment)
-        if src_cell.hyperlink is not None:
-            dst_cell._hyperlink = copy.copy(src_cell.hyperlink)
-    src_dim = src_ws.row_dimensions.get(src_row)
-    if src_dim is not None:
-        dst_dim = copy.copy(src_dim)
-        try:
-            dst_dim.index = dst_row
-        except Exception:
-            pass
-        dst_ws.row_dimensions[dst_row] = dst_dim
+        _copy_cell_presentation_metadata(src_cell, dst_cell)
+    _copy_row_dimension_metadata(src_ws, dst_ws, src_row, dst_row)
 
 
 def _capture_worksheet_rows(ws, start_row: int, count: int):
@@ -4991,6 +5863,2266 @@ def _row_from_cache(rows_cache: dict[int, tuple], row_idx: int | None, max_col: 
     if row_idx is None:
         return (None,) * max_col
     return rows_cache.get(int(row_idx), (None,) * max_col)
+
+
+@dataclass(frozen=True, slots=True)
+class SheetSnapshotVersion:
+    """Keys that make a selected-Sheet parse safe to cache and publish."""
+
+    parser: int
+    topology_generation: int
+    mutation_generation: int
+    file_size: int
+    file_mtime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotCell:
+    cached_value: object
+    cached_type: str
+    formula_value: object
+    formula_type: str
+    formula_kind: str
+    external_link: bool
+
+
+# Openpyxl represents an omitted cell in a rectangular read-only iteration as
+# an empty numeric cell.  Large design tables can be mostly sparse (the real
+# Language Sheet is about 88% omitted cells), so allocating one frozen object
+# for every such coordinate needlessly dominates the immutable model.  Keep a
+# single canonical token; tuple positions still preserve O(1) physical-column
+# access and the exact legacy comparison token (None/n/literal/False).
+_SNAPSHOT_BLANK_CELL = SnapshotCell(None, "n", None, "n", "literal", False)
+
+
+def _snapshot_row_hash(cells: tuple[SnapshotCell, ...]) -> str:
+    """Return the immutable comparison hash for one already-normalized row."""
+    return hashlib.sha256(repr(tuple(
+        (
+            str(cell.cached_type or ""),
+            _merge_cmp_value(cell.cached_value),
+            str(cell.formula_type or ""),
+            repr(_special_formula_signature(cell.formula_value) or _formula_text(cell.formula_value) or ""),
+            bool(cell.external_link),
+        )
+        for cell in cells
+    )).encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _paired_snapshot_cell_is_effectively_blank(
+    cached_value,
+    cached_type: str,
+    formula_value,
+    formula_type: str,
+) -> bool:
+    """Match the paired legacy readers' effective content horizon.
+
+    A style-only cell carries no value or formula on either stream and must not
+    grow the semantic sheet width.  A formula-only coordinate, including one
+    with no data-only cache, remains content through the formula value/type.
+    The type check preserves malformed/special typed coordinates rather than
+    silently treating them as blank merely because their value is absent.
+    """
+    if cached_value not in (None, "") or formula_value not in (None, ""):
+        return False
+    ordinary_empty_types = ("", "n", "s", "str", "inlineStr")
+    return (
+        str(cached_type or "") in ordinary_empty_types
+        and str(formula_type or "") in ordinary_empty_types
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotField:
+    physical_col: int
+    declaration: str
+    type_declaration: str
+    markers: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRow:
+    physical_row: int
+    cells: tuple[SnapshotCell, ...]
+    row_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRecord:
+    key: tuple[str, ...] | None
+    row_start: int
+    row_end: int
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRenderSpan:
+    logical_col: int
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
+class SheetSnapshot:
+    side: str
+    sheet: str
+    version: SheetSnapshotVersion
+    max_row: int
+    max_col: int
+    fields: tuple[SnapshotField, ...]
+    rows: tuple[SnapshotRow, ...]
+
+
+_SNAPSHOT_ALIAS_LOADER = "openpyxl-paired-readonly-v1"
+_SNAPSHOT_ALIAS_OPTIONS = ("data_only=True", "data_only=False", "read_only=True")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotBaseAliasPlan:
+    """One fail-closed request to reuse an immutable Mine/Theirs snapshot as Base.
+
+    File bytes alone are not sufficient: a Base alias must retain the Base
+    side/version identity while proving the paired value/formula inputs and
+    every selected-sheet parse semantic match one candidate side.
+    """
+
+    source_side: str | None
+    reason: str
+    sheet: str
+    generation: int
+    parser: int
+    schema: str
+    topology_generation: int
+    mutation_generation: int
+    loader: str
+    loader_options: tuple[str, ...]
+    base_signature: tuple[tuple[int, str], tuple[int, str]] | None
+    source_signature: tuple[tuple[int, str], tuple[int, str]] | None
+
+
+def _snapshot_alias_semantics(spec: dict, *, sheet: str, generation: int) -> tuple:
+    """Return the selected-sheet parser contract represented by one side spec."""
+    options = spec.get("loader_options", _SNAPSHOT_ALIAS_OPTIONS)
+    if isinstance(options, str):
+        options = (options,)
+    return (
+        str(spec.get("sheet", sheet)),
+        int(spec.get("parser", 1)),
+        str(spec.get("schema", "snapshot-field-declarations-v1")),
+        int(spec.get("generation", generation)),
+        int(spec.get("topology_generation", generation)),
+        int(spec.get("mutation_generation", 0)),
+        str(spec.get("loader", _SNAPSHOT_ALIAS_LOADER)),
+        tuple(str(option) for option in tuple(options)),
+    )
+
+
+def _snapshot_alias_signature_from_fingerprints(
+    spec: dict,
+    fingerprint_by_path: dict[str, tuple[str, int, int, str]],
+) -> tuple[tuple[int, str], tuple[int, str]]:
+    """Project strict stat+SHA fingerprints into the raw paired input proof."""
+    result = []
+    for key in ("value_path", "formula_path"):
+        raw_path = spec.get(key)
+        if not raw_path:
+            raise ValueError(f"snapshot alias missing {key}")
+        path = os.path.abspath(str(raw_path))
+        fingerprint = fingerprint_by_path.get(path)
+        if fingerprint is None:
+            raise ValueError(f"snapshot alias fingerprint missing {key}")
+        _normalized, size, _mtime_ns, digest = fingerprint
+        result.append((int(size), str(digest)))
+    return tuple(result)  # type: ignore[return-value]
+
+
+def _snapshot_alias_input_fingerprints(inputs: dict) -> tuple[tuple[str, int, int, str], ...]:
+    """Fingerprint every paired source path once, preserving the side order."""
+    paths = []
+    for side in ("A", "B", "BASE"):
+        spec = inputs.get(side)
+        if not isinstance(spec, dict):
+            continue
+        for key in ("value_path", "formula_path"):
+            if spec.get(key):
+                paths.append(str(spec[key]))
+    return _snapshot_input_fingerprints(paths)
+
+
+def _snapshot_alias_fingerprint_map(
+    fingerprints: tuple[tuple[str, int, int, str], ...],
+) -> dict[str, tuple[str, int, int, str]]:
+    return {os.path.abspath(str(item[0])): item for item in fingerprints}
+
+
+def _plan_snapshot_base_alias(
+    inputs: dict,
+    *,
+    sheet: str,
+    generation: int,
+    fingerprints: tuple[tuple[str, int, int, str], ...] | None = None,
+    available_source_sides: tuple[str, ...] = ("B", "A"),
+) -> SnapshotBaseAliasPlan:
+    """Choose B then A only when Base has an identical paired raw input proof.
+
+    Planning is intentionally side-effect free apart from the caller-supplied
+    strict input fingerprints.  Any malformed spec or fingerprint failure is
+    represented as a non-alias plan so callers proceed through the ordinary
+    full Base stream.
+    """
+    unavailable = SnapshotBaseAliasPlan(
+        None, "base-alias-not-eligible", str(sheet), int(generation), 1,
+        "snapshot-field-declarations-v1",
+        int(generation), 0, _SNAPSHOT_ALIAS_LOADER,
+        tuple(_SNAPSHOT_ALIAS_OPTIONS), None, None,
+    )
+    base_spec = inputs.get("BASE")
+    if not isinstance(base_spec, dict):
+        return dataclasses.replace(unavailable, reason="no-base-input")
+    try:
+        all_fingerprints = fingerprints or _snapshot_alias_input_fingerprints(inputs)
+        by_path = _snapshot_alias_fingerprint_map(all_fingerprints)
+        base_signature = _snapshot_alias_signature_from_fingerprints(base_spec, by_path)
+        base_semantics = _snapshot_alias_semantics(
+            base_spec, sheet=str(sheet), generation=int(generation),
+        )
+        base_sheet, base_parser, base_schema, base_generation, base_topology, _base_mutation, _base_loader, _base_options = base_semantics
+        if (
+            str(base_sheet) != str(sheet)
+            or int(base_generation) != int(generation)
+            or int(base_topology) != int(generation)
+        ):
+            return dataclasses.replace(
+                unavailable,
+                reason="base-sheet-generation-or-topology-semantics-mismatch",
+                base_signature=base_signature,
+            )
+        for side in tuple(str(item).upper() for item in available_source_sides):
+            spec = inputs.get(side)
+            if not isinstance(spec, dict):
+                continue
+            source_signature = _snapshot_alias_signature_from_fingerprints(spec, by_path)
+            if source_signature != base_signature:
+                continue
+            source_semantics = _snapshot_alias_semantics(
+                spec, sheet=str(sheet), generation=int(generation),
+            )
+            if source_semantics != base_semantics:
+                continue
+            _sheet, parser, schema, request_generation, topology_generation, mutation_generation, loader, options = base_semantics
+            return SnapshotBaseAliasPlan(
+                side, "base-input-signature-match", str(sheet),
+                int(request_generation), int(parser), str(schema), int(topology_generation),
+                int(mutation_generation), str(loader), tuple(options),
+                base_signature, source_signature,
+            )
+        return dataclasses.replace(
+            unavailable,
+            reason="base-value-formula-signature-or-semantics-mismatch",
+            base_signature=base_signature,
+        )
+    except Exception as exc:
+        return dataclasses.replace(
+            unavailable,
+            reason=f"base-alias-planning-error:{type(exc).__name__}",
+        )
+
+
+def _snapshot_alias_schema_digest(snapshot: SheetSnapshot) -> str:
+    """Digest immutable schema/row metadata without retaining a workbook object."""
+    payload = (
+        str(snapshot.sheet), int(snapshot.max_row), int(snapshot.max_col),
+        tuple((field.physical_col, field.declaration, field.type_declaration, tuple(sorted(field.markers))) for field in snapshot.fields),
+        tuple((row.physical_row, row.row_hash, len(row.cells)) for row in snapshot.rows),
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _snapshot_alias_snapshot_is_complete(
+    snapshot: SheetSnapshot,
+    *,
+    side: str,
+    sheet: str,
+    version: SheetSnapshotVersion,
+) -> bool:
+    """Reject a partially built or cross-side mutable candidate before aliasing."""
+    if not isinstance(snapshot, SheetSnapshot):
+        return False
+    if str(snapshot.side).upper() != str(side).upper() or str(snapshot.sheet) != str(sheet):
+        return False
+    if snapshot.version != version:
+        return False
+    if not isinstance(snapshot.fields, tuple) or not isinstance(snapshot.rows, tuple):
+        return False
+    if len(snapshot.fields) != int(snapshot.max_col) or len(snapshot.rows) != int(snapshot.max_row):
+        return False
+    if any(not isinstance(field, SnapshotField) for field in snapshot.fields):
+        return False
+    for index, row in enumerate(snapshot.rows, start=1):
+        if not isinstance(row, SnapshotRow) or int(row.physical_row) != index:
+            return False
+        if not isinstance(row.cells, tuple) or any(not isinstance(cell, SnapshotCell) for cell in row.cells):
+            return False
+    return True
+
+
+def _build_snapshot_base_alias(
+    plan: SnapshotBaseAliasPlan,
+    candidate: SheetSnapshot | None,
+    inputs: dict,
+    *,
+    fingerprints: tuple[tuple[str, int, int, str], ...] | None = None,
+    pickle_dumps=pickle.dumps,
+) -> tuple[SheetSnapshot | None, dict]:
+    """Build a distinct Base wrapper or return a diagnostic for full streaming.
+
+    The wrapper shares *only* frozen row/field tokens.  It carries Base side and
+    version metadata, is independently pickled, and is rejected if a freshness
+    proof changes at any point.  Callers must stream Base normally on ``None``.
+    """
+    telemetry = {
+        "used": False,
+        "source": plan.source_side,
+        "reason": str(plan.reason),
+        "saved_side": None,
+        "input_signatures": {
+            key: value
+            for key, value in (
+                ("BASE", plan.base_signature),
+                (str(plan.source_side or ""), plan.source_signature),
+            )
+            if key and value is not None
+        },
+        "source_payload_digest": None,
+        "wrapper_payload_digest": None,
+    }
+    try:
+        source_side = plan.source_side
+        if not source_side or candidate is None:
+            return None, telemetry
+        source_spec = inputs.get(source_side)
+        base_spec = inputs.get("BASE")
+        if not isinstance(source_spec, dict) or not isinstance(base_spec, dict):
+            raise ValueError("missing alias input spec")
+        current_fingerprints = fingerprints or _snapshot_alias_input_fingerprints(inputs)
+        by_path = _snapshot_alias_fingerprint_map(current_fingerprints)
+        source_signature = _snapshot_alias_signature_from_fingerprints(source_spec, by_path)
+        base_signature = _snapshot_alias_signature_from_fingerprints(base_spec, by_path)
+        if source_signature != plan.source_signature or base_signature != plan.base_signature:
+            raise ValueError("input fingerprint changed before alias wrapper")
+        if source_signature != base_signature:
+            raise ValueError("paired Base input is not byte-identical")
+        expected_semantics = _snapshot_alias_semantics(
+            source_spec, sheet=plan.sheet, generation=plan.generation,
+        )
+        if expected_semantics != _snapshot_alias_semantics(
+            base_spec, sheet=plan.sheet, generation=plan.generation,
+        ):
+            raise ValueError("Base parser semantics differ")
+        _sheet, parser, schema, request_generation, topology_generation, mutation_generation, loader, options = expected_semantics
+        if (
+            int(parser) != int(plan.parser)
+            or str(schema) != str(plan.schema)
+            or int(request_generation) != int(plan.generation)
+            or int(topology_generation) != int(plan.topology_generation)
+            or int(mutation_generation) != int(plan.mutation_generation)
+            or str(loader) != str(plan.loader)
+            or tuple(options) != tuple(plan.loader_options)
+        ):
+            raise ValueError("Base alias plan semantics became stale")
+        expected_source_version = _selected_sheet_snapshot_version(
+            str(source_spec["value_path"]),
+            topology_generation=int(topology_generation),
+            mutation_generation=int(mutation_generation),
+        )
+        expected_base_version = _selected_sheet_snapshot_version(
+            str(base_spec["value_path"]),
+            topology_generation=int(topology_generation),
+            mutation_generation=int(mutation_generation),
+        )
+        if int(parser) != int(expected_source_version.parser) or int(parser) != int(expected_base_version.parser):
+            raise ValueError("Base alias parser version differs from snapshot reader")
+        if not _snapshot_alias_snapshot_is_complete(
+            candidate, side=source_side, sheet=plan.sheet, version=expected_source_version,
+        ):
+            raise ValueError("source snapshot is incomplete or stale")
+        wrapper = SheetSnapshot(
+            side="BASE",
+            sheet=str(plan.sheet),
+            version=expected_base_version,
+            max_row=int(candidate.max_row),
+            max_col=int(candidate.max_col),
+            fields=candidate.fields,
+            rows=candidate.rows,
+        )
+        # A child must eventually serialize this object.  Validate that exact
+        # transport now; a pickle failure merely abandons aliasing and retains
+        # the ordinary Base stream rather than producing a half-valid payload.
+        pickle_dumps(wrapper, protocol=pickle.HIGHEST_PROTOCOL)
+        source_digest = _snapshot_alias_schema_digest(candidate)
+        wrapper_digest = _snapshot_alias_schema_digest(wrapper)
+        telemetry.update({
+            "used": True,
+            "source": str(source_side),
+            "reason": "base-input-signature-match",
+            "saved_side": "BASE",
+            "input_signatures": {
+                "BASE": base_signature,
+                str(source_side): source_signature,
+            },
+            "source_payload_digest": source_digest,
+            "wrapper_payload_digest": wrapper_digest,
+        })
+        return wrapper, telemetry
+    except Exception as exc:
+        telemetry["reason"] = f"base-alias-validation-fallback:{type(exc).__name__}"
+        return None, telemetry
+
+
+def _read_snapshot_inputs_with_base_alias(
+    inputs: dict,
+    *,
+    sheet: str,
+    generation: int,
+    cancel_check=None,
+    stream_snapshot=None,
+) -> tuple[dict[str, SheetSnapshot], dict[str, float], dict, tuple[tuple[str, int, int, str], ...]]:
+    """Read A/B/(Base), using the shared alias plan only after strict proof.
+
+    This function is intentionally Tk-free so the isolated child and pure
+    tests exercise the same planner/builder contract.  The in-process fallback
+    uses the same two helpers with its generation-safe snapshot cache.
+    """
+    stream_snapshot = stream_snapshot or _stream_selected_sheet_snapshot
+    before = _snapshot_alias_input_fingerprints(inputs)
+    plan = _plan_snapshot_base_alias(
+        inputs, sheet=str(sheet), generation=int(generation), fingerprints=before,
+    )
+    side_metrics: dict[str, float] = {}
+    snapshots: dict[str, SheetSnapshot] = {}
+
+    def _read(side: str) -> SheetSnapshot:
+        spec = inputs[side]
+        side_started = time.perf_counter()
+        snapshot = stream_snapshot(
+            spec["value_path"], spec["formula_path"], str(sheet), side,
+            topology_generation=int(spec.get("topology_generation", generation)),
+            mutation_generation=int(spec.get("mutation_generation", 0)),
+            cancel_check=cancel_check,
+        )
+        side_metrics[side] = (time.perf_counter() - side_started) * 1000.0
+        return snapshot
+
+    snapshots["A"] = _read("A")
+    snapshots["B"] = _read("B")
+    alias_telemetry = {
+        "used": False, "source": None, "reason": "no-base-input",
+        "saved_side": None, "input_signatures": {},
+        "source_payload_digest": None, "wrapper_payload_digest": None,
+    }
+    if isinstance(inputs.get("BASE"), dict):
+        source = snapshots.get(str(plan.source_side or ""))
+        try:
+            base, alias_telemetry = _build_snapshot_base_alias(
+                plan, source, inputs,
+                fingerprints=_snapshot_alias_input_fingerprints(inputs),
+            )
+        except Exception as exc:
+            # The planner/builder is an optimization boundary.  A technical
+            # alias fault must not change three-way semantics; take the full
+            # Base stream and leave strict before/after freshness active.
+            base = None
+            alias_telemetry = {
+                "used": False, "source": None,
+                "reason": f"base-alias-builder-exception:{type(exc).__name__}",
+                "saved_side": None, "input_signatures": {},
+                "source_payload_digest": None, "wrapper_payload_digest": None,
+            }
+        if base is None:
+            base = _read("BASE")
+        else:
+            side_metrics["BASE"] = 0.0
+        snapshots["BASE"] = base
+    after = _snapshot_alias_input_fingerprints(inputs)
+    if before != after:
+        raise RuntimeError("snapshot alias input changed during read")
+    alias_telemetry["ingest_ms"] = {
+        side: round(float(side_metrics.get(side, 0.0)), 3)
+        for side in ("A", "B", "BASE") if side in snapshots
+    }
+    return snapshots, side_metrics, alias_telemetry, before
+
+
+def _selected_sheet_snapshot_version(path: str, *, topology_generation: int = 0, mutation_generation: int = 0) -> SheetSnapshotVersion:
+    stat = os.stat(path)
+    return SheetSnapshotVersion(
+        parser=1,
+        topology_generation=max(0, int(topology_generation)),
+        mutation_generation=max(0, int(mutation_generation)),
+        file_size=int(stat.st_size),
+        file_mtime_ns=int(stat.st_mtime_ns),
+    )
+
+
+def _stream_selected_sheet_snapshot(
+    value_path: str,
+    formula_path: str,
+    sheet: str,
+    side: str,
+    *,
+    topology_generation: int = 0,
+    mutation_generation: int = 0,
+    cancel_check=None,
+) -> SheetSnapshot:
+    """Sequentially ingest one Sheet from paired value/formula read-only streams.
+
+    The reader is intentionally narrow: openpyxl opens workbook metadata, but
+    only the requested worksheet is iterated.  Downstream compare/render code
+    can consume the immutable result without retaining a Worksheet object.
+    """
+    value_wb = formula_wb = None
+    try:
+        value_wb = load_workbook(value_path, data_only=True, read_only=True)
+        formula_wb = load_workbook(formula_path, data_only=False, read_only=True)
+        value_ws = value_wb[sheet]
+        formula_ws = formula_wb[sheet]
+
+        value_rows_bound, value_cols_bound = value_ws.max_row, value_ws.max_column
+        formula_rows_bound, formula_cols_bound = formula_ws.max_row, formula_ws.max_column
+        # Some write-only producers omit the `<dimension>` element.  Never
+        # coerce those unknown bounds to 1x1: stream both sides once to EOF and
+        # derive their shared physical envelope while retaining the normal
+        # every-128-row cancellation checkpoint.  A declared one-row sheet is
+        # also streamed dynamically; it is cheap and prevents stale/truncated
+        # dimension metadata from becoming an exact result.
+        dynamic_bounds = any(
+            bound is None or int(bound or 0) <= 0
+            for bound in (
+                value_rows_bound, value_cols_bound,
+                formula_rows_bound, formula_cols_bound,
+            )
+        ) or int(value_rows_bound or 0) <= 1 or int(formula_rows_bound or 0) <= 1
+        if dynamic_bounds:
+            max_row = 0
+            max_col = 0
+            value_rows = value_ws.iter_rows()
+            formula_rows = formula_ws.iter_rows()
+        else:
+            max_row = max(int(value_rows_bound), int(formula_rows_bound))
+            max_col = max(int(value_cols_bound), int(formula_cols_bound))
+            value_rows = value_ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+            formula_rows = formula_ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)
+        rows = []
+        last_nonblank_row = 0
+        last_nonblank_col = 0
+        fields = []
+        for row_index, (value_cells, formula_cells) in enumerate(zip_longest(value_rows, formula_rows, fillvalue=()), start=1):
+            if cancel_check is not None and (row_index & 127) == 0:
+                cancel_check()
+                # openpyxl row decoding is CPU/GIL heavy on real revision
+                # inputs.  Hand the interpreter to Tk at every bounded parser
+                # checkpoint; this does not change snapshot ordering or data.
+                time.sleep(0)
+            row_width = max(len(value_cells), len(formula_cells)) if dynamic_bounds else max_col
+            if dynamic_bounds:
+                max_row = row_index
+                max_col = max(max_col, row_width)
+            cells = []
+            for col_index in range(row_width):
+                value_cell = value_cells[col_index] if col_index < len(value_cells) else None
+                formula_cell = formula_cells[col_index] if col_index < len(formula_cells) else None
+                cached_value = getattr(value_cell, "value", None)
+                formula_value = getattr(formula_cell, "value", None)
+                cached_type = str(getattr(value_cell, "data_type", "") or "")
+                formula_type = str(getattr(formula_cell, "data_type", "") or "")
+                if _paired_snapshot_cell_is_effectively_blank(
+                    cached_value,
+                    cached_type,
+                    formula_value,
+                    formula_type,
+                ):
+                    cells.append(_SNAPSHOT_BLANK_CELL)
+                    continue
+                last_nonblank_row = row_index
+                last_nonblank_col = max(last_nonblank_col, col_index + 1)
+                special = _special_formula_signature(formula_value)
+                formula_text = _formula_text(formula_value)
+                formula_kind = "special" if special is not None else "formula" if formula_text else "literal"
+                cells.append(SnapshotCell(
+                    cached_value=cached_value,
+                    cached_type=cached_type,
+                    formula_value=formula_value,
+                    formula_type=formula_type,
+                    formula_kind=formula_kind,
+                    external_link=bool(formula_text and "[" in formula_text),
+                ))
+            frozen_cells = tuple(cells)
+            rows.append(SnapshotRow(
+                physical_row=row_index,
+                cells=frozen_cells,
+                row_hash=_snapshot_row_hash(frozen_cells),
+            ))
+            if row_index <= 2:
+                for col_index, cell in enumerate(frozen_cells, start=1):
+                    if row_index == 1:
+                        fields.append([col_index, str(cell.cached_value or ""), "", set()])
+                    else:
+                        while len(fields) < col_index:
+                            fields.append([col_index, "", "", set()])
+                        fields[col_index - 1][2] = str(cell.cached_value or "")
+        if dynamic_bounds:
+            max_row = max(1, int(max_row))
+            max_col = max(1, int(max_col))
+        declared_max_col = max(1, int(max_col or 1))
+        if last_nonblank_row:
+            max_row = int(last_nonblank_row)
+            max_col = max(1, int(last_nonblank_col))
+            retained_rows = rows[:max_row]
+        else:
+            # Keep the direct Oracle's all-empty shape: one physical row and
+            # the declared width.  This retains schema-width evidence without
+            # treating style-only blank tail rows as semantic content.
+            max_row = 1
+            max_col = declared_max_col
+            retained_rows = rows[:1]
+        normalized_rows = []
+        for physical_row, row in enumerate(retained_rows, start=1):
+            normalized_cells = tuple(row.cells[:max_col])
+            if len(normalized_cells) < max_col:
+                normalized_cells += (_SNAPSHOT_BLANK_CELL,) * (max_col - len(normalized_cells))
+            normalized_rows.append(SnapshotRow(
+                physical_row=physical_row,
+                cells=normalized_cells,
+                row_hash=_snapshot_row_hash(normalized_cells),
+            ))
+        if not normalized_rows:
+            normalized_cells = (_SNAPSHOT_BLANK_CELL,) * max_col
+            normalized_rows.append(SnapshotRow(
+                physical_row=1,
+                cells=normalized_cells,
+                row_hash=_snapshot_row_hash(normalized_cells),
+            ))
+        rows = normalized_rows
+        fields = fields[:max_col]
+        while len(fields) < max_col:
+            fields.append([len(fields) + 1, "", "", set()])
+        for item in fields:
+            marker_text = (item[1] + " " + item[2]).lower()
+            if "@id" in marker_text:
+                item[3].add("id")
+            if "@const" in marker_text:
+                item[3].add("const")
+        return SheetSnapshot(
+            side=str(side), sheet=str(sheet),
+            version=_selected_sheet_snapshot_version(value_path, topology_generation=topology_generation, mutation_generation=mutation_generation),
+            max_row=max_row, max_col=max_col,
+            fields=tuple(SnapshotField(item[0], item[1], item[2], frozenset(item[3])) for item in fields),
+            rows=tuple(rows),
+        )
+    finally:
+        _wbs_close(value_wb, formula_wb)
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDuplicateFieldOccurrence:
+    """One duplicate occurrence plus its all-side schema interval evidence."""
+
+    descriptor: tuple
+    mine_col: int
+    theirs_col: int
+    base_col: int | None
+    mine_bounds: tuple[int, int]
+    theirs_bounds: tuple[int, int]
+    base_bounds: tuple[int, int] | None = None
+
+    def __post_init__(self):
+        for name in ("mine_col", "theirs_col"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError("duplicate occurrence coordinates must be positive")
+        for bounds in (self.mine_bounds, self.theirs_bounds, self.base_bounds):
+            if bounds is not None and (len(bounds) != 2 or int(bounds[0]) < 0 or int(bounds[0]) >= int(bounds[1])):
+                raise ValueError("duplicate occurrence requires ordered physical bounds")
+
+    @property
+    def pair(self) -> tuple[int, int, int | None]:
+        return int(self.mine_col), int(self.theirs_col), (
+            None if self.base_col is None else int(self.base_col)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDuplicateFieldProof:
+    """Bounded duplicate occurrences; final cache evidence remains mandatory."""
+
+    occurrences: tuple[SnapshotDuplicateFieldOccurrence, ...]
+    three_way: bool = False
+
+    def __post_init__(self):
+        occurrences = tuple(self.occurrences)
+        if not occurrences:
+            raise ValueError("duplicate-field proof requires at least one occurrence")
+        pairs = tuple(occurrence.pair for occurrence in occurrences)
+        if len({pair[0] for pair in pairs}) != len(pairs) or len({pair[1] for pair in pairs}) != len(pairs):
+            raise ValueError("duplicate-field proof coordinates must be unique")
+        if self.three_way:
+            if any(pair[2] is None or occurrence.base_bounds is None for pair, occurrence in zip(pairs, occurrences)):
+                raise ValueError("three-way duplicate proof requires Base evidence")
+            if len({pair[2] for pair in pairs}) != len(pairs):
+                raise ValueError("duplicate-field proof Base coordinates must be unique")
+        elif any(pair[2] is not None or occurrence.base_bounds is not None for pair, occurrence in zip(pairs, occurrences)):
+            raise ValueError("two-way duplicate proof cannot contain Base evidence")
+        object.__setattr__(self, "occurrences", occurrences)
+
+    @property
+    def pairs(self) -> tuple[tuple[int, int, int | None], ...]:
+        return tuple(occurrence.pair for occurrence in self.occurrences)
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDuplicateFieldPreGap:
+    """One occurrence's original cache-alignment gap provenance.
+
+    ``*_cache_bounds`` are physical *anchor* coordinates, inclusive of the
+    surrounding anchors and exclusive of the member interval.  A ``0`` left
+    bound and ``max_col + 1`` right bound represent the virtual ``START`` and
+    ``END`` anchors respectively.  The finalizer must validate the complete
+    member interval of each group; this object deliberately does not promote
+    or normalize a cache slot by itself.
+    """
+
+    occurrence: SnapshotDuplicateFieldOccurrence
+    mine_cache_bounds: tuple[int, int]
+    theirs_cache_bounds: tuple[int, int]
+    base_cache_bounds: tuple[int, int] | None = None
+    alignment_sources: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        for bounds in (
+            self.mine_cache_bounds,
+            self.theirs_cache_bounds,
+            self.base_cache_bounds,
+        ):
+            if bounds is not None and (
+                len(bounds) != 2 or int(bounds[0]) >= int(bounds[1])
+            ):
+                raise ValueError("pre-gap cache bounds must be ordered")
+
+    @property
+    def group_key(self) -> tuple:
+        return (
+            self.mine_cache_bounds,
+            self.theirs_cache_bounds,
+            self.base_cache_bounds,
+            self.alignment_sources,
+        )
+
+
+def _snapshot_duplicate_pre_gap_from_anchor_pairs(
+    left_col: int,
+    right_col: int,
+    *,
+    left_max_col: int,
+    right_max_col: int,
+    anchor_pairs: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """Return the single original cache gap containing a physical pair.
+
+    The cache keeps physical anchor pairs, whereas duplicate descriptors keep
+    their own nearby unique schema anchors.  This helper intentionally uses
+    only the former: two duplicate runs may be in distinct cache gaps even
+    when their field identity is the same, and may share a cache gap even when
+    their own descriptor intervals differ.
+    """
+    left_col, right_col = int(left_col), int(right_col)
+    left_max_col, right_max_col = int(left_max_col), int(right_max_col)
+    if not (
+        1 <= left_col <= left_max_col
+        and 1 <= right_col <= right_max_col
+    ):
+        return None
+    anchors = ((0, 0),) + tuple(
+        (int(left), int(right)) for left, right in anchor_pairs
+    ) + ((left_max_col + 1, right_max_col + 1),)
+    if any(
+        previous[0] >= current[0] or previous[1] >= current[1]
+        for previous, current in zip(anchors, anchors[1:])
+    ):
+        return None
+    for left_anchor, right_anchor in zip(anchors, anchors[1:]):
+        if (
+            left_anchor[0] < left_col < right_anchor[0]
+            and left_anchor[1] < right_col < right_anchor[1]
+        ):
+            return (
+                (int(left_anchor[0]), int(right_anchor[0])),
+                (int(left_anchor[1]), int(right_anchor[1])),
+            )
+    return None
+
+
+def _snapshot_duplicate_proof_pre_gap_groups(
+    proof: SnapshotDuplicateFieldProof,
+    alignment: ColumnAlignmentResult | ColumnAlignment3WayResult | None,
+    *,
+    mine_max_col: int,
+    theirs_max_col: int,
+    base_max_col: int | None = None,
+) -> tuple[tuple[SnapshotDuplicateFieldPreGap, ...], ...] | None:
+    """Group proof occurrences by the original cache gap that contained them.
+
+    This is a pure, fail-closed adapter.  It does not inspect a worksheet or a
+    logical slot.  The consumer must still verify every raw schema member and
+    its final cache slot.  It preserves START/END as virtual anchors and never
+    infers a gap by sorting neighbouring proof occurrences.
+    """
+    if proof.three_way:
+        if not isinstance(alignment, ColumnAlignment3WayResult):
+            return None
+        if base_max_col is None:
+            return None
+    elif not isinstance(alignment, ColumnAlignmentResult):
+        return None
+
+    def _inside_descriptor_bounds(
+        cache_bounds: tuple[int, int],
+        descriptor_bounds: tuple[int, int],
+        physical_col: int,
+    ) -> bool:
+        return (
+            int(cache_bounds[0]) <= int(descriptor_bounds[0])
+            < int(physical_col)
+            < int(descriptor_bounds[1]) <= int(cache_bounds[1])
+        )
+
+    pre_gaps: list[SnapshotDuplicateFieldPreGap] = []
+    for occurrence in proof.occurrences:
+        if not proof.three_way:
+            paired = _snapshot_duplicate_pre_gap_from_anchor_pairs(
+                occurrence.mine_col,
+                occurrence.theirs_col,
+                left_max_col=mine_max_col,
+                right_max_col=theirs_max_col,
+                anchor_pairs=alignment.anchor_pairs,
+            )
+            if paired is None:
+                return None
+            mine_bounds, theirs_bounds = paired
+            if not (
+                _inside_descriptor_bounds(
+                    mine_bounds, occurrence.mine_bounds, occurrence.mine_col
+                )
+                and _inside_descriptor_bounds(
+                    theirs_bounds, occurrence.theirs_bounds,
+                    occurrence.theirs_col,
+                )
+            ):
+                return None
+            pre_gaps.append(SnapshotDuplicateFieldPreGap(
+                occurrence=occurrence,
+                mine_cache_bounds=mine_bounds,
+                theirs_cache_bounds=theirs_bounds,
+                alignment_sources=("mine-theirs",),
+            ))
+            continue
+
+        if occurrence.base_col is None or occurrence.base_bounds is None:
+            return None
+        mine_base = _snapshot_duplicate_pre_gap_from_anchor_pairs(
+            occurrence.mine_col,
+            occurrence.base_col,
+            left_max_col=mine_max_col,
+            right_max_col=int(base_max_col),
+            anchor_pairs=alignment.mine_to_base.anchor_pairs,
+        )
+        theirs_base = _snapshot_duplicate_pre_gap_from_anchor_pairs(
+            occurrence.theirs_col,
+            occurrence.base_col,
+            left_max_col=theirs_max_col,
+            right_max_col=int(base_max_col),
+            anchor_pairs=alignment.theirs_to_base.anchor_pairs,
+        )
+        if mine_base is None or theirs_base is None:
+            return None
+        mine_bounds, base_from_mine = mine_base
+        theirs_bounds, base_from_theirs = theirs_base
+        if base_from_mine != base_from_theirs:
+            return None
+        if not (
+            _inside_descriptor_bounds(
+                mine_bounds, occurrence.mine_bounds, occurrence.mine_col
+            )
+            and _inside_descriptor_bounds(
+                theirs_bounds, occurrence.theirs_bounds,
+                occurrence.theirs_col,
+            )
+            and _inside_descriptor_bounds(
+                base_from_mine, occurrence.base_bounds, occurrence.base_col
+            )
+        ):
+            return None
+        pre_gaps.append(SnapshotDuplicateFieldPreGap(
+            occurrence=occurrence,
+            mine_cache_bounds=mine_bounds,
+            theirs_cache_bounds=theirs_bounds,
+            base_cache_bounds=base_from_mine,
+            alignment_sources=("mine-base", "theirs-base"),
+        ))
+
+    if len({pre_gap.occurrence.pair for pre_gap in pre_gaps}) != len(pre_gaps):
+        return None
+    grouped: dict[tuple, list[SnapshotDuplicateFieldPreGap]] = {}
+    for pre_gap in pre_gaps:
+        grouped.setdefault(pre_gap.group_key, []).append(pre_gap)
+    return tuple(
+        tuple(sorted(
+            group,
+            key=lambda item: (
+                item.occurrence.mine_col,
+                item.occurrence.theirs_col,
+                -1 if item.occurrence.base_col is None else item.occurrence.base_col,
+            ),
+        ))
+        for _key, group in sorted(grouped.items(), key=lambda item: repr(item[0]))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotAlignment:
+    """Pure schema/key alignment result, including conservative ambiguity."""
+
+    field_pairs: tuple[tuple[int | None, int | None, str], ...]
+    row_pairs: tuple[tuple[int | None, int | None], ...]
+    used_declared_keys: bool
+    unresolved: bool
+    duplicate_field_proof: SnapshotDuplicateFieldProof | None = None
+
+
+def _snapshot_field_identity(field: SnapshotField) -> tuple[str, str]:
+    declaration = re.sub(r"@(id|const)\b", "", field.declaration, flags=re.I).strip().casefold()
+    return (declaration, field.type_declaration.strip().casefold())
+
+
+def _snapshot_cell_identity(cell: SnapshotCell) -> str:
+    special = _special_formula_signature(cell.formula_value)
+    formula = _formula_text(cell.formula_value)
+    if special is not None:
+        return "FORMULA:SPECIAL:" + repr(special)
+    if formula:
+        return "FORMULA:TEXT:" + _norm_formula_text(formula)
+    return _merge_cmp_value(cell.cached_value)
+
+
+def _snapshot_declared_records(snapshot: SheetSnapshot):
+    """Return `(key, rows)` groups, preserving blank-key continuations."""
+    key_offsets = [field.physical_col - 1 for field in snapshot.fields if field.markers & {"id", "const"}]
+    if not key_offsets:
+        return None
+    records = []
+    current = None
+    for row in snapshot.rows[2:]:
+        key = tuple(
+            _snapshot_cell_identity(row.cells[offset]) if offset < len(row.cells) else "BLANK:"
+            for offset in key_offsets
+        )
+        blank = all(value == "BLANK:" for value in key)
+        if blank and current is not None:
+            current[1].append(row)
+            continue
+        if blank:
+            # A leading blank continuation has no trustworthy owner.
+            return None
+        current = [key, [row]]
+        records.append(current)
+    if any(key is None for key, _rows in records):
+        return None
+    if len({key for key, _rows in records}) != len(records):
+        return None
+    return tuple((key, tuple(rows)) for key, rows in records)
+
+
+def _snapshot_legacy_row_pairs(left: SheetSnapshot, right: SheetSnapshot) -> tuple[tuple[int | None, int | None], ...]:
+    """Run the legacy deterministic signature matcher from immutable rows only."""
+    max_left = max(1, int(left.max_row or 1))
+    max_right = max(1, int(right.max_row or 1))
+    if not _should_auto_row_align(max_left, max_right, force=False):
+        return tuple(
+            (row if row <= max_left else None, row if row <= max_right else None)
+            for row in range(1, max(max_left, max_right) + 1)
+        )
+    # The overwhelmingly common large-table path is a stable, unique declared
+    # record sequence.  Its physical row groups are already exact; invoking
+    # SequenceMatcher over thousands of giant row signatures adds seconds
+    # without changing legacy output.  Any insertion, deletion, reorder or
+    # continuation-count change deliberately falls through to legacy matching.
+    left_records = _snapshot_declared_records(left)
+    right_records = _snapshot_declared_records(right)
+    if left_records is not None and right_records is not None:
+        left_keys = tuple(key for key, _rows in left_records)
+        right_keys = tuple(key for key, _rows in right_records)
+        if left_keys == right_keys and all(
+            len(left_rows) == len(right_rows)
+            for (_left_key, left_rows), (_right_key, right_rows)
+            in zip(left_records, right_records)
+        ):
+            headers = [
+                (row, row)
+                for row in range(1, min(max_left, max_right, 2) + 1)
+            ]
+            payload = [
+                (left_row.physical_row, right_row.physical_row)
+                for (_left_key, left_rows), (_right_key, right_rows) in zip(left_records, right_records)
+                for left_row, right_row in zip(left_rows, right_rows)
+            ]
+            return tuple(headers + payload)
+    width_left = max(1, int(left.max_col or 1))
+    width_right = max(1, int(right.max_col or 1))
+    left_values = [tuple(cell.cached_value for cell in row.cells) for row in left.rows]
+    right_values = [tuple(cell.cached_value for cell in row.cells) for row in right.rows]
+    left_formulas = [tuple(cell.formula_value for cell in row.cells) for row in left.rows]
+    right_formulas = [tuple(cell.formula_value for cell in row.cells) for row in right.rows]
+    signatures_left, signatures_right = _row_signatures_from_unique_column_anchors(
+        left_values, right_values, width_left, width_right,
+        left_formulas, right_formulas,
+    )
+    return tuple(_compute_row_pairs_from_signatures(signatures_left, signatures_right))
+
+
+def _snapshot_field_groups(snapshot: SheetSnapshot) -> dict[tuple[str, str], tuple[SnapshotField, ...]]:
+    """Return declared fields by normalized identity in physical order."""
+    groups = {}
+    for field in snapshot.fields:
+        groups.setdefault(_snapshot_field_identity(field), []).append(field)
+    return {
+        identity: tuple(sorted(fields, key=lambda field: field.physical_col))
+        for identity, fields in groups.items()
+    }
+
+
+def _snapshot_blank_column_digest(snapshot: SheetSnapshot, physical_col: int) -> str | None:
+    """Return a typed digest only when the complete immutable column is blank."""
+    column = int(physical_col)
+    if column < 1 or column > int(snapshot.max_col or 0):
+        return None
+    tokens = []
+    for row in snapshot.rows:
+        cell = (
+            row.cells[column - 1]
+            if column <= len(row.cells)
+            else _SNAPSHOT_BLANK_CELL
+        )
+        # A literal empty string and every formula are content.  Only an
+        # absent cached value plus absent formula token is the blank proof
+        # admitted by Decision 14.
+        if cell.cached_value is not None or cell.formula_value is not None:
+            return None
+        tokens.append((
+            str(cell.cached_type or ""),
+            str(cell.formula_type or ""),
+            str(cell.formula_kind or ""),
+            bool(cell.external_link),
+        ))
+    return hashlib.sha256(
+        repr(tuple(tokens)).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _snapshot_row_pairs_are_complete_and_keyed(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+    row_pairs: tuple[tuple[int | None, int | None], ...],
+) -> bool:
+    """Require validated declared owners and a complete one-to-one row map."""
+    left_records = _snapshot_declared_records(left)
+    right_records = _snapshot_declared_records(right)
+    if left_records is None or right_records is None:
+        return False
+
+    def _owners(records):
+        return {
+            int(row.physical_row): key
+            for key, rows in records
+            for row in rows
+        }
+
+    left_owner = _owners(left_records)
+    right_owner = _owners(right_records)
+    left_rows = {int(row.physical_row) for row in left.rows}
+    right_rows = {int(row.physical_row) for row in right.rows}
+    if len(row_pairs) != len(left_rows) or len(row_pairs) != len(right_rows):
+        return False
+    seen_left = set()
+    seen_right = set()
+    for left_row, right_row in row_pairs:
+        if left_row is None or right_row is None:
+            return False
+        left_row, right_row = int(left_row), int(right_row)
+        if left_row in seen_left or right_row in seen_right:
+            return False
+        seen_left.add(left_row)
+        seen_right.add(right_row)
+        if left_row <= 2 or right_row <= 2:
+            if left_row != right_row:
+                return False
+            continue
+        if left_owner.get(left_row) != right_owner.get(right_row):
+            return False
+    return seen_left == left_rows and seen_right == right_rows
+
+
+def _snapshot_duplicate_run_descriptors(snapshot: SheetSnapshot):
+    """Describe duplicate occurrences using only immutable schema/payload data.
+
+    A descriptor is per contiguous duplicate run.  Independent occurrences of
+    the same blank identity may therefore be bounded by different intervals
+    (for example one interior and one at ``END``), as long as each occurrence
+    has the same descriptor on every side.
+    """
+    groups = _snapshot_field_groups(snapshot)
+    duplicate_identities = {
+        identity for identity, fields in groups.items() if len(fields) > 1
+    }
+    unique_identities = {
+        identity for identity, fields in groups.items() if len(fields) == 1
+    }
+    by_column = {int(field.physical_col): field for field in snapshot.fields}
+
+    def _anchor(start: int, direction: int):
+        position = int(start) + int(direction)
+        while 1 <= position <= int(snapshot.max_col or 0):
+            field = by_column.get(position)
+            identity = _snapshot_field_identity(field) if field is not None else None
+            if identity in unique_identities:
+                return ("FIELD", identity), position
+            position += int(direction)
+        return (("START", None), 0) if direction < 0 else (
+            ("END", None), int(snapshot.max_col or 0) + 1
+        )
+
+    descriptors = {}
+    for identity in duplicate_identities:
+        fields = groups[identity]
+        run_start = 0
+        while run_start < len(fields):
+            run_end = run_start + 1
+            while (
+                run_end < len(fields)
+                and int(fields[run_end].physical_col)
+                == int(fields[run_end - 1].physical_col) + 1
+            ):
+                run_end += 1
+            run = fields[run_start:run_end]
+            left_anchor, left_position = _anchor(run[0].physical_col, -1)
+            right_anchor, right_position = _anchor(run[-1].physical_col, 1)
+            interval_width = int(right_position) - int(left_position) - 1
+            for ordinal, field in enumerate(run):
+                digest = _snapshot_blank_column_digest(snapshot, field.physical_col)
+                if digest is None:
+                    return None
+                descriptor = (
+                    identity,
+                    left_anchor,
+                    right_anchor,
+                    int(interval_width),
+                    len(run),
+                    int(ordinal),
+                )
+                if descriptor in descriptors:
+                    # Two indistinguishable runs in one interval would need a
+                    # positional guess.  Keep that Sheet unresolved.
+                    return None
+                descriptors[descriptor] = (
+                    field, digest, int(left_position), int(right_position)
+                )
+            run_start = run_end
+    return groups, duplicate_identities, descriptors
+
+
+def _build_snapshot_duplicate_field_identity_proof(
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    alignment: SnapshotAlignment,
+    base: SheetSnapshot | None = None,
+    mine_base_alignment: SnapshotAlignment | None = None,
+    theirs_base_alignment: SnapshotAlignment | None = None,
+) -> SnapshotDuplicateFieldProof | None:
+    """Build the Decision-14 candidate without reading a worksheet.
+
+    This builder intentionally does *not* clear an alignment result on its
+    own.  Its caller must seed the candidate into the final logical-column
+    cache and prove every slot is resolved and bijective.
+    """
+    if not _snapshot_row_pairs_are_complete_and_keyed(
+        mine, theirs, alignment.row_pairs
+    ):
+        return None
+    if base is not None:
+        if mine_base_alignment is None or theirs_base_alignment is None:
+            return None
+        if not _snapshot_row_pairs_are_complete_and_keyed(
+            mine, base, mine_base_alignment.row_pairs
+        ) or not _snapshot_row_pairs_are_complete_and_keyed(
+            theirs, base, theirs_base_alignment.row_pairs
+        ):
+            return None
+
+    mine_data = _snapshot_duplicate_run_descriptors(mine)
+    theirs_data = _snapshot_duplicate_run_descriptors(theirs)
+    base_data = _snapshot_duplicate_run_descriptors(base) if base is not None else None
+    if mine_data is None or theirs_data is None or (base is not None and base_data is None):
+        return None
+    mine_groups, mine_duplicates, mine_descriptors = mine_data
+    theirs_groups, theirs_duplicates, theirs_descriptors = theirs_data
+    all_duplicates = set(mine_duplicates) | set(theirs_duplicates)
+    if base_data is not None:
+        _base_groups, base_duplicates, base_descriptors = base_data
+        all_duplicates |= set(base_duplicates)
+    else:
+        base_descriptors = {}
+    if not all_duplicates:
+        return None
+
+    pairs = []
+    for identity in sorted(all_duplicates):
+        mine_count = len(mine_groups.get(identity, ()))
+        theirs_count = len(theirs_groups.get(identity, ()))
+        if mine_count < 2 or mine_count != theirs_count:
+            return None
+        if base_data is not None and mine_count != len(base_data[0].get(identity, ())):
+            return None
+        mine_entries = {
+            descriptor: payload
+            for descriptor, payload in mine_descriptors.items()
+            if descriptor[0] == identity
+        }
+        theirs_entries = {
+            descriptor: payload
+            for descriptor, payload in theirs_descriptors.items()
+            if descriptor[0] == identity
+        }
+        if set(mine_entries) != set(theirs_entries) or len(mine_entries) != mine_count:
+            return None
+        if base_data is not None:
+            base_entries = {
+                descriptor: payload
+                for descriptor, payload in base_descriptors.items()
+                if descriptor[0] == identity
+            }
+            if set(mine_entries) != set(base_entries) or len(base_entries) != mine_count:
+                return None
+        else:
+            base_entries = {}
+        for descriptor in sorted(mine_entries, key=repr):
+            mine_field, mine_digest, mine_left, mine_right = mine_entries[descriptor]
+            theirs_field, theirs_digest, theirs_left, theirs_right = theirs_entries[descriptor]
+            if mine_digest != theirs_digest:
+                return None
+            if base_data is not None:
+                base_field, base_digest, base_left, base_right = base_entries[descriptor]
+                if mine_digest != base_digest:
+                    return None
+                pairs.append(SnapshotDuplicateFieldOccurrence(
+                    descriptor=descriptor,
+                    mine_col=int(mine_field.physical_col),
+                    theirs_col=int(theirs_field.physical_col),
+                    base_col=int(base_field.physical_col),
+                    mine_bounds=(mine_left, mine_right),
+                    theirs_bounds=(theirs_left, theirs_right),
+                    base_bounds=(base_left, base_right),
+                ))
+            else:
+                pairs.append(SnapshotDuplicateFieldOccurrence(
+                    descriptor=descriptor,
+                    mine_col=int(mine_field.physical_col),
+                    theirs_col=int(theirs_field.physical_col),
+                    base_col=None,
+                    mine_bounds=(mine_left, mine_right),
+                    theirs_bounds=(theirs_left, theirs_right),
+                ))
+    return SnapshotDuplicateFieldProof(tuple(pairs), three_way=base is not None)
+
+
+def _try_snapshot_duplicate_field_identity_proof(*args, **kwargs):
+    """Fail closed if a candidate builder is unavailable or raises."""
+    try:
+        return _build_snapshot_duplicate_field_identity_proof(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _snapshot_has_duplicate_field_identity(*snapshots: SheetSnapshot | None) -> bool:
+    return any(
+        any(len(fields) > 1 for fields in _snapshot_field_groups(snapshot).values())
+        for snapshot in snapshots
+        if snapshot is not None
+    )
+
+
+def _align_selected_sheet_snapshots(left: SheetSnapshot, right: SheetSnapshot) -> SnapshotAlignment:
+    """Align snapshots by validated schema keys, then unique row hashes.
+
+    The fallback is intentionally bounded and conservative: unmatched regions
+    without unique anchors are emitted as independent rows rather than being
+    silently paired by a potentially quadratic fuzzy matcher.
+    """
+    left_fields = {_snapshot_field_identity(field): field.physical_col for field in left.fields}
+    right_fields = {_snapshot_field_identity(field): field.physical_col for field in right.fields}
+    duplicate_left = len(left_fields) != len(left.fields)
+    duplicate_right = len(right_fields) != len(right.fields)
+    field_pairs = []
+    for identity in dict.fromkeys([_snapshot_field_identity(f) for f in left.fields] + [_snapshot_field_identity(f) for f in right.fields]):
+        a_col = left_fields.get(identity)
+        b_col = right_fields.get(identity)
+        state = "matched" if a_col and b_col else "deleted" if a_col else "inserted"
+        if (a_col and list(left_fields).index(identity) + 1 != a_col) or (b_col and list(right_fields).index(identity) + 1 != b_col):
+            state = "reordered" if state == "matched" else state
+        field_pairs.append((a_col, b_col, state))
+    unresolved = duplicate_left or duplicate_right
+    left_records = _snapshot_declared_records(left)
+    right_records = _snapshot_declared_records(right)
+    row_pairs = [(row.physical_row, row.physical_row) for row in left.rows[:2] if row.physical_row <= len(right.rows)]
+    if left_records is not None and right_records is not None:
+        # The legacy identity matcher already uses declared/composite anchors,
+        # including duplicate-key fallback and deterministic equal-count gaps.
+        # Reuse it over immutable payloads to preserve exact independent-row
+        # ordering without a worksheet read or a quadratic fuzzy pass.
+        row_pairs = _snapshot_legacy_row_pairs(left, right)
+        provisional = SnapshotAlignment(
+            tuple(field_pairs), row_pairs, True, unresolved
+        )
+        proof = (
+            _try_snapshot_duplicate_field_identity_proof(left, right, provisional)
+            if unresolved
+            else None
+        )
+        return SnapshotAlignment(
+            tuple(field_pairs), row_pairs, True,
+            # A candidate is deliberately not a terminal proof.  The final
+            # comparator alone may clear this duplicate-field reason after it
+            # validates the logical-column cache and every physical pair.
+            unresolved, proof,
+        )
+
+    left_data = list(left.rows[2:])
+    right_data = list(right.rows[2:])
+    left_counts = {}
+    right_counts = {}
+    for row in left_data:
+        left_counts[row.row_hash] = left_counts.get(row.row_hash, 0) + 1
+    for row in right_data:
+        right_counts[row.row_hash] = right_counts.get(row.row_hash, 0) + 1
+    right_anchor = {
+        row.row_hash: row for row in right_data
+        if left_counts.get(row.row_hash) == 1 and right_counts.get(row.row_hash) == 1
+    }
+    matched_right = set()
+    for left_row in left_data:
+        right_row = right_anchor.get(left_row.row_hash)
+        if right_row is not None:
+            row_pairs.append((left_row.physical_row, right_row.physical_row))
+            matched_right.add(right_row.physical_row)
+        else:
+            row_pairs.append((left_row.physical_row, None))
+            unresolved = True
+    row_pairs.extend((None, row.physical_row) for row in right_data if row.physical_row not in matched_right)
+    return SnapshotAlignment(tuple(field_pairs), tuple(row_pairs), False, unresolved)
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotComparisonResult:
+    row_pairs: tuple[tuple[int | None, int | None], ...]
+    base_rows_by_pair: tuple[int | None, ...]
+    column_cache: object
+    pair_diff_cols: tuple[frozenset[int], ...]
+    pair_base_diff_cols: tuple[frozenset[int], ...]
+    conflict_cols: tuple[frozenset[int], ...]
+    unresolved: bool
+    # A whole-workbook SHA-256 identity proof is stronger than schema/key
+    # alignment. Keep that fact explicit instead of asking a self-comparison
+    # to rediscover it (duplicate declared keys are intentionally ambiguous in
+    # the general matcher).
+    physical_identity: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayCellDelta:
+    record_key: tuple[str, ...] | None
+    field_key: tuple[str, str]
+    side: str
+    physical_row: int
+    physical_col: int
+    before: object
+    after: object
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayTransaction:
+    """Reversible content-only overlay update with prior values captured."""
+
+    deltas: tuple[OverlayCellDelta, ...]
+    replaced: tuple[tuple[tuple, OverlayCellDelta | None], ...]
+
+
+@dataclass
+class SheetOperationOverlay:
+    """Sheet-local content deltas; save continues to use existing manual ops."""
+
+    topology_generation: int = 0
+    mutation_generation: int = 0
+    cells: dict[tuple, OverlayCellDelta] = field(default_factory=dict)
+
+    def apply_batch(self, deltas) -> OverlayTransaction:
+        applied = tuple(deltas or ())
+        replaced = []
+        for delta in applied:
+            if not isinstance(delta, OverlayCellDelta):
+                raise TypeError("overlay requires OverlayCellDelta")
+            key = (delta.record_key, delta.field_key, str(delta.side).upper())
+            replaced.append((key, self.cells.get(key)))
+            self.cells[key] = delta
+        if applied:
+            self.mutation_generation += 1
+        return OverlayTransaction(applied, tuple(replaced))
+
+    def revert_transaction(self, transaction: OverlayTransaction | None) -> None:
+        if transaction is None:
+            return
+        if not isinstance(transaction, OverlayTransaction):
+            raise TypeError("overlay reversion requires OverlayTransaction")
+        for key, previous in reversed(transaction.replaced):
+            if previous is None:
+                self.cells.pop(key, None)
+            else:
+                self.cells[key] = previous
+        if transaction.deltas:
+            self.mutation_generation += 1
+
+    def revert_batch(self, deltas) -> None:
+        """Compatibility helper for callers that only retained raw deltas."""
+        for delta in reversed(tuple(deltas or ())):
+            key = (delta.record_key, delta.field_key, str(delta.side).upper())
+            current = self.cells.get(key)
+            if current == delta:
+                self.cells.pop(key, None)
+        if deltas:
+            self.mutation_generation += 1
+
+    def mark_structural_change(self) -> None:
+        self.topology_generation += 1
+        self.mutation_generation += 1
+        self.cells.clear()
+
+    def clear_side(self, side: str) -> None:
+        normalized = str(side or "").upper()
+        removed = [key for key, delta in self.cells.items() if str(delta.side).upper() == normalized]
+        for key in removed:
+            self.cells.pop(key, None)
+        if removed:
+            self.mutation_generation += 1
+
+
+def _snapshot_row_payload(snapshot: SheetSnapshot, physical_row: int | None) -> tuple[tuple, tuple]:
+    if physical_row is None or not (1 <= int(physical_row) <= len(snapshot.rows)):
+        return (), ()
+    row = snapshot.rows[int(physical_row) - 1]
+    return tuple(cell.cached_value for cell in row.cells), tuple(cell.formula_value for cell in row.cells)
+
+
+def _snapshot_result_base_row_mappings(
+    result: "SnapshotComparisonResult",
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+) -> tuple[dict[int, int], dict[int, int], dict[int, int]] | None:
+    """Validate and project an exact result's authoritative Base row mapping.
+
+    ``SnapshotComparisonResult`` is the single comparison authority.  An
+    adapter must not rediscover Mine/Base or Theirs/Base alignment: those child
+    alignments can conservatively remain unresolved even after the top-level
+    Mine/Base/Theirs comparison has already proven its complete logical model.
+    This helper deliberately accepts the result's legal structural ``None``
+    cases while rejecting malformed, ambiguous, or conflicting physical
+    coordinates before any prepared cache or operation target is published.
+    """
+    try:
+        row_pairs = tuple(result.row_pairs)
+        base_rows = tuple(result.base_rows_by_pair)
+        pair_diffs = tuple(result.pair_diff_cols)
+        base_diffs = tuple(result.pair_base_diff_cols)
+        conflicts = tuple(result.conflict_cols)
+    except Exception:
+        return None
+    pair_count = len(row_pairs)
+    if not (
+        len(base_rows) == pair_count
+        and len(pair_diffs) == pair_count
+        and len(base_diffs) == pair_count
+        and len(conflicts) == pair_count
+    ):
+        return None
+
+    def _valid_row(value, maximum: int) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= int(value) <= int(maximum)
+        )
+
+    mine_limit = min(len(mine.rows), max(1, int(mine.max_row or 1)))
+    theirs_limit = min(len(theirs.rows), max(1, int(theirs.max_row or 1)))
+    base_limit = (
+        min(len(base.rows), max(1, int(base.max_row or 1)))
+        if base is not None
+        else 0
+    )
+    seen_mine: set[int] = set()
+    seen_theirs: set[int] = set()
+    seen_base: dict[int, int] = {}
+    mine_to_base: dict[int, int] = {}
+    theirs_to_base: dict[int, int] = {}
+    pair_base_override: dict[int, int] = {}
+
+    for pair_index, pair in enumerate(row_pairs):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            return None
+        mine_row, theirs_row = pair
+        base_row = base_rows[pair_index]
+        if mine_row is None and theirs_row is None:
+            # A Base-only deletion is represented by the established structural
+            # result model; it is never a synthetic (None, None) display pair.
+            return None
+        if mine_row is not None and not _valid_row(mine_row, mine_limit):
+            return None
+        if theirs_row is not None and not _valid_row(theirs_row, theirs_limit):
+            return None
+        if base_row is not None:
+            if base is None or not _valid_row(base_row, base_limit):
+                return None
+        elif base is None:
+            # Normal 2-way results intentionally carry one None per display
+            # pair.  A missing Base side must never smuggle in a coordinate.
+            pass
+        if base is not None and any(
+            row in (1, 2) for row in (mine_row, theirs_row, base_row)
+        ):
+            # Schema declaration/type rows are not data records.  A Base-aware
+            # exact result must preserve them at their own physical ordinal,
+            # never reinterpret a header/type crossing as a row reorder.
+            if (mine_row, theirs_row, base_row) not in ((1, 1, 1), (2, 2, 2)):
+                return None
+
+        try:
+            pair_diff = frozenset(pair_diffs[pair_index])
+            base_diff = frozenset(base_diffs[pair_index])
+            conflict = frozenset(conflicts[pair_index])
+        except Exception:
+            return None
+        if (mine_row is None) != (theirs_row is None):
+            # The comparator emits precisely the row-structure marker for an
+            # A/B one-sided pair; no per-cell diff can be authoritative there.
+            if pair_diff != frozenset((-1,)):
+                return None
+        elif -1 in pair_diff:
+            return None
+        if base is None:
+            if base_diff or conflict:
+                return None
+        else:
+            if (mine_row is None) != (base_row is None):
+                if base_diff != frozenset((-1,)):
+                    return None
+            elif -1 in base_diff:
+                return None
+            # The immutable comparator never classifies a row conflict until
+            # all three physical sides are present.
+            if (
+                mine_row is None
+                or theirs_row is None
+                or base_row is None
+            ) and conflict:
+                return None
+
+        if mine_row is not None:
+            mine_row = int(mine_row)
+            if mine_row in seen_mine:
+                return None
+            seen_mine.add(mine_row)
+        if theirs_row is not None:
+            theirs_row = int(theirs_row)
+            if theirs_row in seen_theirs:
+                return None
+            seen_theirs.add(theirs_row)
+        if base_row is not None:
+            base_row = int(base_row)
+            # A physical Base row may be owned by Mine and Theirs together,
+            # but only by this one result pair.
+            if base_row in seen_base:
+                return None
+            seen_base[base_row] = pair_index
+            pair_base_override[pair_index] = base_row
+            if mine_row is not None:
+                mine_to_base[mine_row] = base_row
+            if theirs_row is not None:
+                theirs_to_base[theirs_row] = base_row
+
+    if base is None and any(row is not None for row in base_rows):
+        return None
+    return mine_to_base, theirs_to_base, pair_base_override
+
+
+def _physical_identity_snapshot_comparison(
+    snapshot: SheetSnapshot,
+    *,
+    three_way: bool = False,
+) -> SnapshotComparisonResult:
+    """Return an exact physical 1:1 result for proven byte-identical inputs.
+
+    This is deliberately not a shortcut through ``_align_selected_sheet_snapshots``:
+    duplicate ``@id`` fields, blank continuations, and repeated column
+    declarations are correctly ambiguous for ordinary *different-file*
+    comparisons, but cannot be ambiguous when every input workbook has the
+    same complete-file SHA-256. The one immutable selected-sheet snapshot is
+    therefore safe to represent A/B/(Base), with every operation coordinate
+    preserved as its physical Excel coordinate.
+    """
+    max_row = max(1, int(snapshot.max_row or 1))
+    max_col = max(1, int(snapshot.max_col or 1))
+    cache_key = ColumnModelCacheKey(
+        str(snapshot.sheet),
+        int(snapshot.version.topology_generation),
+        int(snapshot.version.mutation_generation),
+    )
+    slots = tuple(
+        ColumnSlot(
+            logical_idx=index,
+            mine_col=index + 1,
+            base_col=(index + 1 if three_way else None),
+            theirs_col=index + 1,
+            state="retained",
+        )
+        for index in range(max_col)
+    )
+    model = ColumnModel.from_slots(
+        cache_key,
+        slots,
+        blocks=_build_column_blocks(slots),
+    )
+    cache = LogicalColumnComparisonCache(model=model)
+    row_pairs = tuple((row, row) for row in range(1, max_row + 1))
+    empty = tuple(frozenset() for _ in row_pairs)
+    return SnapshotComparisonResult(
+        row_pairs=row_pairs,
+        base_rows_by_pair=(
+            tuple(range(1, max_row + 1)) if three_way
+            else tuple(None for _ in row_pairs)
+        ),
+        column_cache=cache,
+        pair_diff_cols=empty,
+        pair_base_diff_cols=empty,
+        conflict_cols=empty,
+        unresolved=False,
+        physical_identity=True,
+    )
+
+
+def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot, base: SheetSnapshot | None = None) -> SnapshotComparisonResult:
+    """Produce 2-way or Base-anchored 3-way results with no Worksheet access."""
+    alignment = _align_selected_sheet_snapshots(mine, theirs)
+    row_pairs = alignment.row_pairs
+    mine_payloads = tuple(_snapshot_row_payload(mine, a) for a, _b in row_pairs)
+    theirs_payloads = tuple(_snapshot_row_payload(theirs, b) for _a, b in row_pairs)
+    mine_values = tuple(payload[0] for payload in mine_payloads)
+    mine_formulas = tuple(payload[1] for payload in mine_payloads)
+    theirs_values = tuple(payload[0] for payload in theirs_payloads)
+    theirs_formulas = tuple(payload[1] for payload in theirs_payloads)
+    stable_ab_columns = (
+        mine.max_col == theirs.max_col
+        and tuple(_snapshot_field_identity(field) for field in mine.fields)
+        == tuple(_snapshot_field_identity(field) for field in theirs.fields)
+    )
+
+    def _same_snapshot_row(left_snapshot, left_row, right_snapshot, right_row, stable_columns):
+        if not stable_columns or left_row is None or right_row is None:
+            return False
+        if not (1 <= int(left_row) <= len(left_snapshot.rows) and 1 <= int(right_row) <= len(right_snapshot.rows)):
+            return False
+        return left_snapshot.rows[int(left_row) - 1].row_hash == right_snapshot.rows[int(right_row) - 1].row_hash
+
+    cache_key = ColumnModelCacheKey(mine.sheet, mine.version.topology_generation, mine.version.mutation_generation)
+    if base is None:
+        cache = build_logical_column_comparison_cache_2way(cache_key, mine_values, theirs_values, mine_formulas, theirs_formulas, mine_max_col=mine.max_col, theirs_max_col=theirs.max_col)
+        alignment_unresolved = bool(alignment.unresolved)
+        if alignment.duplicate_field_proof is not None:
+            proof_cache = _try_apply_snapshot_duplicate_field_proof_to_column_cache(
+                cache,
+                alignment.duplicate_field_proof,
+                mine,
+                theirs,
+            )
+            if proof_cache is not None:
+                cache = proof_cache
+                # The candidate's exact Mine/Theirs pair membership and every
+                # final cache slot were checked by the normalizer.  This is
+                # the only point at which the duplicate-field reason clears.
+                alignment_unresolved = False
+        diffs = []
+        for index, (mine_row, theirs_row) in enumerate(row_pairs):
+            if (mine_row is None) != (theirs_row is None):
+                diffs.append(frozenset((-1,)))
+            elif _same_snapshot_row(mine, mine_row, theirs, theirs_row, stable_ab_columns):
+                diffs.append(frozenset())
+            else:
+                diffs.append(compare_logical_row_2way(cache, mine_values[index], theirs_values[index], mine_formulas[index], theirs_formulas[index], mine_row=mine_row, theirs_row=theirs_row, mine_present=mine_row is not None, theirs_present=theirs_row is not None).diff_cols)
+        return SnapshotComparisonResult(row_pairs, tuple(None for _ in row_pairs), cache, tuple(diffs), tuple(frozenset() for _ in row_pairs), tuple(frozenset() for _ in row_pairs), alignment_unresolved)
+
+    mine_base = _align_selected_sheet_snapshots(mine, base)
+    theirs_base = _align_selected_sheet_snapshots(theirs, base)
+    mine_to_base = {a: b for a, b in mine_base.row_pairs if a is not None and b is not None}
+    theirs_to_base = {a: b for a, b in theirs_base.row_pairs if a is not None and b is not None}
+    base_rows = tuple(mine_to_base.get(a, theirs_to_base.get(b)) for a, b in row_pairs)
+    base_payloads = tuple(_snapshot_row_payload(base, row) for row in base_rows)
+    base_values = tuple(payload[0] for payload in base_payloads)
+    base_formulas = tuple(payload[1] for payload in base_payloads)
+    stable_base_columns = (
+        mine.max_col == base.max_col
+        and tuple(_snapshot_field_identity(field) for field in mine.fields)
+        == tuple(_snapshot_field_identity(field) for field in base.fields)
+    )
+    cache = build_logical_column_comparison_cache_3way(cache_key, mine_values, base_values, theirs_values, mine_formulas, base_formulas, theirs_formulas, mine_max_col=mine.max_col, base_max_col=base.max_col, theirs_max_col=theirs.max_col)
+    alignment_unresolved = bool(
+        alignment.unresolved or mine_base.unresolved or theirs_base.unresolved
+    )
+    if _snapshot_has_duplicate_field_identity(mine, theirs, base):
+        three_way_proof = _try_snapshot_duplicate_field_identity_proof(
+            mine,
+            theirs,
+            alignment,
+            base,
+            mine_base,
+            theirs_base,
+        )
+        if three_way_proof is not None:
+            proof_cache = _try_apply_snapshot_duplicate_field_proof_to_column_cache(
+                cache,
+                three_way_proof,
+                mine,
+                theirs,
+                base,
+            )
+            if proof_cache is not None:
+                cache = proof_cache
+                # The all-side candidate and final Base-aware bijection are
+                # both proven.  Do not carry a duplicate-only pending reason.
+                alignment_unresolved = False
+    diffs, base_diffs, conflicts = [], [], []
+    for index, (mine_row, theirs_row) in enumerate(row_pairs):
+        base_row = base_rows[index]
+        if (mine_row is None) != (theirs_row is None):
+            diffs.append(frozenset((-1,)))
+        elif _same_snapshot_row(mine, mine_row, theirs, theirs_row, stable_ab_columns):
+            diffs.append(frozenset())
+        else:
+            diffs.append(compare_logical_row_2way(cache, mine_values[index], theirs_values[index], mine_formulas[index], theirs_formulas[index], mine_row=mine_row, theirs_row=theirs_row, mine_present=mine_row is not None, theirs_present=theirs_row is not None).diff_cols)
+        if (mine_row is None) != (base_row is None):
+            base_diffs.append(frozenset((-1,)))
+        elif mine_row is None:
+            base_diffs.append(frozenset())
+        elif _same_snapshot_row(mine, mine_row, base, base_row, stable_base_columns):
+            base_diffs.append(frozenset())
+        else:
+            base_diffs.append(compare_logical_row_sides(cache, mine_values[index], base_values[index], mine_formulas[index], base_formulas[index], left_side="mine", right_side="base", left_row=mine_row, right_row=base_row).diff_cols)
+        if mine_row is None or theirs_row is None or base_row is None:
+            conflicts.append(frozenset())
+        elif (
+            _same_snapshot_row(mine, mine_row, theirs, theirs_row, stable_ab_columns)
+            or _same_snapshot_row(mine, mine_row, base, base_row, stable_base_columns)
+            or _same_snapshot_row(theirs, theirs_row, base, base_row, stable_base_columns)
+        ):
+            conflicts.append(frozenset())
+        else:
+            conflicts.append(compare_logical_row_3way(cache, mine_values[index], base_values[index], theirs_values[index], mine_formulas[index], base_formulas[index], theirs_formulas[index], mine_row=mine_row, base_row=base_row, theirs_row=theirs_row).conflict_cols)
+    return SnapshotComparisonResult(row_pairs, base_rows, cache, tuple(diffs), tuple(base_diffs), tuple(conflicts), alignment_unresolved)
+
+
+# The selected-sheet parser uses openpyxl, which can retain the GIL through a
+# multi-second ZIP/XML segment.  Keep the child protocol small and explicit so
+# the GUI process never pays that scheduling cost.  The child has no Tk root,
+# editable workbook, save path, or mutation API; it receives only stable
+# read-only paths and returns the established immutable cache ABI.
+_SNAPSHOT_CHILD_PROTOCOL = 1
+
+
+def _snapshot_input_fingerprints(paths) -> tuple[tuple[str, int, int, str], ...]:
+    """Return a strict stat+SHA freshness proof for isolated snapshot inputs."""
+    result = []
+    for path in paths:
+        normalized = os.path.abspath(str(path))
+        stat_result = os.stat(normalized)
+        result.append((
+            normalized,
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            _sha256_file(normalized),
+        ))
+    return tuple(result)
+
+
+def _snapshot_child_resource_sample(pid: int | None) -> dict:
+    """Best-effort Windows child-process CPU/RSS sample without psutil."""
+    sample = {"pid": int(pid or 0), "tree_pids": (int(pid or 0),), "rss_bytes": 0, "cpu_ms": 0.0}
+    if not pid or os.name != "nt":
+        return sample
+    try:
+        from ctypes import wintypes
+
+        class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        class _FILETIME(ctypes.Structure):
+            _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000 | 0x0010, False, int(pid))
+        if not handle:
+            return sample
+        try:
+            counters = _PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(counters)
+            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                sample["rss_bytes"] = int(counters.WorkingSetSize)
+            created, exited, kernel, user = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+            if kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited),
+                ctypes.byref(kernel), ctypes.byref(user),
+            ):
+                kernel_ticks = (int(kernel.high) << 32) | int(kernel.low)
+                user_ticks = (int(user.high) << 32) | int(user.low)
+                sample["cpu_ms"] = round((kernel_ticks + user_ticks) / 10_000.0, 3)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return sample
+
+
+def _snapshot_result_to_sheet_cache_immutable(
+    sheet: str,
+    result: SnapshotComparisonResult,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+    *,
+    has_base: bool = False,
+    cancel_check=None,
+) -> dict:
+    """Pure immutable-result adapter shared by parent and isolated child."""
+    def _checkpoint():
+        if callable(cancel_check):
+            cancel_check()
+
+    def _unresolved(reason: str) -> dict:
+        return {
+            "sheet": sheet,
+            "snapshot_engine": True,
+            "unresolved_reason": str(reason),
+            "prepared_complete": False,
+            "has_diff": True,
+            "completeness": {
+                "formula_aware": False,
+                "row_model_exact": False,
+                "column_projection_exact": False,
+                "sheet_summary_exact": False,
+                "ab_diff_exact": False,
+                "base_diff_exact": False,
+                "only_diff_rows_exact": False,
+                "mode": "snapshot-unresolved",
+            },
+        }
+
+    if result.unresolved:
+        return _unresolved("快照行或列映射存在歧义，无法证明精确结果")
+    row_pairs = list(result.row_pairs)
+    max_col = max(1, int(mine.max_col), int(theirs.max_col), int(base.max_col) if base else 1)
+    max_r_a = max(1, int(mine.max_row))
+    max_r_b = max(1, int(theirs.max_row))
+    max_r_base = max(1, int(base.max_row)) if base is not None else 0
+    max_row = max(max_r_a, max_r_b, max_r_base)
+    base_mappings = _snapshot_result_base_row_mappings(
+        result, mine, theirs, base,
+    )
+    if base_mappings is None:
+        return _unresolved("快照 Base 行映射无效或冲突，无法证明精确结果")
+    mine_to_base_row, theirs_to_base_row, pair_base_row_override = base_mappings
+
+    def _payload(snapshot, physical_row):
+        if snapshot is None or physical_row is None:
+            return (None,) * max_col, (None,) * max_col
+        values, formulas = _snapshot_row_payload(snapshot, physical_row)
+        return (
+            tuple(values[:max_col]) + (None,) * max(0, max_col - len(values)),
+            tuple(formulas[:max_col]) + (None,) * max(0, max_col - len(formulas)),
+        )
+
+    pair_diff_cols = {idx: set(cols) for idx, cols in enumerate(result.pair_diff_cols)}
+    pair_base_diff_cols = {
+        idx: set(cols) for idx, cols in enumerate(result.pair_base_diff_cols)
+    }
+    pair_parts_a, pair_parts_b, pair_parts_base = {}, {}, {}
+    col_char_widths = {}
+    row_a_to_pair_idx, row_b_to_pair_idx = {}, {}
+    for idx, (ra, rb) in enumerate(row_pairs):
+        if (idx & 127) == 0:
+            _checkpoint()
+        if ra is not None:
+            row_a_to_pair_idx[int(ra)] = idx
+        if rb is not None:
+            row_b_to_pair_idx[int(rb)] = idx
+        a_values, a_formulas = _payload(mine, ra)
+        b_values, b_formulas = _payload(theirs, rb)
+        parts_a, parts_b = [], []
+        for ci in range(max_col):
+            da, db, _equal = _cell_display_and_equal_from_values(
+                a_values[ci], b_values[ci], a_formulas[ci], b_formulas[ci]
+            )
+            sa, sb = _val_to_str(da), _val_to_str(db)
+            parts_a.append(sa)
+            parts_b.append(sb)
+            col = ci + 1
+            col_char_widths[col] = max(
+                int(col_char_widths.get(col, 0)),
+                min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH),
+            )
+        pair_parts_a[idx], pair_parts_b[idx] = parts_a, parts_b
+        if base is not None:
+            base_row = result.base_rows_by_pair[idx]
+            base_values, _base_formulas = _payload(base, base_row)
+            parts_base = [_val_to_str(value) for value in base_values]
+            pair_parts_base[idx] = parts_base
+            for ci, text_value in enumerate(parts_base, start=1):
+                col_char_widths[ci] = max(
+                    int(col_char_widths.get(ci, 0)),
+                    min(len(text_value), _COL_MAX_DISPLAY_WIDTH),
+                )
+    for col in range(1, max_col + 1):
+        col_char_widths[col] = max(4, int(col_char_widths.get(col, 1)))
+
+    structural_cols = {
+        int(col) for col in result.column_cache.structural_diff_cols if int(col) > 0
+    }
+    resolved_common_insertions = {
+        slot.logical_idx + 1
+        for slot in result.column_cache.model.slots
+        if (
+            slot.base_col is None and slot.mine_col is not None
+            and slot.theirs_col is not None and slot.state != "unresolved"
+            and not slot.confidence.ambiguous
+        )
+    }
+    only_diff_rows = []
+    for idx in range(len(row_pairs)):
+        visual_cols = set(pair_diff_cols.get(idx, set())) | set(pair_base_diff_cols.get(idx, set()))
+        visual_cols.difference_update(structural_cols)
+        visual_cols.difference_update(
+            col for col in resolved_common_insertions if col not in pair_diff_cols.get(idx, set())
+        )
+        if visual_cols:
+            only_diff_rows.append(idx)
+    common_sheet_added_vs_base = bool(has_base and base is None)
+    has_diff = bool(
+        result.column_cache.structural_diff_cols
+        or any(pair_diff_cols.values())
+        or any(pair_base_diff_cols.values())
+        or common_sheet_added_vs_base
+    )
+    return {
+        "sheet": sheet,
+        "max_row": max_row,
+        "max_row_a": max_r_a,
+        "max_row_b": max_r_b,
+        "max_row_base": max_r_base,
+        "max_col": max_col,
+        "col_max_a": max(1, int(mine.max_col)),
+        "col_max_base": max(1, int(base.max_col)) if base is not None else 1,
+        "col_max_b": max(1, int(theirs.max_col)),
+        "row_pairs": row_pairs,
+        "pair_diff_cols": pair_diff_cols,
+        "pair_base_diff_cols": pair_base_diff_cols,
+        "pair_parts_a": pair_parts_a,
+        "pair_parts_b": pair_parts_b,
+        "pair_parts_base": pair_parts_base,
+        "col_char_widths": col_char_widths,
+        "row_a_to_pair_idx": row_a_to_pair_idx,
+        "row_b_to_pair_idx": row_b_to_pair_idx,
+        "mine_to_base_row": mine_to_base_row,
+        "theirs_to_base_row": theirs_to_base_row,
+        "pair_base_row_override": pair_base_row_override,
+        "column_comparison_cache": result.column_cache,
+        "sheet_structural_diff": common_sheet_added_vs_base,
+        "has_diff": has_diff,
+        "only_diff_rows": only_diff_rows,
+        "prepared_complete": True,
+        "snapshot_engine": True,
+        "completeness": {
+            "formula_aware": True,
+            "row_model_exact": True,
+            "column_projection_exact": True,
+            "sheet_summary_exact": True,
+            "ab_diff_exact": True,
+            "base_diff_exact": True,
+            "only_diff_rows_exact": True,
+            "mode": "snapshot-full",
+        },
+    }
+
+
+def _isolated_snapshot_child_entry(request: dict) -> None:
+    """Spawn target: read-only snapshot, exact compare, adapter, and pickle IPC."""
+    result_path = str(request.get("result_path") or "")
+    partial_path = f"{result_path}.{os.getpid()}.partial"
+    payload = {
+        "protocol": _SNAPSHOT_CHILD_PROTOCOL,
+        "token": request.get("token"),
+        "sheet": request.get("sheet"),
+        "generation": request.get("generation"),
+        "ok": False,
+    }
+    try:
+        if int(request.get("protocol", -1)) != _SNAPSHOT_CHILD_PROTOCOL:
+            raise RuntimeError("snapshot child protocol mismatch")
+        sheet = str(request["sheet"])
+        # Test-only child-side failure injection.  A spawned Windows child does
+        # not inherit an in-process monkeypatch, so deterministic lifecycle
+        # coverage needs an explicit, inert-by-default transport.
+        if os.environ.get("SOW_TEST_SNAPSHOT_TECHNICAL_FAILURE_SHEET", "") == sheet:
+            raise OSError("injected snapshot technical failure")
+        generation = int(request["generation"])
+        inputs = dict(request["inputs"])
+        paths = []
+        for side in ("A", "B", "BASE"):
+            spec = inputs.get(side)
+            if spec:
+                paths.extend((spec["value_path"], spec["formula_path"]))
+        before = _snapshot_input_fingerprints(paths)
+        started = time.perf_counter()
+        # Count the actual immutable streams in the child rather than inferring
+        # alias use later from elapsed time.  This wrapper delegates directly
+        # to the same production reader and never changes its parse/order.
+        stream_counts: dict[str, int] = {}
+
+        def _counted_stream(value_path, formula_path, selected_sheet, side, **kwargs):
+            key = str(side)
+            stream_counts[key] = int(stream_counts.get(key, 0)) + 1
+            return _stream_selected_sheet_snapshot(
+                value_path,
+                formula_path,
+                selected_sheet,
+                key,
+                topology_generation=int(kwargs.get("topology_generation", 0)),
+                mutation_generation=int(kwargs.get("mutation_generation", 0)),
+                cancel_check=kwargs.get("cancel_check"),
+            )
+
+        snapshots, side_metrics, base_alias, alias_before = _read_snapshot_inputs_with_base_alias(
+            inputs,
+            sheet=sheet,
+            generation=generation,
+            stream_snapshot=_counted_stream,
+        )
+        mine = snapshots["A"]
+        theirs = snapshots["B"]
+        base = snapshots.get("BASE")
+        alias_source = snapshots.get(str(base_alias.get("source") or ""))
+        base_wrapper = {
+            "side": str(getattr(base, "side", "") or ""),
+            "source_side": str(getattr(alias_source, "side", "") or ""),
+            # The immutable wrapper deliberately has the BASE identity while
+            # retaining the request that validated it.  These are audit facts
+            # only; no scheduling or comparison behaviour depends on them.
+            "generation": int(generation),
+            "request_token": str(request.get("token") or ""),
+            "is_distinct_from_source": bool(
+                base is not None and alias_source is not None and base is not alias_source
+            ),
+            "shares_frozen_rows_with_source": bool(
+                base is not None and alias_source is not None and base.rows is alias_source.rows
+            ),
+            "shares_frozen_fields_with_source": bool(
+                base is not None and alias_source is not None and base.fields is alias_source.fields
+            ),
+        }
+        compare_started = time.perf_counter()
+        comparison = _compare_selected_sheet_snapshots(mine, theirs, base)
+        compare_ms = (time.perf_counter() - compare_started) * 1000.0
+        adapter_started = time.perf_counter()
+        cache = _snapshot_result_to_sheet_cache_immutable(
+            sheet, comparison, mine, theirs, base,
+            has_base=bool(request.get("has_base", False)),
+        )
+        adapter_ms = (time.perf_counter() - adapter_started) * 1000.0
+        after = _snapshot_input_fingerprints(paths)
+        if before != after or tuple(alias_before) != before:
+            raise RuntimeError("snapshot child input changed during read")
+        payload.update({
+            "ok": True,
+            "input_fingerprints": before,
+            "snapshot_versions": {"A": mine.version, "B": theirs.version, "BASE": base.version if base else None},
+            "base_alias": dict(base_alias),
+            "stream_counts": dict(stream_counts),
+            "base_wrapper": base_wrapper,
+            "cache": cache,
+            "metrics_ms": {
+                "mine_ingest": round(side_metrics.get("A", 0.0), 3),
+                "theirs_ingest": round(side_metrics.get("B", 0.0), 3),
+                "paired_ingest": round(side_metrics.get("A", 0.0) + side_metrics.get("B", 0.0), 3),
+                "base_ingest": round(side_metrics.get("BASE", 0.0), 3),
+                "compare": round(compare_ms, 3),
+                "adapter": round(adapter_ms, 3),
+                "total": round((time.perf_counter() - started) * 1000.0, 3),
+                "isolated_process": True,
+            },
+        })
+    except Exception as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+        payload["traceback"] = traceback.format_exc(limit=8)
+    try:
+        with open(partial_path, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(partial_path, result_path)
+    except Exception:
+        try:
+            os.remove(partial_path)
+        except Exception:
+            pass
+
+
+def _snapshot_manifest_cell(snapshot: SheetSnapshot | None, row: int | None, col: int | None) -> dict:
+    """Serialize a snapshot cell in the frozen legacy-Oracle token shape.
+
+    This is deliberately a pure adapter: it makes the experimental snapshot
+    result auditable without reopening a normal-mode workbook or touching Tk.
+    """
+    if snapshot is None or row is None or col is None:
+        return {"present": False}
+    if not (1 <= int(row) <= len(snapshot.rows)):
+        return {"present": False}
+    cells = snapshot.rows[int(row) - 1].cells
+    if not (1 <= int(col) <= len(cells)):
+        return {"present": False}
+    cell = cells[int(col) - 1]
+    value = cell.cached_value
+    if value is None:
+        typed = {"type": "blank", "value": None}
+    elif isinstance(value, (datetime, date, datetime_time)):
+        typed = {"type": type(value).__name__, "value": value.isoformat()}
+    elif isinstance(value, bytes):
+        typed = {"type": "bytes", "value": value.hex()}
+    else:
+        typed = {"type": type(value).__name__, "value": str(value)}
+    special = _special_formula_signature(cell.formula_value)
+    return {
+        "present": True,
+        "cached": typed,
+        "cached_data_type": str(cell.cached_type or ""),
+        "formula_data_type": str(cell.formula_type or ""),
+        "formula": repr(special) if special is not None else _formula_text(cell.formula_value),
+    }
+
+
+def snapshot_comparison_oracle_manifest(
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    result: SnapshotComparisonResult,
+    base: SheetSnapshot | None = None,
+) -> dict:
+    """Expose a normalized candidate manifest for exact Oracle parity tests.
+
+    The function is test-only until the snapshot feature flag is enabled.  It
+    intentionally emits unresolved evidence rather than making it disappear:
+    callers must reject it as a parity success unless the legacy oracle agrees.
+    """
+    projection = LogicalColumnProjection.from_model(result.column_cache.model)
+    columns = [
+        {
+            "logical": slot.logical_idx + 1,
+            "mine": slot.mine_col,
+            "base": slot.base_col,
+            "theirs": slot.theirs_col,
+            "state": slot.state,
+            "ambiguous": bool(slot.confidence.ambiguous),
+        }
+        for slot in projection.model.slots
+    ]
+    structural_logical_cols = {
+        slot.logical_idx + 1
+        for slot in projection.model.slots
+        if slot.state != "retained"
+    }
+    records = []
+    only_diff_rows = []
+    for pair, (mine_row, theirs_row) in enumerate(result.row_pairs):
+        changed = sorted(int(value) for value in result.pair_diff_cols[pair] if int(value) != -1)
+        base_changed = sorted(int(value) for value in result.pair_base_diff_cols[pair] if int(value) != -1)
+        if not changed and not base_changed and mine_row is not None and theirs_row is not None:
+            continue
+        cells = {}
+        for logical in sorted(set(changed) | set(base_changed)):
+            slot = projection.slot(logical)
+            if slot is None:
+                continue
+            cells[str(logical)] = {
+                "mine": _snapshot_manifest_cell(mine, mine_row, slot.mine_col),
+                "theirs": _snapshot_manifest_cell(theirs, theirs_row, slot.theirs_col),
+                "base": _snapshot_manifest_cell(
+                    base,
+                    result.base_rows_by_pair[pair] if base is not None else None,
+                    slot.base_col,
+                ),
+            }
+        records.append({
+            "pair": pair,
+            "mine_row": mine_row,
+            "theirs_row": theirs_row,
+            "base_row": result.base_rows_by_pair[pair] if base is not None else None,
+            "row_structure": -1 in result.pair_diff_cols[pair],
+            "diff_cols": changed,
+            "base_diff_cols": base_changed,
+            "conflicts": sorted(int(value) for value in result.conflict_cols[pair]),
+            "cells": cells,
+        })
+        # Legacy keeps structural inserted/deleted cell evidence in records,
+        # but does not make every affected row navigable in only-diff mode.
+        visible_changed = set(changed) | set(base_changed)
+        # A column can be structural relative to Base while still exist on
+        # both Mine and Theirs.  If its values disagree it is actionable in
+        # only-diff mode; hiding it loses a real conflict/change.  A truly
+        # one-sided inserted/deleted column remains structural-only, matching
+        # the legacy renderer contract.
+        shared_structural_change = any(
+            (slot := projection.slot(logical)) is not None
+            and slot.mine_col is not None and slot.theirs_col is not None
+            for logical in visible_changed
+        )
+        if (
+            mine_row is None or theirs_row is None
+            or bool(visible_changed - structural_logical_cols)
+            or shared_structural_change
+        ):
+            only_diff_rows.append(pair)
+    return {
+        "schema": "snapshot-large-sheet-candidate-v1",
+        "sheet": mine.sheet,
+        "three_way": base is not None,
+        "columns": columns,
+        "only_diff_rows": only_diff_rows,
+        "records": records,
+        "unresolved": bool(result.unresolved),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -5822,6 +8954,616 @@ def build_logical_column_comparison_cache_3way(
     )
 
 
+def _snapshot_duplicate_proof_slot_matches(
+    slot: ColumnSlot,
+    pair: tuple[int, int, int | None],
+    *,
+    three_way: bool,
+) -> bool:
+    mine_col, theirs_col, base_col = pair
+    return bool(
+        int(slot.mine_col or 0) == int(mine_col)
+        and int(slot.theirs_col or 0) == int(theirs_col)
+        and (
+            not three_way
+            or int(slot.base_col or 0) == int(base_col or 0)
+        )
+    )
+
+
+def _snapshot_duplicate_proof_cache_is_bijective(
+    cache: LogicalColumnComparisonCache,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+) -> bool:
+    """Require final slot-level, all-side evidence after candidate seeding."""
+    slots = tuple(cache.model.slots)
+    side_widths = {
+        "mine_col": int(mine.max_col or 0),
+        "theirs_col": int(theirs.max_col or 0),
+    }
+    if base is not None:
+        side_widths["base_col"] = int(base.max_col or 0)
+    if not slots or any(width <= 0 or len(slots) != width for width in side_widths.values()):
+        return False
+    if cache.model.confidence.ambiguous or cache.unresolved_cols or any(
+        slot.state == "unresolved" or slot.confidence.ambiguous
+        for slot in slots
+    ):
+        return False
+    for field_name, width in side_widths.items():
+        physical = [getattr(slot, field_name) for slot in slots]
+        if any(value is None for value in physical):
+            return False
+        if {int(value) for value in physical} != set(range(1, width + 1)):
+            return False
+    return True
+
+
+def _rebuild_snapshot_duplicate_proof_interval(
+    cache: LogicalColumnComparisonCache,
+    proof: SnapshotDuplicateFieldProof,
+    replacement_by_pair: dict,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+) -> tuple[tuple[ColumnSlot, ...], frozenset[int], frozenset[int]] | None:
+    """Rebuild only a proven duplicate interval from immutable evidence.
+
+    The candidate blank columns become anchors only after every intervening
+    non-proof column has independently retained its all-side identity and
+    physical mapping.  This prevents a formula signal elsewhere in the old
+    unanchored gap from being discarded merely because a blank duplicate was
+    proven at either end.
+    """
+    slots_by_logical = {int(slot.logical_idx): slot for slot in cache.model.slots}
+    proof_slots = set(replacement_by_pair.values())
+    if len(slots_by_logical) != len(cache.model.slots):
+        return None
+    if set(replacement_by_pair) != set(proof.pairs):
+        return None
+
+    snapshots = (("mine", mine), ("theirs", theirs)) + (
+        (("base", base),) if proof.three_way and base is not None else ()
+    )
+    if proof.three_way and base is None:
+        return None
+    side_names = tuple(side for side, _snapshot in snapshots)
+    alignment = cache.three_way_alignment if proof.three_way else cache.two_way_alignment
+    pre_gap_groups = _snapshot_duplicate_proof_pre_gap_groups(
+        proof,
+        alignment,
+        mine_max_col=mine.max_col,
+        theirs_max_col=theirs.max_col,
+        base_max_col=None if base is None else base.max_col,
+    )
+    if pre_gap_groups is None:
+        return None
+
+    field_groups = {}
+    descriptors = {}
+    for side, snapshot in snapshots:
+        data = _snapshot_duplicate_run_descriptors(snapshot)
+        if data is None:
+            return None
+        field_groups[side], _duplicate_identities, descriptors[side] = data
+
+    def _slot_column(slot: ColumnSlot, side: str) -> int | None:
+        return _logical_model_side_col(slot, side)
+
+    def _gap_bounds(pre_gap: SnapshotDuplicateFieldPreGap, side: str):
+        if side == "mine":
+            return pre_gap.mine_cache_bounds
+        if side == "theirs":
+            return pre_gap.theirs_cache_bounds
+        return pre_gap.base_cache_bounds
+
+    def _gap_member_columns(bounds: tuple[int, int] | None) -> tuple[int, ...] | None:
+        if bounds is None or int(bounds[0]) + 1 >= int(bounds[1]):
+            return None
+        return tuple(range(int(bounds[0]) + 1, int(bounds[1])))
+
+    def _slot_coordinates(slot: ColumnSlot) -> tuple[int | None, ...]:
+        return tuple(_slot_column(slot, side) for side in side_names)
+
+    def _signature_range(bounds: tuple[int, int]) -> tuple[int, ...]:
+        # Signature indices are zero-based; physical member coordinates are
+        # exactly ``left < physical < right``.
+        return tuple(range(int(bounds[0]), int(bounds[1]) - 1))
+
+    signature_cache = {}
+
+    def _signatures(snapshot: SheetSnapshot):
+        side = snapshot.side
+        if side not in signature_cache:
+            payloads = tuple(
+                _snapshot_row_payload(snapshot, row.physical_row)
+                for row in snapshot.rows
+            )
+            signature_cache[side] = build_column_signature_snapshot(
+                cache.model.cache_key,
+                tuple(payload[0] for payload in payloads),
+                tuple(payload[1] for payload in payloads),
+                max_col=snapshot.max_col,
+            ).signatures
+        return signature_cache[side]
+
+    coordinate_slots: dict[tuple[int, ...], ColumnSlot] = {}
+    for candidate in cache.model.slots:
+        coordinates = _slot_coordinates(candidate)
+        if any(value is None for value in coordinates):
+            continue
+        normalized_coordinates = tuple(int(value) for value in coordinates)
+        if normalized_coordinates in coordinate_slots:
+            return None
+        coordinate_slots[normalized_coordinates] = candidate
+
+    interval_slots: set[int] = set()
+    formula_provenance_slots: set[int] = set()
+    for pre_gap_group in pre_gap_groups:
+        if not pre_gap_group:
+            return None
+        template = pre_gap_group[0]
+        if any(item.group_key != template.group_key for item in pre_gap_group):
+            return None
+        bounds_by_side = {
+            side: _gap_bounds(template, side) for side in side_names
+        }
+        member_columns = {
+            side: _gap_member_columns(bounds_by_side[side])
+            for side in side_names
+        }
+        if any(columns is None for columns in member_columns.values()):
+            return None
+
+        # The occurrence descriptor is immutable candidate evidence.  Re-read
+        # it from every side so no later cache mutation can replace its
+        # anchor/width/ordinal with a neighbouring duplicate run.
+        proof_columns = {side: set() for side in side_names}
+        proof_coordinates: dict[tuple[int, ...], int] = {}
+        mine_order = tuple(item.occurrence.pair for item in pre_gap_group)
+        for side_index, side in enumerate(side_names):
+            ordered_pairs = tuple(
+                item.occurrence.pair for item in sorted(
+                    pre_gap_group,
+                    key=lambda item: int(item.occurrence.pair[side_index]),
+                )
+            )
+            if ordered_pairs != mine_order:
+                return None
+        for pre_gap in pre_gap_group:
+            occurrence = pre_gap.occurrence
+            logical = replacement_by_pair.get(occurrence.pair)
+            slot = slots_by_logical.get(int(logical)) if logical is not None else None
+            if slot is None or not _snapshot_duplicate_proof_slot_matches(
+                slot, occurrence.pair, three_way=proof.three_way
+            ):
+                return None
+            digests = []
+            coordinates = []
+            for side_index, (side, snapshot) in enumerate(snapshots):
+                physical = occurrence.pair[side_index]
+                descriptor_bounds = (
+                    occurrence.mine_bounds if side == "mine" else
+                    occurrence.theirs_bounds if side == "theirs" else
+                    occurrence.base_bounds
+                )
+                if physical is None or descriptor_bounds is None:
+                    return None
+                payload = descriptors[side].get(occurrence.descriptor)
+                if payload is None:
+                    return None
+                field, digest, left_anchor, right_anchor = payload
+                if not (
+                    int(field.physical_col) == int(physical)
+                    and (int(left_anchor), int(right_anchor))
+                    == tuple(map(int, descriptor_bounds))
+                    and int(physical) in member_columns[side]
+                ):
+                    return None
+                blank_digest = _snapshot_blank_column_digest(snapshot, int(physical))
+                if blank_digest is None or blank_digest != digest:
+                    return None
+                proof_columns[side].add(int(physical))
+                coordinates.append(int(physical))
+                digests.append(digest)
+            normalized_coordinates = tuple(coordinates)
+            if len(set(digests)) != 1 or normalized_coordinates in proof_coordinates:
+                return None
+            proof_coordinates[normalized_coordinates] = int(logical)
+
+        nonproof_columns = {
+            side: tuple(
+                physical for physical in member_columns[side]
+                if physical not in proof_columns[side]
+            )
+            for side in side_names
+        }
+        nonproof_identities = {}
+        for side, snapshot in snapshots:
+            identities = []
+            for physical in nonproof_columns[side]:
+                if not (1 <= int(physical) <= len(snapshot.fields)):
+                    return None
+                field = snapshot.fields[int(physical) - 1]
+                if int(field.physical_col) != int(physical):
+                    return None
+                identity = _snapshot_field_identity(field)
+                if len(field_groups[side].get(identity, ())) != 1:
+                    return None
+                identities.append(identity)
+            nonproof_identities[side] = tuple(identities)
+        if any(
+            nonproof_identities[side] != nonproof_identities["mine"]
+            for side in side_names[1:]
+        ):
+            return None
+
+        expected_coordinates = dict(proof_coordinates)
+        for ordinal in range(len(nonproof_columns["mine"])):
+            coordinates = tuple(
+                int(nonproof_columns[side][ordinal]) for side in side_names
+            )
+            candidate = coordinate_slots.get(coordinates)
+            if (
+                candidate is None
+                or candidate.state != "retained"
+                or candidate.confidence.ambiguous
+                or candidate.logical_idx in proof_slots
+                or coordinates in expected_coordinates
+            ):
+                return None
+            expected_coordinates[coordinates] = int(candidate.logical_idx)
+            interval_slots.add(int(candidate.logical_idx))
+
+        expected_logicals = set(expected_coordinates.values())
+        observed_logicals = set()
+        for candidate in cache.model.slots:
+            coordinates = _slot_coordinates(candidate)
+            touches_gap = tuple(
+                coordinate is not None
+                and int(coordinate) in member_columns[side]
+                for coordinate, side in zip(coordinates, side_names)
+            )
+            if not any(touches_gap):
+                continue
+            if not all(touches_gap):
+                return None
+            normalized_coordinates = tuple(int(value) for value in coordinates)
+            expected_logical = expected_coordinates.get(normalized_coordinates)
+            if expected_logical is None or int(candidate.logical_idx) != expected_logical:
+                return None
+            observed_logicals.add(int(candidate.logical_idx))
+        if observed_logicals != expected_logicals:
+            return None
+
+        formula_slots = {
+            logical for logical in proof_coordinates.values()
+            if COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH
+            in set(slots_by_logical[logical].confidence.cause_codes)
+        }
+        if formula_slots:
+            formula_sources = set()
+            if proof.three_way:
+                mine_base_causes = _column_alignment_gap_cause_codes(
+                    _signatures(mine),
+                    _signatures(base),
+                    _signature_range(template.mine_cache_bounds),
+                    _signature_range(template.base_cache_bounds),
+                    str(getattr(alignment.mine_to_base, "fallback_reason", "")),
+                )
+                theirs_base_causes = _column_alignment_gap_cause_codes(
+                    _signatures(theirs),
+                    _signatures(base),
+                    _signature_range(template.theirs_cache_bounds),
+                    _signature_range(template.base_cache_bounds),
+                    str(getattr(alignment.theirs_to_base, "fallback_reason", "")),
+                )
+                if COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH in mine_base_causes:
+                    formula_sources.add("mine-base")
+                if COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH in theirs_base_causes:
+                    formula_sources.add("theirs-base")
+            else:
+                causes = _column_alignment_gap_cause_codes(
+                    _signatures(mine),
+                    _signatures(theirs),
+                    _signature_range(template.mine_cache_bounds),
+                    _signature_range(template.theirs_cache_bounds),
+                    str(getattr(alignment, "fallback_reason", "")),
+                )
+                if COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH in causes:
+                    formula_sources.add("mine-theirs")
+            if not formula_sources:
+                return None
+            formula_provenance_slots.update(formula_slots)
+
+    normalized_slots = []
+    for slot in cache.model.slots:
+        if slot.logical_idx not in proof_slots:
+            normalized_slots.append(slot)
+            continue
+        normalized_slots.append(ColumnSlot(
+            logical_idx=slot.logical_idx,
+            mine_col=slot.mine_col,
+            base_col=slot.base_col,
+            theirs_col=slot.theirs_col,
+            state="retained",
+            confidence=ColumnMappingConfidence(
+                1.0,
+                False,
+                "snapshot-duplicate-blank-proof",
+                (
+                    "blank-full-column",
+                    "same-anchor-interval",
+                    "same-run-ordinal",
+                    "all-side-digest",
+                    "stage-two-interval-rebuild",
+                ),
+            ),
+            base_boundary=slot.base_boundary,
+            origin_side=slot.origin_side,
+        ))
+    return tuple(normalized_slots), frozenset(interval_slots), frozenset(formula_provenance_slots)
+
+
+def _snapshot_duplicate_proof_matches_exact_top_cache(
+    cache: LogicalColumnComparisonCache,
+    proof: SnapshotDuplicateFieldProof,
+    replacement_by_pair: dict,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+) -> bool:
+    """Validate the non-pending Decision-14 top-cache fast path.
+
+    This path never examines the Mine/Base or Theirs/Base child gap ranges and
+    never normalizes a slot.  An already exact top model is stronger evidence
+    than those asymmetric child diagnostics, but only if its proof triples and
+    every physical coordinate are already fully retained and bijective.
+    """
+    if bool(base is not None) != bool(proof.three_way):
+        return False
+    if set(replacement_by_pair) != set(proof.pairs):
+        return False
+    if len(set(replacement_by_pair.values())) != len(proof.pairs):
+        return False
+    # This deliberately examines only the top-level two-/three-way alignment.
+    # Child Mine/Base and Theirs/Base gaps may differ while the already-built
+    # three-way top cache still proves every physical triple exactly.
+    top_alignment = (
+        cache.three_way_alignment if proof.three_way
+        else cache.two_way_alignment
+    )
+    if (
+        top_alignment is None
+        or bool(getattr(top_alignment, "used_physical_fallback", False))
+        or bool(getattr(top_alignment, "fallback_slot_indices", ()))
+    ):
+        return False
+    model_confidence = cache.model.confidence
+    if (
+        float(model_confidence.score) < _COLUMN_ALIGNMENT_MIN_SCORE
+        or COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE
+        in set(model_confidence.cause_codes)
+    ):
+        return False
+    if (
+        cache.model.confidence.ambiguous
+        or cache.unresolved_cols
+        or cache.structural_diff_cols
+        or any(
+            slot.state != "retained"
+            or slot.confidence.ambiguous
+            or float(slot.confidence.score) < _COLUMN_ALIGNMENT_MIN_SCORE
+            or COLUMN_MAPPING_CAUSE_LOW_CONFIDENCE
+            in set(slot.confidence.cause_codes)
+            for slot in cache.model.slots
+        )
+    ):
+        return False
+    for pair, logical in replacement_by_pair.items():
+        slot = next(
+            (candidate for candidate in cache.model.slots
+             if int(candidate.logical_idx) == int(logical)),
+            None,
+        )
+        if slot is None or not _snapshot_duplicate_proof_slot_matches(
+            slot, pair, three_way=proof.three_way
+        ):
+            return False
+    return _snapshot_duplicate_proof_cache_is_bijective(
+        cache, mine, theirs, base
+    )
+
+
+def _apply_snapshot_duplicate_field_proof_to_column_cache(
+    cache: LogicalColumnComparisonCache,
+    proof: SnapshotDuplicateFieldProof,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None = None,
+) -> LogicalColumnComparisonCache | None:
+    """Seed a bounded proof, then require a fully resolved cache bijection.
+
+    The transformation refuses to invent a slot.  Every proof coordinate must
+    already identify exactly one cache slot, and only that slot may be promoted
+    from the duplicate blank-column ambiguity.  All other unresolved or
+    structural evidence remains terminal.
+    """
+    if bool(base is not None) != bool(proof.three_way):
+        return None
+    replacement_by_pair = {}
+    for pair in proof.pairs:
+        matches = [
+            slot for slot in cache.model.slots
+            if _snapshot_duplicate_proof_slot_matches(
+                slot, pair, three_way=proof.three_way
+            )
+        ]
+        if len(matches) != 1:
+            return None
+        replacement_by_pair[pair] = matches[0].logical_idx
+    if len(set(replacement_by_pair.values())) != len(proof.pairs):
+        return None
+
+    # A fully exact top model may be stronger than asymmetric child alignment
+    # gaps in three-way mode.  Validate it as-is; do not infer a replacement
+    # mapping or require pre-gap equality when no top-level cache evidence is
+    # pending.
+    if _snapshot_duplicate_proof_matches_exact_top_cache(
+        cache, proof, replacement_by_pair, mine, theirs, base
+    ):
+        return cache
+
+    ambiguous_slots = {
+        slot.logical_idx for slot in cache.model.slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    }
+    has_pending_cache_evidence = bool(
+        cache.model.confidence.ambiguous
+        or ambiguous_slots
+        or cache.unresolved_cols
+    )
+    # Rebuilding an arbitrary already-resolved but non-exact cache would turn
+    # candidate metadata into a mapping guess.  Only a genuinely pending cache
+    # may take the bounded Decision-14 rebuild path.
+    if not has_pending_cache_evidence:
+        return None
+
+    proof_slots = set(replacement_by_pair.values())
+    rebuilt = _rebuild_snapshot_duplicate_proof_interval(
+        cache, proof, replacement_by_pair, mine, theirs, base
+    )
+    if rebuilt is None:
+        return None
+    normalized_slots, interval_slots, formula_provenance_slots = rebuilt
+    if has_pending_cache_evidence:
+        # Pending cache evidence is admissible only when it is entirely the
+        # exact blank-column fallback represented by this proof.  In
+        # particular, a malformed cache cannot hide unresolved slots behind a
+        # false global flag and be normalized into an actionable mapping.
+        alignment = (
+            cache.three_way_alignment if proof.three_way
+            else cache.two_way_alignment
+        )
+        fallback_slots = set(getattr(alignment, "fallback_slot_indices", ()))
+        proof_unresolved_cols = {slot + 1 for slot in proof_slots}
+        proof_causes = {
+            frozenset(slot.confidence.cause_codes)
+            for slot in cache.model.slots
+            if slot.logical_idx in proof_slots
+        }
+        formula_gap = any(
+            COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH in causes
+            for causes in proof_causes
+        )
+        if not (
+            cache.model.confidence.ambiguous
+            and alignment is not None
+            and cache.model.confidence.reason == "unresolved-column-range"
+            and set(cache.model.confidence.cause_codes).issubset({
+                COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+                COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH,
+            })
+            and bool(getattr(alignment, "used_physical_fallback", False))
+            and str(getattr(alignment, "fallback_reason", ""))
+            == "unresolved-column-range"
+            and fallback_slots == proof_slots
+            and ambiguous_slots == proof_slots
+            and set(cache.unresolved_cols) == proof_unresolved_cols
+            and all(
+                causes in (
+                    frozenset((COLUMN_MAPPING_CAUSE_BLANK_COLUMN,)),
+                    frozenset((
+                        COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+                        COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH,
+                    )),
+                )
+                for causes in proof_causes
+            )
+            and (not formula_gap or bool(formula_provenance_slots))
+        ):
+            return None
+    model = ColumnModel.from_slots(
+        cache.model.cache_key,
+        normalized_slots,
+        blocks=_build_column_blocks(normalized_slots),
+        confidence=ColumnMappingConfidence(
+            min((slot.confidence.score for slot in normalized_slots), default=1.0),
+            any(slot.state == "unresolved" or slot.confidence.ambiguous for slot in normalized_slots),
+            "snapshot-duplicate-blank-proof",
+            ("snapshot-duplicate-blank-proof",),
+        ),
+    )
+    if proof.three_way:
+        alignment = ColumnAlignment3WayResult(
+            model,
+            cache.three_way_alignment.mine_to_base,
+            cache.three_way_alignment.theirs_to_base,
+            tuple(
+                slot.logical_idx for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            ),
+            any(slot.state == "unresolved" or slot.confidence.ambiguous for slot in normalized_slots),
+            "unresolved-column-range" if any(
+                slot.state == "unresolved" or slot.confidence.ambiguous
+                for slot in normalized_slots
+            ) else "",
+        )
+        normalized = LogicalColumnComparisonCache(
+            model=model,
+            three_way_alignment=alignment,
+            structural_diff_cols=frozenset(
+                slot.logical_idx + 1 for slot in normalized_slots
+                if slot.mine_col is None or slot.theirs_col is None
+            ),
+            unresolved_cols=frozenset(
+                slot.logical_idx + 1 for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            ),
+        )
+    else:
+        alignment = ColumnAlignmentResult(
+            model,
+            cache.two_way_alignment.anchor_pairs,
+            tuple(
+                slot.logical_idx for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            ),
+            any(slot.state == "unresolved" or slot.confidence.ambiguous for slot in normalized_slots),
+            "unresolved-column-range" if any(
+                slot.state == "unresolved" or slot.confidence.ambiguous
+                for slot in normalized_slots
+            ) else "",
+        )
+        normalized = LogicalColumnComparisonCache(
+            model=model,
+            two_way_alignment=alignment,
+            structural_diff_cols=frozenset(
+                slot.logical_idx + 1 for slot in normalized_slots
+                if slot.mine_col is None or slot.theirs_col is None
+            ),
+            unresolved_cols=frozenset(
+                slot.logical_idx + 1 for slot in normalized_slots
+                if slot.state == "unresolved" or slot.confidence.ambiguous
+            ),
+        )
+    return (
+        normalized
+        if _snapshot_duplicate_proof_cache_is_bijective(normalized, mine, theirs, base)
+        else None
+    )
+
+
+def _try_apply_snapshot_duplicate_field_proof_to_column_cache(*args, **kwargs):
+    """A malformed candidate/cache remains unresolved rather than guessed."""
+    try:
+        return _apply_snapshot_duplicate_field_proof_to_column_cache(*args, **kwargs)
+    except Exception:
+        return None
+
+
 def compare_logical_row_sides(
     column_cache: LogicalColumnComparisonCache,
     left_value_row,
@@ -6309,10 +10051,25 @@ def _special_formula_signature(value):
             _norm_formula_text(getattr(value, "text", None)),
         )
     if isinstance(value, DataTableFormula):
-        try:
-            attrs = tuple(sorted((str(key), str(val)) for key, val in value))
-        except Exception:
-            attrs = tuple(sorted((str(key), repr(val)) for key, val in vars(value).items()))
+        attrs = tuple(
+            (
+                key,
+                type(attr).__module__,
+                type(attr).__qualname__,
+                attr,
+            )
+            for key, attr in (
+                ("t", getattr(value, "t", None)),
+                ("ref", getattr(value, "ref", None)),
+                ("ca", getattr(value, "ca", None)),
+                ("dt2D", getattr(value, "dt2D", None)),
+                ("dtr", getattr(value, "dtr", None)),
+                ("r1", getattr(value, "r1", None)),
+                ("r2", getattr(value, "r2", None)),
+                ("del1", getattr(value, "del1", None)),
+                ("del2", getattr(value, "del2", None)),
+            )
+        )
         return ("dataTable", attrs)
     return None
 
@@ -7733,30 +11490,67 @@ def _validated_structural_replay_operations(row_ops, column_ops) -> list[dict[st
     return normalized
 
 
-def _run_excel_powershell_with_transient_retry(script: str, *, timeout: int):
+class _ExcelComDeadlineExceeded(TimeoutError):
+    """An explicit caller deadline stopped an Excel COM invocation."""
+
+
+def _run_excel_powershell_with_transient_retry(
+    script: str,
+    *,
+    timeout: int,
+    absolute_deadline: float | None = None,
+):
     """Run an Excel COM script, retrying only the transient logon-session fault."""
     result = None
     for attempt in range(4):
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        run_timeout = timeout
+        if absolute_deadline is not None:
+            remaining = float(absolute_deadline) - time.monotonic()
+            if remaining <= 0:
+                raise _ExcelComDeadlineExceeded(
+                    f"Excel COM deadline expired before attempt {attempt + 1}/4"
+                )
+            run_timeout = min(float(timeout), remaining)
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=run_timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            if absolute_deadline is not None:
+                raise _ExcelComDeadlineExceeded(
+                    f"Excel COM deadline expired during attempt {attempt + 1}/4"
+                ) from exc
+            raise
         error_text = str(getattr(result, "stderr", "") or "")
         if int(getattr(result, "returncode", 1) or 0) == 0:
             return result
         if "80070520" not in error_text or attempt >= 3:
             return result
         _dlog(f"Excel COM logon session unavailable; transient retry {attempt + 2}/4")
-        time.sleep(float(attempt + 1))
+        delay = float(attempt + 1)
+        if absolute_deadline is None:
+            time.sleep(delay)
+            continue
+        remaining = float(absolute_deadline) - time.monotonic()
+        if remaining <= 0:
+            raise _ExcelComDeadlineExceeded(
+                f"Excel COM deadline expired before transient retry {attempt + 2}/4"
+            )
+        time.sleep(min(delay, remaining))
+        if time.monotonic() >= float(absolute_deadline):
+            raise _ExcelComDeadlineExceeded(
+                f"Excel COM deadline expired during transient retry {attempt + 2}/4"
+            )
     return result
 
 
-def _excel_reopen_validate(path: str) -> bool:
+def _excel_reopen_validate(path: str, *, absolute_deadline: float | None = None) -> bool:
     """Require Excel itself to reopen the final native-replay package."""
     if not _workbook_package_ready(path):
         return False
@@ -7776,11 +11570,16 @@ def _excel_reopen_validate(path: str) -> bool:
             "[GC]::Collect();[GC]::WaitForPendingFinalizers();[GC]::Collect();[GC]::WaitForPendingFinalizers();"
             "};"
         )
-        result = _run_excel_powershell_with_transient_retry(ps, timeout=120)
+        retry_kwargs = {"timeout": 120}
+        if absolute_deadline is not None:
+            retry_kwargs["absolute_deadline"] = float(absolute_deadline)
+        result = _run_excel_powershell_with_transient_retry(ps, **retry_kwargs)
         if result.returncode != 0:
             _dlog(f"Excel reopen validation failed: {result.stderr.strip()}")
             return False
         return True
+    except _ExcelComDeadlineExceeded:
+        raise
     except Exception as exc:
         _dlog(f"Excel reopen validation exception: {exc}")
         return False
@@ -8250,6 +12049,27 @@ def _scan_formula_cache(path: str):
     finally:
         _wbs_close(wb_val, wb_edit)
     return has_formula, missing_cache
+
+
+def _find_missing_formula_cache_paths(paths) -> list[tuple[str, str]]:
+    """Return named workbook paths that contain formulas without saved values.
+
+    This intentionally only detects; it never launches Excel or changes a
+    workbook.  Callers run it off the Tk thread and decide whether to ask the
+    user to recalculate the returned files.
+    """
+    missing = []
+    for label, path in paths:
+        if not path:
+            continue
+        try:
+            _has_formula, has_missing_cache = _scan_formula_cache(path)
+        except Exception as e:
+            _dlog(f"formula cache scan failed: label={label} path={path} err={e}")
+            continue
+        if has_missing_cache:
+            missing.append((str(label), str(path)))
+    return missing
 
 
 def _recalc_with_excel(path: str) -> str | None:
@@ -9266,7 +13086,7 @@ def _read_cross_branch_sources_from_wc(
     """Read exact Source Before/After identity evidence from ``ACTUAL_NODE``."""
     db_path = os.path.join(wc_root, ".svn", "wc.db")
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             rows = conn.execute(
                 """
                 select conflict_data
@@ -9334,7 +13154,7 @@ def _wc_node_metadata(wc_root: str, local_relpath: str) -> tuple[int | None, str
     """Return current WC BASE last-change metadata, read-only and locally."""
     db_path = os.path.join(wc_root, ".svn", "wc.db")
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 """
                 select changed_revision, changed_author
@@ -9370,7 +13190,7 @@ def _wc_author_for_exact_sidecar_revision(
     source_path = str(repository_identity or "").replace("\\", "/").strip().lstrip("/")
     if source_path:
         try:
-            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
                 rows = conn.execute(
                     """
                     select local_relpath, changed_author
@@ -9396,7 +13216,7 @@ def _wc_author_for_exact_sidecar_revision(
     name = re.sub(r"-rev\d+\.svn\d+\.tmp\.(xlsx|xlsm)$", r".\1", name, flags=re.IGNORECASE)
     name = name.lower()
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             rows = conn.execute(
                 """
                 select local_relpath, changed_author
@@ -9426,7 +13246,7 @@ def _wc_repository_metadata_for_local_path(
     if not relpath:
         return None, None, "target working-copy relative path unavailable"
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 """
                 select r.root, r.uuid
@@ -9851,7 +13671,7 @@ def _svn_author_for_source_identity(
     return None, "; ".join(dict.fromkeys(reasons)) or "source input URL unavailable"
 
 
-def _copy_wc_pristine_local(path: str | None) -> str | None:
+def _copy_wc_pristine_local(path: str | None, *, owned_paths=None) -> str | None:
     """Copy the target WC pristine blob without SVN CLI/Tortoise GUI fallback."""
     if not path or not os.path.isfile(path):
         _dlog(f"target pristine unavailable: target path missing {path!r}")
@@ -9863,7 +13683,7 @@ def _copy_wc_pristine_local(path: str | None) -> str | None:
     relpath = os.path.relpath(os.path.abspath(path), wc_root).replace("\\", "/")
     db_path = os.path.join(wc_root, ".svn", "wc.db")
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             row = conn.execute(
                 """
                 select checksum from NODES
@@ -9883,18 +13703,23 @@ def _copy_wc_pristine_local(path: str | None) -> str | None:
         if not os.path.isfile(pristine):
             _dlog(f"target pristine unavailable: pristine blob missing {pristine}")
             return None
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = os.path.join(
-            tempfile.gettempdir(),
-            f"{APP_NAME}_target_pristine_{os.getpid()}_{ts}_{os.path.basename(path)}",
+        ext = _workbook_ext(path)
+        fd, target = tempfile.mkstemp(
+            prefix=f"{APP_NAME}_target_pristine_{os.getpid()}_",
+            suffix=ext,
+            dir=tempfile.gettempdir(),
         )
-        if not target.lower().endswith(_workbook_ext(path)):
-            target += _workbook_ext(path)
-        shutil.copyfile(pristine, target)
-        if _workbook_package_ready(target):
-            _dlog(f"target pristine copied from wc.db: {path} -> {target}")
-            return target
-        _dlog(f"target pristine copy invalid package: {target}")
+        os.close(fd)
+        try:
+            shutil.copyfile(pristine, target)
+            if _workbook_package_ready(target):
+                _register_created_startup_temp_path(owned_paths, target)
+                _dlog(f"target pristine copied from wc.db: {path} -> {target}")
+                return target
+            _dlog(f"target pristine copy invalid package: {target}")
+        finally:
+            if not _workbook_package_ready(target):
+                _readonly_safe_unlink(target)
     except Exception as exc:
         _dlog(f"target pristine copy failed: {exc}")
     return None
@@ -10045,16 +13870,34 @@ def merge_side_label(context: MergeLaunchContext | None, side: str, *, candidate
     return merge_role_label(context, role or normalized.lower(), candidate=candidate)
 
 
-def _create_startup_candidate_copy(source_path: str, role: str) -> str:
+def _register_created_startup_temp_path(owned_paths, path: str | os.PathLike | None) -> None:
+    """Record one path only after this process has created it successfully."""
+    if owned_paths is None or not path:
+        return
+    owned_paths.add(os.path.normcase(os.path.abspath(os.fspath(path))))
+
+
+def _create_startup_candidate_copy(
+    source_path: str,
+    role: str,
+    *,
+    owned_paths=None,
+) -> str:
     ext = _workbook_ext(source_path)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    candidate = os.path.join(
-        tempfile.gettempdir(),
-        f"{APP_NAME}_startup_candidate_{role}_{os.getpid()}_{stamp}{ext}",
+    fd, candidate = tempfile.mkstemp(
+        prefix=f"{APP_NAME}_startup_candidate_{role}_{os.getpid()}_",
+        suffix=ext,
+        dir=tempfile.gettempdir(),
     )
-    shutil.copy2(source_path, candidate)
-    if not _workbook_package_ready(candidate):
-        raise RuntimeError(f"candidate copy is not a complete workbook: {candidate}")
+    os.close(fd)
+    try:
+        shutil.copy2(source_path, candidate)
+        if not _workbook_package_ready(candidate):
+            raise RuntimeError(f"candidate copy is not a complete workbook: {candidate}")
+    except Exception:
+        _readonly_safe_unlink(candidate)
+        raise
+    _register_created_startup_temp_path(owned_paths, candidate)
     return candidate
 
 
@@ -10113,7 +13956,11 @@ def _legacy_premerge_effective_width_mismatch(
     return None
 
 
-def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnalysis:
+def run_startup_merge_analysis(
+    context: MergeLaunchContext,
+    *,
+    owned_startup_paths=None,
+) -> StartupMergeAnalysis:
     """Run the complete conservative pre-UI analysis without changing SVN state.
 
     Raw roles remain in ``context``.  A separate candidate file is made only
@@ -10124,7 +13971,10 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
         if identity is None or not identity.path:
             continue
         try:
-            identity.stable_path = _ensure_xlsx_copy(identity.path)
+            identity.stable_path = _ensure_xlsx_copy(
+                identity.path,
+                owned_paths=owned_startup_paths,
+            )
         except Exception as exc:
             identity.stable_path = identity.path
             identity.availability_reason = f"stable copy unavailable: {exc}"
@@ -10133,7 +13983,10 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
     if context.merged_path and not context.target_pristine_path:
         # The helper is intentionally local-only; retaining this call seam also
         # lets host integrations supply an already-read WC pristine identity.
-        pristine = _try_export_svn_base_from_working_copy(context.merged_path)
+        pristine = _try_export_svn_base_from_working_copy(
+            context.merged_path,
+            owned_paths=owned_startup_paths,
+        )
         context.target_pristine_path = pristine
         pristine_identity = context.identity_for("target_pristine")
         if pristine_identity is not None:
@@ -10161,7 +14014,9 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
     if outcome.source_role and source_identity and source_identity.available:
         try:
             outcome.candidate_path = _create_startup_candidate_copy(
-                str(source_identity.effective_path), outcome.source_role
+                str(source_identity.effective_path),
+                outcome.source_role,
+                owned_paths=owned_startup_paths,
             )
             _dlog(
                 f"STARTUP_CONVERGENCE action={outcome.automatic_action} source={outcome.source_role} "
@@ -10192,6 +14047,7 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
                 str(base.effective_path),
                 str(mine.effective_path),
                 str(theirs.effective_path),
+                owned_startup_paths=owned_startup_paths,
             )
             outcome.incoming_count = int(branch_summary.get("incoming_count", 0))
             outcome.applied_count = int(branch_summary.get("applied_count", 0))
@@ -10204,7 +14060,9 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
                 outcome.fallback_reasons.append(f"source-delta projection safely declined: {manual_reason}")
                 try:
                     outcome.candidate_path = _create_startup_candidate_copy(
-                        str(mine.effective_path), "mine"
+                        str(mine.effective_path),
+                        "mine",
+                        owned_paths=owned_startup_paths,
                     )
                     outcome.source_role = "mine"
                 except Exception as exc:
@@ -10256,7 +14114,11 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
                 # pipeline will build its complete row/column conflict model
                 # after the user opens the manual three-way workspace.
                 try:
-                    outcome.candidate_path = _create_startup_candidate_copy(mine_path, "mine")
+                    outcome.candidate_path = _create_startup_candidate_copy(
+                        mine_path,
+                        "mine",
+                        owned_paths=owned_startup_paths,
+                    )
                 except Exception as exc:
                     outcome.fallback_reasons.append(f"manual Mine candidate initialization failed: {exc}")
                 outcome.automatic_action = "manual-review"
@@ -10276,9 +14138,12 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
                         theirs_path,
                         context.merged_path or mine_path,
                         save_merged=False,
+                        owned_startup_paths=owned_startup_paths,
                     )
                     outcome.candidate_path = preview or _create_startup_candidate_copy(
-                        mine_path, "mine"
+                        mine_path,
+                        "mine",
+                        owned_paths=owned_startup_paths,
                     )
                     merged_summary = globals().get("_LAST_SEMANTIC_PREMERGE_SUMMARY", {}) or {}
                     outcome.merged_count = int(merged_summary.get("merged_count", 0))
@@ -10313,7 +14178,10 @@ def run_startup_merge_analysis(context: MergeLaunchContext) -> StartupMergeAnaly
                     outcome.fallback_reasons.append(f"semantic pre-merge safely declined: {exc}")
                     try:
                         conflicts, conflict_map = _scan_three_way_conflicts(
-                            base_path, mine_path, theirs_path
+                            base_path,
+                            mine_path,
+                            theirs_path,
+                            owned_startup_paths=owned_startup_paths,
                         )
                         outcome.unresolved_count = len(conflicts)
                     except Exception as scan_exc:
@@ -10380,13 +14248,13 @@ def _try_export_svn_revision_from_merge_temp(path: str) -> str:
 
 
 
-def _try_export_svn_base_from_working_copy(path: str) -> str | None:
+def _try_export_svn_base_from_working_copy(path: str, *, owned_paths=None) -> str | None:
     """Return a local WC pristine copy without invoking SVN/Tortoise UI.
 
     Retained for callers outside the launch path.  WC pristine is diagnostic
     fourth input only; it is never a substitute for the raw source Base.
     """
-    return _copy_wc_pristine_local(path)
+    return _copy_wc_pristine_local(path, owned_paths=owned_paths)
 
 
 def _find_handle_exe():
@@ -10982,32 +14850,118 @@ def _atomic_save_wb(wb, target_path: str):
         raise
 
 
-def _ensure_xlsx_copy(path: str) -> str:
+def _ensure_xlsx_copy(path: str, *, owned_paths=None) -> str:
     """If path is not a directly openable workbook path, copy it to a temp workbook path."""
     if not path:
         return path
     if os.path.splitext(path)[1].lower() in _SUPPORTED_WORKBOOK_EXTS:
-        return _ensure_stable_copy(path)
+        return _ensure_stable_copy(path, owned_paths=owned_paths)
+    tmp = None
     try:
         if not _wait_for_complete_workbook(path):
             raise RuntimeError(f"SVN 临时 Excel 文件尚未完整生成或已损坏：{path}")
         base = os.path.basename(path)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ext = _workbook_ext(path)
-        tmp = os.path.join(tempfile.gettempdir(), f"{APP_NAME}_svn_{base}_{ts}")
-        if not tmp.lower().endswith(ext):
-            tmp += ext
+        fd, tmp = tempfile.mkstemp(
+            prefix=f"{APP_NAME}_svn_{base}_",
+            suffix=ext,
+            dir=tempfile.gettempdir(),
+        )
+        os.close(fd)
         shutil.copy2(path, tmp)
         if not _workbook_package_ready(tmp):
             raise RuntimeError(f"SVN 临时 Excel 文件复制后校验失败：{path}")
+        _register_created_startup_temp_path(owned_paths, tmp)
         return tmp
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"无法准备 SVN 临时 Excel 文件：{path}\n{e}") from e
+    except Exception as exc:
+        if tmp:
+            rollback = _readonly_safe_unlink(tmp)
+            if rollback.get("error") or rollback.get("exists_after"):
+                _dlog(
+                    "SVN_COPY rollback cleanup failed "
+                    f"path={rollback.get('path')} error={rollback.get('error')}"
+                )
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"无法准备 SVN 临时 Excel 文件：{path}\n{exc}") from exc
 
 
-def _ensure_stable_copy(path: str) -> str:
+def _readonly_safe_unlink(path: str | os.PathLike | None) -> dict:
+    """Remove an app-owned temporary path while preserving cleanup evidence.
+
+    Stable copies inherit the source file's Windows readonly attribute through
+    ``copy2``.  Clear that attribute only for an explicitly owned path, then
+    report every observed outcome instead of hiding a failed removal.
+    """
+    candidate = os.path.abspath(os.fspath(path)) if path else ""
+    evidence = {
+        "path": candidate,
+        "mode_before": None,
+        "readonly_before": None,
+        "chmod_attempted": False,
+        "removed": False,
+        "exists_after": False,
+        "error": "",
+    }
+    if not candidate:
+        evidence["error"] = "empty-path"
+        return evidence
+    try:
+        if not os.path.exists(candidate):
+            evidence["removed"] = True
+            return evidence
+        mode = int(os.stat(candidate).st_mode)
+        readonly = not bool(mode & stat.S_IWRITE)
+        evidence["mode_before"] = stat.S_IMODE(mode)
+        evidence["readonly_before"] = readonly
+        if readonly:
+            evidence["chmod_attempted"] = True
+            os.chmod(candidate, mode | stat.S_IWRITE)
+        os.remove(candidate)
+        evidence["removed"] = not os.path.exists(candidate)
+    except Exception as exc:
+        evidence["error"] = f"{type(exc).__name__}:{exc}"
+    finally:
+        evidence["exists_after"] = bool(os.path.exists(candidate))
+        if evidence["exists_after"]:
+            evidence["removed"] = False
+    return evidence
+
+
+def _cleanup_owned_startup_temp_paths(paths) -> tuple[dict, ...]:
+    """Delete only this app instance's registered startup copies."""
+    normalized = {
+        os.path.normcase(os.path.abspath(os.fspath(path)))
+        for path in tuple(paths or ()) if path
+    }
+    return tuple(_readonly_safe_unlink(path) for path in sorted(normalized))
+
+
+def _cleanup_unclaimed_startup_temp_paths(paths, *, reason: str) -> tuple[dict, ...]:
+    """Clean only a main-owned ledger that was never transferred to an app."""
+    evidence = _cleanup_owned_startup_temp_paths(paths)
+    try:
+        paths.clear()
+    except Exception:
+        pass
+    for item in evidence:
+        if item.get("error") or item.get("exists_after"):
+            _dlog(
+                "UNCLAIMED_STARTUP_TEMP cleanup failed "
+                f"reason={reason} path={item.get('path')} error={item.get('error')}"
+            )
+    return evidence
+
+
+def _consume_owned_startup_temp_paths(paths, evidence_sink) -> tuple[dict, ...]:
+    """Record and clear an App-owned startup ledger exactly once."""
+    evidence = _cleanup_owned_startup_temp_paths(paths)
+    evidence_sink.extend(evidence)
+    paths.clear()
+    return evidence
+
+
+def _ensure_stable_copy(path: str, *, owned_paths=None) -> str:
     """If path looks like a temp/svn artifact, copy to a stable temp file."""
     if not path:
         return path
@@ -11041,22 +14995,25 @@ def _ensure_stable_copy(path: str) -> str:
             shutil.copy2(path, tmp)
             if not _workbook_package_ready(tmp):
                 raise RuntimeError(f"SVN 临时 Excel 文件稳定副本校验失败：{path}")
+            _register_created_startup_temp_path(owned_paths, tmp)
             return tmp
     except RuntimeError:
         if tmp:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
+            rollback = _readonly_safe_unlink(tmp)
+            if rollback.get("error") or rollback.get("exists_after"):
+                _dlog(
+                    "STABLE_COPY rollback cleanup failed "
+                    f"path={rollback.get('path')} error={rollback.get('error')}"
+                )
         raise
     except Exception:
         if tmp:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
+            rollback = _readonly_safe_unlink(tmp)
+            if rollback.get("error") or rollback.get("exists_after"):
+                _dlog(
+                    "STABLE_COPY rollback cleanup failed "
+                    f"path={rollback.get('path')} error={rollback.get('error')}"
+                )
         pass
     return path
 
@@ -11101,6 +15058,8 @@ def _cross_branch_source_delta_premerge(
     source_before_path: str,
     target_working_path: str,
     source_after_path: str,
+    *,
+    owned_startup_paths=None,
 ) -> tuple[list[tuple], str | None, dict, dict[str, int], str | None]:
     """Project only a source-branch delta onto a target-working candidate.
 
@@ -11168,7 +15127,11 @@ def _cross_branch_source_delta_premerge(
         )
         # Preserve Target Working byte-for-byte even when a source change is
         # unsupported; callers still need a safe candidate to inspect.
-        candidate = _create_startup_candidate_copy(target_working_path, "mine")
+        candidate = _create_startup_candidate_copy(
+            target_working_path,
+            "mine",
+            owned_paths=owned_startup_paths,
+        )
         return conflicts, candidate, conflict_cells_by_sheet, dict(summary), reason
 
     def _cell_value_key(ws_val, ws_edit, row: int, col: int):
@@ -11407,9 +15370,18 @@ def _cross_branch_source_delta_premerge(
             return {}, max(0, abs(int(target_width) - int(source_width)))
 
     try:
-        source_before_path = _ensure_xlsx_copy(source_before_path)
-        target_working_path = _ensure_xlsx_copy(target_working_path)
-        source_after_path = _ensure_xlsx_copy(source_after_path)
+        source_before_path = _ensure_xlsx_copy(
+            source_before_path,
+            owned_paths=owned_startup_paths,
+        )
+        target_working_path = _ensure_xlsx_copy(
+            target_working_path,
+            owned_paths=owned_startup_paths,
+        )
+        source_after_path = _ensure_xlsx_copy(
+            source_after_path,
+            owned_paths=owned_startup_paths,
+        )
         before_val_path = _prepare_val_path(source_before_path)
         target_val_path = _prepare_val_path(target_working_path)
         after_val_path = _prepare_val_path(source_after_path)
@@ -11739,17 +15711,27 @@ def _cross_branch_source_delta_premerge(
         summary["merged_count"] = summary["applied_count"]
         candidate = None
         if summary["applied_count"]:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            candidate = os.path.join(
-                tempfile.gettempdir(),
-                f"{APP_NAME}_cross_branch_candidate_{os.getpid()}_{stamp}{_workbook_ext(target_working_path)}",
+            fd, candidate = tempfile.mkstemp(
+                prefix=f"{APP_NAME}_cross_branch_candidate_{os.getpid()}_",
+                suffix=_workbook_ext(target_working_path),
+                dir=tempfile.gettempdir(),
             )
-            _atomic_save_wb(wb_target_edit, candidate)
+            os.close(fd)
+            try:
+                _atomic_save_wb(wb_target_edit, candidate)
+            except Exception:
+                _readonly_safe_unlink(candidate)
+                raise
+            _register_created_startup_temp_path(owned_startup_paths, candidate)
         else:
             # Crucial for an all-already-present merge: openpyxl must not touch
             # OOXML members just to make a preview.  A direct Target Working
             # copy preserves raw/package equality for Building and audits.
-            candidate = _create_startup_candidate_copy(target_working_path, "mine")
+            candidate = _create_startup_candidate_copy(
+                target_working_path,
+                "mine",
+                owned_paths=owned_startup_paths,
+            )
         _LAST_SEMANTIC_PREMERGE_SUMMARY = dict(summary)
         _dlog(
             "CROSS_BRANCH_SOURCE_DELTA "
@@ -11771,7 +15753,15 @@ def _cross_branch_source_delta_premerge(
                     pass
 
 
-def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_path: str, save_merged: bool = True):
+def _merge_three_way(
+    base_path: str,
+    mine_path: str,
+    theirs_path: str,
+    merged_path: str,
+    save_merged: bool = True,
+    *,
+    owned_startup_paths=None,
+):
     """3-way merge using row-aligned diff (consistent with _scan_three_way_conflicts).
 
     Conflict: mine and theirs both changed an aligned cell differently vs base.
@@ -11799,7 +15789,10 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     # column write pipeline is implemented in the later merge phase.
     preflight_started = time.perf_counter()
     preflight_conflicts, preflight_conflict_map = _scan_three_way_conflicts(
-        base_path, mine_path, theirs_path
+        base_path,
+        mine_path,
+        theirs_path,
+        owned_startup_paths=owned_startup_paths,
     )
     _dlog(
         "SEMANTIC_PREMERGE_PREFLIGHT "
@@ -11824,9 +15817,9 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
             conflict_cells_by_sheet=preflight_conflict_map,
         )
 
-    base_path = _ensure_xlsx_copy(base_path)
-    mine_path = _ensure_xlsx_copy(mine_path)
-    theirs_path = _ensure_xlsx_copy(theirs_path)
+    base_path = _ensure_xlsx_copy(base_path, owned_paths=owned_startup_paths)
+    mine_path = _ensure_xlsx_copy(mine_path, owned_paths=owned_startup_paths)
+    theirs_path = _ensure_xlsx_copy(theirs_path, owned_paths=owned_startup_paths)
 
     base_val_path = _prepare_val_path(base_path)
     mine_val_path = _prepare_val_path(mine_path)
@@ -12106,12 +16099,18 @@ def _merge_three_way(base_path: str, mine_path: str, theirs_path: str, merged_pa
     try:
         # Always save a preview for UI if needed
         if conflicts or (not save_merged):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            preview = os.path.join(
-                tempfile.gettempdir(),
-                f"{APP_NAME}_merged_preview_{os.getpid()}_{ts}{_workbook_ext(merged_path or mine_path)}",
+            fd, preview = tempfile.mkstemp(
+                prefix=f"{APP_NAME}_merged_preview_{os.getpid()}_",
+                suffix=_workbook_ext(merged_path or mine_path),
+                dir=tempfile.gettempdir(),
             )
-            _atomic_save_wb(wb_merged, preview)
+            os.close(fd)
+            try:
+                _atomic_save_wb(wb_merged, preview)
+            except Exception:
+                _readonly_safe_unlink(preview)
+                raise
+            _register_created_startup_temp_path(owned_startup_paths, preview)
             _merge_result = (conflicts, preview, conflict_cells_by_sheet)
         else:
             # No conflicts: save directly to merged path
@@ -12139,11 +16138,17 @@ _LAST_SEMANTIC_PREMERGE_SUMMARY: dict[str, int] = {
 }
 
 
-def _scan_three_way_conflicts(base_path: str, mine_path: str, theirs_path: str):
+def _scan_three_way_conflicts(
+    base_path: str,
+    mine_path: str,
+    theirs_path: str,
+    *,
+    owned_startup_paths=None,
+):
     """Detect cell and structural conflicts through cached logical columns."""
-    base_path = _ensure_xlsx_copy(base_path)
-    mine_path = _ensure_xlsx_copy(mine_path)
-    theirs_path = _ensure_xlsx_copy(theirs_path)
+    base_path = _ensure_xlsx_copy(base_path, owned_paths=owned_startup_paths)
+    mine_path = _ensure_xlsx_copy(mine_path, owned_paths=owned_startup_paths)
+    theirs_path = _ensure_xlsx_copy(theirs_path, owned_paths=owned_startup_paths)
 
     base_val_path = _prepare_val_path(base_path)
     mine_val_path = _prepare_val_path(mine_path)
@@ -12535,6 +16540,78 @@ class _DiffBlock:
     pending: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _VisualDiffSurfaceContext:
+    """Immutable inputs shared by one bounded viewport publication.
+
+    The raw pair channels deliberately remain outside this object: every row
+    still decides its own A/B/Base difference set.  This context only freezes
+    the expensive column-model/common-insertion facts which cannot change
+    while one synchronous Tk surface is being published.
+    """
+
+    structural_positive_cols: frozenset[int] = frozenset()
+    resolved_common_insertions: frozenset[int] = frozenset()
+    accepted_common_sources: tuple[tuple[int, str], ...] = ()
+    accepted_common_equality_scope: tuple | None = None
+    # A sparse immutable snapshot of true proofs for the rows in this one
+    # publication.  Missing keys are intentionally conservative (not equal).
+    accepted_common_equality_true_keys: frozenset[tuple[int, int, str]] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class _DiffCellSurfaceContext:
+    """Immutable visible-column geometry for one bounded Text publication."""
+
+    rendered_logical_columns: frozenset[int] = frozenset()
+    # (logical column, start, end), in the shared visible Text geometry.
+    visible_base_spans: tuple[tuple[int, int, int], ...] = ()
+    mine_present_columns: frozenset[int] = frozenset()
+    base_present_columns: frozenset[int] = frozenset()
+    theirs_present_columns: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class _VirtualLineRenderContext:
+    """Frozen formatter inputs for one bounded virtual publication.
+
+    The immutable raw fragments keep their physical-side coordinates.  A
+    publication already knows its visible logical columns and geometry, so it
+    can freeze the corresponding physical offsets once rather than rebuilding
+    the complete projected row for every cache miss.  This context is never
+    retained by the formatted-row LRU and therefore cannot cross a projection,
+    width, grid, data, or horizontal-window transition.
+    """
+
+    rendered_logical_columns: tuple[int, ...]
+    widths: tuple[int, ...]
+    grid_enabled: bool
+    separator: str
+    trailing: str
+    mine_offsets: tuple[int | None, ...]
+    base_offsets: tuple[int | None, ...]
+    theirs_offsets: tuple[int | None, ...]
+    placeholder: str
+    projection_generation: int
+    widths_version: int
+    window_generation: int
+    window_start: int
+    data_version: int
+
+    def offsets_for(self, side: str) -> tuple[int | None, ...] | None:
+        try:
+            normalized = _normalize_logical_column_side(side)
+        except Exception:
+            return None
+        if normalized == "mine":
+            return self.mine_offsets
+        if normalized == "base":
+            return self.base_offsets
+        if normalized == "theirs":
+            return self.theirs_offsets
+        return None
+
+
 class SheetView:
     """TortoiseMerge-like side-by-side full-sheet viewer.
 
@@ -12584,6 +16661,16 @@ class SheetView:
         self.pair_text_a: dict[int, str] = {}
         self.pair_text_b: dict[int, str] = {}
         self.pair_text_base: dict[int, str] = {}
+        # Formatted strings are a bounded virtual-view cache.  Immutable raw
+        # fragments remain the complete source of truth for hover/copy/render;
+        # do not retain a second 20k-row formatted graph after a full scroll.
+        self._prepared_text_lru = OrderedDict()
+        # Immutable physical-cell display fragments published with the exact
+        # cache. Hover and the optional C-cell inspector must use these data,
+        # never Worksheet.cell() or a deferred editable workbook.
+        self.pair_raw_parts_a: dict[int, tuple[str, ...]] = {}
+        self.pair_raw_parts_b: dict[int, tuple[str, ...]] = {}
+        self.pair_raw_parts_base: dict[int, tuple[str, ...]] = {}
         self.pair_diff_cols: dict[int, set[int]] = {}
         self.pair_base_diff_cols: dict[int, set[int]] = {}
         self.row_a_to_pair_idx: dict[int, int] = {}
@@ -12615,6 +16702,59 @@ class SheetView:
         self.display_rows: list[int] = []
         self._full_display_rows: list[int] = []
         self._render_limit: int = _FAST_RENDER_ROW_LIMIT
+        # The logical result can be much larger than the Text documents.  A
+        # virtual window is published only from already prepared row strings;
+        # it never asks openpyxl for a missing row while the user scrolls.
+        self._virtual_window_start = 0
+        self._virtual_viewport_row_cap = _VIRTUAL_VIEWPORT_MAX_ROWS
+        self._virtual_pending_start: int | None = None
+        self._virtual_publish_after_id = None
+        # One after(0) owner drains the newest two-dimensional intent on the
+        # next event-loop turn.  The token invalidates a callback that became
+        # runnable while a tab/generation transition was cancelling it.
+        self._virtual_publish_token = 0
+        self._virtual_column_window_start = 0
+        self._virtual_pending_column_start: int | None = None
+        self._virtual_column_publish_after_id = None
+        self._virtual_column_window_generation = 0
+        self._virtual_publishing = False
+        self._virtual_publish_generation = 0
+        self._virtual_scroll_publications = 0
+        self._virtual_publication_timestamps = deque(maxlen=128)
+        # End-to-end input telemetry.  Internal render-phase samples below
+        # remain diagnostics only; acceptance uses completed latest requests
+        # from input receipt through main/header/C/selection publication.
+        self._viewport_request_seq = 0
+        self._viewport_request_active: dict | None = None
+        self._viewport_request_samples_ms = deque(maxlen=128)
+        self._interaction_request_samples_ms = deque(maxlen=128)
+        self._viewport_request_completed = deque(maxlen=128)
+        self._viewport_request_terminal = deque(maxlen=128)
+        # Bounded per-publication evidence.  This remains diagnostic-only: it
+        # snapshots the immutable viewport window and its local render phases
+        # so an end-to-end request can be attributed without retaining rows or
+        # mutable Tk state beyond the existing 128-record telemetry horizon.
+        self._virtual_publication_telemetry = deque(maxlen=128)
+        self._last_virtual_publication_telemetry: dict = {}
+        # Full-diff navigation can synchronously materialize a distant logical
+        # viewport.  Keep its bounded outer-phase evidence separate from the
+        # normal wheel/thumb request stream.
+        self._diff_navigation_telemetry = deque(maxlen=128)
+        self._last_diff_navigation_telemetry: dict = {}
+        self._viewport_request_superseded = 0
+        self._interaction_request_seq = 0
+        self._interaction_request_active: dict | None = None
+        self._interaction_request_completed = deque(maxlen=128)
+        self._interaction_request_superseded = 0
+        self._viewport_render_samples_ms = deque(maxlen=128)
+        self._c_area_render_samples_ms = deque(maxlen=128)
+        # Raw-cache installation is intentionally distinct from display
+        # formatting. Keep bounded evidence for cache-apply/tab-promotion
+        # audits without putting telemetry work on input hot paths.
+        self._snapshot_install_only_samples_ms = deque(maxlen=64)
+        self._last_snapshot_install_only_ms = 0.0
+        self._c_area_same_row_skips = 0
+        self._c_area_last_render_key = None
         self.row_to_line: dict[int, int] = {}
         self._pending_yview: float | None = None
         self._render_cache = {}
@@ -12649,6 +16789,14 @@ class SheetView:
         # only while the source and target cells at the copied physical row
         # remain formula/value equivalent.
         self._accepted_common_insert_sources: dict[int, str] = {}
+        # Rendering is intentionally cache-only.  Accepted common-insertion
+        # equality is built explicitly by a completed structural mutation (or
+        # its undo/rollback) from the ready edit/value workbooks; scroll,
+        # hover, tab activation and ordinary refresh must never consult a
+        # worksheet to answer this cosmetic question.
+        self._accepted_common_insertion_equalities: dict[tuple, bool] = {}
+        self._accepted_common_insertion_mutation_generation = 0
+        self._accepted_common_insertion_equality_error: str | None = None
         self._applied_main_sel_col: int | None = None
         self._applied_main_sel_line: int | None = None
         self._cursor_cmp_sel_col: int | None = None
@@ -12680,6 +16828,17 @@ class SheetView:
         self._mode_switch_pending = False
         self._mode_switch_seq = 0
         self._mode_switch_after_id = None
+        # A result-driven only-diff completion may need to wait for the
+        # cache-only publisher. Keep exactly one callback with its scheduler
+        # ticket so a stale/coalesced callback cannot close a newer dialog or
+        # claim that an old surface was published.
+        self._mode_switch_completion = None
+        # A cached full/only-difference publication owns at most one short UI
+        # transition reservation.  Keep its release callback with the current
+        # sequence so a rapid toggle cannot leave a cooperative child paused.
+        self._mode_switch_release_transition = None
+        self._mode_switch_requested_value: int | None = None
+        self._mode_switch_origin_value: int | None = None
         self._pending_exact_render = False
         self._pending_pair_parts_cache = None
         self._pending_column_only_diff_seed = None
@@ -12693,6 +16852,7 @@ class SheetView:
         # Set to True once initial diff data has been computed (background or manual).
         # Prevents refresh(rescan=False) from triggering a full rescan on empty initial state.
         self._data_ready = False
+        self._prepared_complete = False
 
         # Rows that were modified via overwrite in this session.
         # In "只看差异" mode, we keep these rows visible even if diffs are resolved.
@@ -12706,6 +16866,10 @@ class SheetView:
         self._only_diff_rows_cache_key: tuple | None = None
         self._only_diff_async_build_key: tuple | None = None
         self._only_diff_async_build_seq = 0
+        # A public only-diff build may temporarily mark an already exact Sheet
+        # CALCULATING. Retain that terminal entry only for its owning token so
+        # cancel/show failure can restore it without ever reviving stale work.
+        self._only_diff_async_prior_exact: dict[str, object] | None = None
         self._only_diff_async_building = False
         self._only_diff_async_thread: threading.Thread | None = None
         self._only_diff_async_requested_value = int(
@@ -12775,7 +16939,7 @@ class SheetView:
 
         self.only_diff_cb = tk.Checkbutton(
             self.toolbar_action_group,
-            text="仅差异",
+            text="只看差异内容",
             variable=self.only_diff_var,
             onvalue=1,
             offvalue=0,
@@ -12991,12 +17155,21 @@ class SheetView:
             pady=2,
             command=self._undo_last_action,
         )
+        self.redo_btn = tk.Button(
+            self.toolbar_action_group,
+            text="重做",
+            bg="#f2f2f2",
+            padx=8,
+            pady=2,
+            command=self._redo_last_action,
+        )
         # Keep at top-right (avoid misclick)
         self.use_right_group.pack(side="right", padx=(6, 0))
         if self.use_base_btn is not None:
             self.use_base_btn.pack(side="right", padx=(6, 0))
         self.use_left_group.pack(side="right")
         self.undo_btn.pack(side="right", padx=(6, 0))
+        self.redo_btn.pack(side="right", padx=(6, 0))
 
         self.manual_rescan_btn = ttk.Button(self.toolbar_action_group, text="刷新", command=self._manual_rescan)
         self.manual_rescan_btn.pack(side="right", padx=(6, 0))
@@ -13293,6 +17466,9 @@ class SheetView:
 
         def _xscroll_left(first, last):
             # called when left xview changes
+            if self._wide_column_virtual_active():
+                self._set_wide_column_scrollbars()
+                return
             if self._is_click_trace_active():
                 _dlog(f"xscroll_left first={first} last={last} xsyncing={self._xsyncing}")
             if self._xsyncing:
@@ -13311,6 +17487,9 @@ class SheetView:
                 pass
 
         def _xscroll_right(first, last):
+            if self._wide_column_virtual_active():
+                self._set_wide_column_scrollbars()
+                return
             if self._is_click_trace_active():
                 _dlog(f"xscroll_right first={first} last={last} xsyncing={self._xsyncing}")
             if self._xsyncing:
@@ -13329,6 +17508,9 @@ class SheetView:
                 pass
 
         def _xscroll_mid(first, last):
+            if self._wide_column_virtual_active():
+                self._set_wide_column_scrollbars()
+                return
             if self._is_click_trace_active():
                 _dlog(f"xscroll_mid first={first} last={last} xsyncing={self._xsyncing}")
             if self._xsyncing:
@@ -13348,6 +17530,9 @@ class SheetView:
 
         def _xview_left(*args):
             # scrollbar drag/click on left
+            self._note_view_activity("hscroll-main")
+            if self._virtual_xview(*args):
+                return
             self._xsyncing = True
             try:
                 self.left.xview(*args)
@@ -13363,6 +17548,9 @@ class SheetView:
                 pass
 
         def _xview_right(*args):
+            self._note_view_activity("hscroll-main")
+            if self._virtual_xview(*args):
+                return
             self._xsyncing = True
             try:
                 self.right.xview(*args)
@@ -13378,6 +17566,9 @@ class SheetView:
                 pass
 
         def _xview_mid(*args):
+            self._note_view_activity("hscroll-main")
+            if self._virtual_xview(*args):
+                return
             self._xsyncing = True
             try:
                 self.base.xview(*args)
@@ -13474,6 +17665,10 @@ class SheetView:
         self.left_ln.pack(side="left", fill="y")
         ttk.Separator(left_body, orient="vertical").pack(side="left", fill="y")
         self.left.pack(fill="both", expand=True)
+        # The virtual row window must track the actual main-pane height. A
+        # fixed 20-row document leaves a large blank region below the grid on
+        # normal and maximized windows.
+        self.left.bind("<Configure>", self._on_main_viewport_configure, "+")
         self.hsb_left.pack(fill="x")
         self.hdiff_left.pack(fill="x")
         self.base_ln.pack(side="left", fill="y")
@@ -13743,6 +17938,11 @@ class SheetView:
         self._hover_clear_after_id = None
         self._last_hover_compare_key = None
         self._hover_payload_cache = {}
+        # Consecutive callbacks for one unchanged target share their immutable
+        # payload.  This avoids rebuilding even the prepared-text payload when
+        # Tk sends duplicate motion/tooltip events for the same cell.
+        self._last_hover_payload_request_key = None
+        self._last_hover_payload_request_value = None
         # Hover throttle: dedup identical targets and debounce heavy panel refresh.
         self._last_hover_target_key = None
         self._hover_debounce_id = None
@@ -13812,6 +18012,42 @@ class SheetView:
         # Initial panel state (must run after C区 widgets are created)
         self._toggle_three_way_view(init_only=True)
         self._refresh_interaction_gate()
+        self._virtual_widgets_warmed = False
+        try:
+            # Allocate the Text/header backing stores while the calculating
+            # surface is visible.  Some Tk builds charge that one-time cost to
+            # the first insert, which must not turn an otherwise bounded exact
+            # viewport publication into a >33ms scroll/render sample.
+            self.frame.after_idle(self._warm_virtual_text_widgets)
+        except Exception:
+            pass
+
+    def _warm_virtual_text_widgets(self):
+        if bool(getattr(self, "_virtual_widgets_warmed", False)):
+            return
+        self._virtual_widgets_warmed = True
+        for widget in (
+            getattr(self, "left", None), getattr(self, "base", None), getattr(self, "right", None),
+            getattr(self, "left_ln", None), getattr(self, "base_ln", None), getattr(self, "right_ln", None),
+        ):
+            if widget is None:
+                continue
+            is_header = widget in (
+                getattr(self, "left_ln", None), getattr(self, "base_ln", None), getattr(self, "right_ln", None),
+            )
+            try:
+                if is_header:
+                    widget.configure(state="normal")
+                widget.insert("1.0", " ")
+                widget.delete("1.0", "end")
+            except Exception:
+                pass
+            finally:
+                if is_header:
+                    try:
+                        widget.configure(state="disabled")
+                    except Exception:
+                        pass
 
     # ---------- Scrolling sync ----------
     def _is_three_way_enabled(self) -> bool:
@@ -13933,8 +18169,9 @@ class SheetView:
         if not getattr(self.app, "has_base", False):
             return None
         overrides = getattr(self, "pair_base_row_override", {}) or {}
-        if pair_idx in overrides:
-            return overrides.get(pair_idx)
+        override_row = overrides.get(pair_idx)
+        if override_row is not None:
+            return int(override_row)
         if pair is None:
             if not (0 <= pair_idx < len(self.row_pairs)):
                 return None
@@ -13951,6 +18188,83 @@ class SheetView:
             return theirs_map.get(rb)
         return None
 
+    def _is_exact_immutable_view_ready(self) -> bool:
+        """Whether a selected Sheet may perform a snapshot-only view action.
+
+        This is intentionally narrower than a visual "not loading" check and
+        intentionally broader than mutation ``READY``: a completed immutable
+        exact surface can drive only-difference presentation while the lazy
+        editable workbook backend remains deferred.  It never creates an edit
+        owner, opens a worksheet, or treats an unresolved/stale projection as
+        view-ready.
+        """
+        app = self.app
+        if bool(getattr(app, "_is_closing", False)):
+            return False
+        if str(getattr(app, "selected_sheet", "") or "") != str(self.sheet):
+            return False
+        exact_current = getattr(app, "_is_sheet_exact_current", None)
+        if not callable(exact_current) or not bool(exact_current(self.sheet)):
+            return False
+        exact_entry = getattr(app, "_sheet_exact_entry", lambda _sheet: {})(self.sheet) or {}
+        if str(exact_entry.get("state") or "") not in _SHEET_EXACT_TERMINAL:
+            return False
+        if not bool(exact_entry.get("full_detail_terminal", False)):
+            return False
+        if getattr(self, "_lifecycle_error", None) or bool(
+            getattr(self, "_lifecycle_canceled", False)
+        ):
+            return False
+        interactive_event = getattr(app, "_interactive_action_event", None)
+        try:
+            if interactive_event is not None and interactive_event.is_set():
+                return False
+        except Exception:
+            return False
+        if any(
+            bool(getattr(self, name, False))
+            for name in (
+                "_mode_switch_pending",
+                "_pending_exact_render",
+                "_only_diff_async_building",
+                "_virtual_publishing",
+                "_prepared_cache_publish_active",
+            )
+        ):
+            return False
+        if not bool(getattr(self, "_data_ready", False)):
+            return False
+        if not bool(getattr(self, "_prepared_complete", False)):
+            return False
+        if not bool(getattr(self, "_row_model_exact", False)):
+            return False
+        if not bool(getattr(self, "_cache_formula_aware", False)):
+            return False
+        if not bool(getattr(self, "_pair_diff_full_exact", False)):
+            return False
+        if (
+            self._is_three_way_enabled()
+            and getattr(app, "has_base", False)
+            and not bool(getattr(self, "_base_diff_full_exact", False))
+        ):
+            return False
+        try:
+            if not self._has_complete_prepared_rows():
+                return False
+            if not self._column_mapping_is_current():
+                return False
+        except Exception:
+            return False
+        requested_only_diff = bool(
+            getattr(self, "only_diff_var", None) and self.only_diff_var.get()
+        )
+        if requested_only_diff and (
+            not bool(getattr(self, "_only_diff_rows_exact", False))
+            or not self._has_valid_only_diff_snapshot_cache()
+        ):
+            return False
+        return True
+
     def _derive_lifecycle_state(self) -> str:
         """Return the current per-Sheet readiness state.
 
@@ -13960,6 +18274,14 @@ class SheetView:
         """
         if bool(getattr(self.app, "_is_closing", False)):
             return "CLOSING"
+        exact_entry = getattr(self.app, "_sheet_exact_entry", lambda _sheet: {})(self.sheet)
+        exact_state = str(exact_entry.get("state") or _SHEET_EXACT_PENDING)
+        if exact_state not in _SHEET_EXACT_TERMINAL:
+            if exact_state == _SHEET_EXACT_FAILED:
+                return "FAILED"
+            if exact_state == _SHEET_EXACT_UNRESOLVED:
+                return "UNRESOLVED"
+            return "DIFFING"
         if getattr(self, "_lifecycle_error", None):
             return "FAILED"
         if bool(getattr(self, "_lifecycle_canceled", False)):
@@ -13971,6 +18293,11 @@ class SheetView:
         except Exception:
             pass
         if bool(getattr(self, "_mode_switch_pending", False)):
+            return "DIFFING"
+        # A cache-owning publisher (or a stale tab hand-off) has reserved this
+        # view's next exact surface.  Do not expose the preceding bounded
+        # document as READY before that current generation actually publishes.
+        if bool(getattr(self, "_pending_exact_render", False)):
             return "DIFFING"
         if not bool(getattr(self, "_data_ready", False)):
             return "LOADING"
@@ -13999,7 +18326,11 @@ class SheetView:
             return "DIFFING"
         edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
         if callable(edit_ready) and not edit_ready():
-            return "EDIT_LOADING"
+            return (
+                "EDIT_LOADING"
+                if bool(getattr(self.app, "_edit_loading_started", False))
+                else "EDIT_DEFERRED"
+            )
         return "READY"
 
     def _mutation_block_message(self, action: str = "此操作") -> str:
@@ -14007,9 +18338,11 @@ class SheetView:
         detail = {
             "LOADING": "当前 Sheet 正在加载行结构。",
             "DIFFING": "当前 Sheet 正在生成精确差异。",
+            "EDIT_DEFERRED": "为加快打开，可编辑工作簿尚未加载；首次操作将启动加载。",
             "EDIT_LOADING": "可编辑工作簿正在后台加载。",
             "BUSY": "当前有一项修改正在执行。",
             "FAILED": f"当前 Sheet 计算失败：{getattr(self, '_lifecycle_error', '')}",
+            "UNRESOLVED": "当前 Sheet 无法证明精确映射。",
             "CANCELED": "当前 Sheet 的后台计算已取消。",
             "CLOSING": "工具正在关闭。",
         }.get(state, "当前 Sheet 尚未准备完成。")
@@ -14019,47 +18352,40 @@ class SheetView:
         self._refresh_interaction_gate()
         if getattr(self, "_lifecycle_state", "") == "READY":
             return True
+        # Snapshot-first comparison intentionally defers editable workbooks.
+        # A real cell/row/region/column action is an explicit demand signal,
+        # just like Save: start the single-owner preload, but still reject this
+        # first attempt and explain why.  No mutation may race the load.
+        deferred_edit = (
+            getattr(self.app, "_is_sheet_exact_current", lambda _sheet: False)(self.sheet)
+            and not getattr(self.app, "_edit_workbooks_ready", lambda: False)()
+            and not bool(getattr(self.app, "_edit_loading_started", False))
+        )
+        if deferred_edit:
+            self._last_mutation_started_edit_preload = True
+        if (
+            getattr(self.app, "_is_sheet_exact_current", lambda _sheet: False)(self.sheet)
+            and not getattr(self.app, "_edit_workbooks_ready", lambda: False)()
+        ):
+            request_preload = getattr(self.app, "_request_edit_preload", None)
+            if callable(request_preload):
+                request_preload(
+                    reason=f"mutation:{action}",
+                    caller="SheetView._guard_mutation_ready",
+                )
         if notify:
-            show_notice = getattr(self.app, "show_nonblocking_notice", None)
-            if callable(show_notice):
-                show_notice(self._mutation_block_message(action), warning=False, duration_ms=6000)
+            show_modal = getattr(self.app, "_show_exact_readiness_modal", None)
+            if callable(show_modal):
+                show_modal(action, self.sheet)
+            else:
+                show_notice = getattr(self.app, "show_nonblocking_notice", None)
+                if callable(show_notice):
+                    show_notice(self._mutation_block_message(action), warning=False, duration_ms=6000)
         _dlog(
             f"mutation blocked sheet={self.sheet} action={action} "
             f"state={getattr(self, '_lifecycle_state', 'unknown')}"
         )
         return False
-
-    def _column_undo_model_ready(self) -> bool:
-        """Allow a column transaction while only-diff presentation finishes.
-
-        Column actions have a complete workbook snapshot, and both applying and
-        restoring them rely only on the exact row, Base, formula, and column
-        models.  They therefore remain safe while the optional only-diff row
-        list is still being rebuilt.
-        """
-        try:
-            if bool(getattr(self.app, "_is_closing", False)):
-                return False
-            if getattr(self, "_lifecycle_error", None) or bool(getattr(self, "_lifecycle_canceled", False)):
-                return False
-            event = getattr(self.app, "_interactive_action_event", None)
-            if event is not None and event.is_set():
-                return False
-            if not all((
-                bool(getattr(self, "_data_ready", False)),
-                bool(getattr(self, "_row_model_exact", False)),
-                bool(getattr(self, "_cache_formula_aware", False)),
-                bool(getattr(self, "_pair_diff_full_exact", False)),
-                bool(getattr(self, "_column_mapping_is_current", lambda: False)()),
-            )):
-                return False
-            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
-                if not bool(getattr(self, "_base_diff_full_exact", False)):
-                    return False
-            edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
-            return not callable(edit_ready) or bool(edit_ready())
-        except Exception:
-            return False
 
     def _refresh_interaction_gate(self):
         """Atomically project lifecycle readiness onto every mutation control."""
@@ -14075,10 +18401,14 @@ class SheetView:
         ready = current == "READY"
         mutation_state = "normal" if ready else "disabled"
         try:
-            checkbox_state = mutation_state
+            # Only-difference is a snapshot-only presentation action.  Its
+            # immutable exact surface is sufficient even while edit workbooks
+            # remain deliberately deferred; all mutation controls retain the
+            # stricter edit-backed lifecycle gate below.
+            checkbox_state = "normal" if self._is_exact_immutable_view_ready() else "disabled"
             if getattr(self.app, "merge_conflict_mode", False):
                 checkbox_state = "disabled"
-            self.only_diff_cb.configure(text="仅差异", state=checkbox_state)
+            self.only_diff_cb.configure(text="只看差异内容", state=checkbox_state)
         except Exception:
             pass
         try:
@@ -14088,6 +18418,12 @@ class SheetView:
             self.force_align_cb.configure(state=force_state)
         except Exception:
             pass
+        # Keep guarded operations clickable while a Sheet is non-ready.  A
+        # real click must reach the shared readiness modal; a disabled Tk
+        # button would silently swallow the user's attempt.  The handlers are
+        # still the authority and cannot mutate unless the current generation
+        # is exact and all edit models are ready.
+        operation_state = "disabled" if current == "CLOSING" else "normal"
         for name in (
             "use_left_btn",
             "use_right_btn",
@@ -14095,6 +18431,7 @@ class SheetView:
             "use_right_menu_btn",
             "use_base_btn",
             "undo_btn",
+            "redo_btn",
             "save_a_btn",
             "save_b_btn",
             "three_way_cb",
@@ -14102,12 +18439,12 @@ class SheetView:
             widget = getattr(self, name, None)
             if widget is not None:
                 try:
-                    widget.configure(state=mutation_state)
+                    widget.configure(state=operation_state)
                 except Exception:
                     pass
         try:
             self.manual_rescan_btn.configure(
-                state=("normal" if current in ("READY", "FAILED", "CANCELED") else "disabled")
+                state=("normal" if current in ("READY", "FAILED", "UNRESOLVED", "CANCELED") else "disabled")
             )
         except Exception:
             pass
@@ -14295,18 +18632,18 @@ class SheetView:
         except Exception:
             pass
         try:
-            gate_ready = getattr(self, "_lifecycle_state", "") == "READY"
+            operation_clickable = getattr(self, "_lifecycle_state", "") != "CLOSING"
             if self._is_missing_sheet_view():
                 if enabled:
-                    left_state = "normal" if gate_ready and (meta.get("has_base") or meta.get("has_a")) else "disabled"
+                    left_state = "normal" if operation_clickable and (meta.get("has_base") or meta.get("has_a")) else "disabled"
                 else:
-                    left_state = "normal" if gate_ready and meta.get("has_a") else "disabled"
-                right_state = "normal" if gate_ready and meta.get("has_b") else "disabled"
-                mine_state = "normal" if gate_ready and meta.get("has_a") else "disabled"
+                    left_state = "normal" if operation_clickable and meta.get("has_a") else "disabled"
+                right_state = "normal" if operation_clickable and meta.get("has_b") else "disabled"
+                mine_state = "normal" if operation_clickable and meta.get("has_a") else "disabled"
             else:
-                left_state = "normal" if gate_ready else "disabled"
-                right_state = "normal" if gate_ready else "disabled"
-                mine_state = "normal" if gate_ready else "disabled"
+                left_state = "normal" if operation_clickable else "disabled"
+                right_state = "normal" if operation_clickable else "disabled"
+                mine_state = "normal" if operation_clickable else "disabled"
             self.use_left_btn.configure(state=left_state)
             self.use_right_btn.configure(state=right_state)
             if self.use_base_btn is not None:
@@ -14436,6 +18773,25 @@ class SheetView:
             frac = float(first)
         except Exception:
             return
+        if self._wide_column_virtual_active():
+            active = getattr(self, "_viewport_request_active", None)
+            pending_col = getattr(active, "get", lambda *_args: None)("column_start")
+            if (
+                active
+                and active.get("status") == "pending"
+                and pending_col is not None
+                and int(pending_col) != int(self._virtual_column_window_start)
+            ):
+                # Programmatic Text/C alignment is older than a queued user
+                # logical hscroll. Preserve that newest target instead of
+                # creating a synthetic hscroll request from a local xview.
+                _dlog(
+                    f"wide_xsync_preserve_pending pending_col={pending_col} "
+                    f"current={self._virtual_column_window_start}"
+                )
+                return
+            self._queue_virtual_column_window_fraction(frac)
+            return
 
         prev_xsync = bool(getattr(self, "_xsyncing", False))
         self._xsyncing = True
@@ -14457,6 +18813,9 @@ class SheetView:
         try:
             frac = float(first)
         except Exception:
+            return
+        if self._wide_column_virtual_active():
+            self._set_wide_column_scrollbars()
             return
 
         # Programmatic C-pane sync must not feed back into main panes.
@@ -14480,7 +18839,22 @@ class SheetView:
         finally:
             self._suppress_c_xsync = prev_suppress
 
+    def _restore_horizontal_after_cursor_cmp_click(self, saved_x):
+        """Restore cursor-click horizontal presentation without retargeting wide windows."""
+        if self._wide_column_virtual_active():
+            # ``saved_x`` is the logical scrollbar fraction (start / total),
+            # whereas wide request routing consumes a travel fraction
+            # (start / (total - cap)).  C refresh is already wide-safe and
+            # must not enqueue a synthetic horizontal viewport request.
+            self._sync_c_x_to_frac(saved_x)
+            return
+        self._sync_main_x_to_frac(saved_x)
+        self._sync_c_x_to_frac(saved_x)
+
     def _set_c_hscrollbars_from_main(self):
+        if self._wide_column_virtual_active():
+            self._set_wide_column_scrollbars()
+            return
         try:
             first, last = self.left.xview()
         except Exception:
@@ -14557,6 +18931,9 @@ class SheetView:
 
     def _sync_main_x_from_widget(self, src_widget: tk.Text, src_first):
         """Sync A/B(/BASE) in the shared logical-slot coordinate system."""
+        if self._wide_column_virtual_active():
+            self._set_wide_column_scrollbars()
+            return
         try:
             # Every main pane now renders exactly the same slot widths and
             # separators.  Re-mapping through independently inferred pixel
@@ -14646,10 +19023,24 @@ class SheetView:
         _dlog(f"click_trace {stage} x(left={lx:.6f},right={rx:.6f},c={cx:.6f}) insert(left={li},right={ri})")
 
     def _post_click_x_guard(self, saved_x: float, stage: str):
-        try:
-            now_x = float((self.left.xview() or (0.0, 1.0))[0])
-        except Exception:
-            now_x = saved_x
+        if self._wide_column_virtual_active():
+            active = getattr(self, "_viewport_request_active", None)
+            pending_col = getattr(active, "get", lambda *_args: None)("column_start")
+            if (
+                active
+                and active.get("status") == "pending"
+                and pending_col is not None
+                and int(pending_col) != int(self._virtual_column_window_start)
+            ):
+                # A real hthumb/hminimap request arrived before the deferred
+                # Text click guard.  Its target is newer user intent; never
+                # enqueue a synthetic restore of the old local Text xview.
+                _dlog(
+                    f"click_guard_preserve_pending_wide stage={stage} "
+                    f"pending_col={pending_col} current={self._virtual_column_window_start}"
+                )
+                return
+        now_x = self._logical_horizontal_first()
         drift = abs(now_x - saved_x)
         if drift > 1e-4:
             try:
@@ -14663,6 +19054,9 @@ class SheetView:
         self._log_click_trace_state(f"post_guard:{stage}")
 
     def _xview_cursor_cmp(self, *args):
+        self._note_view_activity("hscroll-c-area")
+        if self._virtual_xview(*args):
+            return
         if self._xsyncing:
             return
         self._xsyncing = True
@@ -14691,6 +19085,9 @@ class SheetView:
             pass
 
     def _xview_cell_cmp(self, *args):
+        self._note_view_activity("hscroll-c-area")
+        if self._virtual_xview(*args):
+            return
         if self._xsyncing:
             return
         self._xsyncing = True
@@ -14743,6 +19140,1380 @@ class SheetView:
         except Exception:
             pass
 
+    # ---------- Fixed virtual result window ----------
+    def _has_complete_prepared_rows_for(self, rows) -> bool:
+        """Return whether every logical row can render without Worksheet I/O.
+
+        ``pair_text_*`` is deliberately a lazy, viewport-sized formatting cache.
+        The immutable raw fragments are the complete prepared render model; do
+        not require every row to have gone through Unicode/Tk formatting before
+        a large Sheet can enter virtual mode.
+        """
+        rows = list(rows or ())
+        if not rows:
+            return True
+        if any(
+            idx not in self.pair_raw_parts_a or idx not in self.pair_raw_parts_b
+            for idx in rows
+        ):
+            return False
+        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+            return all(idx in self.pair_raw_parts_base for idx in rows)
+        return True
+
+    def _has_complete_prepared_rows(self) -> bool:
+        return self._has_complete_prepared_rows_for(self._full_display_rows)
+
+    def _virtual_viewport_row_capacity(self) -> int:
+        """Return the row count needed to cover the visible main Text area.
+
+        Tk reports a one-pixel height before the first layout pass, so retain
+        the fixed initial fallback until a real Text display line is available.
+        One extra row covers a partially visible final line without exposing a
+        white strip at the bottom of the pane.
+        """
+        fallback = int(_VIRTUAL_VIEWPORT_MAX_ROWS)
+        widget = getattr(self, "left", None)
+        if widget is None:
+            return fallback
+        try:
+            height = int(widget.winfo_height())
+            line_info = widget.dlineinfo("1.0")
+            line_height = int(line_info[3]) if line_info is not None else 0
+            if height <= 1 or line_height <= 0:
+                return fallback
+            return max(fallback, int(math.ceil(height / line_height)) + 1)
+        except Exception:
+            return fallback
+
+    def _on_main_viewport_configure(self, _event=None) -> None:
+        """Republish the current immutable window after a height change."""
+        capacity = self._virtual_viewport_row_capacity()
+        previous = int(getattr(
+            self, "_virtual_viewport_row_cap", _VIRTUAL_VIEWPORT_MAX_ROWS
+        ))
+        if capacity == previous:
+            return
+        total = len(getattr(self, "_full_display_rows", ()) or ())
+        old_start = int(
+            getattr(self, "_virtual_pending_start", None)
+            if getattr(self, "_virtual_pending_start", None) is not None
+            else getattr(self, "_virtual_window_start", 0)
+        )
+        old_cap = min(max(0, previous), total)
+        was_at_tail = old_start >= max(0, total - old_cap)
+        self._virtual_viewport_row_cap = capacity
+        if not self._virtual_mode_active():
+            return
+        new_cap = min(capacity, total)
+        target_start = (
+            max(0, total - new_cap)
+            if was_at_tail
+            else self._canonical_virtual_row_start(old_start)
+        )
+        # Publish the newly canonical position synchronously in model state;
+        # the Text documents are still replaced cooperatively by after(0).
+        self._virtual_window_start = target_start
+        self._queue_virtual_window(
+            target_start,
+            reason="resize",
+            force_after0=True,
+        )
+
+    def _virtual_mode_active(self) -> bool:
+        return bool(
+            _LARGE_SHEET_VIRTUALIZATION_ENABLED
+            # Cache apply has installed a complete immutable result, but keeps
+            # the public Sheet state CALCULATING until the first bounded Tk
+            # surface is in place.  That preserves the atomic publication
+            # contract without briefly rendering the legacy 200-row prefix.
+            and (
+                getattr(self.app, "_is_sheet_exact_current", lambda _sheet: False)(self.sheet)
+                or bool(getattr(self, "_prepared_cache_publish_active", False))
+            )
+            and (
+                not bool(getattr(self, "_pending_exact_render", False))
+                or bool(getattr(self, "_prepared_cache_publish_active", False))
+            )
+            # A short only-difference result may still be a dense 69-column
+            # sheet.  Treat either dimension as a virtual surface: the row
+            # window simply contains every short result row while the column
+            # window prevents a full-width Tk document/presentational stall.
+            and (
+                len(self._full_display_rows) > _VIRTUAL_VIEWPORT_MAX_ROWS
+                or self._logical_slot_count() >= _WIDE_COLUMN_VIRTUALIZATION_THRESHOLD
+            )
+            and self._has_complete_prepared_rows()
+        )
+
+    def _wide_column_virtual_active(self) -> bool:
+        """Whether this bounded row viewport also needs bounded columns.
+
+        The decision is deliberately presentation-only.  All logical slots and
+        their physical/Base projections stay installed on the SheetView; only
+        the short-lived Tk strings, header strings, and character spans are
+        reduced to the current logical column window.
+        """
+        try:
+            return bool(
+                self._virtual_mode_active()
+                and self._logical_slot_count() >= _WIDE_COLUMN_VIRTUALIZATION_THRESHOLD
+            )
+        except Exception:
+            return False
+
+    def _rendered_logical_columns(self) -> tuple[int, ...]:
+        """Return global logical columns currently materialized in Tk.
+
+        Keys remain the stable one-based logical slot numbers rather than
+        recycled visible indices.  Hit testing, tooltip, copy, and operations
+        can therefore consume a span map without knowing whether a wide window
+        is active.
+        """
+        total = max(0, int(self._logical_slot_count() or 0))
+        if total <= 0:
+            return ()
+        if not self._wide_column_virtual_active():
+            return tuple(range(1, total + 1))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        start = max(0, min(int(getattr(self, "_virtual_column_window_start", 0) or 0), total - cap))
+        self._virtual_column_window_start = start
+        return tuple(range(start + 1, start + cap + 1))
+
+    def _wide_column_scroll_fractions(self) -> tuple[float, float]:
+        total = max(1, int(self._logical_slot_count() or 0))
+        if not self._wide_column_virtual_active():
+            return (0.0, 1.0)
+        cols = self._rendered_logical_columns()
+        first = float(max(0, int(getattr(self, "_virtual_column_window_start", 0) or 0))) / float(total)
+        last = float(min(total, int(getattr(self, "_virtual_column_window_start", 0) or 0) + len(cols))) / float(total)
+        return (max(0.0, min(1.0, first)), max(0.0, min(1.0, last)))
+
+    def _logical_horizontal_first(self) -> float:
+        """Return the authoritative full-width horizontal fraction.
+
+        A wide rendered Text line is only the current column window, so its
+        xview is a local pixel offset and is never a valid complete-sheet
+        fraction.  Keep legacy Text behaviour for narrow sheets.
+        """
+        if self._wide_column_virtual_active():
+            return self._wide_column_scroll_fractions()[0]
+        try:
+            return float((self.left.xview() or (0.0, 1.0))[0])
+        except Exception:
+            return 0.0
+
+    def _viewport_request_generation(self):
+        try:
+            entry = self.app._sheet_exact_entry(self.sheet)
+            return int(entry.get("generation", -1))
+        except Exception:
+            return None
+
+    def _begin_viewport_request(
+        self,
+        reason: str,
+        *,
+        row_start: int | None = None,
+        column_start: int | None = None,
+        kind: str = "viewport",
+    ) -> int:
+        """Start a latest-wins viewport latency sample at input receipt.
+
+        A scrollbar drag can enqueue several targets before Tk publishes one.
+        Only the final intent is a user-visible completion; older records are
+        explicitly superseded and never included in latency percentiles.
+        """
+        active = getattr(self, "_viewport_request_active", None)
+        if active and active.get("status") == "pending":
+            self._supersede_viewport_request(active, "newer-input")
+        self._viewport_request_seq += 1
+        request_id = int(self._viewport_request_seq)
+        target_row = int(
+            self._virtual_window_start if row_start is None else row_start
+        )
+        target_col = int(
+            self._virtual_column_window_start if column_start is None else column_start
+        )
+        self._viewport_request_active = {
+            "id": request_id,
+            "reason": str(reason or "viewport"),
+            "kind": str(kind or "viewport"),
+            "started": time.perf_counter(),
+            "previous_row_start": int(self._virtual_window_start),
+            "previous_column_start": int(self._virtual_column_window_start),
+            "row_start": target_row,
+            "column_start": target_col,
+            "generation": self._viewport_request_generation(),
+            "selected_sheet": str(getattr(self.app, "selected_sheet", "") or ""),
+            "status": "pending",
+        }
+        _dlog(
+            f"VIEWPORT_REQUEST begin id={request_id} reason={reason} "
+            f"row={target_row} col={target_col} gen={self._viewport_request_active['generation']}"
+        )
+        return request_id
+
+    def _supersede_viewport_request(self, active: dict, reason: str) -> None:
+        if active.get("status") != "pending":
+            return
+        active["status"] = "superseded"
+        active["superseded_reason"] = str(reason)
+        active["superseded_at"] = time.perf_counter()
+        navigation = active.get("navigation")
+        if isinstance(navigation, dict):
+            navigation["status"] = "superseded"
+            navigation["superseded_reason"] = str(reason)
+            phases = dict(navigation.get("phase_ms", {}) or {})
+            phases.setdefault("block_lookup", float(navigation.get("lookup_ms", 0.0) or 0.0))
+            phases.setdefault("materialize_publish", 0.0)
+            phases.setdefault("selection", 0.0)
+            phases.setdefault("restore", 0.0)
+            phases.setdefault("ui", 0.0)
+            phases["total"] = max(
+                0.0,
+                (float(active["superseded_at"]) - float(active.get("started", active["superseded_at"])))
+                * 1000.0,
+            )
+            navigation["phase_ms"] = phases
+            self._record_diff_navigation_telemetry(
+                action="full-diff-block",
+                block_idx=navigation.get("block_idx"),
+                pair_idx=navigation.get("target_pair_idx"),
+                outcome="superseded",
+                phase_ms=phases,
+            )
+        self._viewport_request_superseded += 1
+        self._viewport_request_terminal.append(dict(active))
+        _dlog(
+            f"VIEWPORT_REQUEST supersede id={active.get('id')} reason={reason} "
+            f"input={active.get('reason')} target=({active.get('row_start')},{active.get('column_start')})"
+        )
+
+    def _fail_viewport_request(self, active: dict | None, reason: str, *, error=None) -> None:
+        """Terminally fail one current viewport request without a false complete.
+
+        Most viewport routes are allowed to retain their historical exception
+        propagation.  A deferred diff-navigation request is different: its
+        public callback has already returned, so a scheduler/publish/target
+        error must leave an explicit terminal record rather than a forever
+        pending request or a successful terminal on the old selection.
+        """
+        if not isinstance(active, dict) or active.get("status") != "pending":
+            return
+        active["status"] = "failed"
+        active["failure_reason"] = str(reason or "viewport-failed")
+        if error is not None:
+            active["failure_error"] = f"{type(error).__name__}: {error}"
+        navigation = active.get("navigation")
+        if isinstance(navigation, dict):
+            navigation["status"] = "failed"
+            navigation["failure_reason"] = str(reason or "viewport-failed")
+            if error is not None:
+                navigation["failure_error"] = f"{type(error).__name__}: {error}"
+            phases = dict(navigation.get("phase_ms", {}) or {})
+            phases.setdefault("block_lookup", float(navigation.get("lookup_ms", 0.0) or 0.0))
+            phases.setdefault("materialize_publish", 0.0)
+            phases.setdefault("selection", 0.0)
+            phases.setdefault("restore", 0.0)
+            phases.setdefault("ui", 0.0)
+            phases["total"] = max(
+                0.0,
+                (time.perf_counter() - float(active.get("started", time.perf_counter())))
+                * 1000.0,
+            )
+            navigation["phase_ms"] = phases
+            self._record_diff_navigation_telemetry(
+                action="full-diff-block",
+                block_idx=navigation.get("block_idx"),
+                pair_idx=navigation.get("target_pair_idx"),
+                outcome="failed",
+                phase_ms=phases,
+            )
+        active["failed_at"] = time.perf_counter()
+        self._viewport_request_terminal.append(dict(active))
+        _dlog(
+            f"VIEWPORT_REQUEST failed id={active.get('id')} reason={active.get('failure_reason')} "
+            f"input={active.get('reason')}"
+        )
+
+    def _begin_interaction_request(self, reason: str) -> int:
+        """Time a click/selection callback without touching viewport intent."""
+        active = getattr(self, "_interaction_request_active", None)
+        if active and active.get("status") == "pending":
+            active["status"] = "superseded"
+            self._interaction_request_superseded += 1
+        self._interaction_request_seq += 1
+        request_id = int(self._interaction_request_seq)
+        self._interaction_request_active = {
+            "id": request_id,
+            "reason": str(reason or "interaction"),
+            "started": time.perf_counter(),
+            "generation": self._viewport_request_generation(),
+            "selected_sheet": str(getattr(self.app, "selected_sheet", "") or ""),
+            "status": "pending",
+        }
+        return request_id
+
+    def _complete_interaction_request_if_current(self) -> None:
+        active = getattr(self, "_interaction_request_active", None)
+        if not active or active.get("status") != "pending":
+            return
+        if active.get("generation") != self._viewport_request_generation():
+            active["status"] = "superseded"
+            self._interaction_request_superseded += 1
+            return
+        expected_selected = str(active.get("selected_sheet") or "")
+        if expected_selected and expected_selected != str(getattr(self.app, "selected_sheet", "") or ""):
+            active["status"] = "superseded"
+            self._interaction_request_superseded += 1
+            return
+        elapsed_ms = (time.perf_counter() - float(active["started"])) * 1000.0
+        active["status"] = "complete"
+        active["elapsed_ms"] = elapsed_ms
+        self._interaction_request_samples_ms.append(elapsed_ms)
+        self._interaction_request_completed.append(dict(active))
+
+    def _update_viewport_request_target(
+        self,
+        request_id: int | None,
+        *,
+        row_start: int | None = None,
+        column_start: int | None = None,
+    ) -> None:
+        active = getattr(self, "_viewport_request_active", None)
+        if not active or active.get("status") != "pending":
+            return
+        if request_id is not None and int(active.get("id", -1)) != int(request_id):
+            return
+        if row_start is not None:
+            active["row_start"] = int(row_start)
+        if column_start is not None:
+            active["column_start"] = int(column_start)
+
+    def _mark_viewport_publish_started(self) -> None:
+        """Capture bounded queue delay for the current 2D viewport intent."""
+        active = getattr(self, "_viewport_request_active", None)
+        if not active or active.get("status") != "pending":
+            return
+        now = time.perf_counter()
+        active["publish_started"] = now
+        active["queue_wait_ms"] = (now - float(active["started"])) * 1000.0
+
+    def _complete_viewport_request_if_current(self) -> None:
+        """Close one request after the full immutable viewport surface exists."""
+        active = getattr(self, "_viewport_request_active", None)
+        if not active or active.get("status") != "pending":
+            return
+        if active.get("generation") != self._viewport_request_generation():
+            self._supersede_viewport_request(active, "generation")
+            return
+        expected_selected = str(active.get("selected_sheet") or "")
+        if expected_selected and expected_selected != str(getattr(self.app, "selected_sheet", "") or ""):
+            self._supersede_viewport_request(active, "selected-sheet")
+            return
+        if int(active.get("row_start", -1)) != int(self._virtual_window_start):
+            return
+        if self._wide_column_virtual_active() and int(
+            active.get("column_start", -1)
+        ) != int(self._virtual_column_window_start):
+            return
+        navigation = active.get("navigation")
+        if isinstance(navigation, dict) and str(active.get("kind") or "") == "diff-navigation":
+            if navigation.get("status") != "selected":
+                self._fail_viewport_request(active, "navigation-terminal-without-selection")
+                return
+        # This method is deliberately invoked only after main panes, row and
+        # column headers, C-area/selection and scrollbar/minimap state have
+        # been synchronously updated by `_publish_virtual_window`.
+        elapsed_ms = (time.perf_counter() - float(active["started"])) * 1000.0
+        publish_started = float(active.get("publish_started", active["started"]))
+        active["status"] = "complete"
+        active["elapsed_ms"] = elapsed_ms
+        active["queue_wait_ms"] = (publish_started - float(active["started"])) * 1000.0
+        active["publish_ms"] = max(0.0, elapsed_ms - float(active["queue_wait_ms"]))
+        active["actual_row_start"] = int(self._virtual_window_start)
+        active["actual_column_start"] = int(self._virtual_column_window_start)
+        active["actual_display_rows"] = tuple(self.display_rows)
+        active["actual_rendered_columns"] = tuple(self._rendered_logical_columns())
+        # Keep bounded phase evidence with the end-to-end record.  The
+        # internal `total` phase deliberately remains diagnostic-only; the
+        # request's elapsed time is the acceptance value and includes C,
+        # headers, selection, scrollbars, and coalescing delay.
+        active["publish_phases_ms"] = dict(
+            getattr(self, "_last_virtual_render_phases_ms", {}) or {}
+        )
+        publication = getattr(self, "_last_virtual_publication_telemetry", {}) or {}
+        if (
+            isinstance(publication, dict)
+            and publication.get("request_id") is not None
+            and int(publication.get("request_id")) == int(active.get("id", -1))
+        ):
+            active["publication"] = {
+                **publication,
+                "phase_ms": dict(publication.get("phase_ms", {}) or {}),
+                "materialize": {
+                    **dict(publication.get("materialize", {}) or {}),
+                    "sides": {
+                        str(side): dict(counts or {})
+                        for side, counts in dict(
+                            (publication.get("materialize", {}) or {}).get("sides", {})
+                        ).items()
+                    },
+                },
+                "render_context": {
+                    **dict(publication.get("render_context", {}) or {}),
+                    "versions": dict(
+                        dict(publication.get("render_context", {}) or {}).get(
+                            "versions", {}
+                        )
+                        or {}
+                    ),
+                    "offset_counts": dict(
+                        dict(publication.get("render_context", {}) or {}).get(
+                            "offset_counts", {}
+                        )
+                        or {}
+                    ),
+                    "formatted": dict(
+                        dict(publication.get("render_context", {}) or {}).get(
+                            "formatted", {}
+                        )
+                        or {}
+                    ),
+                },
+                "window": dict(publication.get("window", {}) or {}),
+            }
+        active["c_area_ms"] = float(
+            getattr(self, "_last_c_area_render_ms", 0.0) or 0.0
+        )
+        changed = bool(
+            int(active["actual_row_start"]) != int(active["previous_row_start"])
+            or (
+                self._wide_column_virtual_active()
+                and int(active["actual_column_start"])
+                != int(active["previous_column_start"])
+            )
+        )
+        if isinstance(navigation, dict):
+            # A visible target can remain in the same row/column window while
+            # its actual logical selection changes.  That is still a completed
+            # diff-navigation interaction and must be represented in its own
+            # end-to-end accounting rather than classified as a no-op.
+            changed = bool(changed or navigation.get("selection_changed"))
+            active["navigation"] = {
+                **navigation,
+                "phase_ms": dict(navigation.get("phase_ms", {}) or {}),
+                "actual_button_states": dict(
+                    navigation.get("actual_button_states", {}) or {}
+                ),
+                "expected_button_states": dict(
+                    navigation.get("expected_button_states", {}) or {}
+                ),
+            }
+        active["surface_changed"] = changed
+        active["counted"] = bool(changed)
+        if active["counted"]:
+            self._viewport_request_samples_ms.append(elapsed_ms)
+        self._viewport_request_completed.append(dict(active))
+        self._viewport_request_terminal.append(dict(active))
+        _dlog(
+            f"VIEWPORT_REQUEST complete id={active.get('id')} reason={active.get('reason')} "
+            f"elapsed_ms={elapsed_ms:.3f} changed={changed} "
+            f"target=({active.get('row_start')},{active.get('column_start')})"
+        )
+
+    def _set_wide_column_scrollbars(self):
+        """Publish logical-width scrollbar thumbs for a rendered column window."""
+        if not self._wide_column_virtual_active():
+            return
+        first, last = self._wide_column_scroll_fractions()
+        for bar in (
+            getattr(self, "hsb_left", None), getattr(self, "hsb_mid", None),
+            getattr(self, "hsb_right", None), getattr(self, "cursor_hsb", None),
+            getattr(self, "cell_cmp_hsb", None),
+        ):
+            try:
+                if bar is not None:
+                    bar.set(first, last)
+            except Exception:
+                pass
+        # The short Tk document itself has no physical x-scroll.  Its xview is
+        # reset by the bounded document replacement; deliberately do not call
+        # ``xview_moveto`` here because doing so would re-enter xscrollcommand
+        # while publishing a logical scrollbar thumb.
+
+    def _clear_prepared_text_for_column_window(self):
+        """Drop rendered strings tied to a previous logical column window.
+
+        Raw fragments remain immutable and complete.  The old caches are keyed
+        only by pair index, so retaining them across a column-window move would
+        make a later viewport show the wrong fields under correct logical spans.
+        """
+        self.pair_text_a.clear()
+        self.pair_text_b.clear()
+        self.pair_text_base.clear()
+        self._prepared_text_lru.clear()
+        self._base_spans_cache = None
+        self._base_spans_cache_key = None
+        # C renders the same formatted fragments as the main panes.  A
+        # same-row hover after a horizontal move must not retain the previous
+        # window merely because its pair/selection identity is unchanged.
+        self._c_area_last_render_key = None
+
+    def _set_virtual_column_window_start(self, start: int) -> bool:
+        if not self._wide_column_virtual_active():
+            return False
+        total = max(0, int(self._logical_slot_count() or 0))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        target = max(0, min(int(start), max(0, total - cap)))
+        if target == int(getattr(self, "_virtual_column_window_start", 0) or 0):
+            return False
+        self._virtual_column_window_start = target
+        self._virtual_column_window_generation = int(
+            getattr(self, "_virtual_column_window_generation", 0)
+        ) + 1
+        self._clear_prepared_text_for_column_window()
+        return True
+
+    def _apply_pending_virtual_column_window(self) -> bool:
+        pending = getattr(self, "_virtual_pending_column_start", None)
+        self._virtual_pending_column_start = None
+        if pending is None:
+            return False
+        return self._set_virtual_column_window_start(int(pending))
+
+    def _cancel_virtual_2d_publish(self, reason: str = "") -> None:
+        """Invalidate a pending 2D drain and terminalise its intent.
+
+        A tab/generation/close transition must not leave a runnable after(0)
+        callback painting an obsolete view. Invalidation is token based
+        because Tcl can make it runnable while its after id is being cleared.
+        """
+        self._virtual_publish_token = int(
+            getattr(self, "_virtual_publish_token", 0) or 0
+        ) + 1
+        callback_ids = (getattr(self, "_virtual_publish_after_id", None),)
+        self._virtual_publish_after_id = None
+        self._virtual_column_publish_after_id = None
+        self._virtual_pending_start = None
+        self._virtual_pending_column_start = None
+        for callback_id in callback_ids:
+            if callback_id is None:
+                continue
+            try:
+                self.frame.after_cancel(callback_id)
+            except Exception:
+                pass
+        active = getattr(self, "_viewport_request_active", None)
+        if reason and active and active.get("status") == "pending":
+            self._supersede_viewport_request(active, reason)
+
+    def _schedule_virtual_2d_publish(self) -> None:
+        """Drain the newest requested logical row/column window once.
+
+        Row and column callbacks deliberately share this owner.  Scheduling a
+        vertical publish beside a pending horizontal one used to repaint the
+        obsolete `(old row, new column)` surface immediately before the true
+        combined target.  The immutable raw model lets us safely hold both
+        desired coordinates until this one short frame callback runs.
+        """
+        if getattr(self, "_virtual_publish_after_id", None) is not None:
+            return
+
+        self._virtual_publish_token = int(
+            getattr(self, "_virtual_publish_token", 0) or 0
+        ) + 1
+        token = int(self._virtual_publish_token)
+
+        def _publish(trigger: str, *, force: bool = False):
+            if token != int(getattr(self, "_virtual_publish_token", 0) or 0):
+                return
+            callback_id = getattr(self, "_virtual_publish_after_id", None)
+            if not force and callback_id is None:
+                return
+            # Claim the owner before publishing. New h/v input in the same
+            # event-loop turn merely updates the pending target; it cannot
+            # create a second callback until this bounded surface completes.
+            self._virtual_publish_after_id = None
+            # Kept as an inert compatibility field for close/cancel paths that
+            # still inspect it; only this unified owner schedules callbacks.
+            self._virtual_column_publish_after_id = None
+            if not self._virtual_mode_active():
+                active = getattr(self, "_viewport_request_active", None)
+                if active and active.get("status") == "pending":
+                    if active.get("generation") != self._viewport_request_generation():
+                        reason = "generation"
+                    elif str(active.get("selected_sheet") or "") != str(
+                        getattr(self.app, "selected_sheet", "") or ""
+                    ):
+                        reason = "selected-sheet"
+                    else:
+                        reason = "virtual-inactive"
+                    self._supersede_viewport_request(active, reason)
+                self._virtual_pending_start = None
+                self._virtual_pending_column_start = None
+                return
+            target = getattr(self, "_virtual_pending_start", None)
+            self._virtual_pending_start = None
+            if target is None:
+                target = int(getattr(self, "_virtual_window_start", 0) or 0)
+            self._apply_pending_virtual_column_window()
+            active = getattr(self, "_viewport_request_active", None)
+            if active and active.get("status") == "pending":
+                active["drain_trigger"] = str(trigger)
+            self._mark_viewport_publish_started()
+            try:
+                published = self._publish_virtual_window(int(target))
+            except Exception as exc:
+                active = getattr(self, "_viewport_request_active", None)
+                if (
+                    isinstance(active, dict)
+                    and active.get("status") == "pending"
+                    and str(active.get("kind") or "") == "diff-navigation"
+                ):
+                    self._fail_viewport_request(active, "publish-exception", error=exc)
+                    return
+                raise
+            if published is False:
+                # A deferred diff-navigation callback has already accepted a
+                # public input. It may not leave its request pending merely
+                # because a bounded publisher declined to install a surface.
+                # Ordinary viewport routes retain their historic no-op result.
+                active = getattr(self, "_viewport_request_active", None)
+                if (
+                    isinstance(active, dict)
+                    and active.get("status") == "pending"
+                    and str(active.get("kind") or "") == "diff-navigation"
+                ):
+                    self._fail_viewport_request(active, "publish-returned-false")
+                    return
+
+        try:
+            # Sequential wheel/thumb input in one event-loop turn shares a
+            # single zero-delay owner and newest immutable 2D target. Unlike
+            # after_idle it is not held behind unrelated idle callbacks.
+            self._virtual_publish_after_id = self.frame.after(
+                0, lambda: _publish("after0")
+            )
+        except Exception:
+            for callback_id in (getattr(self, "_virtual_publish_after_id", None),):
+                if callback_id is None:
+                    continue
+                try:
+                    self.frame.after_cancel(callback_id)
+                except Exception:
+                    pass
+            self._virtual_publish_after_id = None
+            active = getattr(self, "_viewport_request_active", None)
+            if (
+                isinstance(active, dict)
+                and active.get("status") == "pending"
+                and str(active.get("kind") or "") == "diff-navigation"
+            ):
+                # Public diff navigation must remain asynchronous.  Falling
+                # back to synchronous publication here would make a callback
+                # appear to meet the request contract while violating its
+                # ≤33ms input bound on a busy Tk surface.
+                self._fail_viewport_request(active, "after-install-failed")
+                return
+            _publish("fallback", force=True)
+
+    def _queue_virtual_column_window(
+        self,
+        start: int,
+        *,
+        reason: str = "hscroll",
+        request_id: int | None = None,
+    ) -> bool:
+        """Coalesce wide-sheet horizontal input to the newest logical window."""
+        self._note_view_activity("hviewport")
+        if not self._wide_column_virtual_active():
+            return False
+        total = max(0, int(self._logical_slot_count() or 0))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        target = max(0, min(int(start), max(0, total - cap)))
+        if request_id is None:
+            request_id = self._begin_viewport_request(
+                reason,
+                row_start=(
+                    self._virtual_pending_start
+                    if self._virtual_pending_start is not None
+                    else self._virtual_window_start
+                ),
+                column_start=target,
+            )
+        else:
+            self._update_viewport_request_target(
+                request_id, column_start=target
+            )
+        if (
+            self._virtual_column_publish_after_id is None
+            and self._virtual_publish_after_id is None
+            and self._virtual_pending_column_start is None
+            and target == int(getattr(self, "_virtual_column_window_start", 0) or 0)
+        ):
+            self._complete_viewport_request_if_current()
+            return True
+        self._virtual_pending_column_start = target
+        self._schedule_virtual_2d_publish()
+        return True
+
+    def _queue_virtual_column_window_fraction(
+        self, frac: float, *, reason: str = "hscroll", request_id: int | None = None
+    ) -> bool:
+        try:
+            fraction = max(0.0, min(1.0, float(frac)))
+        except Exception:
+            return False
+        total = max(0, int(self._logical_slot_count() or 0))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        return self._queue_virtual_column_window(
+            int(fraction * max(0, total - cap)),
+            reason=reason,
+            request_id=request_id,
+        )
+
+    def _virtual_xview(self, *args) -> bool:
+        """Interpret Tk scrollbar commands in complete logical columns."""
+        if not self._wide_column_virtual_active() or not args:
+            return False
+        total = max(0, int(self._logical_slot_count() or 0))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        current = int(getattr(self, "_virtual_column_window_start", 0) or 0)
+        command = str(args[0])
+        if command == "moveto" and len(args) >= 2:
+            try:
+                return self._queue_virtual_column_window(
+                    int(float(args[1]) * max(0, total - cap)), reason="hthumb"
+                )
+            except Exception:
+                return True
+        if command == "scroll" and len(args) >= 3:
+            try:
+                amount = int(args[1])
+            except Exception:
+                return True
+            unit = str(args[2])
+            step = max(1, cap - 2) if unit == "pages" else 1
+            return self._queue_virtual_column_window(
+                current + amount * step,
+                reason="hpage" if unit == "pages" else "hscroll",
+            )
+        return True
+
+    def _ensure_logical_column_materialized(self, logical_col: int) -> bool:
+        """Synchronously bring a logical target into the bounded wide window."""
+        try:
+            col = int(logical_col)
+        except Exception:
+            return False
+        if not self._wide_column_virtual_active():
+            return True
+        cols = self._rendered_logical_columns()
+        if col in cols:
+            return True
+        total = max(0, int(self._logical_slot_count() or 0))
+        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+        # Keep an explicitly focused off-screen field at the left edge.  A
+        # centred target could force Text.see() to create a second, local
+        # horizontal offset that headers/C do not share.
+        start = max(0, min(col - 1, max(0, total - cap)))
+        self._virtual_pending_column_start = None
+        self._set_virtual_column_window_start(start)
+        # Focus/copy navigation needs a valid current span before it places a
+        # Text mark.  This bounded repaint stays immutable and does no I/O.
+        self._publish_virtual_window(int(getattr(self, "_virtual_window_start", 0) or 0))
+        return col in self._rendered_logical_columns()
+
+    def _virtual_window_rows(self, start: int | None = None) -> list[int]:
+        total = len(self._full_display_rows)
+        cap = min(self._virtual_viewport_row_capacity(), total)
+        if total <= cap:
+            self._virtual_window_start = 0
+            return list(self._full_display_rows)
+        if start is None:
+            start = self._virtual_window_start
+        start = max(0, min(int(start or 0), total - cap))
+        self._virtual_window_start = start
+        return list(self._full_display_rows[start:start + cap])
+
+    def _virtual_scroll_fractions(self) -> tuple[float, float]:
+        total = len(self._full_display_rows)
+        if total <= 0:
+            return (0.0, 1.0)
+        first = float(self._virtual_window_start) / float(total)
+        last = float(self._virtual_window_start + len(self.display_rows)) / float(total)
+        return (max(0.0, min(1.0, first)), max(0.0, min(1.0, last)))
+
+    def _canonical_virtual_row_start(self, start: int) -> int:
+        """Return the only valid bounded row-window start for this snapshot."""
+        total = len(getattr(self, "_full_display_rows", ()) or ())
+        cap = min(self._virtual_viewport_row_capacity(), total)
+        return max(0, min(int(start), max(0, total - cap)))
+
+    def _queue_virtual_window(
+        self,
+        start: int,
+        *,
+        reason: str = "viewport",
+        request_id: int | None = None,
+        force_after0: bool = False,
+    ):
+        """Coalesce high-rate scroll input without comparison or workbook reads."""
+        note_activity = getattr(self.app, "_note_ui_activity", None)
+        if callable(note_activity):
+            note_activity("viewport")
+        if not self._virtual_mode_active():
+            return False
+        if bool(getattr(self, "_staged_virtual_surface_active", False)):
+            # The opaque calculating surface owns this first document.  Keep
+            # the latest exact window stable until its generation completes;
+            # no partial line/target can be exposed underneath the overlay.
+            active = getattr(self, "_viewport_request_active", None)
+            if (
+                isinstance(active, dict)
+                and active.get("status") == "pending"
+                and str(active.get("kind") or "") == "diff-navigation"
+                and (request_id is None or int(active.get("id", -1)) == int(request_id))
+            ):
+                # Diff-block navigation cannot complete against the opaque
+                # calculating surface. Fail closed rather than leave a
+                # scheduled request with neither an after(0) owner nor a
+                # terminal record.
+                self._cancel_virtual_2d_publish()
+                self._fail_viewport_request(active, "navigation-staged-surface")
+                return None
+            return True
+        target_start = self._canonical_virtual_row_start(int(start))
+        target_col = (
+            self._virtual_pending_column_start
+            if self._virtual_pending_column_start is not None
+            else self._virtual_column_window_start
+        )
+        if request_id is None:
+            request_id = self._begin_viewport_request(
+                reason, row_start=target_start, column_start=target_col
+            )
+        else:
+            self._update_viewport_request_target(
+                request_id, row_start=target_start, column_start=target_col
+            )
+        if (
+            not bool(force_after0)
+            and
+            self._virtual_publish_after_id is None
+            and self._virtual_pending_start is None
+            and self._virtual_pending_column_start is None
+            and target_start == int(getattr(self, "_virtual_window_start", 0))
+            and list(getattr(self, "display_rows", ()) or ())
+            == self._virtual_window_rows(target_start)
+        ):
+            # A wheel/page/minimap burst frequently resolves to the already
+            # visible edge.  Do not clear and repaint the same Tk document:
+            # that adds a costly paint flush without changing any cell.
+            self._complete_viewport_request_if_current()
+            return True
+        self._virtual_pending_start = target_start
+        self._schedule_virtual_2d_publish()
+        return True
+
+    def _publish_virtual_window(self, start: int):
+        """Replace Tk documents from immutable prepared rows only.
+
+        This method intentionally contains no call to ``app.ws_*``, worksheet
+        iteration, formula normalization, row alignment, or diff generation.
+        Those operations are permitted only while the snapshot is prepared in
+        the background.
+        """
+        if not self._virtual_mode_active():
+            return False
+        self._apply_pending_virtual_column_window()
+        render_started = time.perf_counter()
+        phase_marks = {}
+        detail_phase_ms: dict[str, float] = {}
+        phase_started = render_started
+
+        def _mark_detail_phase(name: str) -> None:
+            nonlocal phase_started
+            now = time.perf_counter()
+            detail_phase_ms[str(name)] = max(0.0, (now - phase_started) * 1000.0)
+            phase_started = now
+
+        rows = self._virtual_window_rows(start)
+        _mark_detail_phase("bounded_row_selection")
+        # A 3-way visual-diff decision can consult structural/common-insertion
+        # state.  Freeze the column/proof facts once for this immutable
+        # (rows, column-window) publication, while preserving the per-pair raw
+        # A/B/Base channels below.  The context is never retained across a new
+        # data/projection/window generation; build failure falls back to the
+        # legacy helper rather than guessing that a difference is resolved.
+        visual_diff_surface_context = self._build_visual_diff_surface_context(rows)
+        _mark_detail_phase("visual_context")
+        visual_diff_cols_by_pair = {
+            int(pair_idx): frozenset(
+                self._visual_diff_cols_for_pair(
+                    pair_idx,
+                    surface_context=visual_diff_surface_context,
+                )
+            )
+            for pair_idx in rows
+        }
+        rendered_logical_columns_ordered = tuple(self._rendered_logical_columns())
+        rendered_logical_columns = frozenset(rendered_logical_columns_ordered)
+        # Full visual sets remain authoritative for diff rows, only-diff, C,
+        # and action eligibility.  The Text cell-tag pass needs only the
+        # visible positive columns, so prepare that projection and its shared
+        # geometry once rather than rediscovering it for every pane/row.
+        visible_diff_cols_by_pair = {
+            int(pair_idx): frozenset(
+                int(col)
+                for col in visual_diff_cols_by_pair.get(int(pair_idx), frozenset())
+                if int(col) > 0 and int(col) in rendered_logical_columns
+            )
+            for pair_idx in rows
+        }
+        _mark_detail_phase("visual_map_projection")
+        diffcell_surface_context = self._build_diffcell_surface_context(
+            rendered_logical_columns
+        )
+        _mark_detail_phase("diffcell_context")
+        line_render_context, line_render_context_telemetry = (
+            self._build_virtual_line_render_context(rendered_logical_columns_ordered)
+        )
+        _mark_detail_phase("line_render_context")
+        # In an only-difference viewport where every logical row is already a
+        # difference, the per-row `diffrow` background is uniform.  Paint it
+        # once as the widget background instead of issuing six Text tag-add
+        # calls for every recycled row. Padding/diff-cell tags still override
+        # it, so missing rows and exact changed-cell emphasis remain visible.
+        flat_diff_background = bool(rows) and bool(self.only_diff_var.get()) and all(
+            bool(visual_diff_cols_by_pair.get(int(pair_idx), ()))
+            for pair_idx in rows
+        )
+        self._set_virtual_flat_diff_background(flat_diff_background)
+        _mark_detail_phase("flat_bg")
+        self._virtual_publishing = True
+        try:
+            # Rendering is lazy but remains snapshot-only: this formats at
+            # most the bounded viewport from immutable raw fragments and never
+            # asks a Worksheet (or editable backend) for a missing value.
+            materialize_stats = self._materialize_prepared_pair_text(
+                rows,
+                render_context=line_render_context,
+            )
+            if not isinstance(materialize_stats, dict):
+                materialize_stats = {"rows": len(rows), "sides": {}}
+            _mark_detail_phase("materialize")
+            self.display_rows = rows
+            self.row_to_line = {pair_idx: line for line, pair_idx in enumerate(rows, start=1)}
+            _mark_detail_phase("row_map")
+            # `_replace_text_document` below replaces the entire bounded
+            # document and therefore also removes its old tag ranges.  Do not
+            # first send a second whole-document `delete` command: on a dense
+            # two-dimensional window that redundant native mutation was a
+            # measurable part of the end-to-end wheel/thumb latency.
+            phase_marks["delete"] = (time.perf_counter() - render_started) * 1000.0
+
+            lines_a = [self.pair_text_a[pair_idx] for pair_idx in rows]
+            lines_b = [self.pair_text_b[pair_idx] for pair_idx in rows]
+            lines_base = [self.pair_text_base.get(pair_idx, "") for pair_idx in rows]
+            self._replace_text_document(
+                self.left, "\n".join(lines_a) + ("\n" if lines_a else "")
+            )
+            if self._is_three_way_enabled():
+                self._replace_text_document(
+                    self.base, "\n".join(lines_base) + ("\n" if lines_base else "")
+                )
+            self._replace_text_document(
+                self.right, "\n".join(lines_b) + ("\n" if lines_b else "")
+            )
+            _mark_detail_phase("tk_replace")
+            phase_marks["insert"] = (time.perf_counter() - render_started) * 1000.0
+            # Headers use the identical global logical-column window and must
+            # be rebuilt with each horizontal publication, not merely cache
+            # application.  The complete column model remains untouched.
+            self._render_col_headers()
+            phase_marks["column_headers"] = (time.perf_counter() - render_started) * 1000.0
+            self._render_row_headers_full()
+            phase_marks["row_header_detail"] = dict(
+                getattr(self, "_last_row_header_render_phases_ms", {}) or {}
+            )
+            phase_marks["row_headers"] = (time.perf_counter() - render_started) * 1000.0
+            phase_marks["headers"] = (time.perf_counter() - render_started) * 1000.0
+            _mark_detail_phase("headers")
+
+            diffrow_args = []
+            diffcell_a = []
+            diffcell_base = []
+            diffcell_b = []
+            pad_left = []
+            pad_right = []
+            diff_count = 0
+            for line, pair_idx in enumerate(rows, start=1):
+                ra, rb = self.row_pairs[pair_idx]
+                if ra is None:
+                    pad_left.extend([f"{line}.0", f"{line}.end"])
+                if rb is None:
+                    pad_right.extend([f"{line}.0", f"{line}.end"])
+                visual_diff_cols = visual_diff_cols_by_pair.get(
+                    int(pair_idx),
+                    frozenset(),
+                )
+                if not visual_diff_cols:
+                    continue
+                diff_count += 1
+                if not flat_diff_background:
+                    diffrow_args.extend([f"{line}.0", f"{line}.end"])
+                a_args, base_args, b_args, _ar, _br, _rr = self._diffcell_tag_args_for_line(
+                    line,
+                    pair_idx,
+                    lines_a[line - 1],
+                    lines_base[line - 1],
+                    lines_b[line - 1],
+                    visual_diff_cols=visual_diff_cols,
+                    rendered_logical_columns=rendered_logical_columns,
+                    visible_diff_cols=visible_diff_cols_by_pair.get(
+                        int(pair_idx), frozenset()
+                    ),
+                    surface_context=diffcell_surface_context,
+                )
+                diffcell_a.extend(a_args)
+                diffcell_base.extend(base_args)
+                diffcell_b.extend(b_args)
+            phase_marks["diff_tag_args"] = (time.perf_counter() - render_started) * 1000.0
+            if diffrow_args:
+                for widget in (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln):
+                    widget.tag_add("diffrow", *diffrow_args)
+            if diffcell_a:
+                self.left.tag_add("diffcell", *diffcell_a)
+            if diffcell_base and self._is_three_way_enabled():
+                self.base.tag_add("diffcell", *diffcell_base)
+            if diffcell_b:
+                self.right.tag_add("diffcell", *diffcell_b)
+            phase_marks["diff_tags"] = (time.perf_counter() - render_started) * 1000.0
+            # ``diffcell`` has higher tag priority than ``diffrow``.  Do not
+            # issue one Tcl ``tag_remove`` per cell range here: that was the
+            # dominant cost of a recycled all-difference viewport.
+            if pad_left:
+                self.left.tag_add("paddingrow", *pad_left)
+            if pad_right:
+                self.right.tag_add("paddingrow", *pad_right)
+            phase_marks["padding_row_tags"] = (time.perf_counter() - render_started) * 1000.0
+            phase_marks["row_cell_tags"] = (time.perf_counter() - render_started) * 1000.0
+            for widget, side in ((self.left, "A"), (self.base, "BASE"), (self.right, "B")):
+                args = self._padding_column_tag_args(side, len(rows))
+                if args and (side != "BASE" or self._is_three_way_enabled()):
+                    widget.tag_add("paddingcol", *args)
+            _mark_detail_phase("tags")
+            self._display_diff_row_count = diff_count
+            self._virtual_scroll_publications += 1
+            self._last_virtual_render_ms = (time.perf_counter() - render_started) * 1000.0
+            self._viewport_render_samples_ms.append(self._last_virtual_render_ms)
+            phase_marks["total"] = self._last_virtual_render_ms
+            self._last_virtual_render_phases_ms = phase_marks
+            self.info.configure(text=self._normal_sheet_info_text())
+            deferred_navigation_active = (
+                self._active_deferred_diff_navigation()[0] is not None
+            )
+            if not deferred_navigation_active:
+                self._refresh_diff_block_ui()
+                self._update_diff_nav_state()
+                # The C-area is a separate Text document. Refresh it after
+                # the main/header window completes for every ordinary virtual
+                # request, not only wide tables, so the end-to-end boundary
+                # never leaves a stale selection/C surface behind.
+                self._update_cursor_lines()
+            first, last = self._virtual_scroll_fractions()
+            self._yscroll_all(first, last)
+            self._set_wide_column_scrollbars()
+            self._trim_prepared_text_cache()
+            if deferred_navigation_active:
+                # Diff-block navigation intentionally performs the original
+                # selection/x-restore/C/nav refresh only after the bounded
+                # document, headers, tags, and logical scrollbars are current.
+                # It then becomes part of this request's one terminal E2E
+                # sample; no callback may complete against the old selection.
+                if self._finish_deferred_diff_navigation_after_publish() is not True:
+                    return False
+            _mark_detail_phase("cursor")
+            phase_marks["cursor"] = (time.perf_counter() - render_started) * 1000.0
+            _mark_detail_phase("finalize")
+            phase_marks["finalize"] = (time.perf_counter() - render_started) * 1000.0
+            detail_phase_ms["render_total"] = max(
+                0.0, (time.perf_counter() - render_started) * 1000.0
+            )
+            phase_marks["detail_ms"] = dict(detail_phase_ms)
+            phase_marks["materialize"] = {
+                **dict(materialize_stats),
+                "sides": {
+                    str(side): dict(counts or {})
+                    for side, counts in dict(
+                        materialize_stats.get("sides", {}) or {}
+                    ).items()
+                },
+            }
+            formatter_stats = dict(materialize_stats.get("formatter", {}) or {})
+            line_render_context_telemetry = {
+                **dict(line_render_context_telemetry or {}),
+                "fallback": bool(
+                    dict(line_render_context_telemetry or {}).get("fallback")
+                    or formatter_stats.get("fallback")
+                ),
+                "fallback_reason": str(
+                    formatter_stats.get("fallback_reason")
+                    or dict(line_render_context_telemetry or {}).get("fallback_reason")
+                    or ""
+                ),
+                "formatted": {
+                    "context": int(formatter_stats.get("context_formatted", 0) or 0),
+                    "legacy": int(formatter_stats.get("legacy_formatted", 0) or 0),
+                    "base_empty_legacy": int(
+                        formatter_stats.get("base_empty_legacy", 0) or 0
+                    ),
+                },
+            }
+            phase_marks["line_render_context"] = dict(line_render_context_telemetry)
+            # Capture the complete local publication phases after C, logical
+            # scrollbars, and cache maintenance.  End-to-end records take a
+            # bounded copy immediately below for per-input diagnostics.
+            self._last_virtual_render_phases_ms = phase_marks
+            active_request = getattr(self, "_viewport_request_active", None) or {}
+            try:
+                request_id = (
+                    int(active_request.get("id"))
+                    if active_request.get("status") == "pending"
+                    else None
+                )
+            except Exception:
+                request_id = None
+            publication = {
+                "publication_seq": int(self._virtual_scroll_publications),
+                "request_id": request_id,
+                "generation": self._viewport_request_generation(),
+                "selected_sheet": str(getattr(self.app, "selected_sheet", "") or ""),
+                "window": {
+                    "row_start": int(self._virtual_window_start),
+                    "row_count": len(rows),
+                    "column_start": int(self._virtual_column_window_start),
+                    "rendered_logical_columns": tuple(sorted(rendered_logical_columns)),
+                },
+                "phase_ms": dict(detail_phase_ms),
+                "materialize": dict(phase_marks["materialize"]),
+                "render_context": dict(line_render_context_telemetry),
+            }
+            self._last_virtual_publication_telemetry = publication
+            history = getattr(self, "_virtual_publication_telemetry", None)
+            if history is None:
+                history = deque(maxlen=128)
+                self._virtual_publication_telemetry = history
+            try:
+                history.append(dict(publication))
+            except Exception:
+                pass
+            self._complete_viewport_request_if_current()
+            # Timestamp only after main/header/C/scrollbar publication and
+            # end-to-end request completion, never at an earlier body phase.
+            self._virtual_publication_timestamps.append(time.perf_counter())
+            if self._last_virtual_render_ms > 33.0:
+                _dlog(
+                    "WIDE_VIEWPORT_SLOW "
+                    f"sheet={self.sheet} rows={len(rows)} cols={len(self._rendered_logical_columns())} "
+                    f"phases={phase_marks}"
+                )
+            return True
+        finally:
+            self._virtual_publishing = False
+
+    def _set_virtual_flat_diff_background(self, enabled: bool) -> None:
+        """Apply the uniform only-diff row colour once per state transition."""
+        enabled = bool(enabled)
+        if enabled == getattr(self, "_virtual_flat_diff_background_active", None):
+            return
+        self._virtual_flat_diff_background_active = enabled
+        body_colors = (_MINE_BG, _BASE_BG, _THEIRS_BG) if enabled else ("white", "white", "white")
+        header_color = "#ffd9d9" if enabled else "#efefef"
+        for widget, color in zip((self.left, self.base, self.right), body_colors):
+            try:
+                widget.configure(bg=color)
+            except Exception:
+                pass
+        for widget in (self.left_ln, self.base_ln, self.right_ln):
+            try:
+                widget.configure(bg=header_color)
+            except Exception:
+                pass
+
+    def _begin_staged_virtual_first_surface(self, on_complete, *, chunk_rows: int = 5) -> bool:
+        """Paint a dense first virtual surface in bounded, still-gated frames.
+
+        The calculation overlay remains opaque and the public Sheet state stays
+        ``CALCULATING`` until the final callback.  Each frame writes only a
+        small immutable row slice, so a 69-column viewport cannot starve the
+        Tk heartbeat while its first exact surface is prepared.
+        """
+        if (
+            not self._virtual_mode_active()
+            or self._wide_column_virtual_active()
+            or int(getattr(self, "max_col", 0)) < 48
+        ):
+            return False
+        rows = self._virtual_window_rows(self._virtual_window_start)
+        if len(rows) <= max(1, int(chunk_rows)):
+            return False
+        token = int(getattr(self, "_virtual_publish_generation", 0)) + 1
+        self._virtual_publish_generation = token
+        expected_sheet = str(self.sheet)
+        expected_selected_sheet = str(getattr(self.app, "selected_sheet", "") or "")
+        expected_exact_generation = getattr(
+            getattr(self.app, "_sheet_exact_entry", lambda _sheet: {})(self.sheet),
+            "get",
+            lambda _key, _default=None: _default,
+        )("generation")
+        expected_column_generation = int(getattr(self, "_virtual_column_window_generation", 0))
+        self._staged_virtual_surface_active = True
+        self._virtual_publishing = True
+        self._materialize_prepared_pair_text(rows)
+        lines_a = [self.pair_text_a[pair_idx] for pair_idx in rows]
+        lines_b = [self.pair_text_b[pair_idx] for pair_idx in rows]
+        lines_base = [self.pair_text_base.get(pair_idx, "") for pair_idx in rows]
+        self.display_rows = list(rows)
+        self.row_to_line = {pair_idx: line for line, pair_idx in enumerate(rows, start=1)}
+        for widget in (self.left, self.base, self.right):
+            widget.delete("1.0", "end")
+        self._render_row_headers_full()
+        cursor = {"offset": 0}
+
+        def _current() -> bool:
+            return bool(
+                getattr(self, "_staged_virtual_surface_active", False)
+                and int(getattr(self, "_virtual_publish_generation", -1)) == token
+                and self._virtual_mode_active()
+                and str(getattr(self.app, "selected_sheet", "") or "") == expected_selected_sheet
+                and expected_selected_sheet == expected_sheet
+                and getattr(
+                    getattr(self.app, "_sheet_exact_entry", lambda _sheet: {})(self.sheet),
+                    "get",
+                    lambda _key, _default=None: _default,
+                )("generation") == expected_exact_generation
+                and int(getattr(self, "_virtual_column_window_generation", 0)) == expected_column_generation
+            )
+
+        def _finish():
+            if not _current():
+                return
+            started = time.perf_counter()
+            diffrow_args, diffcell_a, diffcell_base, diffcell_b = [], [], [], []
+            pad_left, pad_right, diff_count = [], [], 0
+            for line, pair_idx in enumerate(rows, start=1):
+                ra, rb = self.row_pairs[pair_idx]
+                if ra is None:
+                    pad_left.extend([f"{line}.0", f"{line}.end"])
+                if rb is None:
+                    pad_right.extend([f"{line}.0", f"{line}.end"])
+                if not self._pair_has_visual_diff(pair_idx):
+                    continue
+                diff_count += 1
+                diffrow_args.extend([f"{line}.0", f"{line}.end"])
+                a_args, base_args, b_args, _ar, _br, _rr = self._diffcell_tag_args_for_line(
+                    line, pair_idx, lines_a[line - 1], lines_base[line - 1], lines_b[line - 1]
+                )
+                diffcell_a.extend(a_args)
+                diffcell_base.extend(base_args)
+                diffcell_b.extend(b_args)
+            if diffrow_args:
+                for widget in (self.left, self.base, self.right, self.left_ln, self.base_ln, self.right_ln):
+                    widget.tag_add("diffrow", *diffrow_args)
+            if diffcell_a:
+                self.left.tag_add("diffcell", *diffcell_a)
+            if diffcell_base and self._is_three_way_enabled():
+                self.base.tag_add("diffcell", *diffcell_base)
+            if diffcell_b:
+                self.right.tag_add("diffcell", *diffcell_b)
+            if pad_left:
+                self.left.tag_add("paddingrow", *pad_left)
+            if pad_right:
+                self.right.tag_add("paddingrow", *pad_right)
+            for widget, side in ((self.left, "A"), (self.base, "BASE"), (self.right, "B")):
+                args = self._padding_column_tag_args(side, len(rows))
+                if args and (side != "BASE" or self._is_three_way_enabled()):
+                    widget.tag_add("paddingcol", *args)
+            self._display_diff_row_count = diff_count
+            self._virtual_scroll_publications += 1
+            self._virtual_publication_timestamps.append(time.perf_counter())
+            self._last_virtual_render_ms = (time.perf_counter() - started) * 1000.0
+            self._viewport_render_samples_ms.append(self._last_virtual_render_ms)
+            self.info.configure(text=self._normal_sheet_info_text())
+            self._refresh_diff_block_ui()
+            self._update_diff_nav_state()
+            first, last = self._virtual_scroll_fractions()
+            self._yscroll_all(first, last)
+            self._trim_prepared_text_cache()
+            self._staged_virtual_surface_active = False
+            self._virtual_publishing = False
+            on_complete()
+
+        def _append_chunk():
+            if not _current():
+                # A tab/generation/column-window change superseded this
+                # opaque first-surface frame.  Clear its local ownership and
+                # let the caller's completion guard restore a hidden terminal
+                # summary or publish the current generation; otherwise a
+                # later tab return would remain stranded in CALCULATING.
+                self._staged_virtual_surface_active = False
+                self._virtual_publishing = False
+                on_complete()
+                return
+            started = time.perf_counter()
+            begin = int(cursor["offset"])
+            end = min(len(rows), begin + max(1, int(chunk_rows)))
+            suffix = "\n" if end > begin else ""
+            self.left.insert("end", "\n".join(lines_a[begin:end]) + suffix)
+            if self._is_three_way_enabled():
+                self.base.insert("end", "\n".join(lines_base[begin:end]) + suffix)
+            self.right.insert("end", "\n".join(lines_b[begin:end]) + suffix)
+            self._viewport_render_samples_ms.append((time.perf_counter() - started) * 1000.0)
+            cursor["offset"] = end
+            if end < len(rows):
+                # Use a frame-scale delay rather than 1ms: ``Tk.update`` can
+                # otherwise consume every newly-due chunk in one turn and turn
+                # a nominally staged viewport back into a single paint stall.
+                self.frame.after(_VIRTUAL_SCROLL_COALESCE_MS, _append_chunk)
+            else:
+                # Let Tk paint the final body slice before tags/terminal state.
+                self.frame.after(_VIRTUAL_SCROLL_COALESCE_MS, _finish)
+
+        self.frame.after(_VIRTUAL_SCROLL_COALESCE_MS, _append_chunk)
+        return True
+
+    def _virtual_yview(self, *args, reason: str = "vscroll"):
+        if not self._virtual_mode_active() or not args:
+            return False
+        total = len(self._full_display_rows)
+        cap = min(self._virtual_viewport_row_capacity(), total)
+        target = self._virtual_window_start
+        command = str(args[0])
+        if command == "moveto" and len(args) >= 2:
+            try:
+                target = int(float(args[1]) * max(0, total - cap))
+            except Exception:
+                return True
+        elif command == "scroll" and len(args) >= 3:
+            try:
+                amount = int(args[1])
+            except Exception:
+                return True
+            unit = str(args[2])
+            target += amount * (max(1, cap - 2) if unit == "pages" else 3)
+        else:
+            return False
+        if command == "moveto":
+            reason = "vthumb" if reason == "vscroll" else reason
+        elif command == "scroll" and len(args) >= 3 and str(args[2]) == "pages":
+            reason = "vpage" if reason == "vscroll" else reason
+        self._queue_virtual_window(target, reason=reason)
+        return True
+
     def _yscroll_all(self, first, last):
         for sb in (self.vsb_left, self.vsb_a, self.vsb_m, self.vsb_b):
             try:
@@ -14755,6 +20526,8 @@ class SheetView:
             pass
 
     def _yscroll_left(self, first, last):
+        if self._virtual_publishing:
+            return
         if self._syncing:
             return
         self._syncing = True
@@ -14771,6 +20544,8 @@ class SheetView:
         self._maybe_load_more_rows(last)
 
     def _yscroll_mid(self, first, last):
+        if self._virtual_publishing:
+            return
         if self._syncing:
             return
         self._syncing = True
@@ -14786,6 +20561,8 @@ class SheetView:
         self._maybe_load_more_rows(last)
 
     def _yscroll_right(self, first, last):
+        if self._virtual_publishing:
+            return
         if self._syncing:
             return
         self._syncing = True
@@ -14801,7 +20578,16 @@ class SheetView:
             self._syncing = False
         self._maybe_load_more_rows(last)
 
-    def _yview_both(self, *args):
+    def _note_view_activity(self, reason: str) -> None:
+        """Record a view callback without coupling it to workbook access."""
+        note_activity = getattr(self.app, "_note_ui_activity", None)
+        if callable(note_activity):
+            note_activity(str(reason or "view"))
+
+    def _yview_both(self, *args, _viewport_reason: str | None = None):
+        self._note_view_activity("vscroll")
+        if self._virtual_yview(*args, reason=(_viewport_reason or "vscroll")):
+            return
         self._syncing = True
         try:
             self.left.yview(*args)
@@ -14825,6 +20611,7 @@ class SheetView:
             pass
 
     def _on_mousewheel(self, event):
+        self._note_view_activity("wheel")
         if getattr(event, "num", None) == 4:
             delta = 120
         elif getattr(event, "num", None) == 5:
@@ -14832,13 +20619,21 @@ class SheetView:
         else:
             delta = event.delta
         steps = int(-1 * (delta / 120))
-        self._yview_both("scroll", steps, "units")
+        self._yview_both("scroll", steps, "units", _viewport_reason="wheel")
         return "break"
 
     def _on_vdiff_map_click(self, event):
+        self._note_view_activity("vminimap")
         try:
             h = max(1, self.vdiff_map.winfo_height())
             frac = min(1.0, max(0.0, float(event.y) / float(h)))
+            if self._virtual_mode_active():
+                total = len(self._full_display_rows)
+                self._queue_virtual_window(
+                    int(frac * max(0, total - self._virtual_viewport_row_capacity())),
+                    reason="vminimap",
+                )
+                return
             total_pairs = len(self.row_pairs) if getattr(self, "row_pairs", None) else 0
             if total_pairs > 0 and self.display_rows:
                 target_pair = min(total_pairs - 1, max(0, int(frac * total_pairs)))
@@ -14881,6 +20676,7 @@ class SheetView:
         return start_pair, min(len(self.row_pairs), end_pair + 1)
 
     def _on_hdiff_map_click(self, event, pane: str):
+        self._note_view_activity("hminimap")
         try:
             canvas = self.hdiff_left if pane == "left" else (self.hdiff_mid if pane == "mid" else self.hdiff_right)
             w = max(1, canvas.winfo_width())
@@ -14889,6 +20685,9 @@ class SheetView:
             logical_col = min(logical_count, max(1, int(frac * logical_count) + 1))
             source_side = "A" if pane == "left" else ("BASE" if pane == "mid" else "B")
             self._select_column_block_by_logical_col(logical_col, source_side)
+            if self._wide_column_virtual_active():
+                self._queue_virtual_column_window_fraction(frac, reason="hminimap")
+                return
             self._sync_main_x_to_frac(frac)
             self._sync_c_x_to_frac(frac)
         except Exception:
@@ -15037,7 +20836,10 @@ class SheetView:
             canvases = [self.hdiff_left, self.hdiff_right]
             if self._is_three_way_enabled():
                 canvases.insert(1, self.hdiff_mid)
-            lf, ll = self.left.xview()
+            if self._wide_column_virtual_active():
+                lf, ll = self._wide_column_scroll_fractions()
+            else:
+                lf, ll = self.left.xview()
             for canvas in canvases:
                 canvas.delete("vpbox")
                 cw = max(1, canvas.winfo_width())
@@ -15298,6 +21100,9 @@ class SheetView:
         y_root: int | None = None,
         refresh_c_area: bool = True,
     ):
+        note_activity = getattr(self.app, "_note_ui_activity", None)
+        if callable(note_activity):
+            note_activity("hover")
         pair_idx = self._normalize_pair_idx(pair_idx)
         try:
             col_idx = int(col_idx) if col_idx is not None else None
@@ -15316,18 +21121,33 @@ class SheetView:
         if refresh_c_area and not self.has_explicit_cell_selection():
             self._update_cursor_lines()
 
-        panel_payload = self._cmp_tooltip_payload_by_pair_col(
-            pair_idx,
-            col_idx,
-            force_show=bool(popup_force_show),
-            force_panel=bool(force_panel),
+        # The same immutable payload feeds both the compare panel and optional
+        # popup. Computing it twice used to double a hidden workbook fallback
+        # on every pointer move.
+        payload_request_key = (
+            int(pair_idx),
+            int(col_idx),
+            bool(popup_force_show),
+            bool(force_panel),
+            int(getattr(self, "_data_version", 0) or 0),
+            int(getattr(self, "_column_projection_generation", 0) or 0),
         )
-        if panel_payload:
-            panel_text, panel_key = panel_payload
+        if payload_request_key == getattr(self, "_last_hover_payload_request_key", None):
+            payload = self._last_hover_payload_request_value
+        else:
+            payload = self._cmp_tooltip_payload_by_pair_col(
+                pair_idx,
+                col_idx,
+                force_show=bool(popup_force_show),
+                force_panel=bool(force_panel),
+            )
+            self._last_hover_payload_request_key = payload_request_key
+            self._last_hover_payload_request_value = payload
+        if payload:
+            panel_text, panel_key = payload
             self._set_hover_compare_panel(panel_text, panel_key)
-        popup_payload = self._cmp_tooltip_payload_by_pair_col(pair_idx, col_idx, force_show=bool(popup_force_show))
-        if popup_payload and x_root is not None and y_root is not None:
-            tip_text, key = popup_payload
+        if payload and x_root is not None and y_root is not None:
+            tip_text, key = payload
             self._show_cell_tooltip(tip_text, int(x_root), int(y_root), key)
         else:
             self._hide_cell_tooltip(clear_panel=False)
@@ -15394,6 +21214,8 @@ class SheetView:
 
     def _select_from_widget(self, w: tk.Text, event):
         # Set insert mark to the clicked position so follow-up actions can use it.
+        self._note_view_activity("main-click")
+        self._begin_interaction_request("main-click")
         x_before = 0.0
         try:
             x_before = float((self.left.xview() or (0.0, 1.0))[0])
@@ -15464,6 +21286,7 @@ class SheetView:
             _dlog(f"select_from_widget xview before={x_before:.6f} after={x_after:.6f} line={line} col={col}")
         except Exception:
             pass
+        self._complete_interaction_request_if_current()
 
     def _select_line(self, line: int):
         if line < 1:
@@ -15487,6 +21310,7 @@ class SheetView:
         self._update_diff_nav_state()
 
     def _on_row_header_click(self, w: tk.Text, event, direction: str):
+        self._note_view_activity("row-header-click")
         try:
             idx = w.index(f"@{event.x},{event.y}")
             line = int(str(idx).split(".")[0])
@@ -15624,6 +21448,7 @@ class SheetView:
             self._hover_ln_line_right = None
 
     def _on_row_header_hover(self, w: tk.Text, event, direction: str):
+        self._note_view_activity("row-header-hover")
         try:
             idx = w.index(f"@{event.x},{event.y}")
             line = int(str(idx).split(".")[0])
@@ -16055,6 +21880,38 @@ class SheetView:
             except Exception:
                 self._hide_cell_tooltip(clear_panel=False)
 
+    def _prepared_value_for_logical_cell(
+        self,
+        pair_idx: int,
+        side: str,
+        logical_col: int,
+    ) -> str:
+        """Return a view-only value from immutable prepared fragments.
+
+        This deliberately has no Worksheet fallback. A missing fragment means
+        the exact render data is not installed for this target yet, which is a
+        presentation condition rather than permission to materialize editable
+        workbooks on the Tk thread.
+        """
+        side = str(side or "").upper()
+        maps = {
+            "A": getattr(self, "pair_raw_parts_a", {}),
+            "B": getattr(self, "pair_raw_parts_b", {}),
+            "BASE": getattr(self, "pair_raw_parts_base", {}),
+        }
+        physical_col = self._physical_col_for_logical(side, logical_col)
+        if physical_col is None:
+            reason = self._active_column_projection().structural_reason(side, logical_col)
+            return f"<{_LOGICAL_COLUMN_PLACEHOLDER}: {reason}>"
+        raw_parts = maps.get(side, {}).get(int(pair_idx))
+        if raw_parts is None:
+            return "<视图数据正在准备>"
+        offset = int(physical_col) - 1
+        if offset < 0 or offset >= len(raw_parts):
+            return ""
+        value = raw_parts[offset]
+        return str(value).replace("\r\n", "⏎").replace("\r", "⏎").replace("\n", "⏎")
+
     def _cmp_tooltip_payload_by_pair_col(
         self,
         pair_idx: int,
@@ -16080,54 +21937,17 @@ class SheetView:
                 rows.append(self._base_row_for_pair(int(pair_idx), pair))
             else:
                 rows.append(self._row_for_side(pair, side))
-        ws_edit_cache = {}
-
         values = []
         for side, row_no in zip(sides, rows):
             if row_no is None:
                 values.append("<missing>")
                 continue
-            physical_col = self._physical_col_for_logical(side, target_col)
-            if physical_col is None:
-                reason = self._active_column_projection().structural_reason(side, target_col)
-                values.append(f"<{_LOGICAL_COLUMN_PLACEHOLDER}: {reason}>")
-                continue
             try:
-                if side == "A":
-                    ws_val = self.app.ws_a_val(self.sheet)
-                elif side == "BASE":
-                    ws_val = self.app.ws_base_val(self.sheet)
-                else:
-                    ws_val = self.app.ws_b_val(self.sheet)
-                v_disp = ws_val.cell(row=row_no, column=physical_col).value
-                # Keep tooltip value source aligned with row rendering:
-                # when cached-values mode misses literals, rendering falls back to edit WB.
-                if _USE_CACHED_VALUES_ONLY and v_disp is None:
-                    ws_edit = ws_edit_cache.get(side)
-                    if ws_edit is None:
-                        try:
-                            if side == "A":
-                                ws_edit = self.app.ws_a_edit(self.sheet)
-                            elif side == "BASE":
-                                ws_edit = self.app.ws_base_edit(self.sheet)
-                            else:
-                                ws_edit = self.app.ws_b_edit(self.sheet)
-                            ws_edit_cache[side] = ws_edit
-                        except Exception:
-                            ws_edit = None
-                    if ws_edit is not None:
-                        try:
-                            v_edit = ws_edit.cell(row=row_no, column=physical_col).value
-                            if v_edit is not None and not _formula_text(v_edit):
-                                v_disp = v_edit
-                        except Exception:
-                            pass
-                if v_disp is None:
-                    v_str = ""
-                else:
-                    v_str = str(v_disp)
-                    v_str = v_str.replace("\r\n", "⏎").replace("\r", "⏎").replace("\n", "⏎")
-                values.append(v_str)
+                values.append(
+                    self._prepared_value_for_logical_cell(
+                        int(pair_idx), side, target_col
+                    )
+                )
             except Exception:
                 return None
 
@@ -16200,6 +22020,7 @@ class SheetView:
         return None, 0, 0
 
     def _on_cell_hover_tooltip(self, w: tk.Text, event, side: str):
+        self._note_view_activity("main-hover")
         try:
             idx = w.index(f"@{event.x},{event.y}")
             line = int(idx.split(".")[0])
@@ -16253,6 +22074,7 @@ class SheetView:
         return self._cmp_tooltip_payload_by_pair_col(pair_idx, target_col, force_panel=force_panel)
 
     def _on_cursor_cmp_hover_tooltip(self, event):
+        self._note_view_activity("c-area-hover")
         try:
             idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
             idx_s = str(idx)
@@ -16290,6 +22112,7 @@ class SheetView:
         )
 
     def _on_main_pane_right_click(self, w: tk.Text, event, side: str):
+        self._note_view_activity("main-right-click")
         self.clear_explicit_cell_selection()
         self._update_cursor_lines()
         self._update_diff_nav_state()
@@ -16297,18 +22120,16 @@ class SheetView:
         return "break"
 
     def _on_cursor_cmp_right_click(self, event):
+        self._note_view_activity("c-area-right-click")
         self.clear_explicit_cell_selection()
         self._update_cursor_lines()
         self._update_diff_nav_state()
         return "break"
 
     def _on_click_with_arrow(self, w: tk.Text, event, direction: str):
+        self._note_view_activity("main-click")
         # Keep horizontal position stable on click; Tk default Text binding may call see(insert).
-        saved_x = 0.0
-        try:
-            saved_x = float((self.left.xview() or (0.0, 1.0))[0])
-        except Exception:
-            saved_x = 0.0
+        saved_x = self._logical_horizontal_first()
 
         try:
             self._click_trace_seq = int(getattr(self, "_click_trace_seq", 0)) + 1
@@ -16487,12 +22308,9 @@ class SheetView:
             first = float((self.left.yview() or (0.0, 1.0))[0])
         except Exception:
             first = 0.0
+        x_main = self._logical_horizontal_first()
         try:
-            x_main = float((self.left.xview() or (0.0, 1.0))[0])
-        except Exception:
-            x_main = 0.0
-        try:
-            x_c = float((self.cursor_cmp.xview() or (0.0, 1.0))[0])
+            x_c = x_main if self._wide_column_virtual_active() else float((self.cursor_cmp.xview() or (0.0, 1.0))[0])
         except Exception:
             x_c = x_main
         try:
@@ -16601,27 +22419,62 @@ class SheetView:
                 cols.add(c)
         return cols
 
-    def _update_cursor_lines(self):
+    def _update_cursor_lines(
+        self,
+        *,
+        strict: bool = False,
+        strict_x_restore: dict | None = None,
+    ):
         """Update compact row compare block.
 
         2-way: line1=mine(A), line2=theirs(B)
         3-way: line1=base, line2=mine, line3=theirs
         """
+        c_render_started = time.perf_counter()
         prev_suppress_c_xsync = bool(getattr(self, "_suppress_c_xsync", False))
+        previous_c_render_key = getattr(self, "_c_area_last_render_key", None)
+        previous_c_completed_key = getattr(
+            self, "_c_area_last_completed_render_key", None
+        )
+        previous_c_pair_idx = getattr(self, "_last_cursor_cmp_pair_idx", None)
         self._suppress_c_xsync = True
         cursor_first = 0.0
         cell_first = 0.0
+        strict_restore_context = None
         try:
-            try:
-                # Keep C area aligned with main panes by default.
-                cursor_first = float((self.left.xview() or (0.0, 1.0))[0])
-            except Exception:
-                cursor_first = 0.0
-            if hasattr(self, "cell_cmp_text"):
+            if strict_x_restore is not None:
+                if not strict or self._wide_column_virtual_active():
+                    raise RuntimeError("strict C x restore context is not applicable")
+                strict_restore_context = dict(strict_x_restore)
                 try:
-                    cell_first = cursor_first
+                    source_x = float(strict_restore_context["source_x"])
+                    cursor_first = float(strict_restore_context["cursor_x"])
                 except Exception:
-                    cell_first = 0.0
+                    raise RuntimeError("strict C x restore context is incomplete")
+                if not math.isfinite(source_x) or not math.isfinite(cursor_first):
+                    raise RuntimeError("strict C x restore context is non-finite")
+                if hasattr(self, "cell_cmp_text"):
+                    try:
+                        cell_first = float(strict_restore_context["cell_x"])
+                    except Exception:
+                        raise RuntimeError("strict C cell x restore context is incomplete")
+                    if not math.isfinite(cell_first):
+                        raise RuntimeError("strict C cell x restore context is non-finite")
+            else:
+                try:
+                    # A wide C pane is a matching logical-column window, not a
+                    # second full-width Text document.  Its local xview is fixed
+                    # at zero and never becomes global horizontal state.
+                    cursor_first = 0.0 if self._wide_column_virtual_active() else float((self.left.xview() or (0.0, 1.0))[0])
+                except Exception:
+                    if strict:
+                        raise
+                    cursor_first = 0.0
+                if hasattr(self, "cell_cmp_text"):
+                    try:
+                        cell_first = cursor_first
+                    except Exception:
+                        cell_first = 0.0
 
             pair_idx = self.resolved_pair_idx_for_c_area()
             if pair_idx is not None:
@@ -16637,29 +22490,76 @@ class SheetView:
             diff_cols = self._all_logical_diff_cols_for_pair(pair_idx) if pair_idx is not None else set()
             a_text = self.pair_text_a.get(pair_idx, "") if pair_idx is not None else ""
             b_text = self.pair_text_b.get(pair_idx, "") if pair_idx is not None else ""
-            base_text = ""
-            if self._is_three_way_enabled() and pair_idx is not None:
-                base_text = self._build_base_line(pair_idx)
-
             is_three = self._is_three_way_enabled()
-            self._render_cursor_row_headers(pair, is_three)
+            base_text = (
+                self.pair_text_base.get(pair_idx, "")
+                if is_three and pair_idx is not None
+                else ""
+            )
+            try:
+                selected_col = int(getattr(self, "_cursor_cmp_sel_col", 0) or 0)
+                selected_line = int(getattr(self, "_cursor_cmp_sel_line", 0) or 0)
+            except Exception:
+                selected_col = selected_line = 0
+            c_only_diff_value = bool(
+                getattr(self, "c_only_diff_cells", None)
+                and self.c_only_diff_cells.get()
+            )
+            # Pointer motion often repeats the same logical row. Do not
+            # delete/reinsert/re-tag the complete C-area row in that case.
+            c_render_key = (
+                int(pair_idx) if pair_idx is not None else None,
+                bool(is_three),
+                selected_col,
+                selected_line,
+                bool(c_only_diff_value),
+                int(getattr(self, "_data_version", 0)),
+                int(getattr(self, "_column_projection_generation", 0)),
+                int(getattr(self, "_virtual_column_window_generation", 0)),
+                tuple(self._rendered_logical_columns()),
+            )
+            if (
+                c_render_key == getattr(self, "_c_area_last_render_key", None)
+                and (
+                    not strict
+                    or (
+                        strict_x_restore is None
+                        and c_render_key
+                        == getattr(self, "_c_area_last_completed_render_key", None)
+                    )
+                )
+            ):
+                self._c_area_same_row_skips += 1
+                self._last_c_area_render_ms = 0.0
+                self._suppress_c_xsync = prev_suppress_c_xsync
+                return True if strict else None
+            # The ordinary renderer historically exposes its current key as
+            # soon as it begins. A strict deferred navigation treats this as
+            # an uncommitted transaction and publishes the new key only after
+            # headers, document/tags, selected-cell state and x restoration
+            # have all completed below.
+            if not strict:
+                self._c_area_last_render_key = c_render_key
+            if strict and self._render_cursor_row_headers(
+                pair, is_three, strict=True
+            ) is not True:
+                raise RuntimeError("strict C row-header render incomplete")
+            if not strict:
+                self._render_cursor_row_headers(pair, is_three)
             # Force strict rendering order:
             # 2-way: mine/theirs
             # 3-way: base/mine/theirs
             self.cursor_cmp.configure(state="normal")
-            self.cursor_cmp.delete("1.0", "end")
             if is_three:
-                self.cursor_cmp.insert("1.0", f"{base_text}\n{a_text}\n{b_text}")
+                self._replace_text_document(
+                    self.cursor_cmp, f"{base_text}\n{a_text}\n{b_text}"
+                )
             else:
-                self.cursor_cmp.insert("1.0", f"{a_text}\n{b_text}")
+                self._replace_text_document(self.cursor_cmp, f"{a_text}\n{b_text}")
 
-            # Clear & apply base tags
-            self.cursor_cmp.tag_remove("a", "1.0", "end")
-            self.cursor_cmp.tag_remove("base", "1.0", "end")
-            self.cursor_cmp.tag_remove("b", "1.0", "end")
-            self.cursor_cmp.tag_remove("missing", "1.0", "end")
-            self.cursor_cmp.tag_remove("diffcell", "1.0", "end")
-            self.cursor_cmp.tag_remove("cselcell", "1.0", "end")
+            # Whole-document replacement removes all previous tag ranges.
+            # Re-removing every tag here only adds Tcl round trips; applying
+            # the exact current snapshot tags below is sufficient.
             if is_three:
                 base_r = self._base_row_for_pair(pair_idx, pair)
                 if base_r is None:
@@ -16742,26 +22642,30 @@ class SheetView:
                     self.cell_cmp_text.tag_remove("diffcell", "1.0", "end")
 
                     if pair is not None:
-                        ws_a_val = self.app.ws_a_val(self.sheet)
-                        ws_b_val = self.app.ws_b_val(self.sheet)
-                        show_only_diff = bool(self.c_only_diff_cells.get())
-                        cols_to_show = (
-                            sorted(c for c in diff_cols if c > 0)
-                            if show_only_diff
-                            else list(range(1, self._logical_slot_count() + 1))
-                        )
+                        # The optional per-cell inspector is view-only too.
+                        # Read immutable exact fragments rather than reopening
+                        # a value worksheet on every hover/click.
+                        show_only_diff = c_only_diff_value
+                        rendered_cols = self._rendered_logical_columns()
+                        if self._wide_column_virtual_active():
+                            cols_to_show = [
+                                c for c in rendered_cols
+                                if (not show_only_diff or c in diff_cols)
+                            ]
+                        else:
+                            cols_to_show = (
+                                sorted(c for c in diff_cols if c > 0)
+                                if show_only_diff
+                                else list(range(1, self._logical_slot_count() + 1))
+                            )
 
                         if show_only_diff:
                             parts_a = []
                             parts_b = []
                             widths = []
                             for c in cols_to_show:
-                                ca = self._physical_col_for_logical("A", c)
-                                cb = self._physical_col_for_logical("B", c)
-                                va = ws_a_val.cell(row=ra, column=ca).value if ra is not None and ca is not None else None
-                                vb = ws_b_val.cell(row=rb, column=cb).value if rb is not None and cb is not None else None
-                                a_s = _val_to_str(va) if ca is not None else _LOGICAL_COLUMN_PLACEHOLDER
-                                b_s = _val_to_str(vb) if cb is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                                a_s = self._prepared_value_for_logical_cell(pair_idx, "A", c)
+                                b_s = self._prepared_value_for_logical_cell(pair_idx, "B", c)
                                 parts_a.append(a_s)
                                 parts_b.append(b_s)
                                 widths.append(max(4, min(max(len(a_s), len(b_s)), _COL_MAX_DISPLAY_WIDTH)))
@@ -16783,12 +22687,8 @@ class SheetView:
                         else:
                             line_no = 1
                             for c in cols_to_show:
-                                ca = self._physical_col_for_logical("A", c)
-                                cb = self._physical_col_for_logical("B", c)
-                                va = ws_a_val.cell(row=ra, column=ca).value if ra is not None and ca is not None else None
-                                vb = ws_b_val.cell(row=rb, column=cb).value if rb is not None and cb is not None else None
-                                a_s = _val_to_str(va) if ca is not None else _LOGICAL_COLUMN_PLACEHOLDER
-                                b_s = _val_to_str(vb) if cb is not None else _LOGICAL_COLUMN_PLACEHOLDER
+                                a_s = self._prepared_value_for_logical_cell(pair_idx, "A", c)
+                                b_s = self._prepared_value_for_logical_cell(pair_idx, "B", c)
 
                                 self.cell_cmp_text.insert("end", a_s + "\n")
                                 self.cell_cmp_text.insert("end", b_s + "\n")
@@ -16796,7 +22696,7 @@ class SheetView:
                                 self.cell_cmp_text.tag_add("a", f"{line_no}.0", f"{line_no}.end")
                                 self.cell_cmp_text.tag_add("b", f"{line_no+1}.0", f"{line_no+1}.end")
 
-                                if va != vb:
+                                if c in diff_cols:
                                     self.cell_cmp_text.tag_add("diffcell", f"{line_no}.0", f"{line_no}.end")
                                     self.cell_cmp_text.tag_add("diffcell", f"{line_no+1}.0", f"{line_no+1}.end")
 
@@ -16804,35 +22704,94 @@ class SheetView:
 
                     self.cell_cmp_text.configure(state="disabled")
                 except Exception:
+                    if strict:
+                        raise
                     try:
                         self.cell_cmp_text.configure(state="disabled")
                     except Exception:
                         pass
 
             # Restore C pane horizontal viewport without driving main panes.
-            try:
-                self.cursor_cmp.xview_moveto(cursor_first)
-                cf, cl = self.cursor_cmp.xview()
-                self.cursor_hsb.set(cf, cl)
-                # Also restore column header: delete+insert resets its xview to 0.
-                if getattr(self, "cursor_cmp_colhdr", None) is not None:
-                    self.cursor_cmp_colhdr.xview_moveto(cursor_first)
-            except Exception:
-                pass
-            if hasattr(self, "cell_cmp_text"):
+            # Deferred diff navigation may supply a precomputed strict mapping
+            # from the freshly restored main pane.  That lets the only C xview
+            # mutation happen *after* replacement/tags, rather than moving an
+            # old C document immediately before this renderer replaces it.
+            strict_restore_started = time.perf_counter() if strict else None
+            if self._wide_column_virtual_active():
+                self._set_wide_column_scrollbars()
+            else:
                 try:
-                    self.cell_cmp_text.xview_moveto(cell_first)
-                    sf, sl = self.cell_cmp_text.xview()
-                    self.cell_cmp_hsb.set(sf, sl)
+                    self.cursor_cmp.xview_moveto(cursor_first)
+                    cf, cl = self.cursor_cmp.xview()
+                    self.cursor_hsb.set(cf, cl)
+                    # Also restore column header: delete+insert resets its xview to 0.
+                    if getattr(self, "cursor_cmp_colhdr", None) is not None:
+                        self.cursor_cmp_colhdr.xview_moveto(cursor_first)
                 except Exception:
+                    if strict:
+                        raise
                     pass
+                if hasattr(self, "cell_cmp_text"):
+                    try:
+                        self.cell_cmp_text.xview_moveto(cell_first)
+                        sf, sl = self.cell_cmp_text.xview()
+                        self.cell_cmp_hsb.set(sf, sl)
+                    except Exception:
+                        if strict:
+                            raise
+                        pass
+            if strict_restore_context is not None:
+                actual_cursor_x = float((self.cursor_cmp.xview() or (0.0, 1.0))[0])
+                if not math.isclose(actual_cursor_x, cursor_first, abs_tol=0.02):
+                    raise RuntimeError(
+                        "strict C cursor x restore mismatch "
+                        f"{actual_cursor_x} != {cursor_first}"
+                    )
+                cursor_header = getattr(self, "cursor_cmp_colhdr", None)
+                if cursor_header is not None:
+                    actual_header_x = float((cursor_header.xview() or (0.0, 1.0))[0])
+                    if not math.isclose(actual_header_x, cursor_first, abs_tol=0.02):
+                        raise RuntimeError(
+                            "strict C header x restore mismatch "
+                            f"{actual_header_x} != {cursor_first}"
+                        )
+                if hasattr(self, "cell_cmp_text"):
+                    actual_cell_x = float((self.cell_cmp_text.xview() or (0.0, 1.0))[0])
+                    if not math.isclose(actual_cell_x, cell_first, abs_tol=0.02):
+                        raise RuntimeError(
+                            "strict C cell x restore mismatch "
+                            f"{actual_cell_x} != {cell_first}"
+                        )
+            if strict and strict_restore_started is not None:
+                self._last_strict_c_final_restore_ms = max(
+                    0.0, (time.perf_counter() - strict_restore_started) * 1000.0
+                )
+            self._last_c_area_render_ms = (
+                time.perf_counter() - c_render_started
+            ) * 1000.0
+            self._c_area_render_samples_ms.append(self._last_c_area_render_ms)
+            # Do not promote the early render key to strict evidence until the
+            # row header, document replacement, tags, selected-cell state and
+            # C horizontal restoration all completed without a swallowed error.
+            self._c_area_last_render_key = c_render_key
+            self._c_area_last_completed_render_key = c_render_key
             self._suppress_c_xsync = prev_suppress_c_xsync
+            return True if strict else None
         except Exception:
             try:
                 self._suppress_c_xsync = prev_suppress_c_xsync
             except Exception:
                 pass
-            pass
+            if strict:
+                # A strict retry must not classify an early pair/key write
+                # from a failed document/tag/x stage as a completed C surface.
+                # Restore the prior committed presentation identity instead.
+                self._last_strict_c_final_restore_ms = 0.0
+                self._c_area_last_render_key = previous_c_render_key
+                self._c_area_last_completed_render_key = previous_c_completed_key
+                self._last_cursor_cmp_pair_idx = previous_c_pair_idx
+                return False
+            return None
 
     def _selected_column_block(self) -> ColumnBlock | None:
         ordinal = getattr(self, "selected_column_block_ordinal", None)
@@ -17055,7 +23014,11 @@ class SheetView:
         automatic selection, while a completed structural action may rebuild
         the projection and expose the next pending block.
         """
-        if getattr(self, "_lifecycle_state", "") != "READY":
+        # Structural auto-selection is presentation-only.  A full immutable
+        # exact surface may expose it before editable workbooks are loaded;
+        # the public action handler still guards the first mutation demand and
+        # rejects it while the single-owner edit preload starts.
+        if getattr(self, "_lifecycle_state", "") not in ("READY", "EDIT_DEFERRED"):
             return None
         try:
             projection = self._ensure_column_projection_current("自动选择结构列块")
@@ -17106,11 +23069,10 @@ class SheetView:
         self._auto_select_first_structural_column_block_if_ready()
         self._refresh_column_action_selection_badge()
         selected = self._selected_column_block() is not None
-        ready = (
-            getattr(self, "_lifecycle_state", "") == "READY"
-            or self._column_undo_model_ready()
-        )
-        state = "normal" if selected and ready else "disabled"
+        # A selected structural block remains clickable while comparison is
+        # pending so the handler can explain the exact readiness state.  It is
+        # disabled only when no actionable block exists or the app is closing.
+        state = "normal" if selected and getattr(self, "_lifecycle_state", "") != "CLOSING" else "disabled"
         for name in ("use_mine_col_btn", "use_theirs_col_btn"):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -17139,6 +23101,10 @@ class SheetView:
 
     def _apply_column_block_selection_tags(self):
         selection = getattr(self, "selected_column_logical_range", None)
+        configured_widgets = getattr(self, "_column_block_tag_widgets", None)
+        if configured_widgets is None:
+            configured_widgets = set()
+            self._column_block_tag_widgets = configured_widgets
         for widget in (
             getattr(self, "left_colhdr", None),
             getattr(self, "base_colhdr", None),
@@ -17148,7 +23114,14 @@ class SheetView:
             if widget is None:
                 continue
             try:
-                widget.tag_configure("colblocksel", background="#8EB9FF", foreground="#153A66")
+                # Tcl tag configuration is invariant for the life of a Text
+                # widget.  Repeating it for each horizontal viewport used to
+                # dominate a 69-column first paint even though only the ranges
+                # change.
+                widget_id = str(widget)
+                if widget_id not in configured_widgets:
+                    widget.tag_configure("colblocksel", background="#8EB9FF", foreground="#153A66")
+                    configured_widgets.add(widget_id)
                 widget.tag_remove("colblocksel", "1.0", "end")
                 if not selection:
                     continue
@@ -17215,6 +23188,8 @@ class SheetView:
         return block
 
     def _on_column_header_click(self, widget: tk.Text, event, source_side: str):
+        self._note_view_activity("column-header-click")
+        self._begin_interaction_request("column-header-click")
         try:
             char_pos = int(str(widget.index(f"@{event.x},{event.y}")).split(".")[1])
             logical_col = self._col_from_char(char_pos)
@@ -17222,6 +23197,7 @@ class SheetView:
                 self._select_column_block_by_logical_col(logical_col, source_side)
         except Exception:
             pass
+        self._complete_interaction_request_if_current()
         return "break"
 
     @staticmethod
@@ -18307,6 +24283,12 @@ class SheetView:
             "manual_column_ops": copy.deepcopy(list(manual_ops)),
             "manual_cell_ops": copy.deepcopy(dict(manual_cell_ops)),
             "manual_formula_cache_ops": copy.deepcopy(dict(manual_formula_cache_ops)),
+            "manual_column_op_seq": int(
+                getattr(self.app, "_manual_column_op_seq", 0) or 0
+            ),
+            "manual_structural_op_seq": int(
+                getattr(self.app, "_manual_structural_op_seq", 0) or 0
+            ),
             "modified_a": bool(getattr(self.app, "modified_a", False)),
             "modified_b": bool(getattr(self.app, "modified_b", False)),
             "modified_sheets_a": set(getattr(self.app, "modified_sheets_a", set()) or set()),
@@ -18524,6 +24506,12 @@ class SheetView:
         manual_formula_cache_ops.clear()
         manual_formula_cache_ops.update(
             copy.deepcopy(snapshot.get("manual_formula_cache_ops") or {})
+        )
+        self.app._manual_column_op_seq = int(
+            snapshot.get("manual_column_op_seq", 0) or 0
+        )
+        self.app._manual_structural_op_seq = int(
+            snapshot.get("manual_structural_op_seq", 0) or 0
         )
         self.app.modified_a = bool(snapshot.get("modified_a", False))
         self.app.modified_b = bool(snapshot.get("modified_b", False))
@@ -18812,16 +24800,15 @@ class SheetView:
         *,
         confirm_unresolved: bool = False,
         _failure_injector=None,
+        _action_id: str | None = None,
     ) -> ColumnBlockActionPlan:
-        if (
-            not self._guard_mutation_ready("列结构操作", notify=False)
-            and not self._column_undo_model_ready()
-        ):
+        if not self._guard_mutation_ready("列结构操作", notify=False):
             raise RuntimeError(self._mutation_block_message("列结构操作"))
         plan = self._plan_selected_column_block_action(
             source_side,
             target_side,
             confirm_unresolved=confirm_unresolved,
+            action_id=_action_id,
         )
         selection_before = {
             "block_ordinal": self.selected_column_block_ordinal,
@@ -19028,6 +25015,7 @@ class SheetView:
                 "mode": "apply",
             }
             self.refresh(row_only=None, rescan=True, column_only=True)
+            self._finalize_accepted_common_equality_cache_after_mutation()
             if callable(_failure_injector):
                 _failure_injector("after_refresh", plan)
             self.app.push_undo({
@@ -19106,6 +25094,12 @@ class SheetView:
                 self._restore_column_action_workbook_snapshot(
                     snapshot, post_refresh_cleanup=True
                 )
+                # The failed mutation has now restored its former accepted
+                # sources, projection and workbook bytes.  Rebuild only here,
+                # after cleanup, so rollback returns to the same cosmetic
+                # proof rather than leaving intentionally equal copied cells
+                # conservatively highlighted forever.
+                self._finalize_accepted_common_equality_cache_after_mutation()
                 self._restore_column_block_selection(selection_before)
             raise
         finally:
@@ -19138,10 +25132,7 @@ class SheetView:
             self._update_cursor_lines()
 
     def _undo_column_action(self, action: dict) -> bool:
-        if (
-            not self._guard_mutation_ready("撤销列结构操作", notify=False)
-            and not self._column_undo_model_ready()
-        ):
+        if not self._guard_mutation_ready("撤销列结构操作"):
             return False
         snapshot = action.get("snapshot")
         if snapshot is None:
@@ -19179,6 +25170,7 @@ class SheetView:
             self._restore_column_action_workbook_snapshot(
                 snapshot, post_refresh_cleanup=True
             )
+            self._finalize_accepted_common_equality_cache_after_mutation()
             self._restore_column_block_selection(action.get("selection") or snapshot.get("selection"))
             self._update_cursor_lines()
             self._set_column_action_status("已完整撤销列结构操作并恢复列映射与选择。")
@@ -19187,12 +25179,43 @@ class SheetView:
             if callable(end_interactive):
                 end_interactive()
 
+    def _redo_column_action(self, action: dict) -> bool:
+        """Replay one saved column action through the normal guarded path.
+
+        The saved immutable plan is both the redo decision and the topology
+        oracle.  Replanning after undo must produce that exact plan before the
+        regular mutation path is allowed to create a fresh inverse snapshot,
+        manual-column journal entries, overlay state, and mapping refresh.
+        """
+        if not self._guard_mutation_ready("重做列结构操作"):
+            return False
+        plan = action.get("plan")
+        if not isinstance(plan, ColumnBlockActionPlan):
+            raise RuntimeError("列结构重做缺少已验证的操作计划。")
+        if str(plan.sheet) != str(self.sheet):
+            raise RuntimeError("列结构重做的 Sheet 已改变，已阻止回放。")
+        self._restore_column_block_selection(action.get("selection"))
+        replay_plan = self._plan_selected_column_block_action(
+            plan.source_side,
+            plan.target_side,
+            confirm_unresolved=bool(plan.unresolved),
+            action_id=plan.action_id,
+        )
+        if replay_plan != plan:
+            raise RuntimeError("列结构映射已改变，无法安全重做已保存的操作。")
+        applied_plan = self._apply_selected_column_block(
+            plan.source_side,
+            plan.target_side,
+            confirm_unresolved=bool(plan.unresolved),
+            _action_id=plan.action_id,
+        )
+        if applied_plan != plan:
+            raise RuntimeError("列结构重做计划与保存计划不一致。")
+        return True
+
     def _on_column_action_button(self, source_side: str):
         try:
-            if (
-                not self._guard_mutation_ready("列结构操作", notify=False)
-                and not self._column_undo_model_ready()
-            ):
+            if not self._guard_mutation_ready("列结构操作", notify=True):
                 return
             block = self._selected_column_block()
             if block is None:
@@ -19327,6 +25350,46 @@ class SheetView:
                 f"Excel列 {_excel_column_display(logical_col)} 在源侧或目标侧不存在；请使用列结构操作，不能按单元格覆盖。"
             )
         return int(source_col), int(destination_col)
+
+    def _overlay_transaction_for_cells(self, target: str, cells) -> OverlayTransaction | None:
+        """Mirror a completed content action as one local overlay transaction.
+
+        ``pair_idx`` is scoped by the current topology generation; structural
+        actions invalidate that generation and clear the overlay instead of
+        trying to remap coordinates speculatively.
+        """
+        side = str(target or "").upper()
+        if side not in ("A", "B"):
+            return None
+        projection = self._active_column_projection()
+        physical_side = "mine" if side == "A" else "theirs"
+        pair_lookup = self.row_a_to_pair_idx if side == "A" else self.row_b_to_pair_idx
+        try:
+            value_ws = self.app.ws_a_val(self.sheet) if side == "A" else self.app.ws_b_val(self.sheet)
+        except Exception:
+            return None
+        overlay = self.app.sheet_operation_overlay(self.sheet)
+        topology = (int(self._row_model_version), int(self._column_model_version), int(overlay.topology_generation))
+        deltas = []
+        for row, physical_col, _old_edit, old_value in tuple(cells or ()):
+            try:
+                row, physical_col = int(row), int(physical_col)
+                pair_idx = pair_lookup.get(row)
+                logical_col = projection.logical_col(physical_side, physical_col)
+                if pair_idx is None or logical_col is None:
+                    continue
+                deltas.append(OverlayCellDelta(
+                    record_key=("pair", str(topology[0]), str(topology[1]), str(topology[2]), str(pair_idx)),
+                    field_key=("logical", str(logical_col)),
+                    side=side,
+                    physical_row=row,
+                    physical_col=physical_col,
+                    before=old_value,
+                    after=value_ws.cell(row=row, column=physical_col).value,
+                ))
+            except Exception:
+                continue
+        return self.app.apply_sheet_operation_overlay(self.sheet, deltas) if deltas else None
 
     def _filter_row_action_unresolved_blank_noops(
         self,
@@ -19615,6 +25678,7 @@ class SheetView:
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
             self.refresh(row_only=dst_r, rescan=False)
+            self._finalize_accepted_common_equality_cache_after_mutation()
             self._restore_view_anchor(anchor)
             self._update_cursor_lines()
             if adopted_formula_cache:
@@ -19624,6 +25688,8 @@ class SheetView:
 
     def _on_cursor_cmp_click(self, event):
         """Single-click in C区: map clicked cell back to current pair/column selection."""
+        self._note_view_activity("c-area-click")
+        self._begin_interaction_request("c-area-click")
         try:
             idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
             line_no = int(str(idx).split(".")[0])
@@ -19662,11 +25728,7 @@ class SheetView:
         except Exception:
             target_line = 1
 
-        saved_x = 0.0
-        try:
-            saved_x = float((self.left.xview() or (0.0, 1.0))[0])
-        except Exception:
-            saved_x = 0.0
+        saved_x = self._logical_horizontal_first()
 
         target_idx = f"{target_line}.{max(0, int(hit_char))}"
         for w in (self.left, self.base, self.right):
@@ -19696,14 +25758,15 @@ class SheetView:
         # Re-render C block and keep x aligned.
         self._update_cursor_lines()
         try:
-            self._sync_main_x_to_frac(saved_x)
-            self._sync_c_x_to_frac(saved_x)
+            self._restore_horizontal_after_cursor_cmp_click(saved_x)
         except Exception:
             pass
         self._update_diff_nav_state()
+        self._complete_interaction_request_if_current()
         return "break"
 
     def _on_cursor_cmp_double_click(self, event):
+        self._note_view_activity("c-area-double-click")
         try:
             idx = self.cursor_cmp.index(f"@{event.x},{event.y}")
             line_no = int(str(idx).split(".")[0])
@@ -20187,6 +26250,7 @@ class SheetView:
         self._update_sheet_role_labels()
         self.app.refresh_sheet_nav()
         self.refresh(row_only=None, rescan=True)
+        self._finalize_accepted_common_equality_cache_after_mutation()
         self._update_cursor_lines()
 
     def _apply_global_sheet_overwrite(self, source_side: str, target_side: str) -> bool:
@@ -20233,6 +26297,7 @@ class SheetView:
             self._update_sheet_role_labels()
             self.app.refresh_sheet_nav()
             self.refresh(row_only=None, rescan=True)
+            self._finalize_accepted_common_equality_cache_after_mutation()
             self._update_cursor_lines()
             self.app.push_undo({
                 "kind": "global_sheet_copy",
@@ -20666,6 +26731,7 @@ class SheetView:
                 self._cache_only_diff_rows_from_exact_pair_maps()
             self._invalidate_render_cache()
             self.refresh(row_only=None, rescan=False)
+            self._finalize_accepted_common_equality_cache_after_mutation()
             self._refresh_diff_block_ui()
             self._update_cursor_lines()
             elapsed = time.perf_counter() - started
@@ -20770,6 +26836,7 @@ class SheetView:
             self._update_sheet_role_labels()
             self.app.refresh_sheet_nav()
             self.refresh(row_only=None, rescan=True)
+            self._finalize_accepted_common_equality_cache_after_mutation()
             self._update_cursor_lines()
         except Exception as e:
             messagebox.showerror("Error", f"整Sheet操作失败：\n{e}")
@@ -20836,7 +26903,15 @@ class SheetView:
 
     def _diff_block_model_ready(self) -> bool:
         try:
-            return bool(self.only_diff_var.get()) and bool(self._data_ready) and not bool(self._only_diff_async_building)
+            # A virtual full-mode pane has only a recycled viewport, but its
+            # prepared logical result is complete. Region actions and direct
+            # navigation must use that complete pair map, not the 24 visible
+            # rows. Only the presentation indicator remains only-diff-only.
+            return (
+                (bool(self.only_diff_var.get()) or self._virtual_mode_active())
+                and bool(self._data_ready)
+                and not bool(self._only_diff_async_building)
+            )
         except Exception:
             return False
 
@@ -20856,7 +26931,12 @@ class SheetView:
         if self._full_diff_blocks_cache_key == key:
             return self._full_diff_blocks
         blocks = self._group_diff_pair_rows(
-            (pair_idx for pair_idx in rows if 0 <= int(pair_idx) < len(self.row_pairs)),
+            (
+                pair_idx
+                for pair_idx in rows
+                if 0 <= int(pair_idx) < len(self.row_pairs)
+                and self._pair_has_visual_diff(int(pair_idx))
+            ),
             pending_predicate=self._pair_has_visual_diff,
         )
         pair_to_block = {}
@@ -21062,7 +27142,7 @@ class SheetView:
         if anchor_pair_idx is None:
             return []
         try:
-            if bool(self.only_diff_var.get()):
+            if self._diff_block_model_ready():
                 block = self._full_diff_block_for_pair(anchor_pair_idx)
                 if block is not None:
                     return list(block.pair_indices)
@@ -21902,6 +27982,7 @@ class SheetView:
                     # Exact pair caches above already contain every changed row;
                     # one non-rescanning render is sufficient for any region size.
                     self.refresh(row_only=None, rescan=False)
+                self._finalize_accepted_common_equality_cache_after_mutation()
                 self._invalidate_render_cache()
                 self._refresh_diff_block_ui()
                 _dlog(
@@ -21969,7 +28050,12 @@ class SheetView:
             only_diff = bool(self.only_diff_var.get())
         except Exception:
             only_diff = False
-        if only_diff:
+        # A virtual full-mode pane exposes only a bounded document, while its
+        # immutable logical result already contains every diff block.  Use the
+        # same complete navigator as only-diff mode; non-virtual full mode
+        # retains its historical current-document navigation below.
+        use_full_logical_blocks = bool(only_diff) or bool(self._virtual_mode_active())
+        if use_full_logical_blocks:
             self._update_diff_block_indicator()
             if not self._diff_block_model_ready():
                 self.prev_diff_btn.configure(state="disabled")
@@ -22002,11 +28088,7 @@ class SheetView:
     def _replace_rendered_rows_for_navigation(self, rows: list[int]):
         """Replace the visible only-diff page with a bounded navigation preview."""
         rows = [int(pair_idx) for pair_idx in rows]
-        saved_x = 0.0
-        try:
-            saved_x = float((self.left.xview() or (0.0, 1.0))[0])
-        except Exception:
-            pass
+        saved_x = self._logical_horizontal_first()
         for widget in (self.left, self.base, self.right):
             try:
                 widget.delete("1.0", "end")
@@ -22048,6 +28130,12 @@ class SheetView:
                 return False
         except Exception:
             return False
+        if self._virtual_mode_active():
+            # Directly recycle the fixed viewport around the logical target.
+            # No preceding rows are appended and no workbook data is read.
+            start = max(0, target_pos - min(12, target_pos))
+            self._publish_virtual_window(start)
+            return pair_idx in self.row_to_line
         # Navigation targets a logical block.  On large sheets, materializing
         # every preceding diff row (or a 400+ row block) makes a button click
         # seconds long.  A bounded preview keeps the interaction synchronous and
@@ -22118,42 +28206,429 @@ class SheetView:
         )
         return pair_idx in self.row_to_line
 
-    def _goto_full_diff_block(self, block_idx: int):
-        blocks = self._ensure_full_diff_blocks()
-        if not (0 <= int(block_idx) < len(blocks)):
-            self._update_diff_nav_state()
-            return
-        pair_idx = blocks[int(block_idx)].start_pair_idx
-        if not self._materialize_pair_for_navigation(pair_idx):
-            self._update_diff_nav_state()
-            return
-        line = self.row_to_line.get(pair_idx)
-        if line is None:
-            self._update_diff_nav_state()
-            return
-        self._goto_block_start(line)
+    def _record_diff_navigation_telemetry(
+        self,
+        *,
+        action: str,
+        block_idx: int | None,
+        pair_idx: int | None,
+        outcome: str,
+        phase_ms: dict | None = None,
+    ) -> None:
+        """Persist bounded global-diff navigation phases for diagnostics only."""
+        phases = {
+            "block_lookup": 0.0,
+            "materialize_publish": 0.0,
+            "selection": 0.0,
+            "restore": 0.0,
+            "main_x_observe": 0.0,
+            "main_x_fallback": 0.0,
+            "ui": 0.0,
+            "total": 0.0,
+        }
+        for name, value in dict(phase_ms or {}).items():
+            if name not in phases:
+                continue
+            try:
+                phases[name] = max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+        record = {
+            "action": str(action),
+            "block_idx": int(block_idx) if block_idx is not None else None,
+            "pair_idx": int(pair_idx) if pair_idx is not None else None,
+            "outcome": str(outcome),
+            "generation": self._viewport_request_generation(),
+            "selected_sheet": str(getattr(self.app, "selected_sheet", "") or ""),
+            "phase_ms": phases,
+        }
+        self._last_diff_navigation_telemetry = dict(record)
+        history = getattr(self, "_diff_navigation_telemetry", None)
+        if history is None:
+            history = deque(maxlen=128)
+            self._diff_navigation_telemetry = history
+        try:
+            history.append(dict(record))
+        except Exception:
+            pass
 
-    def _goto_block_start(self, start_line: int):
+    def _active_deferred_diff_navigation(self):
+        """Return the current request-attached navigation intent, if any."""
+        active = getattr(self, "_viewport_request_active", None)
+        if not isinstance(active, dict) or active.get("status") != "pending":
+            return None, None
+        navigation = active.get("navigation")
+        if (
+            not isinstance(navigation, dict)
+            or str(active.get("kind") or "") != "diff-navigation"
+            or int(navigation.get("request_id", -1)) != int(active.get("id", -2))
+        ):
+            return None, None
+        return active, navigation
+
+    def _finish_deferred_diff_navigation_after_publish(self) -> bool | None:
+        """Select an offscreen diff target only after its surface is current.
+
+        The sole source of truth is ``active[\"navigation\"]``.  A newer
+        scroll/diff request replaces that active record, so an old after(0)
+        publish cannot later restore an obsolete selection.
+        """
+        active, navigation = self._active_deferred_diff_navigation()
+        if active is None:
+            return None
+        request_id = int(active.get("id", -1))
+        expected_generation = navigation.get("generation")
+        expected_sheet = str(navigation.get("selected_sheet") or "")
+        expected_token = navigation.get("publish_token")
+        if expected_generation != self._viewport_request_generation():
+            self._supersede_viewport_request(active, "generation")
+            return False
+        if expected_sheet and expected_sheet != str(
+            getattr(self.app, "selected_sheet", "") or ""
+        ):
+            self._supersede_viewport_request(active, "selected-sheet")
+            return False
+        if expected_token != int(getattr(self, "_virtual_publish_token", 0) or 0):
+            self._supersede_viewport_request(active, "navigation-token")
+            return False
+        expected_row_start = int(navigation.get("expected_row_start", -1))
+        if (
+            int(active.get("row_start", -1)) != expected_row_start
+            or int(self._virtual_window_start) != expected_row_start
+        ):
+            self._fail_viewport_request(active, "navigation-window-mismatch")
+            return False
+        expected_column_start = int(navigation.get("expected_column_start", -1))
+        if (
+            int(active.get("column_start", -1)) != expected_column_start
+            or int(self._virtual_column_window_start) != expected_column_start
+        ):
+            self._fail_viewport_request(active, "navigation-column-window-mismatch")
+            return False
+        target_pair_idx = self._normalize_pair_idx(navigation.get("target_pair_idx"))
+        target_line = (
+            self.row_to_line.get(target_pair_idx)
+            if target_pair_idx is not None
+            else None
+        )
+        if target_line is None:
+            self._fail_viewport_request(active, "navigation-target-line-missing")
+            return False
+
+        phases = dict(navigation.get("phase_ms", {}) or {})
+        publish_started = float(active.get("publish_started", active.get("started", time.perf_counter())))
+        phases["block_lookup"] = float(
+            navigation.get("lookup_ms", phases.get("block_lookup", 0.0)) or 0.0
+        )
+        phases["materialize_publish"] = max(
+            0.0, (time.perf_counter() - publish_started) * 1000.0
+        )
+        try:
+            # The historic visible/nonvirtual path deliberately tolerates a
+            # best-effort C/x refresh.  A deferred request is different: its
+            # public callback already returned, so every selection/C/x/UI
+            # step must be witnessed before it can close successfully.
+            self._goto_block_start_strict(
+                int(target_line), navigation_phases=phases
+            )
+        except Exception as exc:
+            navigation.update(
+                {
+                    "main_x_fast_path": bool(
+                        float(phases.get("main_x_fast_path", 0.0) or 0.0)
+                    ),
+                    "main_x_observe_ms": max(
+                        0.0, float(phases.get("main_x_observe", 0.0) or 0.0)
+                    ),
+                    "main_x_fallback_ms": max(
+                        0.0, float(phases.get("main_x_fallback", 0.0) or 0.0)
+                    ),
+                }
+            )
+            self._fail_viewport_request(
+                active, "navigation-selection-restore-failed", error=exc
+            )
+            return False
+
+        actual_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+        actual_block_idx = self._active_full_diff_block_index()
+        expected_block_idx = int(navigation.get("block_idx", -1))
+        blocks = self._ensure_full_diff_blocks()
+        expected_button_states = {
+            "prev": "normal" if expected_block_idx > 0 else "disabled",
+            "next": (
+                "normal"
+                if expected_block_idx + 1 < len(blocks)
+                else "disabled"
+            ),
+        }
+        try:
+            actual_button_states = {
+                "prev": str(self.prev_diff_btn.cget("state")),
+                "next": str(self.next_diff_btn.cget("state")),
+            }
+        except Exception:
+            actual_button_states = {"prev": "", "next": ""}
+        if (
+            actual_pair_idx != target_pair_idx
+            or actual_block_idx != expected_block_idx
+            or actual_button_states != expected_button_states
+        ):
+            navigation.update(
+                {
+                    "actual_pair_idx": actual_pair_idx,
+                    "actual_block_idx": actual_block_idx,
+                    "actual_button_states": actual_button_states,
+                    "expected_button_states": expected_button_states,
+                }
+            )
+            self._fail_viewport_request(active, "navigation-selection-verify")
+            return False
+        phases.setdefault("selection", 0.0)
+        phases.setdefault("restore", 0.0)
+        phases.setdefault("ui", 0.0)
+        phases["total"] = max(
+            0.0, (time.perf_counter() - float(active.get("started", time.perf_counter()))) * 1000.0
+        )
+        navigation.update(
+            {
+                "status": "selected",
+                "actual_pair_idx": actual_pair_idx,
+                "actual_block_idx": actual_block_idx,
+                "actual_button_states": actual_button_states,
+                "expected_button_states": expected_button_states,
+                "selection_changed": actual_pair_idx
+                != self._normalize_pair_idx(navigation.get("previous_selected_pair_idx")),
+                "main_x_fast_path": bool(
+                    float(phases.get("main_x_fast_path", 0.0) or 0.0)
+                ),
+                "main_x_observe_ms": max(
+                    0.0, float(phases.get("main_x_observe", 0.0) or 0.0)
+                ),
+                "main_x_fallback_ms": max(
+                    0.0, float(phases.get("main_x_fallback", 0.0) or 0.0)
+                ),
+                "phase_ms": phases,
+                "terminal_ready_at": time.perf_counter(),
+            }
+        )
+        self._record_diff_navigation_telemetry(
+            action="full-diff-block",
+            block_idx=expected_block_idx,
+            pair_idx=target_pair_idx,
+            outcome="complete",
+            phase_ms=phases,
+        )
+        _dlog(
+            f"DIFF_BLOCK_NAV terminal-ready id={request_id} pair={target_pair_idx} "
+            f"block={expected_block_idx} phases={phases}"
+        )
+        return True
+
+    def _queue_deferred_full_diff_block(
+        self, block_idx: int, pair_idx: int, lookup_ms: float
+    ) -> bool | None:
+        """Create one async offscreen block intent on the active request."""
+        try:
+            target_pos = bisect.bisect_left(self._full_display_rows, int(pair_idx))
+            if (
+                target_pos >= len(self._full_display_rows)
+                or int(self._full_display_rows[target_pos]) != int(pair_idx)
+            ):
+                return False
+        except Exception:
+            return False
+        target_start = self._canonical_virtual_row_start(
+            max(0, target_pos - min(12, target_pos))
+        )
+        # Snapshot this before request creation as well as rechecking after
+        # queueing below. The terminal still needs a real request record, but
+        # a pre-existing staged first surface is never eligible to schedule a
+        # diff-navigation publish.
+        staged_before_begin = bool(
+            getattr(self, "_staged_virtual_surface_active", False)
+        )
+        request_id = self._begin_viewport_request(
+            "diff-block",
+            row_start=target_start,
+            column_start=int(getattr(self, "_virtual_column_window_start", 0) or 0),
+            kind="diff-navigation",
+        )
+        active = getattr(self, "_viewport_request_active", None)
+        if not isinstance(active, dict) or int(active.get("id", -1)) != int(request_id):
+            return False
+        active["navigation"] = {
+            "request_id": int(request_id),
+            "block_idx": int(block_idx),
+            "target_pair_idx": int(pair_idx),
+            "expected_row_start": int(target_start),
+            "expected_column_start": int(
+                getattr(self, "_virtual_column_window_start", 0) or 0
+            ),
+            "previous_selected_pair_idx": self._normalize_pair_idx(self.selected_pair_idx),
+            "generation": active.get("generation"),
+            "selected_sheet": str(active.get("selected_sheet") or ""),
+            "lookup_ms": max(0.0, float(lookup_ms)),
+            "phase_ms": {"block_lookup": max(0.0, float(lookup_ms))},
+            "status": "queued",
+        }
+        if staged_before_begin or bool(
+            getattr(self, "_staged_virtual_surface_active", False)
+        ):
+            # Do not hand a diff-navigation intent to an opaque first-surface
+            # publisher. It has no current target line to select and would
+            # otherwise remain pending without a terminal.
+            self._cancel_virtual_2d_publish()
+            self._fail_viewport_request(active, "navigation-staged-surface")
+            return None
+        queued = self._queue_virtual_window(
+            target_start,
+            reason="diff-block",
+            request_id=request_id,
+            force_after0=True,
+        )
+        active = getattr(self, "_viewport_request_active", None)
+        if queued is None:
+            # `_queue_virtual_window` has already recorded the required
+            # terminal for a staged surface. Keep the caller from reporting a
+            # false scheduled state or a duplicate failure telemetry entry.
+            return None
+        if not queued or not isinstance(active, dict) or int(active.get("id", -1)) != int(request_id):
+            if isinstance(active, dict) and active.get("status") == "pending":
+                self._fail_viewport_request(active, "navigation-queue-failed")
+            return False
+        if bool(getattr(self, "_staged_virtual_surface_active", False)):
+            # The surface may become staged between the pre-queue check and
+            # after(0) installation. Terminalise instead of leaving an owner
+            # that cannot lawfully select the intent target.
+            if active.get("status") == "pending":
+                self._cancel_virtual_2d_publish()
+                self._fail_viewport_request(active, "navigation-staged-surface")
+            return None
+        if active.get("status") != "pending":
+            # The scheduler can fail terminally while `_queue_virtual_window`
+            # returns to this callback.  Distinguish that already-recorded
+            # terminal from an ordinary queue refusal so callers do not append
+            # a second navigation telemetry record.
+            return None
+        navigation = active.get("navigation")
+        if not isinstance(navigation, dict):
+            self._fail_viewport_request(active, "navigation-intent-lost")
+            return False
+        # `_schedule_virtual_2d_publish` either installed this replaceable
+        # owner or reused the existing owner which will drain the newest target.
+        navigation["publish_token"] = int(
+            getattr(self, "_virtual_publish_token", 0) or 0
+        )
+        navigation["status"] = "scheduled"
+        return True
+
+    def _goto_full_diff_block(self, block_idx: int):
+        """Navigate a full logical diff block with bounded outer telemetry."""
+        started = time.perf_counter()
+        phase_started = started
+        phases: dict[str, float] = {}
+        resolved_pair_idx = None
+        outcome = "unknown"
+
+        def _mark(name: str) -> None:
+            nonlocal phase_started
+            now = time.perf_counter()
+            phases[name] = max(0.0, (now - phase_started) * 1000.0)
+            phase_started = now
+
+        try:
+            blocks = self._ensure_full_diff_blocks()
+            if not (0 <= int(block_idx) < len(blocks)):
+                _mark("block_lookup")
+                outcome = "invalid-block"
+                self._update_diff_nav_state()
+                return
+            resolved_pair_idx = int(blocks[int(block_idx)].start_pair_idx)
+            _mark("block_lookup")
+            # Only an offscreen target in a virtual full-logical surface is
+            # requestized.  Visible targets retain the existing synchronous
+            # behavior (and its direct callback bound); nonvirtual panes keep
+            # their historic append/preview navigation unchanged.
+            if (
+                self._virtual_mode_active()
+                and resolved_pair_idx not in self.row_to_line
+            ):
+                queued = self._queue_deferred_full_diff_block(
+                    int(block_idx),
+                    resolved_pair_idx,
+                    float(phases.get("block_lookup", 0.0)),
+                )
+                if queued is True:
+                    outcome = "scheduled"
+                    return
+                if queued is None:
+                    outcome = "terminal-failed"
+                    return
+                outcome = "queue-failed"
+                self._update_diff_nav_state()
+                return
+            if not self._materialize_pair_for_navigation(resolved_pair_idx):
+                _mark("materialize_publish")
+                outcome = "materialize-failed"
+                self._update_diff_nav_state()
+                return
+            _mark("materialize_publish")
+            line = self.row_to_line.get(resolved_pair_idx)
+            if line is None:
+                outcome = "line-missing"
+                self._update_diff_nav_state()
+                return
+            self._goto_block_start(line, navigation_phases=phases)
+            outcome = "complete"
+        finally:
+            phases.setdefault("block_lookup", 0.0)
+            phases.setdefault("materialize_publish", 0.0)
+            phases.setdefault("selection", 0.0)
+            phases.setdefault("restore", 0.0)
+            phases.setdefault("ui", 0.0)
+            phases["total"] = max(0.0, (time.perf_counter() - started) * 1000.0)
+            # The deferred path records once at its terminal request.  An
+            # immediate `scheduled` record here would misrepresent a complete
+            # navigation before its target selection and C/UI surface exist.
+            if outcome not in ("scheduled", "terminal-failed"):
+                self._record_diff_navigation_telemetry(
+                    action="full-diff-block",
+                    block_idx=block_idx,
+                    pair_idx=resolved_pair_idx,
+                    outcome=outcome,
+                    phase_ms=phases,
+                )
+
+    def _goto_block_start(self, start_line: int, *, navigation_phases: dict | None = None):
         # Scroll so the line is visible
+        phase_started = time.perf_counter()
+
+        def _mark(name: str) -> None:
+            nonlocal phase_started
+            if navigation_phases is None:
+                return
+            now = time.perf_counter()
+            navigation_phases[name] = max(0.0, (now - phase_started) * 1000.0)
+            phase_started = now
+
         try:
             # Preserve horizontal position: see() would reset xview to column 0.
-            saved_x = 0.0
-            try:
-                saved_x = float((self.left.xview() or (0.0, 1.0))[0])
-            except Exception:
-                pass
+            saved_x = self._logical_horizontal_first()
             nav_widgets = [self.left, self.right]
             if self._is_three_way_enabled():
                 nav_widgets.insert(1, self.base)
             for w in nav_widgets:
                 w.mark_set("insert", f"{start_line}.0")
                 w.see(f"{start_line}.0")
+            _mark("selection")
             # Restore horizontal position after see() reset it.
             try:
                 self._sync_main_x_to_frac(saved_x)
                 self._sync_c_x_to_frac(saved_x)
             except Exception:
                 pass
+            _mark("restore")
             self._highlight_selected_line(start_line)
             pair = self._pair_for_line(start_line)
             self.selected_pair_idx = self._pair_idx_for_line(start_line)
@@ -22167,6 +28642,258 @@ class SheetView:
             self._update_cursor_lines()
         except Exception:
             pass
+        _mark("ui")
+        self._update_diff_nav_state()
+
+    def _observe_strict_main_x_alignment(self, saved_x: float):
+        """Return a witnessed narrow main-pane x state, or ``None``.
+
+        This is intentionally a strict-navigation-only fast-path witness.  A
+        normal main x sync is still the recovery path for every missing widget,
+        read failure, or even a very small mismatch.  ``ttk.Scrollbar`` has no
+        state readback API, so a successful ``set`` using the observed Text
+        tuple is the strongest same-turn commit we can make for its thumb.
+        """
+        self._last_strict_main_x_observation_error = None
+        try:
+            target = float(saved_x)
+            if (
+                not math.isfinite(target)
+                or target < 0.0
+                or target > 1.0
+                or self._wide_column_virtual_active()
+                or bool(getattr(self, "_xsyncing", False))
+            ):
+                return None
+
+            sides = [
+                ("A", self.left, getattr(self, "left_colhdr", None), getattr(self, "hsb_left", None)),
+                ("B", self.right, getattr(self, "right_colhdr", None), getattr(self, "hsb_right", None)),
+            ]
+            if self._is_three_way_enabled():
+                sides.insert(
+                    1,
+                    (
+                        "BASE",
+                        self.base,
+                        getattr(self, "base_colhdr", None),
+                        getattr(self, "hsb_mid", None),
+                    ),
+                )
+
+            observed = []
+            # A skip has a much tighter tolerance than the historic post-sync
+            # assertion.  When a pane is merely close, perform the existing
+            # authoritative sync rather than accepting observable drift.
+            skip_tolerance = 1e-4
+            for side, text, header, scrollbar in sides:
+                if text is None or header is None or scrollbar is None:
+                    return None
+                first, last = text.xview()
+                first = float(first)
+                last = float(last)
+                if (
+                    not math.isfinite(first)
+                    or not math.isfinite(last)
+                    or first < 0.0
+                    or last <= first
+                    or last > 1.0
+                    or not math.isclose(first, target, abs_tol=skip_tolerance)
+                ):
+                    return None
+                header_first, header_last = header.xview()
+                header_first = float(header_first)
+                header_last = float(header_last)
+                if (
+                    not math.isfinite(header_first)
+                    or not math.isfinite(header_last)
+                    or header_first < 0.0
+                    or header_last <= header_first
+                    or header_last > 1.0
+                    or not math.isclose(
+                        header_first, first, abs_tol=skip_tolerance
+                    )
+                ):
+                    return None
+                observed.append((side, first, last, scrollbar))
+
+            # There is no reliable Scrollbar getter.  Treat a successful
+            # direct commit of the current Text fractions as its strict witness
+            # and fail closed if any side rejects it.
+            for _side, first, last, scrollbar in observed:
+                scrollbar.set(first, last)
+            return {
+                "source_x": float(observed[0][1]),
+                "sides": tuple(
+                    (side, float(first), float(last))
+                    for side, first, last, _scrollbar in observed
+                ),
+            }
+        except Exception as exc:
+            self._last_strict_main_x_observation_error = exc
+            return None
+
+    def _goto_block_start_strict(
+        self, start_line: int, *, navigation_phases: dict
+    ) -> None:
+        """Finish one deferred virtual diff-navigation intent fail-closed.
+
+        The normal block-navigation route predates request terminals and keeps
+        its deliberately forgiving Text/C-area behavior.  This narrow helper
+        is used only after an offscreen after(0) publication: failures must
+        reach the request owner rather than leave a correct-looking selected
+        line with an unverified C surface or horizontal restore.
+        """
+        phase_started = time.perf_counter()
+
+        def _mark(name: str) -> None:
+            nonlocal phase_started
+            now = time.perf_counter()
+            navigation_phases[name] = max(0.0, (now - phase_started) * 1000.0)
+            phase_started = now
+
+        line = int(start_line)
+        expected_pair_idx = self._normalize_pair_idx(self._pair_idx_for_line(line))
+        if expected_pair_idx is None:
+            raise RuntimeError("deferred navigation line has no logical pair")
+
+        # Preserve the original order: make the target visible, restore the
+        # horizontal geometry, then create the main/C selection and navigation
+        # state.  No broad exception handling is permitted in this terminal
+        # path; the caller records a failed request for any broken step.
+        saved_x = self._logical_horizontal_first()
+        nav_widgets = [self.left, self.right]
+        if self._is_three_way_enabled():
+            nav_widgets.insert(1, self.base)
+        for widget in nav_widgets:
+            widget.mark_set("insert", f"{line}.0")
+            widget.see(f"{line}.0")
+        _mark("selection")
+
+        is_wide_main = bool(self._wide_column_virtual_active())
+        strict_main_x = None
+        navigation_phases["main_x_observe"] = 0.0
+        navigation_phases["main_x_fast_path"] = 0.0
+        navigation_phases["main_x_fallback"] = 0.0
+        if is_wide_main:
+            # Preserve the existing wide-column controller path.  Its local
+            # Text xview is not a complete-sheet fraction and therefore can
+            # never satisfy the narrow observer.
+            main_x_fallback_started = time.perf_counter()
+            self._sync_main_x_to_frac(saved_x)
+            navigation_phases["main_x_fallback"] = max(
+                0.0, (time.perf_counter() - main_x_fallback_started) * 1000.0
+            )
+        else:
+            main_x_observe_started = time.perf_counter()
+            strict_main_x = self._observe_strict_main_x_alignment(saved_x)
+            navigation_phases["main_x_observe"] = max(
+                0.0, (time.perf_counter() - main_x_observe_started) * 1000.0
+            )
+            navigation_phases["main_x_fast_path"] = 1.0 if strict_main_x is not None else 0.0
+            if strict_main_x is None:
+                main_x_fallback_started = time.perf_counter()
+                self._sync_main_x_to_frac(saved_x)
+                navigation_phases["main_x_fallback"] = max(
+                    0.0, (time.perf_counter() - main_x_fallback_started) * 1000.0
+                )
+                strict_main_x = self._observe_strict_main_x_alignment(saved_x)
+                if strict_main_x is None:
+                    detail = getattr(self, "_last_strict_main_x_observation_error", None)
+                    suffix = f": {detail}" if detail is not None else ""
+                    raise RuntimeError(
+                        "deferred navigation main x restore did not finalize" + suffix
+                    )
+        strict_c_x_restore = None
+        if not is_wide_main:
+            actual_main_x = float(strict_main_x["source_x"])
+            if not math.isclose(actual_main_x, float(saved_x), abs_tol=0.02):
+                raise RuntimeError(
+                    f"deferred navigation main x restore mismatch {actual_main_x} != {saved_x}"
+                )
+            strict_c_x_restore = {
+                "source_x": float(actual_main_x),
+                "cursor_x": float(
+                    self._map_xfirst_between_widgets(
+                        self.left, self.cursor_cmp, float(actual_main_x)
+                    )
+                ),
+            }
+            if hasattr(self, "cell_cmp_text"):
+                strict_c_x_restore["cell_x"] = float(
+                    self._map_xfirst_between_widgets(
+                        self.left, self.cell_cmp_text, float(actual_main_x)
+                    )
+                )
+        else:
+            # `_sync_c_x_to_frac` historically maintained these logical wide
+            # scrollbars during strict navigation.  There is no independent C
+            # xview in wide mode, but retain the same visible scrollbar state
+            # without resurrecting the redundant pre-render C movement.
+            self._set_wide_column_scrollbars()
+        _mark("restore")
+        navigation_phases["restore_main"] = navigation_phases["restore"]
+
+        self._highlight_selected_line(line)
+        pair = self._pair_for_line(line)
+        self.selected_pair_idx = self._pair_idx_for_line(line)
+        self.hover_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+        self.hover_col_idx = None
+        self.hover_side = None
+        self.selected_excel_row_a = self._row_for_side(pair, "A")
+        self.selected_excel_row_b = self._row_for_side(pair, "B")
+        self.selected_excel_row = self.selected_excel_row_a or self.selected_excel_row_b
+        self._set_main_selected_cell(line, None)
+        if self._update_cursor_lines(
+            strict=True,
+            strict_x_restore=strict_c_x_restore,
+        ) is not True:
+            raise RuntimeError("deferred navigation C surface did not finalize")
+        navigation_phases["c_final_restore"] = max(
+            0.0,
+            float(getattr(self, "_last_strict_c_final_restore_ms", 0.0) or 0.0),
+        )
+
+        actual_pair_idx = self._normalize_pair_idx(self.selected_pair_idx)
+        c_pair_idx = self._normalize_pair_idx(
+            getattr(self, "_last_cursor_cmp_pair_idx", None)
+        )
+        c_render_key = getattr(self, "_c_area_last_completed_render_key", None)
+        if actual_pair_idx != expected_pair_idx:
+            raise RuntimeError("deferred navigation selected logical pair mismatch")
+        if c_pair_idx != expected_pair_idx:
+            raise RuntimeError("deferred navigation C logical pair mismatch")
+        if (
+            not isinstance(c_render_key, tuple)
+            or not c_render_key
+            or self._normalize_pair_idx(c_render_key[0]) != expected_pair_idx
+        ):
+            raise RuntimeError("deferred navigation C render target mismatch")
+        if strict_c_x_restore is not None:
+            expected_c_x = float(strict_c_x_restore["cursor_x"])
+            actual_c_x = float((self.cursor_cmp.xview() or (0.0, 1.0))[0])
+            if not math.isclose(actual_c_x, expected_c_x, abs_tol=0.02):
+                raise RuntimeError(
+                    f"deferred navigation C x restore mismatch {actual_c_x} != {expected_c_x}"
+                )
+            cursor_header = getattr(self, "cursor_cmp_colhdr", None)
+            if cursor_header is not None:
+                actual_header_x = float((cursor_header.xview() or (0.0, 1.0))[0])
+                if not math.isclose(actual_header_x, expected_c_x, abs_tol=0.02):
+                    raise RuntimeError(
+                        "deferred navigation C header x restore mismatch "
+                        f"{actual_header_x} != {expected_c_x}"
+                    )
+            if hasattr(self, "cell_cmp_text"):
+                expected_cell_x = float(strict_c_x_restore["cell_x"])
+                actual_cell_x = float((self.cell_cmp_text.xview() or (0.0, 1.0))[0])
+                if not math.isclose(actual_cell_x, expected_cell_x, abs_tol=0.02):
+                    raise RuntimeError(
+                        "deferred navigation C cell x restore mismatch "
+                        f"{actual_cell_x} != {expected_cell_x}"
+                    )
+
+        _mark("ui")
         self._update_diff_nav_state()
 
     def focus_logical_cell(self, excel_row: int, logical_col: int) -> bool:
@@ -22200,6 +28927,12 @@ class SheetView:
         if line is None:
             return False
         line = int(line)
+        if not self._ensure_logical_column_materialized(logical_col):
+            return False
+        # A bounded horizontal publication keeps the same logical row window,
+        # but fetch the visible line again rather than trusting a recycled
+        # Text-line number from before the column move.
+        line = int(self.row_to_line.get(pair_idx, line))
         self._goto_block_start(line)
         self._set_main_selected_cell(line, logical_col)
         self.selected_pair_idx = pair_idx
@@ -22240,11 +28973,18 @@ class SheetView:
                 nav_widgets.insert(1, self.base)
             for widget in nav_widgets:
                 widget.mark_set("insert", cell_index)
-                widget.see(cell_index)
+                widget.see(f"{line}.0" if self._wide_column_virtual_active() else cell_index)
             try:
-                fraction = float((self.left.xview() or (0.0, 1.0))[0])
-                self._sync_main_x_to_frac(fraction)
-                self._sync_c_x_to_frac(fraction)
+                if self._wide_column_virtual_active():
+                    # ``see`` reports a fraction inside the short current Tk
+                    # document.  It is not a fraction of the complete logical
+                    # width and must never be fed back into the column-window
+                    # controller after an off-screen target was materialized.
+                    self._set_wide_column_scrollbars()
+                else:
+                    fraction = float((self.left.xview() or (0.0, 1.0))[0])
+                    self._sync_main_x_to_frac(fraction)
+                    self._sync_c_x_to_frac(fraction)
             except Exception:
                 pass
         except Exception:
@@ -22275,7 +29015,10 @@ class SheetView:
 
     def _goto_next_diff_block(self):
         try:
-            if bool(self.only_diff_var.get()):
+            use_full_logical_blocks = bool(self.only_diff_var.get()) or bool(
+                self._virtual_mode_active()
+            )
+            if use_full_logical_blocks:
                 blocks = self._ensure_full_diff_blocks()
                 active_idx = self._active_full_diff_block_index()
                 if blocks:
@@ -22302,7 +29045,10 @@ class SheetView:
 
     def _goto_prev_diff_block(self):
         try:
-            if bool(self.only_diff_var.get()):
+            use_full_logical_blocks = bool(self.only_diff_var.get()) or bool(
+                self._virtual_mode_active()
+            )
+            if use_full_logical_blocks:
                 active_idx = self._active_full_diff_block_index()
                 if active_idx is not None and active_idx > 0:
                     self._goto_full_diff_block(active_idx - 1)
@@ -22347,10 +29093,32 @@ class SheetView:
         if bool(getattr(self, "only_diff_var", None) and self.only_diff_var.get()):
             message = "只看差异 | 正在后台生成精确差异；当前只读，可查看或切换 Sheet..."
         try:
+            overlay = getattr(self, "_calculation_overlay", None)
+            if overlay is None or not overlay.winfo_exists():
+                overlay = tk.Frame(self.frame, bg="#F5F7FA", highlightthickness=1, highlightbackground="#9E9E9E")
+                label = tk.Label(
+                    overlay,
+                    bg="#F5F7FA",
+                    fg="#1565C0",
+                    font=("Segoe UI", 10, "bold"),
+                    justify="center",
+                    wraplength=620,
+                )
+                label.place(relx=0.5, rely=0.5, anchor="center")
+                self._calculation_overlay = overlay
+                self._calculation_overlay_label = label
+            label = getattr(self, "_calculation_overlay_label", None)
+            if label is not None:
+                label.configure(text=message)
+            overlay.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
+            overlay.lift()
             if not self.loading_progress.winfo_manager():
                 self.loading_progress.pack(side="left", padx=(10, 0))
             self.loading_progress.start(12)
-            for w in (self.left, self.right):
+            panes = [self.left, self.right]
+            if self._is_three_way_enabled():
+                panes.insert(1, self.base)
+            for w in panes:
                 w.configure(state="normal")
                 w.delete("1.0", "end")
                 w.insert("1.0", "正在加载并计算差异...\n")
@@ -22364,8 +29132,33 @@ class SheetView:
             pass
         self._refresh_interaction_gate()
 
+    def _show_exact_unavailable(self, message: str):
+        """Replace every comparison pane with a stable non-provisional state."""
+        try:
+            self.loading_progress.stop()
+            self.loading_progress.pack_forget()
+            panes = [self.left, self.right]
+            if self._is_three_way_enabled():
+                panes.insert(1, self.base)
+            for pane in panes:
+                pane.configure(state="normal")
+                pane.delete("1.0", "end")
+                pane.insert("1.0", "当前 Sheet 无法发布可操作的精确结果。\n")
+            for line_numbers in (self.left_ln, self.base_ln, self.right_ln):
+                line_numbers.configure(state="normal")
+                line_numbers.delete("1.0", "end")
+                line_numbers.insert("1.0", "\n")
+                line_numbers.configure(state="disabled")
+            self.info.configure(text=message)
+        except Exception:
+            pass
+        self._refresh_interaction_gate()
+
     def _hide_loading(self):
         try:
+            overlay = getattr(self, "_calculation_overlay", None)
+            if overlay is not None and overlay.winfo_exists():
+                overlay.place_forget()
             self.loading_progress.stop()
             self.loading_progress.pack_forget()
         except Exception:
@@ -22403,15 +29196,143 @@ class SheetView:
             row_b_edit_vals=_row_from_cache(rows_b_edit, rb, self.max_col),
         )
 
-    def _render_line_from_raw_parts(self, raw_parts: list[str], side: str | None = None) -> str:
+    def _build_virtual_line_render_context(self, rendered_logical_columns):
+        """Build one formatter projection for the current bounded surface.
+
+        This is intentionally a geometry-only helper.  In particular, it does
+        not call ``_has_complete_prepared_rows`` (the caller has already
+        established publication readiness) and it never inspects raw rows.
+        A construction error is conservative: materialization uses the exact
+        historical formatter for the entire publication.
+        """
+        started = time.perf_counter()
+        rendered = tuple(int(column) for column in rendered_logical_columns)
+        telemetry = {
+            "enabled": False,
+            "fallback": False,
+            "fallback_reason": "",
+            "build_ms": 0.0,
+            "rendered_logical_columns": rendered,
+            "readiness_scan_count": 0,
+            "versions": {
+                "projection_generation": int(
+                    getattr(self, "_column_projection_generation", 0) or 0
+                ),
+                "widths_version": int(getattr(self, "_col_widths_version", 0) or 0),
+                "window_generation": int(
+                    getattr(self, "_virtual_column_window_generation", 0) or 0
+                ),
+                "window_start": int(
+                    getattr(self, "_virtual_column_window_start", 0) or 0
+                ),
+                "data_version": int(getattr(self, "_data_version", 0) or 0),
+            },
+            "offset_counts": {"A": 0, "BASE": 0, "B": 0},
+        }
+        try:
+            projection = self._active_column_projection()
+            widths = tuple(
+                int(self.col_char_widths.get(logical_col, 1))
+                for logical_col in rendered
+            )
+            grid_enabled = self._is_grid_overlay_enabled()
+
+            def _offsets(side: str) -> tuple[int | None, ...]:
+                return tuple(
+                    (
+                        int(physical_col) - 1
+                        if (physical_col := projection.physical_col(side, logical_col))
+                        is not None
+                        else None
+                    )
+                    for logical_col in rendered
+                )
+
+            mine_offsets = _offsets("A")
+            base_offsets = _offsets("BASE")
+            theirs_offsets = _offsets("B")
+            context = _VirtualLineRenderContext(
+                rendered_logical_columns=rendered,
+                widths=widths,
+                grid_enabled=bool(grid_enabled),
+                separator=_COL_SEP if grid_enabled else "   ",
+                trailing=" │" if grid_enabled else "",
+                mine_offsets=mine_offsets,
+                base_offsets=base_offsets,
+                theirs_offsets=theirs_offsets,
+                placeholder=_LOGICAL_COLUMN_PLACEHOLDER,
+                projection_generation=int(
+                    getattr(self, "_column_projection_generation", 0) or 0
+                ),
+                widths_version=int(getattr(self, "_col_widths_version", 0) or 0),
+                window_generation=int(
+                    getattr(self, "_virtual_column_window_generation", 0) or 0
+                ),
+                window_start=int(
+                    getattr(self, "_virtual_column_window_start", 0) or 0
+                ),
+                data_version=int(getattr(self, "_data_version", 0) or 0),
+            )
+            telemetry["enabled"] = True
+            telemetry["offset_counts"] = {
+                "A": sum(offset is not None for offset in mine_offsets),
+                "BASE": sum(offset is not None for offset in base_offsets),
+                "B": sum(offset is not None for offset in theirs_offsets),
+            }
+            return context, telemetry
+        except Exception as exc:
+            telemetry["fallback"] = True
+            telemetry["fallback_reason"] = (
+                f"build:{type(exc).__name__}" if exc is not None else "build"
+            )
+            return None, telemetry
+        finally:
+            telemetry["build_ms"] = max(
+                0.0, (time.perf_counter() - started) * 1000.0
+            )
+
+    def _render_line_from_raw_parts(
+        self,
+        raw_parts: list[str],
+        side: str | None = None,
+        *,
+        render_context: _VirtualLineRenderContext | None = None,
+    ) -> str:
+        """Render raw fragments, optionally using one frozen publication context.
+
+        ``side is None`` deliberately retains the historical logical-row
+        formatter.  It is used by non-virtual callers whose raw fragments are
+        already logical, so it must never inherit a side projection or a
+        virtual publication context.
+        """
+        if render_context is not None and side is not None:
+            offsets = render_context.offsets_for(side)
+            if offsets is not None:
+                values = list(raw_parts or ())
+                return render_context.separator.join(
+                    _format_cell(
+                        (
+                            render_context.placeholder
+                            if offset is None
+                            else values[offset]
+                            if 0 <= int(offset) < len(values)
+                            else ""
+                        ),
+                        int(width),
+                    )
+                    for offset, width in zip(offsets, render_context.widths)
+                ) + render_context.trailing
         if side is not None:
             raw_parts = self._project_raw_parts(raw_parts, side)
         grid_on = self._is_grid_overlay_enabled()
         sep = _COL_SEP if grid_on else "   "
         trail = " \u2502" if grid_on else ""
         return sep.join(
-            _format_cell(raw_parts[i], self.col_char_widths.get(i + 1, 1))
-            for i in range(len(raw_parts))
+            _format_cell(
+                raw_parts[logical_col - 1] if logical_col - 1 < len(raw_parts) else "",
+                self.col_char_widths.get(logical_col, 1),
+            )
+            for logical_col in self._rendered_logical_columns()
         ) + trail
 
     def _raw_parts_from_row_values(self, row_vals, max_col: int | None = None) -> list[str]:
@@ -22468,6 +29389,11 @@ class SheetView:
         column_structure: bool = False,
         edited_sides=(),
     ):
+        if row_structure or column_structure:
+            # Physical content coordinates are no longer stable.  The save
+            # journal retains its own structural records; this local overlay
+            # is intentionally dropped rather than guessed through a remap.
+            self.app.mark_sheet_operation_overlay_structural(self.sheet)
         if row_structure:
             self._row_model_version = int(getattr(self, "_row_model_version", 0)) + 1
             self._row_alignment_reuse_requested = False
@@ -22488,6 +29414,9 @@ class SheetView:
         if "theirs" in normalized_sides:
             self._theirs_edit_version = int(getattr(self, "_theirs_edit_version", 0)) + 1
         self._column_mapping_stale_reason = str(reason or "worksheet-edited")
+        self._clear_accepted_common_insertion_equalities(
+            f"mapping-stale:{self._column_mapping_stale_reason}"
+        )
         self._invalidate_only_diff_snapshot_cache()
         self._diff_map_cache = None
         self._diff_map_cache_version = None
@@ -22579,6 +29508,7 @@ class SheetView:
         self._column_projection_generation = int(
             getattr(self, "_column_projection_generation", 0)
         ) + 1
+        self._clear_accepted_common_insertion_equalities("projection-install")
         self._column_mapping_stale_reason = ""
         self._set_uniform_logical_column_widths(projection)
         self._base_spans_cache = None
@@ -22701,7 +29631,150 @@ class SheetView:
             bool(replace),
         )
 
-    def _materialize_staged_pair_parts(self):
+    def _materialize_prepared_pair_text(
+        self,
+        pair_indices=None,
+        *,
+        force: bool = False,
+        render_context: _VirtualLineRenderContext | None = None,
+    ):
+        """Format selected immutable raw rows into the small Text-line cache.
+
+        Large cache application retains raw fragments for every logical row,
+        but runs costly NFC/display-width formatting only for the visible
+        window.  This is intentionally UI-only and has no Worksheet fallback.
+        """
+        if pair_indices is None:
+            indices = set(self.pair_raw_parts_a) | set(self.pair_raw_parts_b)
+            indices |= set(self.pair_raw_parts_base)
+        else:
+            indices = {int(idx) for idx in pair_indices}
+        materialize_stats = {
+            "rows": len(indices),
+            "force": bool(force),
+            "sides": {
+                side: {"hit": 0, "miss": 0, "absent": 0}
+                for side in ("A", "BASE", "B")
+            },
+            "formatter": {
+                "context_enabled": bool(render_context is not None),
+                "fallback": False,
+                "fallback_reason": "",
+                "context_formatted": 0,
+                "legacy_formatted": 0,
+                "base_empty_legacy": 0,
+            },
+        }
+        active_context = render_context
+        context_rendered: list[tuple[dict[int, str], int, tuple[str, ...], str]] = []
+
+        def _format_parts(destination, pair_idx: int, parts, side: str) -> str:
+            """Format one miss and atomically fall back for this publication.
+
+            A context failure must not leave half a publication using a
+            potentially inconsistent projection.  Re-render prior context
+            misses through the exact legacy path, then keep that legacy path
+            for all remaining misses.  No LRU or cache-key behavior changes.
+            """
+            nonlocal active_context
+            raw_parts = tuple(parts or ())
+            formatter = materialize_stats["formatter"]
+            if active_context is not None:
+                try:
+                    rendered = self._render_line_from_raw_parts(
+                        list(raw_parts), side, render_context=active_context
+                    )
+                    context_rendered.append((destination, int(pair_idx), raw_parts, side))
+                    formatter["context_formatted"] += 1
+                    return rendered
+                except Exception as exc:
+                    active_context = None
+                    formatter["fallback"] = True
+                    formatter["fallback_reason"] = f"format:{type(exc).__name__}"
+                    for prior_destination, prior_pair_idx, prior_parts, prior_side in context_rendered:
+                        prior_destination[prior_pair_idx] = self._render_line_from_raw_parts(
+                            list(prior_parts), prior_side
+                        )
+                    formatter["legacy_formatted"] += len(context_rendered)
+                    formatter["context_formatted"] = 0
+                    context_rendered.clear()
+            formatter["legacy_formatted"] += 1
+            return self._render_line_from_raw_parts(list(raw_parts), side)
+
+        for pair_idx in indices:
+            rendered = False
+            parts_a = self.pair_raw_parts_a.get(pair_idx)
+            if parts_a is not None and (force or pair_idx not in self.pair_text_a):
+                materialize_stats["sides"]["A"]["miss"] += 1
+                self.pair_text_a[pair_idx] = _format_parts(
+                    self.pair_text_a, pair_idx, parts_a, "A"
+                )
+                rendered = True
+            elif parts_a is not None:
+                materialize_stats["sides"]["A"]["hit"] += 1
+            else:
+                materialize_stats["sides"]["A"]["absent"] += 1
+            parts_b = self.pair_raw_parts_b.get(pair_idx)
+            if parts_b is not None and (force or pair_idx not in self.pair_text_b):
+                materialize_stats["sides"]["B"]["miss"] += 1
+                self.pair_text_b[pair_idx] = _format_parts(
+                    self.pair_text_b, pair_idx, parts_b, "B"
+                )
+                rendered = True
+            elif parts_b is not None:
+                materialize_stats["sides"]["B"]["hit"] += 1
+            else:
+                materialize_stats["sides"]["B"]["absent"] += 1
+            parts_base = self.pair_raw_parts_base.get(pair_idx)
+            if parts_base is not None and (force or pair_idx not in self.pair_text_base):
+                materialize_stats["sides"]["BASE"]["miss"] += 1
+                if parts_base:
+                    self.pair_text_base[pair_idx] = _format_parts(
+                        self.pair_text_base, pair_idx, parts_base, "BASE"
+                    )
+                else:
+                    # Preserve the legacy distinction between an empty Base
+                    # raw channel and a Base row containing empty cells.
+                    materialize_stats["formatter"]["base_empty_legacy"] += 1
+                    self.pair_text_base[pair_idx] = ""
+                rendered = True
+            elif parts_base is not None:
+                materialize_stats["sides"]["BASE"]["hit"] += 1
+            else:
+                materialize_stats["sides"]["BASE"]["absent"] += 1
+            if rendered or pair_idx in self._prepared_text_lru:
+                self._prepared_text_lru[pair_idx] = None
+                self._prepared_text_lru.move_to_end(pair_idx)
+        return materialize_stats
+
+    def _trim_prepared_text_cache(self):
+        """Bound virtual formatted text while retaining immutable raw rows.
+
+        Operation paths may replace text without updating raw snapshot parts,
+        so they deliberately retain their current strings.  The snapshot-only,
+        unmodified view path is safe to evict and reconstruct on demand.
+        """
+        if (
+            not bool(getattr(self, "_is_large_sheet", False))
+            or str(getattr(self, "_cache_source", "")) != "snapshot"
+            or bool(getattr(self, "touched_rows", ()))
+        ):
+            return
+        row_cap = self._virtual_viewport_row_capacity()
+        limit = min(320, max(row_cap, row_cap * 4))
+        keep = set(getattr(self, "display_rows", ()) or ())
+        while len(self._prepared_text_lru) > limit:
+            pair_idx, _unused = self._prepared_text_lru.popitem(last=False)
+            if pair_idx in keep:
+                self._prepared_text_lru[pair_idx] = None
+                continue
+            # All entries in this LRU were produced from raw fragments.  It is
+            # safe to regenerate them if a later logical viewport needs them.
+            self.pair_text_a.pop(pair_idx, None)
+            self.pair_text_b.pop(pair_idx, None)
+            self.pair_text_base.pop(pair_idx, None)
+
+    def _materialize_staged_pair_parts(self, pair_indices=None):
         staged = self._pending_pair_parts_cache
         if staged is None:
             return
@@ -22736,38 +29809,97 @@ class SheetView:
             int(idx): _parts_with_missing_marker(idx, parts, "BASE")
             for idx, parts in dict(pair_parts_base or {}).items()
         }
+        # Retain the immutable pre-render fragments for view-only inspection.
+        # They remain compact strings and preserve the side's physical column
+        # coordinates; `_prepared_value_for_logical_cell` projects them through
+        # the already exact logical-column model on demand.
+        if replace:
+            self.pair_raw_parts_a = pair_parts_a
+            self.pair_raw_parts_b = pair_parts_b
+            self.pair_raw_parts_base = pair_parts_base
+        else:
+            self.pair_raw_parts_a.update(pair_parts_a)
+            self.pair_raw_parts_b.update(pair_parts_b)
+            self.pair_raw_parts_base.update(pair_parts_base)
+        # Prepared fragments may have changed without a selection change.
+        # Never reuse an earlier hover payload across that transition.
+        self._last_hover_payload_request_key = None
+        self._last_hover_payload_request_value = None
         self._projected_widths_from_cached_parts(
             pair_parts_a,
             pair_parts_b,
             pair_parts_base,
             physical_widths,
         )
-        if pair_parts_a or pair_parts_b:
-            rendered_a = {
-                int(idx): self._render_line_from_raw_parts(list(parts), "A")
-                for idx, parts in pair_parts_a.items()
-            }
-            rendered_b = {
-                int(idx): self._render_line_from_raw_parts(list(parts), "B")
-                for idx, parts in pair_parts_b.items()
-            }
-            if replace:
-                self.pair_text_a = rendered_a
-                self.pair_text_b = rendered_b
-            else:
-                self.pair_text_a.update(rendered_a)
-                self.pair_text_b.update(rendered_b)
-        rendered_base = {
-            int(idx): (
-                self._render_line_from_raw_parts(list(parts), "BASE")
-                if parts else ""
-            )
-            for idx, parts in pair_parts_base.items()
-        }
         if replace:
-            self.pair_text_base = rendered_base
+            self.pair_text_a = {}
+            self.pair_text_b = {}
+            self.pair_text_base = {}
+            self._prepared_text_lru.clear()
+        # Existing callers without a selection retain their historical eager
+        # behavior. Cache application passes a bounded selection for large
+        # sheets; later viewport publication fills only the newly visible rows.
+        self._materialize_prepared_pair_text(pair_indices, force=not replace)
+
+    def _publish_prepared_cache_surface(self, on_staged_complete=None, *, prepared_rows=None):
+        """Publish a cache-applied result without entering ``refresh``.
+
+        ``refresh`` is intentionally allowed to rebuild from worksheet data for
+        mutation paths.  Snapshot cache application must not do that, and must
+        not render the legacy large-sheet prefix while the public exact state is
+        still calculating.  The caller sets ``_prepared_cache_publish_active``
+        for this bounded, immutable-only publication.
+        """
+        if prepared_rows is not None:
+            # The mode-switch scheduler has already proven that this complete
+            # logical row set is current and raw-prepared.  Do not derive it
+            # again from live worksheet state while publishing the bounded Tk
+            # surface.
+            rows = list(prepared_rows)
+        elif bool(self.only_diff_var.get()) and self._has_valid_only_diff_snapshot_cache():
+            rows = self._only_diff_rows_with_touched(self._only_diff_rows_cache)
         else:
-            self.pair_text_base.update(rendered_base)
+            rows = list(range(len(self.row_pairs)))
+        self._full_display_rows = list(rows)
+        self._invalidate_render_cache()
+        try:
+            self._render_col_headers()
+        except Exception:
+            pass
+        if self._virtual_mode_active():
+            if callable(on_staged_complete) and self._begin_staged_virtual_first_surface(
+                on_staged_complete
+            ):
+                return "staged"
+            return self._publish_virtual_window(self._virtual_window_start)
+
+        # Small/only-difference results retain the normal complete presentation,
+        # but are bounded by the logical result itself and use raw snapshot data
+        # only.  Clear all pane/header documents before appending one atomic row
+        # set so no calculating surface or stale rows remain underneath it.
+        self._materialize_prepared_pair_text(rows)
+        self.display_rows = []
+        self.row_to_line = {}
+        self._display_diff_row_count = 0
+        for widget in (
+            self.left, self.base, self.right,
+            self.left_ln, self.base_ln, self.right_ln,
+        ):
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+            except Exception:
+                pass
+            finally:
+                if widget in (self.left_ln, self.base_ln, self.right_ln):
+                    try:
+                        widget.configure(state="disabled")
+                    except Exception:
+                        pass
+        self._append_rows(list(rows), refresh_block_ui=False)
+        self._refresh_diff_block_ui()
+        self._update_diff_nav_state()
+        return True
 
     def _identity_column_comparison_cache(self) -> LogicalColumnComparisonCache:
         """Return an immutable physical-order model until a signature cache is ready."""
@@ -23375,7 +30507,95 @@ class SheetView:
             cols.update(c for c in base_cols if c > 0)
         return cols
 
-    def _visual_diff_cols_for_pair(self, pair_idx: int) -> set[int]:
+    def _build_visual_diff_surface_context(
+        self,
+        pair_indices,
+    ) -> _VisualDiffSurfaceContext | None:
+        """Freeze pure column/proof facts for one viewport publication.
+
+        A context is intentionally local to the synchronous publication.  It
+        never reads a workbook and is never retained across a data/projection
+        change; pair-specific raw A/B/Base channels stay live in
+        ``_visual_diff_cols_for_pair``.  If this defensive preparation cannot
+        complete, callers pass ``None`` and use the pre-existing helper path.
+        """
+        self._visual_diff_surface_context_build_count = int(
+            getattr(self, "_visual_diff_surface_context_build_count", 0) or 0
+        ) + 1
+        try:
+            cache = self._active_column_comparison_cache()
+            structural_positive_cols = frozenset(
+                int(col) for col in cache.structural_diff_cols if int(col) > 0
+            )
+            resolved_common_insertions = frozenset()
+            accepted_common_sources: tuple[tuple[int, str], ...] = ()
+            equality_scope = None
+            equality_true_keys = frozenset()
+            if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+                resolved_common_insertions = frozenset(
+                    int(slot.logical_idx) + 1
+                    for slot in cache.model.slots
+                    if (
+                        slot.base_col is None
+                        and slot.mine_col is not None
+                        and slot.theirs_col is not None
+                        and slot.state != "unresolved"
+                        and not slot.confidence.ambiguous
+                    )
+                )
+                raw_sources = dict(
+                    getattr(self, "_accepted_common_insert_sources", {}) or {}
+                )
+                accepted_common_sources = tuple(
+                    (logical_col, source)
+                    for logical_col in sorted(resolved_common_insertions)
+                    for source in (str(raw_sources.get(logical_col, "") or "").upper(),)
+                    if source in ("A", "B")
+                )
+                if accepted_common_sources:
+                    equality_scope = self._accepted_common_insertion_equality_scope()
+                    equality_map = getattr(
+                        self, "_accepted_common_insertion_equalities", {}
+                    ) or {}
+                    # Snapshot only the bounded surface's true proof keys.
+                    # Absence is the existing conservative "still a diff"
+                    # result, so a sparse frozen map retains exact semantics.
+                    equality_true_keys = frozenset(
+                        (int(pair_idx), int(logical_col), source)
+                        for pair_idx in pair_indices
+                        for logical_col, source in accepted_common_sources
+                        if (
+                            logical_col
+                            in self.pair_diff_cols.get(int(pair_idx), set())
+                            and bool(equality_map.get(
+                                (equality_scope, int(pair_idx), int(logical_col), source),
+                                False,
+                            ))
+                        )
+                    )
+            return _VisualDiffSurfaceContext(
+                structural_positive_cols=structural_positive_cols,
+                resolved_common_insertions=resolved_common_insertions,
+                accepted_common_sources=accepted_common_sources,
+                accepted_common_equality_scope=equality_scope,
+                accepted_common_equality_true_keys=equality_true_keys,
+            )
+        except Exception as exc:
+            self._visual_diff_surface_context_error = (
+                f"{type(exc).__name__}:{exc}"
+            )[:320]
+            _dlog(
+                f"VISUAL_DIFF_SURFACE_CONTEXT_FAILED sheet={self.sheet} "
+                f"fallback=legacy-helper err={self._visual_diff_surface_context_error}"
+            )
+            return None
+
+    def _visual_diff_cols_for_pair(
+        self,
+        pair_idx: int,
+        *,
+        surface_context: _VisualDiffSurfaceContext | None = None,
+    ) -> set[int]:
         """Return row-content diffs only; column structure has its own markers.
 
         A missing logical slot can contain values on its owning side in every
@@ -23386,6 +30606,37 @@ class SheetView:
         actions can still reject that ambiguous mapping independently).
         """
         cols = self._all_logical_diff_cols_for_pair(pair_idx)
+        if surface_context is not None:
+            try:
+                # Do not mutate the legacy raw channel until the whole context
+                # calculation succeeds.  An obsolete/malformed context must
+                # fall back to the original helper with byte-for-byte logical
+                # semantics, not a partially filtered set.
+                context_cols = cols.copy()
+                context_cols.difference_update(surface_context.structural_positive_cols)
+                if surface_context.resolved_common_insertions:
+                    # Keep the original distinction between the raw A/B row
+                    # channel and Base-only evidence: only a direct A/B diff
+                    # can retain a common insertion as row content.
+                    pair_cols = self.pair_diff_cols.get(pair_idx, set())
+                    context_cols.difference_update(
+                        surface_context.resolved_common_insertions.difference(pair_cols)
+                    )
+                    # Source validation happened while the immutable context
+                    # was built.  A true key is equivalent to the legacy
+                    # cache-only lookup; an absent key remains conservative.
+                    for logical_col, source in surface_context.accepted_common_sources:
+                        if (
+                            logical_col in pair_cols
+                            and (int(pair_idx), logical_col, source)
+                            in surface_context.accepted_common_equality_true_keys
+                        ):
+                            context_cols.discard(logical_col)
+                return context_cols
+            except Exception:
+                # A malformed/obsolete context must not change the visible
+                # result.  Fall through to the old per-pair computation.
+                pass
         try:
             cache = self._active_column_comparison_cache()
             structural = set(cache.structural_diff_cols)
@@ -23439,69 +30690,200 @@ class SheetView:
         logical_col: int,
         source_side: str,
     ) -> bool:
-        """Prove an accepted common-insert cell still matches its copy source.
+        """Return an explicit mutation-built equality proof without I/O.
 
-        The comparison deliberately uses the target side's physical row on
-        both current workbooks.  That is the coordinate copied by the column
-        transaction; comparing the normal Mine/Theirs row pair here would
-        reproduce the row-alignment offset that this guard is meant to remove.
-        Any subsequent edit on either side breaks equality and immediately
-        restores the real visual difference.
+        This method sits on the render path, so it must remain a pure lookup:
+        cache absence is deliberately conservative and keeps the real visual
+        difference.  The matching workbook read lives only in
+        ``_compute_accepted_common_insertion_equalities_from_edit_workbooks``.
         """
         source = str(source_side or "").upper()
         if source not in ("A", "B"):
             return False
-        if not (0 <= int(pair_idx) < len(self.row_pairs)):
+        if str((getattr(self, "_accepted_common_insert_sources", {}) or {}).get(
+            int(logical_col), ""
+        )).upper() != source:
             return False
-        row_a, row_b = self.row_pairs[int(pair_idx)]
-        physical_row = row_b if source == "A" else row_a
-        if physical_row is None:
-            return False
-        projection = self._active_column_projection()
-        mine_col = projection.physical_col("A", int(logical_col))
-        theirs_col = projection.physical_col("B", int(logical_col))
-        if mine_col is None or theirs_col is None:
-            return False
+        scope = self._accepted_common_insertion_equality_scope()
+        key = (scope, int(pair_idx), int(logical_col), source)
+        return bool(getattr(self, "_accepted_common_insertion_equalities", {}).get(key, False))
 
-        def _raw_value(ws, row: int, col: int):
-            cells = getattr(ws, "_cells", None)
-            if isinstance(cells, dict):
-                cell = cells.get((int(row), int(col)))
-                return getattr(cell, "value", None) if cell is not None else None
-            return ws.cell(row=int(row), column=int(col)).value
+    def _accepted_common_insertion_equality_scope(self) -> tuple:
+        """Version every immutable equality proof that can affect rendering."""
+        sources = tuple(sorted(
+            (int(col), str(side or "").upper())
+            for col, side in (getattr(self, "_accepted_common_insert_sources", {}) or {}).items()
+            if str(side or "").upper() in ("A", "B")
+        ))
+        app_generations = getattr(self.app, "_sheet_compute_generation", {}) or {}
+        return (
+            str(self.sheet),
+            int(app_generations.get(self.sheet, 0) or 0),
+            int(getattr(self, "_data_version", 0) or 0),
+            int(getattr(self, "_mine_edit_version", 0) or 0),
+            int(getattr(self, "_base_edit_version", 0) or 0),
+            int(getattr(self, "_theirs_edit_version", 0) or 0),
+            int(getattr(self, "_column_projection_generation", 0) or 0),
+            int(getattr(self, "_accepted_common_insertion_mutation_generation", 0) or 0),
+            bool(self._is_three_way_enabled()),
+            bool(getattr(self.app, "has_base", False)),
+            sources,
+        )
 
-        ws_a_val = self.app.ws_a_val(self.sheet)
-        ws_b_val = self.app.ws_b_val(self.sheet)
-        ws_a_edit = self.app.ws_a_edit(self.sheet)
-        ws_b_edit = self.app.ws_b_edit(self.sheet)
-        row = int(physical_row)
-        a_val = _raw_value(ws_a_val, row, mine_col)
-        b_val = _raw_value(ws_b_val, row, theirs_col)
-        a_edit = _raw_value(ws_a_edit, row, mine_col)
-        b_edit = _raw_value(ws_b_edit, row, theirs_col)
-        a_edit = _translate_normal_formula_for_compare(
-            a_val,
-            a_edit,
-            row,
-            int(mine_col),
-            row,
-            int(logical_col),
+    def _clear_accepted_common_insertion_equalities(self, reason: str) -> None:
+        """Forget cosmetic proofs whenever a physical/projection version moves."""
+        self._accepted_common_insertion_equalities = {}
+        self._accepted_common_insertion_equality_error = None
+        self._accepted_common_insertion_mutation_generation = int(
+            getattr(self, "_accepted_common_insertion_mutation_generation", 0) or 0
+        ) + 1
+        _dlog(
+            f"ACCEPTED_COMMON_EQUALITY_CLEAR sheet={self.sheet} reason={reason} "
+            f"generation={self._accepted_common_insertion_mutation_generation}"
         )
-        b_edit = _translate_normal_formula_for_compare(
-            b_val,
-            b_edit,
-            row,
-            int(theirs_col),
-            row,
-            int(logical_col),
-        )
-        _display_a, _display_b, equal = _cell_display_and_equal_from_values(
-            a_val,
-            b_val,
-            a_edit,
-            b_edit,
-        )
-        return bool(equal)
+
+    def _compute_accepted_common_insertion_equalities_from_edit_workbooks(
+        self,
+        ws_a_val,
+        ws_b_val,
+        ws_a_edit,
+        ws_b_edit,
+        *,
+        row_cache_bundle: dict | None = None,
+    ) -> int:
+        """Explicit mutation-only builder for accepted common-insertion proofs.
+
+        The final row pairs and logical projection must already be installed.
+        The builder reads the ready editable/value workbooks once through the
+        foreground row cache, then publishes immutable booleans.  It is never
+        called by view-only refresh, hover, scrolling, or tab activation.
+        """
+        self._clear_accepted_common_insertion_equalities("mutation-build")
+        accepted_sources = {
+            int(col): str(side or "").upper()
+            for col, side in (getattr(self, "_accepted_common_insert_sources", {}) or {}).items()
+            if int(col) > 0 and str(side or "").upper() in ("A", "B")
+        }
+        if not accepted_sources or not (
+            ws_a_val is not None and ws_b_val is not None
+            and ws_a_edit is not None and ws_b_edit is not None
+        ):
+            return 0
+        try:
+            projection = self._active_column_projection()
+            comparable = []
+            rows_needed = set()
+            mine_max_col = 1
+            theirs_max_col = 1
+            for logical_col, source in accepted_sources.items():
+                mine_col = projection.physical_col("A", logical_col)
+                theirs_col = projection.physical_col("B", logical_col)
+                if mine_col is None or theirs_col is None:
+                    continue
+                mine_col = int(mine_col)
+                theirs_col = int(theirs_col)
+                mine_max_col = max(mine_max_col, mine_col)
+                theirs_max_col = max(theirs_max_col, theirs_col)
+                comparable.append((logical_col, source, mine_col, theirs_col))
+                for row_a, row_b in self.row_pairs:
+                    physical_row = row_b if source == "A" else row_a
+                    if physical_row is not None and int(physical_row) > 0:
+                        rows_needed.add(int(physical_row))
+            if not comparable or not rows_needed:
+                return 0
+            rows_a_val = _read_rows_into_shared_cache(
+                ws_a_val, rows_needed, mine_max_col,
+                cache_bundle=row_cache_bundle, cache_key="accepted-common-a-value",
+            )
+            rows_b_val = _read_rows_into_shared_cache(
+                ws_b_val, rows_needed, theirs_max_col,
+                cache_bundle=row_cache_bundle, cache_key="accepted-common-b-value",
+            )
+            rows_a_edit = _read_rows_into_shared_cache(
+                ws_a_edit, rows_needed, mine_max_col,
+                cache_bundle=row_cache_bundle, cache_key="accepted-common-a-edit",
+            )
+            rows_b_edit = _read_rows_into_shared_cache(
+                ws_b_edit, rows_needed, theirs_max_col,
+                cache_bundle=row_cache_bundle, cache_key="accepted-common-b-edit",
+            )
+            scope = self._accepted_common_insertion_equality_scope()
+            published = 0
+            for pair_idx, (row_a, row_b) in enumerate(self.row_pairs):
+                for logical_col, source, mine_col, theirs_col in comparable:
+                    physical_row = row_b if source == "A" else row_a
+                    if physical_row is None:
+                        continue
+                    row = int(physical_row)
+                    if not all(row in rows for rows in (
+                        rows_a_val, rows_b_val, rows_a_edit, rows_b_edit
+                    )):
+                        continue
+                    a_val = rows_a_val[row][mine_col - 1]
+                    b_val = rows_b_val[row][theirs_col - 1]
+                    a_edit = _translate_normal_formula_for_compare(
+                        a_val, rows_a_edit[row][mine_col - 1], row, mine_col,
+                        row, logical_col,
+                    )
+                    b_edit = _translate_normal_formula_for_compare(
+                        b_val, rows_b_edit[row][theirs_col - 1], row, theirs_col,
+                        row, logical_col,
+                    )
+                    _display_a, _display_b, equal = _cell_display_and_equal_from_values(
+                        a_val, b_val, a_edit, b_edit,
+                    )
+                    self._accepted_common_insertion_equalities[
+                        (scope, pair_idx, logical_col, source)
+                    ] = bool(equal)
+                    published += 1
+            _dlog(
+                f"ACCEPTED_COMMON_EQUALITY_BUILD sheet={self.sheet} "
+                f"pairs={len(self.row_pairs)} cols={len(comparable)} entries={published}"
+            )
+            return published
+        except Exception as exc:
+            # A failed proof must be conservative: cache absence leaves a real
+            # visual difference instead of guessing that a copied cell matches.
+            self._accepted_common_insertion_equalities = {}
+            self._accepted_common_insertion_equality_error = (
+                f"{type(exc).__name__}:{exc}"
+            )[:320]
+            _dlog(
+                f"ACCEPTED_COMMON_EQUALITY_BUILD_FAILED sheet={self.sheet} "
+                f"degraded=conservative-diff err={self._accepted_common_insertion_equality_error}"
+            )
+            return 0
+
+    def _finalize_accepted_common_equality_cache_after_mutation(self) -> int:
+        """Explicit post-mutation finalizer; ordinary view refresh never calls it."""
+        edit_ready = getattr(self.app, "_edit_workbooks_ready", None)
+        if not callable(edit_ready) or not edit_ready():
+            self._clear_accepted_common_insertion_equalities("mutation-finalize-not-ready")
+            self._accepted_common_insertion_equality_error = "edit-workbooks-not-ready"
+            _dlog(
+                f"ACCEPTED_COMMON_EQUALITY_FINALIZE_DEGRADED sheet={self.sheet} "
+                "reason=edit-workbooks-not-ready"
+            )
+            return 0
+        try:
+            return self._compute_accepted_common_insertion_equalities_from_edit_workbooks(
+                self.app.ws_a_val(self.sheet),
+                self.app.ws_b_val(self.sheet),
+                self.app.ws_a_edit(self.sheet),
+                self.app.ws_b_edit(self.sheet),
+            )
+        except Exception as exc:
+            # A cosmetic equality proof must never make a completed mutation or
+            # a later save fail.  Rendering will conservatively keep the diff.
+            self._clear_accepted_common_insertion_equalities("mutation-finalize-failed")
+            self._accepted_common_insertion_equality_error = (
+                f"{type(exc).__name__}:{exc}"
+            )[:320]
+            _dlog(
+                f"ACCEPTED_COMMON_EQUALITY_FINALIZE_FAILED sheet={self.sheet} "
+                f"degraded=conservative-diff err={self._accepted_common_insertion_equality_error}"
+            )
+            return 0
 
     def _pair_has_visual_diff(self, pair_idx: int) -> bool:
         return bool(self._visual_diff_cols_for_pair(pair_idx))
@@ -23915,12 +31297,13 @@ class SheetView:
         so it is recomputed only when those change (``_col_widths_version`` bump),
         not once per rendered line in the tag phase."""
         grid = self._is_grid_overlay_enabled()
-        slot_count = self._logical_slot_count()
+        rendered_cols = self._rendered_logical_columns()
         key = (
-            int(slot_count),
+            tuple(rendered_cols),
             bool(grid),
             int(getattr(self, "_col_widths_version", 0)),
             int(getattr(self, "_column_projection_generation", 0)),
+            int(getattr(self, "_virtual_column_window_generation", 0)),
         )
         if getattr(self, "_base_spans_cache", None) is not None \
                 and getattr(self, "_base_spans_cache_key", None) == key:
@@ -23928,11 +31311,11 @@ class SheetView:
         sep_len = len(_COL_SEP) if grid else 3
         pos = 0
         spans = {}
-        for c in range(1, slot_count + 1):
+        for offset, c in enumerate(rendered_cols):
             w = max(1, self.col_char_widths.get(c, 1))
             spans[c] = (pos, pos + w)
             pos += w
-            if c < slot_count:
+            if offset + 1 < len(rendered_cols):
                 pos += sep_len
         self._base_spans_cache = spans
         self._base_spans_cache_key = key
@@ -23951,6 +31334,56 @@ class SheetView:
         text_len = len(text)
         return {c: (min(s, text_len), min(e, text_len)) for c, (s, e) in base.items()}
 
+    def _build_diffcell_surface_context(
+        self,
+        rendered_logical_columns,
+    ) -> _DiffCellSurfaceContext | None:
+        """Freeze visible spans and side presence for one Tk publication.
+
+        This is display geometry only.  It does not decide whether a logical
+        row differs: callers retain the complete visual diff set for row
+        backgrounds, only-diff membership, C-area display, and operations.
+        """
+        self._diffcell_surface_context_build_count = int(
+            getattr(self, "_diffcell_surface_context_build_count", 0) or 0
+        ) + 1
+        try:
+            rendered = frozenset(
+                int(col) for col in (rendered_logical_columns or ()) if int(col) > 0
+            )
+            projection = self._active_column_projection()
+            base_spans = self._base_spans()
+            span_items = tuple(
+                (logical_col, int(base_spans[logical_col][0]), int(base_spans[logical_col][1]))
+                for logical_col in sorted(rendered)
+                if logical_col in base_spans
+            )
+            return _DiffCellSurfaceContext(
+                rendered_logical_columns=rendered,
+                visible_base_spans=span_items,
+                mine_present_columns=frozenset(
+                    logical_col for logical_col in rendered
+                    if projection.physical_col("A", logical_col) is not None
+                ),
+                base_present_columns=frozenset(
+                    logical_col for logical_col in rendered
+                    if projection.physical_col("BASE", logical_col) is not None
+                ),
+                theirs_present_columns=frozenset(
+                    logical_col for logical_col in rendered
+                    if projection.physical_col("B", logical_col) is not None
+                ),
+            )
+        except Exception as exc:
+            self._diffcell_surface_context_error = (
+                f"{type(exc).__name__}:{exc}"
+            )[:320]
+            _dlog(
+                f"DIFFCELL_SURFACE_CONTEXT_FAILED sheet={self.sheet} "
+                f"fallback=legacy-helper err={self._diffcell_surface_context_error}"
+            )
+            return None
+
     def _diffcell_tag_args_for_line(
         self,
         line_no: int,
@@ -23958,6 +31391,11 @@ class SheetView:
         line_a: str = "",
         line_base: str = "",
         line_b: str = "",
+        *,
+        visual_diff_cols: frozenset[int] | None = None,
+        rendered_logical_columns: frozenset[int] | None = None,
+        visible_diff_cols: frozenset[int] | None = None,
+        surface_context: _DiffCellSurfaceContext | None = None,
     ) -> tuple[list[str], list[str], list[str], list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int]]]:
         left_args: list[str] = []
         base_args: list[str] = []
@@ -23970,8 +31408,99 @@ class SheetView:
         pair = self.row_pairs[pair_idx]
         ra, rb = pair
         base_r = self._base_row_for_pair(pair_idx, pair) if self._is_three_way_enabled() else None
-        cols = self._visual_diff_cols_for_pair(pair_idx)
+        cols = (
+            visual_diff_cols
+            if visual_diff_cols is not None
+            else self._visual_diff_cols_for_pair(pair_idx)
+        )
         if not cols:
+            return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+        if surface_context is not None and visible_diff_cols is not None:
+            try:
+                # The full ``cols`` set remains the row/only-diff truth.  This
+                # bounded path intentionally consumes only its visible positive
+                # subset for Text cell tags, avoiding a full 69-column scan
+                # and repeated projection lookups for every recycled row.
+                cell_cols = tuple(
+                    int(col)
+                    for col in visible_diff_cols
+                    if (
+                        int(col) > 0
+                        and int(col) in surface_context.rendered_logical_columns
+                    )
+                )
+                if not cell_cols:
+                    return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
+                base_spans = {
+                    int(logical_col): (int(start), int(end))
+                    for logical_col, start, end in surface_context.visible_base_spans
+                }
+                # Preserve `_spans_for_line` semantics exactly: an empty line
+                # returns the unclamped base geometry, while a concrete line
+                # clamps each tag range to Tk's actual text length.
+                left_len = len(str(line_a)) if str(line_a or "") else None
+                base_len = len(str(line_base)) if str(line_base or "") else None
+                right_len = len(str(line_b)) if str(line_b or "") else None
+
+                def _span_for(logical_col: int, text_len: int | None):
+                    span = base_spans.get(int(logical_col))
+                    if span is None:
+                        return None
+                    start, end = span
+                    if text_len is None:
+                        return start, end
+                    return min(start, text_len), min(end, text_len)
+
+                context_left_args: list[str] = []
+                context_base_args: list[str] = []
+                context_right_args: list[str] = []
+                context_left_ranges: list[tuple[int, int]] = []
+                context_base_ranges: list[tuple[int, int]] = []
+                context_right_ranges: list[tuple[int, int]] = []
+                for c in cell_cols:
+                    if ra is not None and c in surface_context.mine_present_columns:
+                        span = _span_for(c, left_len)
+                        if span is not None:
+                            s, e = span
+                            if s < e:
+                                context_left_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                                context_left_ranges.append((s, e))
+                    if base_r is not None and c in surface_context.base_present_columns:
+                        span = _span_for(c, base_len)
+                        if span is not None:
+                            s, e = span
+                            if s < e:
+                                context_base_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                                context_base_ranges.append((s, e))
+                    if rb is not None and c in surface_context.theirs_present_columns:
+                        span = _span_for(c, right_len)
+                        if span is not None:
+                            s, e = span
+                            if s < e:
+                                context_right_args.extend([f"{line_no}.{s}", f"{line_no}.{e}"])
+                                context_right_ranges.append((s, e))
+                return (
+                    context_left_args,
+                    context_base_args,
+                    context_right_args,
+                    context_left_ranges,
+                    context_base_ranges,
+                    context_right_ranges,
+                )
+            except Exception:
+                # A stale/invalid local context must retain the original
+                # helper behavior rather than produce partial tag ranges.
+                pass
+        if rendered_logical_columns is None:
+            rendered_logical_columns = frozenset(self._rendered_logical_columns())
+        # A bounded wide viewport cannot tag a logical column that it does not
+        # render.  Returning before span construction preserves every visible
+        # range exactly while avoiding repeated per-line string/span work for
+        # off-screen differences.
+        if not any(
+            int(col) > 0 and int(col) in rendered_logical_columns
+            for col in cols
+        ):
             return left_args, base_args, right_args, left_ranges, base_ranges, right_ranges
         spans_a = self._spans_for_line(line_a)
         spans_base = self._spans_for_line(line_base) if self._is_three_way_enabled() else {}
@@ -24029,6 +31558,16 @@ class SheetView:
 
     # ---------- Only-diff toggle ----------
     def _invalidate_only_diff_snapshot_cache(self):
+        active_seq = int(getattr(self, "_only_diff_async_build_seq", -1))
+        restore_prior = getattr(self, "_restore_only_diff_prior_exact", None)
+        if callable(restore_prior):
+            restore_prior(active_seq)
+        release = getattr(self.app, "_release_priority_exact", None)
+        if callable(release):
+            release(self, active_seq)
+        finish = getattr(self.app, "_finish_only_diff_progress", None)
+        if callable(finish):
+            finish(self, active_seq, outcome="invalidated")
         self._only_diff_source_version += 1
         self._only_diff_rows_cache = None
         self._only_diff_rows_cache_key = None
@@ -24036,6 +31575,7 @@ class SheetView:
         self._only_diff_async_build_key = None
         self._only_diff_async_building = False
         self._only_diff_async_build_seq += 1
+        self._only_diff_async_prior_exact = None
         self._invalidate_diff_block_model()
 
     def _has_user_edits_for_current_sheet(self) -> bool:
@@ -24150,6 +31690,612 @@ class SheetView:
         self._update_cursor_lines()
         self._update_diff_nav_state()
 
+    def _apply_async_only_diff_result(
+        self,
+        res,
+        *,
+        build_seq: int,
+        has_base: bool,
+    ) -> str:
+        """Apply an immutable worker result through the cache-only publisher.
+
+        This is deliberately outside the worker closure so the GUI regression
+        can exercise the production completion contract under worksheet/edit
+        sentinels.  ``refresh(rescan=False)`` remains an edit-ready legacy
+        route and is never a valid only-diff result publisher.
+        """
+        def _finish(outcome: str) -> None:
+            finish = getattr(self.app, "_finish_only_diff_progress", None)
+            if callable(finish):
+                finish(self, int(build_seq), outcome=outcome)
+
+        def _current_completion_owner(
+            switch_seq: int | None = None,
+            *,
+            require_selected: bool = False,
+        ) -> bool:
+            """Return whether this immutable result still owns the UI ticket."""
+            if int(build_seq) != int(getattr(self, "_only_diff_async_build_seq", -1)):
+                return False
+            if switch_seq is not None and int(switch_seq) != int(
+                getattr(self, "_mode_switch_seq", -1)
+            ):
+                return False
+            if require_selected and (
+                getattr(self.app, "selected_sheet", None) != self.sheet
+                or bool(getattr(self.app, "_is_closing", False))
+            ):
+                return False
+            return True
+
+        def _best_effort(label: str, callback) -> None:
+            try:
+                callback()
+            except Exception as exc:
+                _dlog(
+                    "only-diff async completion cleanup failed "
+                    f"sheet={self.sheet} step={label}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        def _fail_async_cache_completion(
+            reason: str,
+            exc: Exception | None = None,
+        ) -> None:
+            """Fail a current result ticket without leaking its progress owner."""
+            detail = str(reason)
+            if exc is not None:
+                detail = f"{detail}: {type(exc).__name__}"
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            self._only_diff_preview_full = False
+            self._pending_exact_render = False
+            self._lifecycle_error = detail
+            _best_effort(
+                "exact-state",
+                lambda: self.app._set_sheet_exact_state(
+                    self.sheet,
+                    _SHEET_EXACT_FAILED,
+                    stage="精确差异发布失败",
+                    reason=detail,
+                    refresh=False,
+                ),
+            )
+            if (
+                getattr(self.app, "selected_sheet", None) == self.sheet
+                and not bool(getattr(self.app, "_is_closing", False))
+            ):
+                _best_effort(
+                    "unavailable-surface",
+                    lambda: self._show_exact_unavailable(detail),
+                )
+            _best_effort("gate", self._refresh_interaction_gate)
+            _best_effort("status", self.app._update_exact_status_ui)
+            _best_effort("sheet-nav", self.app.refresh_sheet_nav)
+
+        if not isinstance(res, dict):
+            # The immutable worker never produced a usable model.  Restore the
+            # stable full-view preference, release its build ownership, and keep
+            # the visible surface non-actionable; retry may now allocate a new
+            # generation instead of being blocked by a stale build flag.
+            origin_value = int(
+                bool(
+                    getattr(
+                        self,
+                        "_only_diff_request_origin_value",
+                        getattr(self, "_last_only_diff_value", 0),
+                    )
+                )
+            )
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            self._only_diff_preview_full = False
+            self._pending_exact_render = False
+            self.only_diff_var.set(origin_value)
+            self._last_only_diff_value = origin_value
+            self._prefer_only_diff_when_ready = bool(origin_value)
+            _best_effort("diff-block", self._refresh_diff_block_ui)
+            _fail_async_cache_completion("精确差异后台结果无效")
+            _finish("invalid-payload")
+            return "invalid-payload"
+        try:
+            result_seq = int(res.get("build_seq"))
+        except Exception:
+            result_seq = -1
+        if (
+            result_seq != int(build_seq)
+            or int(build_seq) != int(getattr(self, "_only_diff_async_build_seq", -1))
+            or str(res.get("sheet") or "") != str(self.sheet)
+        ):
+            return "stale-build-seq"
+        if res.get("build_key") != self._current_only_diff_cache_key():
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            if not self._has_valid_only_diff_snapshot_cache():
+                self._lifecycle_canceled = True
+            self._refresh_diff_block_ui()
+            self._refresh_interaction_gate()
+            _finish("superseded")
+            return "superseded"
+        if self._has_user_edits_for_current_sheet():
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            self._lifecycle_canceled = True
+            _dlog(f"only-diff async result dropped after user edits: sheet={self.sheet}")
+            self._refresh_diff_block_ui()
+            self._refresh_interaction_gate()
+            _finish("edited")
+            return "edited"
+
+        self._only_diff_async_building = False
+        self._only_diff_async_build_key = None
+        if not bool(getattr(self, "_prepared_complete", False)):
+            self._pending_exact_render = True
+            self._data_ready = False
+            self.app._set_sheet_exact_state(
+                self.sheet,
+                _SHEET_EXACT_CALCULATING,
+                stage="正在升级完整精确明细",
+                reason="隐藏 Sheet 摘要尚未具备全部可操作行与物理映射",
+                refresh=False,
+            )
+            if getattr(self.app, "selected_sheet", None) == self.sheet:
+                self._show_loading(
+                    f"正在精确计算 {self.sheet}；完成前不会显示临时比较行。"
+                )
+            enqueue = getattr(self.app, "_enqueue_sheet", None)
+            kick = getattr(self.app, "_kick_worker", None)
+            if callable(enqueue):
+                enqueue(
+                    self.sheet,
+                    front=True,
+                    exact_only_diff=bool(self.only_diff_var.get()),
+                    force_recompute=True,
+                )
+            if callable(kick):
+                kick()
+            self._refresh_interaction_gate()
+            _finish("full-detail-upgrade")
+            return "full-detail-upgrade"
+        if res.get("error"):
+            self._fail_only_diff_exact_transition(
+                build_seq,
+                stage="精确差异发布失败",
+                reason=str(res.get("error") or "精确差异生成失败"),
+                outcome="worker-error",
+            )
+            show_notice = getattr(self.app, "show_nonblocking_notice", None)
+            if callable(show_notice):
+                show_notice(
+                    f"{self.sheet} 精确差异生成失败，可稍后重试“只看差异”。",
+                    warning=True,
+                    duration_ms=8000,
+                )
+            return "worker-error"
+
+        base_parts = res.get("pair_parts_base") or {}
+        if has_base:
+            # The worker records an entry (possibly an explicit empty tuple for
+            # a structural Base-none row) for every retained diff pair.  Missing
+            # entries therefore mean a partial three-way payload, not a legal
+            # Base structural marker; reject before changing cache/map state.
+            missing_base_parts = (
+                [int(pair_idx) for pair_idx in (res.get("diff_pair_indices") or ())]
+                if not isinstance(base_parts, dict)
+                else [
+                    int(pair_idx)
+                    for pair_idx in (res.get("diff_pair_indices") or ())
+                    if int(pair_idx) not in base_parts
+                ]
+            )
+            if missing_base_parts:
+                _fail_async_cache_completion(
+                    "三方精确差异缺少 Base 渲染片段"
+                )
+                _finish("base-parts-incomplete")
+                return "base-parts-incomplete"
+
+        self._lifecycle_error = None
+        self._lifecycle_canceled = False
+        self.pair_diff_cols = {
+            int(pair_idx): set(cols)
+            for pair_idx, cols in (res.get("pair_diff_cols") or {}).items()
+            if cols
+        }
+        self._pair_diff_full_exact = True
+        self._base_diff_full_exact = bool(has_base)
+        self._cache_formula_aware = True
+        self._only_diff_rows_exact = True
+        for pair_idx, cols in (res.get("pair_base_diff_cols") or {}).items():
+            self.pair_base_diff_cols[int(pair_idx)] = set(cols)
+        visible = (
+            getattr(self.app, "selected_sheet", None) == self.sheet
+            and not bool(getattr(self.app, "_is_closing", False))
+        )
+        self._stage_cached_pair_parts(
+            res.get("pair_parts_a") or {},
+            res.get("pair_parts_b") or {},
+            base_parts,
+            {},
+            replace=False,
+        )
+        if visible:
+            self._materialize_staged_pair_parts()
+        self._cache_only_diff_rows_snapshot(
+            res.get("diff_pair_indices") or [],
+            exact=True,
+        )
+        self._only_diff_preview_full = False
+        self._invalidate_render_cache()
+        self._install_exact_diff_map_cache(res.get("diff_pair_indices") or [])
+        has_exact_diff = bool(
+            self.pair_diff_cols
+            or self.pair_base_diff_cols
+            or self._active_column_comparison_cache().structural_diff_cols
+            or bool(getattr(self, "_sheet_structural_diff", False))
+        )
+        # Commit the current immutable model before scheduling, but keep the
+        # actual surface locked by `_mode_switch_pending` until bounded publish
+        # succeeds.  The scheduler's gate intentionally requires exact state.
+        self.app._set_sheet_exact_state(
+            self.sheet,
+            _SHEET_EXACT_CHANGED if has_exact_diff else _SHEET_EXACT_SAME,
+            stage="精确差异完成",
+            reason="",
+            refresh=False,
+        )
+
+        requested_value = int(bool(self.only_diff_var.get()))
+        completion_key = res.get("build_key")
+        if requested_value and visible:
+            self._pending_exact_render = False
+
+            def _after_cache_publish(
+                _switch_seq: int,
+                published: bool,
+                reason: str,
+                disposition: str,
+            ) -> None:
+                """Finish this worker ticket after the bounded surface is terminal.
+
+                Completion touches several presentation owners.  Treat it as one
+                transaction: an exception from any of them must produce a current
+                FAILED state and release the progress owner exactly once instead of
+                leaving the checked checkbox/modal locked behind a swallowed Tk
+                callback exception.
+                """
+                outcome = f"publish-{disposition}"
+                current = (
+                    _current_completion_owner(
+                        int(_switch_seq),
+                        require_selected=True,
+                    )
+                    and completion_key == self._current_only_diff_cache_key()
+                )
+                try:
+                    if not current:
+                        outcome = "publish-cancel"
+                        return
+                    if published:
+                        self._pending_exact_render = False
+                        self._last_only_diff_value = requested_value
+                        self._hide_loading()
+                        self._refresh_interaction_gate()
+                        self.app._update_exact_status_ui()
+                        self.app.refresh_sheet_nav()
+                        self._persist_only_diff_setting_debounced()
+                        outcome = "success"
+                        return
+                    if disposition == "failure":
+                        failure_reason = str(
+                            getattr(self, "_lifecycle_error", None)
+                            or f"只看差异缓存切换未发布：{reason}"
+                        )
+                        self.app._set_sheet_exact_state(
+                            self.sheet,
+                            _SHEET_EXACT_FAILED,
+                            stage="精确差异发布失败",
+                            reason=failure_reason,
+                            refresh=False,
+                        )
+                    self._refresh_interaction_gate()
+                    self.app._update_exact_status_ui()
+                    self.app.refresh_sheet_nav()
+                except Exception as exc:
+                    # A UI callback may process events internally.  Re-check the
+                    # result owner at the failure point so an intervening tab,
+                    # generation, or ticket supersession cannot be marked FAILED.
+                    if (
+                        _current_completion_owner(
+                            int(_switch_seq),
+                            require_selected=True,
+                        )
+                        and completion_key == self._current_only_diff_cache_key()
+                    ):
+                        _fail_async_cache_completion(
+                            "精确差异缓存发布完成异常",
+                            exc,
+                        )
+                        outcome = "publish-completion-failed"
+                    else:
+                        outcome = "publish-cancel"
+                finally:
+                    _finish(outcome)
+
+            def _after_cache_publish_error(
+                _switch_seq: int,
+                callback_exc: Exception,
+            ) -> None:
+                if not (
+                    _current_completion_owner(
+                        int(_switch_seq),
+                        require_selected=True,
+                    )
+                    and completion_key == self._current_only_diff_cache_key()
+                ):
+                    _finish("publish-cancel")
+                    return
+                try:
+                    _fail_async_cache_completion(
+                        "精确差异缓存发布回调异常",
+                        callback_exc,
+                    )
+                finally:
+                    _finish("publish-completion-failed")
+
+            if not self._schedule_cached_only_diff_mode_switch(
+                requested_value,
+                on_complete=_after_cache_publish,
+                on_completion_error=_after_cache_publish_error,
+            ):
+                self._lifecycle_error = "无法安排只看差异缓存发布"
+                self.app._set_sheet_exact_state(
+                    self.sheet,
+                    _SHEET_EXACT_FAILED,
+                    stage="精确差异发布失败",
+                    reason=self._lifecycle_error,
+                    refresh=False,
+                )
+                self._show_exact_unavailable(self._lifecycle_error)
+                _finish("publish-submit-failed")
+                return "publish-submit-failed"
+            return "publish-scheduled"
+
+        if requested_value:
+            self._pending_exact_render = True
+            _dlog(f"EXACT_RESULT cached without render sheet={self.sheet}")
+        else:
+            self._update_diff_nav_state()
+        self._last_only_diff_value = requested_value
+        if visible:
+            self._hide_loading()
+        self._refresh_interaction_gate()
+        self.app._update_exact_status_ui()
+        self.app.refresh_sheet_nav()
+        self._persist_only_diff_setting_debounced()
+        _finish("success" if not requested_value else "cached-hidden")
+        return "published" if not requested_value else "cached-hidden"
+
+    def _begin_only_diff_exact_transition(
+        self,
+        build_seq: int,
+        cache_key: tuple,
+    ) -> bool:
+        """Claim one only-diff ticket and preserve its exact terminal source.
+
+        Only a current terminal exact entry is recoverable. The record is bound
+        to its build sequence and generation, so restoration cannot revive stale
+        or newer computation.
+        """
+        build_seq = int(build_seq)
+        app = self.app
+        current_generation = int(
+            getattr(app, "_sheet_compute_generation", {}).get(self.sheet, -1)
+        )
+        prior_entry: dict = {}
+        try:
+            prior_entry = dict(app._sheet_exact_entry(self.sheet) or {})
+        except Exception:
+            prior_entry = {}
+        if (
+            int(prior_entry.get("generation", -1)) == current_generation
+            and str(prior_entry.get("state") or "") in _SHEET_EXACT_TERMINAL
+        ):
+            self._only_diff_async_prior_exact = {
+                "build_seq": build_seq,
+                "generation": current_generation,
+                "entry": copy.deepcopy(prior_entry),
+            }
+        else:
+            self._only_diff_async_prior_exact = None
+        self._lifecycle_canceled = False
+        app._claim_priority_exact(self, build_seq)
+        self._only_diff_async_build_key = cache_key
+        self._only_diff_async_building = True
+        self._only_diff_async_requested_value = int(self.only_diff_var.get())
+        self._only_diff_preview_full = True
+        reopen_capability = None
+        prior_record = getattr(self, "_only_diff_async_prior_exact", None)
+        if isinstance(prior_record, dict):
+            reopen_capability = (
+                self,
+                int(build_seq),
+                cache_key,
+                int(current_generation),
+                copy.deepcopy(prior_entry),
+            )
+        transitioned = app._set_sheet_exact_state(
+            self.sheet,
+            _SHEET_EXACT_CALCULATING,
+            stage="正在完成精确只差异结果",
+            reason="当前 generation 的只差异结果尚未完成",
+            only_diff_reopen_capability=reopen_capability,
+        )
+        if not transitioned:
+            # The capability gate failed before a worker/modal owner existed.
+            # Keep the established terminal evidence and release every partial
+            # build primitive so no caller can continue into progress or I/O.
+            self._only_diff_async_building = False
+            self._only_diff_async_build_key = None
+            self._only_diff_preview_full = False
+            self._pending_exact_render = False
+            self._clear_only_diff_prior_exact(build_seq)
+            release = getattr(app, "_release_priority_exact", None)
+            if callable(release):
+                release(self, build_seq)
+            origin = int(getattr(self, "_only_diff_request_origin_value", 0))
+            self.only_diff_var.set(origin)
+            self._last_only_diff_value = origin
+            self._prefer_only_diff_when_ready = bool(origin)
+            self._lifecycle_error = "只看差异精确状态转换被拒绝"
+            self._refresh_interaction_gate()
+            app._update_exact_status_ui()
+            app.refresh_sheet_nav()
+            return False
+        self._set_only_diff_pending_info()
+        self._refresh_interaction_gate()
+        return True
+
+    def _clear_only_diff_prior_exact(self, build_seq: int | None = None) -> bool:
+        record = getattr(self, "_only_diff_async_prior_exact", None)
+        if not isinstance(record, dict):
+            return False
+        if build_seq is not None:
+            try:
+                if int(record.get("build_seq", -1)) != int(build_seq):
+                    return False
+            except Exception:
+                return False
+        self._only_diff_async_prior_exact = None
+        return True
+
+    def _restore_only_diff_prior_exact(self, build_seq: int) -> bool:
+        """Restore a matching prior terminal exact entry, never stale work."""
+        build_seq = int(build_seq)
+        record = getattr(self, "_only_diff_async_prior_exact", None)
+        if not isinstance(record, dict):
+            return False
+        try:
+            saved_seq = int(record.get("build_seq", -1))
+            saved_generation = int(record.get("generation", -1))
+            prior_entry = copy.deepcopy(dict(record.get("entry") or {}))
+            current_generation = int(
+                getattr(self.app, "_sheet_compute_generation", {}).get(
+                    self.sheet, -1
+                )
+            )
+            current_entry = dict(self.app._sheet_exact_entry(self.sheet) or {})
+        except Exception:
+            return False
+        if (
+            saved_seq != build_seq
+            or int(getattr(self, "_only_diff_async_build_seq", -1)) != build_seq
+            or current_generation != saved_generation
+            or int(current_entry.get("generation", -1)) != saved_generation
+            or str(current_entry.get("state") or "") != _SHEET_EXACT_CALCULATING
+            or int(prior_entry.get("generation", -1)) != saved_generation
+            or str(prior_entry.get("state") or "") not in _SHEET_EXACT_TERMINAL
+        ):
+            return False
+        try:
+            self.app._sheet_exact_states[self.sheet] = prior_entry
+            state_hook = getattr(self.app, "_foreground_resume_on_exact_state", None)
+            if callable(state_hook):
+                state_hook(self.sheet, prior_entry, current_entry)
+            _dlog(
+                "ONLY_DIFF_EXACT_RESTORE "
+                f"sheet={self.sheet} seq={build_seq} generation={saved_generation} "
+                f"state={prior_entry.get('state')}"
+            )
+            self.app._update_exact_status_ui()
+            self.app.refresh_sheet_nav()
+            return True
+        except Exception as exc:
+            _dlog(
+                "only-diff prior exact restore failed "
+                f"sheet={self.sheet} seq={build_seq}: {type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _fail_only_diff_exact_transition(
+        self,
+        build_seq: int,
+        *,
+        stage: str,
+        reason: str,
+        outcome: str,
+    ) -> bool:
+        """Terminally fail one current only-diff ticket without reviving prior data."""
+        build_seq = int(build_seq)
+        if int(getattr(self, "_only_diff_async_build_seq", -1)) != build_seq:
+            return False
+        self._only_diff_async_building = False
+        self._only_diff_async_build_key = None
+        self._only_diff_preview_full = False
+        self._pending_exact_render = False
+        self._lifecycle_error = str(reason or "精确差异生成失败")
+        self.app._set_sheet_exact_state(
+            self.sheet,
+            _SHEET_EXACT_FAILED,
+            stage=str(stage),
+            reason=self._lifecycle_error,
+            refresh=False,
+        )
+        release = getattr(self.app, "_release_priority_exact", None)
+        if callable(release):
+            release(self, build_seq)
+        finish = getattr(self.app, "_finish_only_diff_progress", None)
+        if callable(finish):
+            finish(self, build_seq, outcome=str(outcome))
+        self._refresh_diff_block_ui()
+        self._refresh_interaction_gate()
+        self.app._update_exact_status_ui()
+        self.app.refresh_sheet_nav()
+        return True
+
+    def _queue_only_diff_ui_or_failure(
+        self,
+        callback,
+        *,
+        build_seq: int,
+        generation: int,
+        stage: str,
+        reason: str,
+        outcome: str,
+    ) -> bool:
+        """Queue worker UI work or hand its immutable failure to Tk.
+
+        This is safe to call from the exact worker: it never writes a view,
+        lifecycle registry, modal, or Tk object when the UI queue rejects it.
+        """
+        try:
+            accepted = self.app._queue_ui_task(callback)
+        except Exception as exc:
+            accepted = False
+            _dlog(
+                f"only-diff ui queue raised sheet={self.sheet} seq={build_seq}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if accepted is True:
+            return True
+        handoff = getattr(self.app, "_enqueue_only_diff_failure_handoff", None)
+        if callable(handoff):
+            handoff(
+                self,
+                sheet=self.sheet,
+                build_seq=int(build_seq),
+                generation=int(generation),
+                stage=str(stage),
+                reason=str(reason),
+                outcome=str(outcome),
+            )
+        else:
+            _dlog(
+                f"only-diff failure handoff unavailable sheet={self.sheet} "
+                f"seq={build_seq} stage={stage}"
+            )
+        return False
+
     def _start_async_large_only_diff_build(self, *, user_initiated: bool = False) -> bool:
         # This worker opens disk snapshots. Once the user has adopted any data,
         # those files are stale and must never be allowed to rebuild UI text.
@@ -24170,15 +32316,16 @@ class SheetView:
 
         self._only_diff_async_build_seq += 1
         build_seq = int(self._only_diff_async_build_seq)
-        self._lifecycle_canceled = False
-        self.app._claim_priority_exact(self, build_seq)
-        self._only_diff_async_build_key = cache_key
-        self._only_diff_async_building = True
-        self._only_diff_async_requested_value = int(self.only_diff_var.get())
-        self._only_diff_preview_full = True
-        self._set_only_diff_pending_info()
-        self._refresh_interaction_gate()
-        if user_initiated and getattr(self.app, "selected_sheet", None) == self.sheet:
+        build_generation = int(
+            getattr(self.app, "_sheet_compute_generation", {}).get(self.sheet, -1)
+        )
+        progress_owned = bool(
+            user_initiated
+            and getattr(self.app, "selected_sheet", None) == self.sheet
+        )
+        if not self._begin_only_diff_exact_transition(build_seq, cache_key):
+            return False
+        if progress_owned:
             self.app._begin_only_diff_progress(self, build_seq)
 
         sheet_name = self.sheet
@@ -24202,8 +32349,9 @@ class SheetView:
         def _base_row_for_snapshot(pair_idx: int, pair: tuple[int | None, int | None]) -> int | None:
             if not has_base:
                 return None
-            if pair_idx in pair_base_row_override:
-                return pair_base_row_override.get(pair_idx)
+            override_row = pair_base_row_override.get(pair_idx)
+            if override_row is not None:
+                return int(override_row)
             ra, rb = pair
             mapped = missing_base_row_map.get(pair_idx)
             if mapped is not None:
@@ -24271,16 +32419,12 @@ class SheetView:
                 def _apply_open_fail():
                     if build_seq != self._only_diff_async_build_seq:
                         return
-                    self._only_diff_async_building = False
-                    self._only_diff_async_build_key = None
-                    self._lifecycle_error = "精确差异生成失败"
-                    self.app._finish_only_diff_progress(
-                        self,
+                    self._fail_only_diff_exact_transition(
                         build_seq,
+                        stage="精确差异打开失败",
+                        reason="精确差异生成失败",
                         outcome="open-failed",
                     )
-                    self._refresh_diff_block_ui()
-                    self._refresh_interaction_gate()
                     show_notice = getattr(self.app, "show_nonblocking_notice", None)
                     if callable(show_notice):
                         show_notice(
@@ -24289,10 +32433,14 @@ class SheetView:
                             duration_ms=8000,
                         )
 
-                try:
-                    self.app._queue_ui_task(_apply_open_fail)
-                except Exception:
-                    pass
+                self._queue_only_diff_ui_or_failure(
+                    _apply_open_fail,
+                    build_seq=build_seq,
+                    generation=build_generation,
+                    stage="精确差异打开失败",
+                    reason="精确差异生成失败",
+                    outcome="open-failed",
+                )
                 return
 
             result = {
@@ -24702,132 +32850,47 @@ class SheetView:
                     except Exception:
                         if callable(release_transition):
                             release_transition()
-                if res.get("build_key") != self._current_only_diff_cache_key():
-                    self._only_diff_async_building = False
-                    self._only_diff_async_build_key = None
-                    if not self._has_valid_only_diff_snapshot_cache():
-                        self._lifecycle_canceled = True
-                    # A foreground rescan may already have produced the exact
-                    # row set while this older worker was running.  Dropping
-                    # the stale payload must still publish that now-ready
-                    # block model to the widgets.
-                    self._refresh_diff_block_ui()
-                    self._refresh_interaction_gate()
-                    self.app._finish_only_diff_progress(
-                        self,
-                        build_seq,
-                        outcome="superseded",
+                try:
+                    self._apply_async_only_diff_result(
+                        res,
+                        build_seq=build_seq,
+                        has_base=has_base,
                     )
-                    return
-                if self._has_user_edits_for_current_sheet():
-                    self._only_diff_async_building = False
-                    self._only_diff_async_build_key = None
-                    self._lifecycle_canceled = True
-                    _dlog(f"only-diff async result dropped after user edits: sheet={self.sheet}")
-                    self._refresh_diff_block_ui()
-                    self._refresh_interaction_gate()
-                    self.app._finish_only_diff_progress(
-                        self,
+                except Exception as exc:
+                    failure_reason = f"精确差异发布异常：{type(exc).__name__}"
+                    self._fail_only_diff_exact_transition(
                         build_seq,
-                        outcome="edited",
+                        stage="精确差异发布失败",
+                        reason=failure_reason,
+                        outcome="apply-failed",
                     )
-                    return
-                self._only_diff_async_building = False
-                self._only_diff_async_build_key = None
-                if res.get("error"):
-                    self._lifecycle_error = str(res.get("error") or "精确差异生成失败")
-                    self.app._finish_only_diff_progress(
-                        self,
-                        build_seq,
-                        outcome="failed",
+                    if (
+                        getattr(self.app, "selected_sheet", None) == self.sheet
+                        and not bool(getattr(self.app, "_is_closing", False))
+                    ):
+                        self._show_exact_unavailable(self._lifecycle_error)
+                    _dlog(
+                        f"only-diff async apply failed sheet={self.sheet}: "
+                        f"{type(exc).__name__}: {exc}"
                     )
-                    self._refresh_diff_block_ui()
-                    self._refresh_interaction_gate()
-                    show_notice = getattr(self.app, "show_nonblocking_notice", None)
-                    if callable(show_notice):
-                        show_notice(
-                            f"{self.sheet} 精确差异生成失败，可稍后重试“只看差异”。",
-                            warning=True,
-                            duration_ms=8000,
-                        )
-                    return
-                self._lifecycle_error = None
-                self._lifecycle_canceled = False
-                self.pair_diff_cols = {
-                    int(pair_idx): set(cols)
-                    for pair_idx, cols in (res.get("pair_diff_cols") or {}).items()
-                    if cols
-                }
-                self._pair_diff_full_exact = True
-                self._base_diff_full_exact = bool(has_base)
-                self._cache_formula_aware = True
-                self._only_diff_rows_exact = True
-                for pair_idx, cols in (res.get("pair_base_diff_cols") or {}).items():
-                    self.pair_base_diff_cols[int(pair_idx)] = set(cols)
-                visible = (
-                    getattr(self.app, "selected_sheet", None) == self.sheet
-                    and not bool(getattr(self.app, "_is_closing", False))
-                )
-                self._stage_cached_pair_parts(
-                    res.get("pair_parts_a") or {},
-                    res.get("pair_parts_b") or {},
-                    res.get("pair_parts_base") or {},
-                    {},
-                    replace=False,
-                )
-                if visible:
-                    self._materialize_staged_pair_parts()
-                self._cache_only_diff_rows_snapshot(
-                    res.get("diff_pair_indices") or [],
-                    exact=True,
-                )
-                self._only_diff_preview_full = False
-                self._invalidate_render_cache()
-                self._install_exact_diff_map_cache(
-                    res.get("diff_pair_indices") or []
-                )
-                if bool(self.only_diff_var.get()) and visible:
-                    self._refresh_mode_switch_preserving_selection(rescan=False)
-                    # The first presentation pass can run while the async model
-                    # is still marked as building, in which case it correctly
-                    # clears/omits block tags.  Re-apply after the result has
-                    # been materialized and the ready flag is false so every
-                    # pane receives the final block boundaries.
-                    self._refresh_diff_block_ui()
-                    self._pending_exact_render = False
-                elif bool(self.only_diff_var.get()):
-                    self._pending_exact_render = True
-                    _dlog(f"EXACT_RESULT cached without render sheet={self.sheet}")
-                else:
-                    self._update_diff_nav_state()
-                self._last_only_diff_value = int(self.only_diff_var.get())
-                self._refresh_interaction_gate()
-                self._persist_only_diff_setting_debounced()
-                self.app._finish_only_diff_progress(
-                    self,
-                    build_seq,
-                    outcome="success",
-                )
 
-            try:
-                if not _cancelled():
-                    self.app._queue_ui_task(_apply_result)
-            except Exception as e:
-                _dlog(f"only-diff async queue failed sheet={sheet_name}: {e}")
+            if not _cancelled():
+                self._queue_only_diff_ui_or_failure(
+                    _apply_result,
+                    build_seq=build_seq,
+                    generation=build_generation,
+                    stage="精确差异结果提交失败",
+                    reason="精确差异结果无法提交到界面",
+                    outcome="result-queue-failed",
+                )
 
         def _handle_submit_failure():
-            self.app._release_priority_exact(self, build_seq)
-            self._only_diff_async_building = False
-            self._only_diff_async_build_key = None
-            self._only_diff_preview_full = False
-            self._lifecycle_error = "无法启动精确差异后台任务"
-            self.app._finish_only_diff_progress(
-                self,
+            self._fail_only_diff_exact_transition(
                 build_seq,
+                stage="精确差异任务启动失败",
+                reason="无法启动精确差异后台任务",
                 outcome="submit-failed",
             )
-            self._refresh_diff_block_ui()
-            self._refresh_interaction_gate()
 
         def _launch_exact_worker():
             if (
@@ -24845,7 +32908,7 @@ class SheetView:
                 return False
             return True
 
-        if user_initiated:
+        if progress_owned:
             # Let the modal dialog acquire its grab and paint before openpyxl
             # starts parsing XML. This keeps visible feedback inside the 100 ms
             # contract even on a cold WorldMonster run.
@@ -24857,7 +32920,12 @@ class SheetView:
                 pass
         return _launch_exact_worker()
 
-    def _cancel_only_diff_calculation(self, build_seq: int | None = None):
+    def _cancel_only_diff_calculation(
+        self,
+        build_seq: int | None = None,
+        *,
+        outcome: str = "canceled",
+    ):
         """Cancel only the pending display-mode request, not the stable Sheet."""
         if build_seq is None:
             build_seq = int(self._only_diff_async_build_seq)
@@ -24871,6 +32939,9 @@ class SheetView:
         except Exception:
             pass
 
+        restore_prior = getattr(self, '_restore_only_diff_prior_exact', None)
+        if callable(restore_prior):
+            restore_prior(int(build_seq))
         self._only_diff_async_build_seq += 1
         self._only_diff_async_building = False
         self._only_diff_async_build_key = None
@@ -24893,7 +32964,7 @@ class SheetView:
         self.app._finish_only_diff_progress(
             self,
             int(build_seq),
-            outcome="canceled",
+            outcome=str(outcome or "canceled"),
         )
         self._refresh_diff_block_ui()
         self._refresh_interaction_gate()
@@ -24921,20 +32992,396 @@ class SheetView:
         except Exception as e:
             _dlog(f"settings debounce failed: {e}")
 
-    def _schedule_cached_only_diff_mode_switch(self, requested_value: int) -> bool:
+    def _cached_only_diff_mode_switch_rows(
+        self,
+        requested_value: int,
+        switch_seq: int,
+    ) -> tuple[list[int] | None, str]:
+        """Return a fully prepared row set for a cache-only mode switch.
+
+        This gate intentionally reads only current generation, immutable
+        comparison, and prepared-render state.  A public only-diff checkbox
+        must never route through ``refresh(rescan=False)`` merely to replace a
+        bounded viewport: ``refresh`` is still the worksheet-aware mutation /
+        explicit-rescan entry point.
+        """
+        try:
+            requested_value = int(bool(requested_value))
+        except Exception:
+            return None, "invalid-request"
+        if switch_seq != int(getattr(self, "_mode_switch_seq", -1)):
+            return None, "stale-switch-token"
+        if not bool(getattr(self, "_mode_switch_pending", False)):
+            return None, "switch-not-pending"
+        try:
+            if int(self.only_diff_var.get()) != requested_value:
+                return None, "requested-mode-superseded"
+        except Exception:
+            return None, "requested-mode-unavailable"
+        if bool(getattr(self.app, "_is_closing", False)):
+            return None, "app-closing"
+        if getattr(self.app, "selected_sheet", None) != self.sheet:
+            return None, "selected-sheet-stale"
+        exact_current = getattr(self.app, "_is_sheet_exact_current", None)
+        if not callable(exact_current) or not bool(exact_current(self.sheet)):
+            exact_entry = getattr(self.app, "_sheet_exact_entry", lambda _sheet: {})(
+                self.sheet
+            )
+            exact_state = str((exact_entry or {}).get("state") or "")
+            if exact_state == _SHEET_EXACT_UNRESOLVED:
+                return None, "terminal-unresolved"
+            if exact_state == _SHEET_EXACT_FAILED:
+                return None, "terminal-failed"
+            return None, "generation-not-exact"
+        if bool(getattr(self, "_pending_exact_render", False)):
+            return None, "prepared-surface-pending"
+        if bool(getattr(self, "_only_diff_async_building", False)):
+            return None, "only-diff-build-pending"
+        if bool(getattr(self, "_virtual_publishing", False)):
+            return None, "viewport-publishing"
+        if getattr(self, "_lifecycle_error", None):
+            return None, "lifecycle-error"
+        if bool(getattr(self, "_lifecycle_canceled", False)):
+            return None, "lifecycle-canceled"
+        if not (
+            bool(getattr(self, "_data_ready", False))
+            and bool(getattr(self, "_prepared_complete", False))
+            and bool(getattr(self, "_row_model_exact", False))
+            and bool(getattr(self, "_cache_formula_aware", False))
+            and bool(getattr(self, "_pair_diff_full_exact", False))
+        ):
+            return None, "prepared-result-incomplete"
+        if (
+            self._is_three_way_enabled()
+            and bool(getattr(self.app, "has_base", False))
+            and not bool(getattr(self, "_base_diff_full_exact", False))
+        ):
+            return None, "base-diff-incomplete"
+        try:
+            if not self._column_mapping_is_current():
+                return None, "column-mapping-stale"
+        except Exception:
+            return None, "column-mapping-unavailable"
+        if requested_value:
+            if not (
+                bool(getattr(self, "_only_diff_rows_exact", False))
+                and self._has_valid_only_diff_snapshot_cache()
+            ):
+                return None, "only-diff-cache-incomplete"
+            rows = self._only_diff_rows_with_touched(self._only_diff_rows_cache)
+        else:
+            rows = list(range(len(self.row_pairs)))
+        if not self._has_complete_prepared_rows_for(rows):
+            return None, "raw-prepared-rows-incomplete"
+        return list(rows), "exact-prepared"
+
+    def _cached_mode_switch_window_start(self, rows, saved_selection) -> int:
+        """Map the selected logical pair (or visible top pair) into ``rows``."""
+        rows = list(rows or ())
+        if not rows:
+            return 0
+        anchor_pair = self._pair_idx_from_selection_snapshot(saved_selection)
+        previous_rows = list(getattr(self, "_full_display_rows", ()) or ())
+        if anchor_pair is None and previous_rows:
+            try:
+                old_start = max(0, int(getattr(self, "_virtual_window_start", 0) or 0))
+                anchor_pair = int(previous_rows[min(old_start, len(previous_rows) - 1)])
+            except Exception:
+                anchor_pair = None
+        if anchor_pair is None:
+            anchor_pair = int(rows[0])
+        try:
+            target = rows.index(int(anchor_pair))
+        except ValueError:
+            # The selected pair can disappear when full mode is narrowed to
+            # only-diff.  Keep the closest logical location without inventing
+            # a new row mapping.
+            target = 0
+            for offset, pair_idx in enumerate(rows):
+                if int(pair_idx) >= int(anchor_pair):
+                    target = offset
+                    break
+            else:
+                target = len(rows) - 1
+        cap = min(self._virtual_viewport_row_capacity(), len(rows))
+        return max(0, min(int(target), max(0, len(rows) - cap)))
+
+    def _publish_cached_only_diff_mode_switch(
+        self,
+        requested_value: int,
+        switch_seq: int,
+    ) -> tuple[bool, str]:
+        """Publish a current exact mode change exclusively from prepared data."""
+        rows, reason = self._cached_only_diff_mode_switch_rows(requested_value, switch_seq)
+        if rows is None:
+            return False, reason
+        saved_selection = self._snapshot_explicit_selection_state()
+        previous_column_start = int(
+            getattr(self, "_virtual_column_window_start", 0) or 0
+        )
+        try:
+            self._virtual_window_start = self._cached_mode_switch_window_start(
+                rows,
+                saved_selection,
+            )
+            total_columns = max(0, int(self._logical_slot_count() or 0))
+            column_cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total_columns)
+            self._virtual_column_window_start = max(
+                0,
+                min(previous_column_start, max(0, total_columns - column_cap)),
+            )
+            self._clear_selection_visuals()
+            self._clear_hover_state(clear_panel=True)
+            published = self._publish_prepared_cache_surface(prepared_rows=rows)
+            if published is False:
+                return False, "prepared-publisher-rejected"
+            if not self._restore_explicit_selection_state(saved_selection):
+                self.clear_explicit_cell_selection()
+            self._update_cursor_lines()
+            self._refresh_diff_block_ui()
+            self._update_diff_nav_state()
+            return True, "published"
+        except Exception as exc:
+            return False, f"prepared-publisher-error:{type(exc).__name__}"
+
+    def _release_cached_only_diff_mode_switch_transition(self, switch_seq: int) -> None:
+        if switch_seq != int(getattr(self, "_mode_switch_seq", -1)):
+            return
+        release = getattr(self, "_mode_switch_release_transition", None)
+        self._mode_switch_release_transition = None
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _cached_only_diff_mode_switch_disposition(reason: str) -> str:
+        """Classify a rejected cached switch without treating every race as failure."""
+        reason = str(reason or "")
+        if reason in {
+            "app-closing",
+            "stale-switch-token",
+            "switch-not-pending",
+            "requested-mode-superseded",
+            "requested-mode-unavailable",
+            "selected-sheet-stale",
+            "generation-not-exact",
+            "lifecycle-canceled",
+        }:
+            return "cancel"
+        if reason in {
+            "prepared-surface-pending",
+            "only-diff-build-pending",
+            "viewport-publishing",
+        }:
+            return "defer"
+        if reason in {"terminal-unresolved", "terminal-failed", "lifecycle-error"}:
+            return "terminal"
+        return "failure"
+
+    def _defer_cached_only_diff_mode_switch(self, reason: str) -> None:
+        """Leave a current transition for the cache owner without publishing stale rows."""
+        self._pending_exact_render = True
+        self._set_only_diff_pending_info()
+        _dlog(
+            f"ONLY_DIFF_PUBLISH_DEFER sheet={self.sheet} reason={reason}"
+        )
+
+    def _drop_cached_only_diff_mode_switch(self, reason: str) -> None:
+        """Discard a stale tab/generation callback without changing its terminal state."""
+        if not bool(getattr(self.app, "_is_closing", False)):
+            self._pending_exact_render = True
+        _dlog(
+            f"ONLY_DIFF_PUBLISH_DROP sheet={self.sheet} reason={reason}"
+        )
+
+    def _present_terminal_cached_only_diff_mode_switch(self, reason: str) -> None:
+        """Keep an existing terminal UNRESOLVED/FAILED state terminal and opaque."""
+        self._pending_exact_render = True
+        show_unavailable = getattr(self, "_show_exact_unavailable", None)
+        if callable(show_unavailable):
+            show_unavailable(
+                f"当前 Sheet 无法发布可操作的精确结果：{reason}"
+            )
+        _dlog(
+            f"ONLY_DIFF_PUBLISH_TERMINAL sheet={self.sheet} reason={reason}"
+        )
+
+    def _fail_closed_cached_only_diff_mode_switch(
+        self,
+        *,
+        requested_value: int,
+        origin_value: int,
+        reason: str,
+    ) -> None:
+        """Revoke a stale/incomplete cached transition without a worksheet read."""
+        try:
+            self.only_diff_var.set(int(bool(origin_value)))
+        except Exception:
+            pass
+        self._last_only_diff_value = int(bool(origin_value))
+        self._pending_exact_render = True
+        self._lifecycle_canceled = False
+        self._lifecycle_error = (
+            "只看差异缓存切换未发布："
+            f"{reason}（requested={int(bool(requested_value))}）"
+        )
+        # The previous bounded surface belongs to a *current exact cache whose
+        # invariants failed*.  Cover it until a retry/recompute proves a new
+        # surface.  Transient tab/generation/publisher races use the defer/drop
+        # helpers above instead and must not manufacture a FAILED state.
+        show_unavailable = getattr(self, "_show_exact_unavailable", None)
+        if callable(show_unavailable):
+            show_unavailable(self._lifecycle_error)
+        _dlog(
+            f"ONLY_DIFF_PUBLISH_REJECT sheet={self.sheet} requested="
+            f"{bool(requested_value)} reason={reason}"
+        )
+
+    def _complete_cached_only_diff_mode_switch(
+        self,
+        switch_seq: int,
+        *,
+        published: bool,
+        reason: str,
+        disposition: str,
+    ) -> bool:
+        """Notify the one owner of a cache-only publication exactly once.
+
+        A completion callback may own a progress dialog.  It therefore cannot be
+        silently logged and discarded: its paired error callback (or the generic
+        fail-closed state) observes the exception after the ticket is released.
+        """
+        record = getattr(self, "_mode_switch_completion", None)
+        if not (
+            isinstance(record, tuple)
+            and len(record) == 3
+            and int(record[0]) == int(switch_seq)
+            and callable(record[1])
+        ):
+            return True
+        self._mode_switch_completion = None
+        try:
+            record[1](
+                int(switch_seq),
+                bool(published),
+                str(reason),
+                str(disposition),
+            )
+            return True
+        except Exception as exc:
+            _dlog(
+                "only-diff cached mode completion failed "
+                f"sheet={self.sheet}: {type(exc).__name__}: {exc}"
+            )
+            on_completion_error = record[2]
+            if callable(on_completion_error):
+                try:
+                    on_completion_error(int(switch_seq), exc)
+                    return False
+                except Exception as error_exc:
+                    _dlog(
+                        "only-diff cached completion error handler failed "
+                        f"sheet={self.sheet}: {type(error_exc).__name__}: "
+                        f"{error_exc}"
+                    )
+            self._only_diff_preview_full = False
+            self._pending_exact_render = False
+            self._lifecycle_error = (
+                f"只看差异缓存发布回调异常：{type(exc).__name__}"
+            )
+            try:
+                self.app._set_sheet_exact_state(
+                    self.sheet,
+                    _SHEET_EXACT_FAILED,
+                    stage="精确差异发布失败",
+                    reason=self._lifecycle_error,
+                    refresh=False,
+                )
+            except Exception as state_exc:
+                _dlog(
+                    "only-diff cached completion failure state update failed "
+                    f"sheet={self.sheet}: {type(state_exc).__name__}: {state_exc}"
+                )
+            for label, callback in (
+                ("gate", self._refresh_interaction_gate),
+                ("status", self.app._update_exact_status_ui),
+                ("sheet-nav", self.app.refresh_sheet_nav),
+            ):
+                try:
+                    callback()
+                except Exception as cleanup_exc:
+                    _dlog(
+                        "only-diff cached completion failure cleanup failed "
+                        f"sheet={self.sheet} step={label}: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+            return False
+
+    def _schedule_cached_only_diff_mode_switch(
+        self,
+        requested_value: int,
+        *,
+        on_complete=None,
+        on_completion_error=None,
+    ) -> bool:
         """Publish a large cached mode switch after the Tk callback returns.
 
-        A ready exact cache makes the comparison itself cheap, but rebuilding
-        the visible Text panes can still contend with a background XML parser.
-        The short reservation gives that parser time to reach a cooperative
-        pause before the bounded visible publication runs.
+        ``on_complete`` is tied to this single scheduler ticket and is notified
+        after the ticket has either published, been superseded, or reached an
+        explicit terminal/defer/failure disposition.  ``on_completion_error``
+        owns the matching fail-closed cleanup when that callback raises.  Neither
+        route falls back to a worksheet-aware refresh.
         """
+        requested_value = int(bool(requested_value))
+        if self._has_user_edits_for_current_sheet():
+            _dlog(
+                f"ONLY_DIFF_PUBLISH_BYPASS_EDITED sheet={self.sheet} "
+                f"requested={bool(requested_value)}"
+            )
+            return False
         if bool(getattr(self, "_mode_switch_pending", False)):
-            return True
+            # A Checkbutton normally becomes temporarily disabled, but an
+            # already-queued event can race a second request.  Release and
+            # explicitly resolve the old ticket before assigning the new owner.
+            stale_seq = int(getattr(self, "_mode_switch_seq", 0))
+            stale_after_id = getattr(self, "_mode_switch_after_id", None)
+            if stale_after_id is not None:
+                try:
+                    self.frame.after_cancel(stale_after_id)
+                except Exception:
+                    pass
+            self._mode_switch_after_id = None
+            self._complete_cached_only_diff_mode_switch(
+                stale_seq,
+                published=False,
+                reason="superseded",
+                disposition="cancel",
+            )
+            self._mode_switch_seq += 1
+            self._release_cached_only_diff_mode_switch_transition(
+                int(self._mode_switch_seq)
+            )
+            self._mode_switch_pending = False
         self._mode_switch_seq += 1
         switch_seq = int(self._mode_switch_seq)
+        self._mode_switch_completion = (
+            (
+                switch_seq,
+                on_complete,
+                on_completion_error if callable(on_completion_error) else None,
+            )
+            if callable(on_complete)
+            else None
+        )
+        origin_candidate = getattr(self, "_mode_switch_origin_value", None)
+        if origin_candidate is None:
+            origin_candidate = getattr(self, "_last_only_diff_value", 0)
+        origin_value = int(bool(origin_candidate))
         self._mode_switch_pending = True
-        self._last_only_diff_value = int(requested_value)
+        self._mode_switch_requested_value = requested_value
+        self._mode_switch_origin_value = origin_value
         self._only_diff_preview_full = False
         self._refresh_interaction_gate()
         try:
@@ -24952,57 +33399,122 @@ class SheetView:
         reserve_transition = getattr(self.app, "_reserve_ui_transition_window", None)
         if callable(reserve_transition):
             release_transition = reserve_transition(700)
+        self._mode_switch_release_transition = release_transition
 
         def _apply_mode_switch():
-            self._mode_switch_after_id = None
             if switch_seq != int(getattr(self, "_mode_switch_seq", 0)):
-                if callable(release_transition):
-                    release_transition()
+                self._complete_cached_only_diff_mode_switch(
+                    switch_seq,
+                    published=False,
+                    reason="stale-switch-token",
+                    disposition="cancel",
+                )
                 return
+            self._mode_switch_after_id = None
             if bool(getattr(self.app, "_is_closing", False)):
                 self._mode_switch_pending = False
-                if callable(release_transition):
-                    release_transition()
-                return
-            if getattr(self.app, "selected_sheet", None) != self.sheet:
-                self._pending_exact_render = True
-                self._mode_switch_pending = False
+                self._mode_switch_requested_value = None
+                self._mode_switch_origin_value = None
+                self._only_diff_preview_full = False
+                self._drop_cached_only_diff_mode_switch("app-closing")
                 self._refresh_interaction_gate()
-                if callable(release_transition):
-                    release_transition()
+                self._release_cached_only_diff_mode_switch_transition(switch_seq)
+                self._complete_cached_only_diff_mode_switch(
+                    switch_seq,
+                    published=False,
+                    reason="app-closing",
+                    disposition="cancel",
+                )
                 return
+
             started = time.perf_counter()
+            published = False
+            reason = "scheduler-not-run"
+            disposition = "failure"
             try:
-                self._refresh_mode_switch_preserving_selection(rescan=False)
-                self._pending_exact_render = False
+                published, reason = self._publish_cached_only_diff_mode_switch(
+                    requested_value,
+                    switch_seq,
+                )
+                if published:
+                    self._last_only_diff_value = requested_value
+                    self._pending_exact_render = False
+                    disposition = "success"
+                else:
+                    disposition = self._cached_only_diff_mode_switch_disposition(reason)
+                    if disposition == "failure":
+                        self._fail_closed_cached_only_diff_mode_switch(
+                            requested_value=requested_value,
+                            origin_value=origin_value,
+                            reason=reason,
+                        )
+                    elif disposition == "terminal":
+                        self._present_terminal_cached_only_diff_mode_switch(reason)
+                    elif disposition == "defer":
+                        self._defer_cached_only_diff_mode_switch(reason)
+                    else:
+                        self._drop_cached_only_diff_mode_switch(reason)
             except Exception as exc:
-                self._lifecycle_error = f"显示模式切换失败：{exc}"
+                published = False
+                reason = f"scheduler-error:{type(exc).__name__}"
+                disposition = "failure"
+                self._fail_closed_cached_only_diff_mode_switch(
+                    requested_value=requested_value,
+                    origin_value=origin_value,
+                    reason=reason,
+                )
                 _dlog(
-                    f"only-diff deferred render failed sheet={self.sheet}: "
+                    f"only-diff cached mode switch failed sheet={self.sheet}: "
                     f"{type(exc).__name__}: {exc}"
                 )
             finally:
-                self._mode_switch_pending = False
-                self._only_diff_preview_full = False
-                self._refresh_interaction_gate()
-                if callable(release_transition):
-                    release_transition()
-                _dlog(
-                    f"ONLY_DIFF_PUBLISH sheet={self.sheet} "
-                    f"requested={bool(requested_value)} "
-                    f"render_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+                if switch_seq == int(getattr(self, "_mode_switch_seq", -1)):
+                    self._mode_switch_pending = False
+                    self._mode_switch_requested_value = None
+                    self._mode_switch_origin_value = None
+                    self._only_diff_preview_full = False
+                    self._refresh_interaction_gate()
+                    self._release_cached_only_diff_mode_switch_transition(switch_seq)
+                    _dlog(
+                        f"ONLY_DIFF_PUBLISH sheet={self.sheet} "
+                        f"requested={bool(requested_value)} "
+                        f"render_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+                    )
+                else:
+                    published = False
+                    reason = "stale-switch-token"
+                    disposition = "cancel"
+                self._complete_cached_only_diff_mode_switch(
+                    switch_seq,
+                    published=published,
+                    reason=reason,
+                    disposition=disposition,
                 )
 
         try:
-            # Let the checkbox callback return and give cooperative workbook
-            # parsers several heartbeat slices to observe the pause event.
             self._mode_switch_after_id = self.frame.after(75, _apply_mode_switch)
             return True
-        except Exception:
-            if callable(release_transition):
-                release_transition()
+        except Exception as exc:
             self._mode_switch_pending = False
-            return False
+            self._mode_switch_requested_value = None
+            self._mode_switch_origin_value = None
+            reason = f"scheduler-after-error:{type(exc).__name__}"
+            self._fail_closed_cached_only_diff_mode_switch(
+                requested_value=requested_value,
+                origin_value=origin_value,
+                reason=reason,
+            )
+            self._refresh_interaction_gate()
+            self._release_cached_only_diff_mode_switch_transition(switch_seq)
+            self._complete_cached_only_diff_mode_switch(
+                switch_seq,
+                published=False,
+                reason=reason,
+                disposition="failure",
+            )
+            # Do not fall back to ``refresh``: a scheduler failure remains a
+            # cache-only route and must be fail-closed under worksheet traps.
+            return True
 
     def _toggle_only_diff(self):
         # Snapshot mode confirmed by user: diff rows list is generated once when opening (or manual refresh).
@@ -25026,14 +33538,16 @@ class SheetView:
         cur = int(self.only_diff_var.get())
         previous = int(getattr(self, "_last_only_diff_value", 0))
         # Tk has already changed the IntVar before invoking this callback.
-        # Validate the lifecycle that owned the click, not the newly requested
-        # mode (which legitimately lacks an exact only-diff snapshot yet).
+        # Validate the immutable exact surface that owned the click, not the
+        # newly requested mode (which legitimately lacks an exact only-diff
+        # snapshot yet).  Editable workbook readiness is intentionally not a
+        # prerequisite for this view-only action.
         self.only_diff_var.set(previous)
         try:
-            entry_state = self._derive_lifecycle_state()
+            entry_view_ready = self._is_exact_immutable_view_ready()
         finally:
             self.only_diff_var.set(cur)
-        if entry_state != "READY":
+        if not entry_view_ready:
             self.only_diff_var.set(previous)
             show_notice = getattr(self.app, "show_nonblocking_notice", None)
             if callable(show_notice):
@@ -25108,7 +33622,13 @@ class SheetView:
             )
 
         if bool(getattr(self, "_is_large_sheet", False)):
-            if self._schedule_cached_only_diff_mode_switch(cur):
+            if self._has_user_edits_for_current_sheet():
+                # The scheduler intentionally declines edited Sheets so the
+                # established edit-ready refresh below owns the overlay view.
+                # It is the only public cached-switch case allowed to enter
+                # ``refresh(rescan=False)``.
+                pass
+            elif self._schedule_cached_only_diff_mode_switch(cur):
                 self._persist_only_diff_setting_debounced()
                 return
 
@@ -25166,10 +33686,10 @@ class SheetView:
 
     def _manual_rescan(self):
         state = self._derive_lifecycle_state()
-        if state not in ("READY", "FAILED", "CANCELED"):
+        if state not in ("READY", "FAILED", "UNRESOLVED", "CANCELED"):
             self._guard_mutation_ready("刷新当前 Sheet")
             return
-        if state in ("FAILED", "CANCELED") or not self._has_user_edits_for_current_sheet():
+        if state in ("FAILED", "UNRESOLVED", "CANCELED") or not self._has_user_edits_for_current_sheet():
             self._lifecycle_error = None
             self._lifecycle_canceled = False
             self._data_ready = False
@@ -25181,6 +33701,17 @@ class SheetView:
                 self.app._sheet_compute_generation[self.sheet] = (
                     int(self.app._sheet_compute_generation.get(self.sheet, 0)) + 1
                 )
+                next_generation = int(self.app._sheet_compute_generation[self.sheet])
+            clear_foreground = getattr(self.app, "_foreground_resume_clear", None)
+            if callable(clear_foreground):
+                clear_foreground("user-refresh", sheet=self.sheet)
+            self.app._set_sheet_exact_state(
+                self.sheet,
+                _SHEET_EXACT_PENDING,
+                generation=next_generation,
+                stage="等待重新计算当前 generation",
+                reason="用户请求刷新，旧精确结果已失效",
+            )
             self.app._enqueue_sheet(
                 self.sheet,
                 front=True,
@@ -26145,6 +34676,7 @@ class SheetView:
                     self._invalidate_only_diff_snapshot_cache()
                     self._invalidate_render_cache()
                     self.refresh(row_only=None, rescan=False)
+                    self._finalize_accepted_common_equality_cache_after_mutation()
                     if anchor is not None:
                         self._restore_view_anchor(anchor)
                     self._update_cursor_lines()
@@ -26404,6 +34936,7 @@ class SheetView:
                 self._invalidate_only_diff_snapshot_cache()
                 self._invalidate_render_cache()
                 self.refresh(row_only=None, rescan=True)
+                self._finalize_accepted_common_equality_cache_after_mutation()
                 if anchor is not None:
                     self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
@@ -26707,6 +35240,7 @@ class SheetView:
                         if anchor is not None:
                             self._restore_view_anchor(anchor)
                         self._update_cursor_lines()
+                    self._finalize_accepted_common_equality_cache_after_mutation()
                 except Exception as refresh_error:
                     _dlog(
                         f"row insert committed but refresh failed: sheet={self.sheet} "
@@ -27186,6 +35720,7 @@ class SheetView:
                 if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                     self._recalc_row_diff_and_update(dst_r)
                 self.refresh(row_only=dst_r, rescan=False)
+                self._finalize_accepted_common_equality_cache_after_mutation()
                 self._restore_view_anchor(anchor)
                 self._update_cursor_lines()
                 formula_skipped = int(getattr(self, "_formula_copy_skips_pending", 0)) - formula_skip_before
@@ -27232,16 +35767,7 @@ class SheetView:
                 duration_ms=6000,
             )
             return
-        allow_column_undo_while_diffing = bool(
-            pending
-            and pending.get("kind") == "column_action"
-            and undo_view._column_undo_model_ready()
-        )
-        if (
-            not _internal_rollback
-            and not undo_view._guard_mutation_ready("撤销", notify=False)
-            and not allow_column_undo_while_diffing
-        ):
+        if not _internal_rollback and not undo_view._guard_mutation_ready("撤销"):
             return
         try:
             if not _internal_rollback:
@@ -27277,6 +35803,7 @@ class SheetView:
                     )
                     try:
                         undo_view.refresh(row_only=None, rescan=False)
+                        undo_view._finalize_accepted_common_equality_cache_after_mutation()
                         undo_view._update_cursor_lines()
                     except Exception:
                         pass
@@ -27295,7 +35822,16 @@ class SheetView:
                 )
                 return
             if action.get("kind") == "column_action":
-                column_undo_view._undo_column_action(action)
+                try:
+                    undone = bool(column_undo_view._undo_column_action(action))
+                except Exception:
+                    self.app.undo_stack.append(action)
+                    raise
+                if not undone:
+                    self.app.undo_stack.append(action)
+                    return
+                if not _internal_rollback:
+                    self.app.redo_stack.append(action)
                 return
             if action.get("kind") == "global_safe_cells":
                 snapshot = action.get("snapshot")
@@ -27321,6 +35857,7 @@ class SheetView:
                 if bool(undo_view.only_diff_var.get()) and undo_view.snapshot_only_diff:
                     undo_view._cache_only_diff_rows_from_exact_pair_maps()
                 undo_view.refresh(row_only=None, rescan=False)
+                undo_view._finalize_accepted_common_equality_cache_after_mutation()
                 undo_view._update_cursor_lines()
                 return
             if action.get("kind") == "global_sheet_copy":
@@ -27388,6 +35925,7 @@ class SheetView:
                     undo_view._invalidate_only_diff_snapshot_cache()
                     undo_view._invalidate_render_cache()
                     undo_view.refresh(row_only=None, rescan=True)
+                    undo_view._finalize_accepted_common_equality_cache_after_mutation()
                     undo_view._update_cursor_lines()
                 return
             if target in ("A_DELETE_ROW", "B_DELETE_ROW"):
@@ -27405,6 +35943,18 @@ class SheetView:
                     manual_cache = self.app.manual_b_formula_cache_ops
                     manual_row_ops = self.app.manual_b_row_ops
 
+                # A structural undo must retain the post-apply manual state so
+                # redo can replay the same delete without guessing coordinates.
+                action["redo_manual_cells"] = dict(manual_cells)
+                action["redo_manual_cache"] = dict(manual_cache)
+                action["redo_manual_row_ops"] = copy.deepcopy(list(manual_row_ops))
+                action["redo_modified"] = bool(
+                    self.app.modified_a if target == "A_DELETE_ROW" else self.app.modified_b
+                )
+                action["redo_modified_sheets"] = set(
+                    self.app.modified_sheets_a if target == "A_DELETE_ROW"
+                    else self.app.modified_sheets_b
+                )
                 _restore_captured_worksheet_rows(ws_edit, action.get("edit_snapshot"))
                 _restore_captured_worksheet_rows(ws_val, action.get("val_snapshot"))
                 manual_cells.clear()
@@ -27429,6 +35979,7 @@ class SheetView:
                     undo_view._invalidate_only_diff_snapshot_cache()
                     undo_view._invalidate_render_cache()
                     undo_view.refresh(row_only=None, rescan=True)
+                    undo_view._finalize_accepted_common_equality_cache_after_mutation()
                     undo_view._update_cursor_lines()
                     try:
                         undo_view.info.configure(text=f"已撤销删除 {action.get('count', 1)} 行。")
@@ -27438,12 +35989,55 @@ class SheetView:
                     f"UNDO_DELETE_MISSING_SOURCE_ROWS sheet={sheet} "
                     f"side={target[:1]} row={row} count={action.get('count', 1)}"
                 )
+                if not _internal_rollback:
+                    self.app.redo_stack.append(action)
                 return
             if target in ("A_INSERT_ROW", "B_INSERT_ROW"):
                 row = action.get("row", 1)
                 count = action.get("count", 1)
                 base_inserted = action.get("base_inserted", False)
                 base_row_del = action.get("base_row", row)
+                if target == "A_INSERT_ROW":
+                    redo_ws_edit = self.app.ws_a_edit(sheet)
+                    redo_ws_val = self.app.ws_a_val(sheet)
+                    redo_cells = self.app.manual_a_cell_ops
+                    redo_cache = self.app.manual_a_formula_cache_ops
+                    redo_rows = self.app.manual_a_row_ops
+                    redo_modified = self.app.modified_a
+                    redo_sheets = self.app.modified_sheets_a
+                else:
+                    redo_ws_edit = self.app.ws_b_edit(sheet)
+                    redo_ws_val = self.app.ws_b_val(sheet)
+                    redo_cells = self.app.manual_b_cell_ops
+                    redo_cache = self.app.manual_b_formula_cache_ops
+                    redo_rows = self.app.manual_b_row_ops
+                    redo_modified = self.app.modified_b
+                    redo_sheets = self.app.modified_sheets_b
+                # Capture exactly the inserted rows (including metadata) before
+                # undo deletes them.  Redo restores this immutable after-state
+                # rather than trying to infer it from the current topology.
+                action["redo_edit_snapshot"] = _capture_worksheet_rows(
+                    redo_ws_edit, row, count
+                )
+                action["redo_val_snapshot"] = _capture_worksheet_rows(
+                    redo_ws_val, row, count
+                )
+                action["redo_manual_cells"] = dict(redo_cells)
+                action["redo_manual_cache"] = dict(redo_cache)
+                action["redo_manual_row_ops"] = copy.deepcopy(list(redo_rows))
+                action["redo_modified"] = bool(redo_modified)
+                action["redo_modified_sheets"] = set(redo_sheets)
+                if base_inserted:
+                    try:
+                        action["redo_base_edit_snapshot"] = _capture_worksheet_rows(
+                            self.app.ws_base_edit(sheet), base_row_del, count
+                        )
+                        action["redo_base_val_snapshot"] = _capture_worksheet_rows(
+                            self.app.ws_base_val(sheet), base_row_del, count
+                        )
+                    except Exception:
+                        action.pop("redo_base_edit_snapshot", None)
+                        action.pop("redo_base_val_snapshot", None)
                 if target == "A_INSERT_ROW":
                     ws_edit = self.app.ws_a_edit(sheet)
                     ws_val = self.app.ws_a_val(sheet)
@@ -27558,7 +36152,10 @@ class SheetView:
                     undo_view._invalidate_only_diff_snapshot_cache()
                     undo_view._invalidate_render_cache()
                     undo_view.refresh(row_only=None, rescan=True)
+                    undo_view._finalize_accepted_common_equality_cache_after_mutation()
                     undo_view._update_cursor_lines()
+                if not _internal_rollback:
+                    self.app.redo_stack.append(action)
                 return
             cells = action.get("cells", [])
             if not cells:
@@ -27573,6 +36170,9 @@ class SheetView:
                 ws_val = self.app.ws_b_val(sheet)
                 self.app.modified_b = True
                 self.app.modified_sheets_b.add(sheet)
+            self.app.revert_sheet_operation_overlay(
+                sheet, action.get("overlay_transaction")
+            )
             rows = set()
             for r, c, old_edit, old_val in cells:
                 restored_edit = _choose_edit_value(old_val, old_edit)
@@ -27619,8 +36219,130 @@ class SheetView:
                 else:
                     undo_view.refresh(row_only=None, rescan=False)
                 undo_view._update_cursor_lines()
+            if not _internal_rollback and action.get("redo_cells"):
+                self.app.redo_stack.append(action)
         except Exception as e:
             messagebox.showerror("撤销失败", f"撤销操作失败，数据可能未恢复：\n{e}")
+
+    def _redo_last_action(self):
+        """Replay one captured undo, including exact structural row snapshots."""
+        action = self.app.redo_stack.pop() if getattr(self.app, "redo_stack", None) else None
+        if not action:
+            return
+        sheet, target = action.get("sheet"), action.get("target")
+        redo_cells = list(action.get("redo_cells") or ())
+        view = self if sheet == self.sheet else getattr(self.app, "sheet_views", {}).get(sheet)
+        if view is None:
+            return
+        if not view._guard_mutation_ready("重做"):
+            self.app.redo_stack.append(action)
+            return
+        try:
+            if action.get("kind") == "column_action":
+                self.app._redo_replaying = True
+                try:
+                    replayed = bool(view._redo_column_action(action))
+                finally:
+                    self.app._redo_replaying = False
+                if not replayed:
+                    self.app.redo_stack.append(action)
+                return
+            if target in ("A_INSERT_ROW", "B_INSERT_ROW", "A_DELETE_ROW", "B_DELETE_ROW"):
+                if target.startswith("A"):
+                    ws_edit = self.app.ws_a_edit(sheet)
+                    ws_val = self.app.ws_a_val(sheet)
+                    manual_cells = self.app.manual_a_cell_ops
+                    manual_cache = self.app.manual_a_formula_cache_ops
+                    manual_rows = self.app.manual_a_row_ops
+                else:
+                    ws_edit = self.app.ws_b_edit(sheet)
+                    ws_val = self.app.ws_b_val(sheet)
+                    manual_cells = self.app.manual_b_cell_ops
+                    manual_cache = self.app.manual_b_formula_cache_ops
+                    manual_rows = self.app.manual_b_row_ops
+                row = max(1, int(action.get("row", 1) or 1))
+                count = max(1, int(action.get("count", 1) or 1))
+                if target.endswith("INSERT_ROW"):
+                    _restore_captured_worksheet_rows(ws_edit, action.get("redo_edit_snapshot"))
+                    _restore_captured_worksheet_rows(ws_val, action.get("redo_val_snapshot"))
+                    if action.get("base_inserted"):
+                        base_edit = self.app.ws_base_edit(sheet)
+                        base_val = self.app.ws_base_val(sheet)
+                        if base_edit is not None and base_val is not None:
+                            _restore_captured_worksheet_rows(
+                                base_edit, action.get("redo_base_edit_snapshot")
+                            )
+                            _restore_captured_worksheet_rows(
+                                base_val, action.get("redo_base_val_snapshot")
+                            )
+                else:
+                    ws_edit.delete_rows(row, count)
+                    ws_val.delete_rows(row, count)
+                manual_cells.clear()
+                manual_cells.update(dict(action.get("redo_manual_cells") or {}))
+                manual_cache.clear()
+                manual_cache.update(dict(action.get("redo_manual_cache") or {}))
+                manual_rows[:] = copy.deepcopy(list(action.get("redo_manual_row_ops") or []))
+                if target.startswith("A"):
+                    self.app.modified_a = bool(action.get("redo_modified", True))
+                    self.app.modified_sheets_a.clear()
+                    self.app.modified_sheets_a.update(set(action.get("redo_modified_sheets") or set()))
+                else:
+                    self.app.modified_b = bool(action.get("redo_modified", True))
+                    self.app.modified_sheets_b.clear()
+                    self.app.modified_sheets_b.update(set(action.get("redo_modified_sheets") or set()))
+                view._mark_column_mapping_stale(
+                    "redo-row-structure",
+                    row_structure=True,
+                    edited_sides=("A", "BASE") if target == "A_INSERT_ROW" and action.get("base_inserted")
+                    else (("A",) if target.startswith("A") else ("B",)),
+                )
+                view._invalidate_only_diff_snapshot_cache()
+                view._invalidate_render_cache()
+                view.refresh(row_only=None, rescan=True)
+                view._finalize_accepted_common_equality_cache_after_mutation()
+                view._update_cursor_lines()
+                self.app._redo_replaying = True
+                try:
+                    self.app.push_undo(action)
+                finally:
+                    self.app._redo_replaying = False
+                return
+            if target not in ("A", "B") or not redo_cells:
+                return
+            ws_edit = self.app.ws_a_edit(sheet) if target == "A" else self.app.ws_b_edit(sheet)
+            ws_val = self.app.ws_a_val(sheet) if target == "A" else self.app.ws_b_val(sheet)
+            for row, col, edit_value, value in redo_cells:
+                _assign_edit_cell_value(ws_edit.cell(row=int(row), column=int(col)), edit_value)
+                ws_val.cell(row=int(row), column=int(col)).value = value
+                if target == "A":
+                    self.app.record_manual_a_cell(sheet, row, col, edit_value)
+                    if _formula_text(edit_value):
+                        self.app.record_manual_a_formula_cache(sheet, row, col, value)
+                else:
+                    self.app.record_manual_b_cell(sheet, row, col, edit_value)
+                    if _formula_text(edit_value):
+                        self.app.record_manual_b_formula_cache(sheet, row, col, value)
+            action["overlay_transaction"] = view._overlay_transaction_for_cells(target, [
+                (row, col, None, None) for row, col, _edit, _value in redo_cells
+            ])
+            view._mark_nonstructural_cell_edit("redo-cell-overwrite", edited_sides=(target,))
+            lookup = view.row_a_to_pair_idx if target == "A" else view.row_b_to_pair_idx
+            pairs = list(dict.fromkeys(lookup[int(row)] for row, _col, _edit, _value in redo_cells if int(row) in lookup))
+            view._refresh_pair_indices_exact(pairs)
+            view._invalidate_only_diff_snapshot_cache()
+            view._invalidate_render_cache()
+            view.refresh(row_only=None, rescan=False)
+            view._finalize_accepted_common_equality_cache_after_mutation()
+            view._update_cursor_lines()
+            self.app._redo_replaying = True
+            try:
+                self.app.push_undo(action)
+            finally:
+                self.app._redo_replaying = False
+        except Exception as exc:
+            self.app.redo_stack.append(action)
+            messagebox.showerror("重做失败", f"重做操作失败，数据可能未恢复：\n{exc}")
 
     def _resolve_conflict_cell(self, r: int, c: int):
         try:
@@ -27927,24 +36649,87 @@ class SheetView:
                 pass
         return rn_w
 
+    @staticmethod
+    def _replace_text_document(widget: tk.Text, text: str) -> None:
+        """Replace a bounded Text document in one Tcl command.
+
+        Tk's ``replace`` receives the document as an argument through
+        ``tk.call`` rather than a concatenated Tcl script, so tabs/newlines in
+        spreadsheet display text cannot be interpreted as Tcl.  Whole-range
+        replacement also drops old tag ranges, matching the previous
+        delete+insert behaviour with one fewer cross-interpreter round trip.
+        """
+        try:
+            widget.tk.call(widget._w, "replace", "1.0", "end", str(text))
+        except tk.TclError:
+            # Older Tk builds may not expose the Text `replace` subcommand.
+            # Preserve the exact prior rendering behaviour as a compatibility
+            # fallback instead of relying on a version-specific fast path.
+            widget.delete("1.0", "end")
+            widget.insert("1.0", str(text))
+
     def _render_row_headers_full(self):
+        render_started = time.perf_counter()
         rn_w = self._sync_row_header_width_widgets()
+        render_key = (
+            tuple(self.display_rows),
+            bool(self._is_three_way_enabled()),
+            int(rn_w),
+            int(getattr(self, "_data_version", 0)),
+        )
+        if render_key == getattr(self, "_row_header_render_key", None):
+            self._last_row_header_render_phases_ms = {"cached": 0.0}
+            return
+        # A row header needs the diff-block marker only on the A side.  Do
+        # the complete logical block lookup once per bounded viewport rather
+        # than routing every visible row through `_diff_block_marker_prefix`.
+        # The marker map remains derived from the same complete exact model;
+        # this is presentation caching, not a local approximation.
+        marker_width = self._diff_block_marker_width()
+        marker_prefixes = {}
+        if marker_width > 0:
+            visible_pairs = set(self.display_rows)
+            for block in self._ensure_full_diff_blocks():
+                start_pair = int(block.start_pair_idx)
+                if start_pair in visible_pairs:
+                    marker_prefixes[start_pair] = f"[{block.ordinal}]".ljust(marker_width)
+        marker_blank = "".ljust(marker_width)
         left_lines = []
         base_lines = []
         right_lines = []
         for pidx in self.display_rows:
-            left_lines.append(self._format_main_row_header(pidx, "A", rn_w))
-            base_lines.append(self._format_main_row_header(pidx, "BASE", rn_w))
-            right_lines.append(self._format_main_row_header(pidx, "B", rn_w))
-        for w, lines in ((self.left_ln, left_lines), (self.base_ln, base_lines), (self.right_ln, right_lines)):
+            left_lines.append(
+                marker_prefixes.get(pidx, marker_blank)
+                + self._row_label_for_pair_idx(pidx, "A").rjust(rn_w)
+            )
+            base_lines.append(
+                marker_blank + self._row_label_for_pair_idx(pidx, "BASE").rjust(rn_w)
+            )
+            right_lines.append(
+                marker_blank + self._row_label_for_pair_idx(pidx, "B").rjust(rn_w)
+            )
+        build_finished = time.perf_counter()
+        header_targets = [(self.left_ln, left_lines), (self.right_ln, right_lines)]
+        if self._is_three_way_enabled():
+            header_targets.insert(1, (self.base_ln, base_lines))
+        for w, lines in header_targets:
             try:
                 w.configure(state="normal")
-                w.delete("1.0", "end")
-                w.insert("1.0", "\n".join(lines) + ("\n" if lines else ""))
-                w.tag_remove("diffrow", "1.0", "end")
+                self._replace_text_document(
+                    w, "\n".join(lines) + ("\n" if lines else "")
+                )
+                # Whole-document delete above already drops all diffrow
+                # ranges.  A second tag_remove is disproportionately costly
+                # on a cold dense virtual viewport.
                 w.configure(state="disabled")
             except Exception:
                 pass
+        self._row_header_render_key = render_key
+        written_finished = time.perf_counter()
+        self._last_row_header_render_phases_ms = {
+            "build": (build_finished - render_started) * 1000.0,
+            "write": (written_finished - build_finished) * 1000.0,
+        }
 
     def _render_row_header_line(self, line: int, pair_idx: int):
         rn_w = self._sync_row_header_width_widgets()
@@ -27992,7 +36777,7 @@ class SheetView:
         sep = _COL_SEP if self._is_grid_overlay_enabled() else "   "
         trail = " │" if self._is_grid_overlay_enabled() else ""
         parts = []
-        for c in range(1, projection.slot_count + 1):
+        for c in self._rendered_logical_columns():
             label = projection.header_label(side, c)
             parts.append(_format_cell(label, self.col_char_widths.get(c, 1)))
         return sep.join(parts) + (trail if parts else "")
@@ -28076,9 +36861,19 @@ class SheetView:
 
     def _apply_column_header_structure_tags(self, widget: tk.Text, side: str):
         try:
-            widget.tag_configure("colstruct", background="#FFF1B8", foreground="#7A4B00")
-            widget.tag_configure("colmissing", background="#B0B0B0", foreground="#3A3A3A")
-            widget.tag_configure("colunresolved", background="#FFD1D1", foreground="#8B0000")
+            configured_widgets = getattr(self, "_column_header_tag_widgets", None)
+            if configured_widgets is None:
+                configured_widgets = set()
+                self._column_header_tag_widgets = configured_widgets
+            widget_id = str(widget)
+            if widget_id not in configured_widgets:
+                # These definitions do not depend on the current logical
+                # column window. Configure once; subsequent windows only
+                # replace the small bounded set of tag ranges.
+                widget.tag_configure("colstruct", background="#FFF1B8", foreground="#7A4B00")
+                widget.tag_configure("colmissing", background="#B0B0B0", foreground="#3A3A3A")
+                widget.tag_configure("colunresolved", background="#FFD1D1", foreground="#8B0000")
+                configured_widgets.add(widget_id)
             projection = self._active_column_projection()
             spans = self._spans_for_line(self._build_col_header_line(side))
             for logical_col in range(1, projection.slot_count + 1):
@@ -28101,39 +36896,53 @@ class SheetView:
 
     def _render_col_headers(self):
         rn_w = self._sync_row_header_width_widgets()
+        header_key = (
+            tuple(self._rendered_logical_columns()),
+            int(rn_w),
+            bool(self._is_grid_overlay_enabled()),
+            bool(self._is_three_way_enabled()),
+            int(getattr(self, "_col_widths_version", 0)),
+            int(getattr(self, "_column_projection_generation", 0)),
+            int(getattr(self, "_virtual_column_window_generation", 0)),
+        )
+        if header_key == getattr(self, "_column_header_render_key", None):
+            return
         corner = "".rjust(rn_w + self._diff_block_marker_width())
-        for w in (self.left_corner_hdr, self.base_corner_hdr, self.right_corner_hdr, self.cursor_cmp_corner):
+        corner_widgets = [self.left_corner_hdr, self.right_corner_hdr, self.cursor_cmp_corner]
+        if self._is_three_way_enabled():
+            corner_widgets.insert(1, self.base_corner_hdr)
+        for w in corner_widgets:
             try:
                 w.configure(state="normal")
-                w.delete("1.0", "end")
-                w.insert("1.0", corner)
+                self._replace_text_document(w, corner)
                 w.configure(state="disabled")
             except Exception:
                 pass
-        header_widgets = (
+        header_widgets = [
             (self.left_colhdr, "A"),
-            (self.base_colhdr, "BASE"),
             (self.right_colhdr, "B"),
             # C is a focused logical projection. Its logical headers now use
             # the same Excel A..Z/AA convention as the main panes while
             # retaining structural markers independent of a physical side.
             (self.cursor_cmp_colhdr, "LOGICAL"),
-        )
+        ]
+        if self._is_three_way_enabled():
+            header_widgets.insert(1, (self.base_colhdr, "BASE"))
         for w, side in header_widgets:
             try:
                 hdr = self._build_col_header_line(side)
                 w.configure(state="normal")
-                w.delete("1.0", "end")
-                w.insert("1.0", hdr)
+                self._replace_text_document(w, hdr)
                 self._apply_column_header_structure_tags(w, side)
                 w.configure(state="disabled")
             except Exception:
                 pass
         self._apply_column_block_selection_tags()
+        self._column_header_render_key = header_key
 
-    def _render_cursor_row_headers(self, pair, is_three: bool):
+    def _render_cursor_row_headers(self, pair, is_three: bool, *, strict: bool = False):
         if not hasattr(self, "cursor_cmp_ln"):
-            return
+            return True if strict else None
         rn_w = self._sync_row_header_width_widgets()
         ra = self._row_for_side(pair, "A") if pair else None
         rb = self._row_for_side(pair, "B") if pair else None
@@ -28150,11 +36959,13 @@ class SheetView:
         rows_txt = [prefix + r.rjust(rn_w) for r in rows]
         try:
             self.cursor_cmp_ln.configure(state="normal")
-            self.cursor_cmp_ln.delete("1.0", "end")
-            self.cursor_cmp_ln.insert("1.0", "\n".join(rows_txt) + ("\n" if rows_txt else ""))
+            self._replace_text_document(
+                self.cursor_cmp_ln, "\n".join(rows_txt) + ("\n" if rows_txt else "")
+            )
             self.cursor_cmp_ln.configure(state="disabled")
         except Exception:
-            pass
+            return False if strict else None
+        return True if strict else None
 
     # ---------- Rendering ----------
     def _load_all_rows(self):
@@ -28164,50 +36975,20 @@ class SheetView:
     def _append_rows(self, new_rows: list[int], *, refresh_block_ui: bool = True):
         if not new_rows:
             return
-        ws_a = self.app.ws_a_val(self.sheet)
-        ws_b = self.app.ws_b_val(self.sheet)
-        try:
-            wb_a_edit = getattr(self.app, "_wb_a_edit", None)
-            ws_a_edit = wb_a_edit[self.sheet] if wb_a_edit is not None else None
-        except Exception:
-            ws_a_edit = None
-        try:
-            wb_b_edit = getattr(self.app, "_wb_b_edit", None)
-            ws_b_edit = wb_b_edit[self.sheet] if wb_b_edit is not None else None
-        except Exception:
-            ws_b_edit = None
-        try:
-            wb_base_edit = getattr(self.app, "_wb_base_edit", None)
-            ws_base_edit_ready = wb_base_edit[self.sheet] if wb_base_edit is not None and getattr(self.app, "has_base", False) else None
-        except Exception:
-            ws_base_edit_ready = None
-
-        if getattr(self, "_data_ready", False) and not self._column_mapping_is_current():
-            self._ensure_column_projection_current(
-                "增量加载行",
-                ws_a_val=ws_a,
-                ws_b_val=ws_b,
-                ws_a_edit=ws_a_edit,
-                ws_b_edit=ws_b_edit,
-                ws_base_val=(self.app.ws_base_val(self.sheet) if getattr(self.app, "has_base", False) else None),
-                ws_base_edit=ws_base_edit_ready,
-            )
-
+        # A cache-applied large Sheet retains raw parts for all logical rows but
+        # formats only rows that enter a Tk document.  This remains strictly
+        # view-only and never substitutes a worksheet read for a cache miss.
+        self._materialize_prepared_pair_text(new_rows)
         missing_pair_text = any(
             pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b
             for pair_idx in new_rows
         )
-        # Only rows not covered by the exact background cache need formula-text
-        # fallback. Cached rows must never block scrolling/rendering on workbook I/O.
-        if missing_pair_text and _USE_CACHED_VALUES_ONLY and (ws_a_edit is None or ws_b_edit is None):
-            # Scrolling is a view-only action and must never synchronously parse
-            # editable workbooks on Tk. The background preload will publish
-            # readiness; until then cached values remain viewable.
-            request_preload = getattr(self.app, "_request_edit_preload", None)
-            if callable(request_preload):
-                request_preload()
+        if missing_pair_text:
+            # A viewport is never allowed to recover missing text by touching a
+            # value worksheet or starting editable preload. Exact cache apply
+            # will replace this explicit presentation placeholder atomically.
             _dlog(
-                f"formula fallback deferred off Tk: sheet={self.sheet} "
+                f"view placeholder; prepared row missing: sheet={self.sheet} "
                 f"rows={len(new_rows)}"
             )
 
@@ -28218,24 +36999,10 @@ class SheetView:
         except Exception:
             first = None
 
-        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
-            self._ensure_base_diff_cache(
-                pair_indices=new_rows,
-                max_col=self.max_col,
-                ws_a_val=ws_a,
-                ws_a_edit=ws_a_edit if ws_a_edit is not None else ws_a,
-                ws_base_val=self.app.ws_base_val(self.sheet),
-                ws_base_edit=ws_base_edit_ready if ws_base_edit_ready is not None else self.app.ws_base_val(self.sheet),
-            )
-
         row_header_diffrow_args = []
         for idx, pair_idx in enumerate(new_rows, start=0):
             if pair_idx not in self.pair_text_a or pair_idx not in self.pair_text_b:
-                ra, rb = self.row_pairs[pair_idx]
-                line_a, line_b, cols = self._build_row_and_diff_pair(ws_a, ws_b, ws_a_edit, ws_b_edit, ra, rb)
-                self.pair_diff_cols[pair_idx] = cols
-                self.pair_text_a[pair_idx] = line_a
-                self.pair_text_b[pair_idx] = line_b
+                line_a = line_b = "【视图数据正在准备】"
             else:
                 line_a = self.pair_text_a.get(pair_idx, "")
                 line_b = self.pair_text_b.get(pair_idx, "")
@@ -28244,7 +37011,10 @@ class SheetView:
             line_no = start_line + idx
             self.left.insert("end", line_a + "\n")
             if self._is_three_way_enabled():
-                self.base.insert("end", self._build_base_line(pair_idx) + "\n")
+                self.base.insert(
+                    "end",
+                    self.pair_text_base.get(pair_idx, "【视图数据正在准备】") + "\n",
+                )
             self.right.insert("end", line_b + "\n")
 
             if visual_cols:
@@ -28253,7 +37023,7 @@ class SheetView:
                 self.left.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.base.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
                 self.right.tag_add("diffrow", f"{line_no}.0", f"{line_no}.end")
-                base_line = self._build_base_line(pair_idx) if self._is_three_way_enabled() else ""
+                base_line = self.pair_text_base.get(pair_idx, "") if self._is_three_way_enabled() else ""
                 left_args, base_args, right_args, _lr, _br, _rr = self._diffcell_tag_args_for_line(
                     line_no,
                     pair_idx,
@@ -28295,6 +37065,17 @@ class SheetView:
             self._refresh_diff_block_ui()
 
     def _maybe_load_more_rows(self, last_fraction: float):
+        # Once a full immutable virtual result exists, the legacy prefix
+        # loader must never run again—even while the current exact state is
+        # calculating, unresolved, failed, or shutting down.  In those states
+        # the virtual publisher is intentionally frozen on the status surface;
+        # falling back here would reopen Worksheet data from a Tk callback.
+        if (
+            _LARGE_SHEET_VIRTUALIZATION_ENABLED
+            and len(getattr(self, "_full_display_rows", ()) or ()) > _VIRTUAL_VIEWPORT_MAX_ROWS
+            and self._has_complete_prepared_rows()
+        ):
+            return
         if not _FAST_OPEN_ENABLED:
             return
         try:
@@ -29041,8 +37822,14 @@ class SheetView:
         else:
             self._full_display_rows = list(range(0, len(self.row_pairs)))
 
+        # A complete prepared large result is always shown through the fixed
+        # virtual window.  The legacy prefix mode remains the fallback while a
+        # background cache is incomplete, so scrolling can never discover rows
+        # by synchronously reading a Worksheet on Tk.
+        if self._virtual_mode_active():
+            self.display_rows = self._virtual_window_rows(self._virtual_window_start)
         # Fast render: limit initial rows unless user opted to load all
-        if self._full_render or (not _FAST_OPEN_ENABLED):
+        elif self._full_render or (not _FAST_OPEN_ENABLED):
             self.display_rows = list(self._full_display_rows)
         else:
             # reset render limit if full list shrank
@@ -29072,7 +37859,12 @@ class SheetView:
             self.display_rows = self._full_display_rows[:self._render_limit]
         _dlog(f"  build display_rows: {len(self.display_rows)} / {self.max_row} (only_diff={bool(self.only_diff_var.get())} raw={self.only_diff_var.get()})")
 
-        if self._is_three_way_enabled() and getattr(self.app, "has_base", False) and self.display_rows:
+        if (
+            self._is_three_way_enabled()
+            and getattr(self.app, "has_base", False)
+            and self.display_rows
+            and not self._virtual_mode_active()
+        ):
             added_base_diff = self._ensure_base_diff_cache(
                 pair_indices=self.display_rows,
                 max_col=self.max_col,
@@ -29142,10 +37934,7 @@ class SheetView:
         self.row_to_line = {r: i + 1 for i, r in enumerate(self.display_rows)}
 
         if row_only is None:
-            try:
-                frac = float((self.left.xview() or (0.0, 1.0))[0])
-            except Exception:
-                frac = 0.0
+            frac = self._logical_horizontal_first()
             try:
                 self._render_col_headers()
                 # _render_col_headers() resets header xview to 0; restore all panes uniformly.
@@ -29421,7 +38210,11 @@ class SheetView:
                 pass
             self._pending_yview = None
 
-        if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
+        if (
+            self._is_three_way_enabled()
+            and getattr(self.app, "has_base", False)
+            and not self._virtual_mode_active()
+        ):
             added_base_diff = self._ensure_base_diff_cache(
                 pair_indices=self.display_rows,
                 max_col=self.max_col,
@@ -29551,7 +38344,10 @@ class SowMergeApp:
                  merge_conflict_cells_by_sheet: dict | None = None, merge_conflict_mode: bool = False,
                  raw_base: str | None = None, raw_mine: str | None = None, raw_theirs: str | None = None,
                  launch_context: MergeLaunchContext | None = None,
-                 startup_outcome: StartupMergeOutcome | None = None):
+                 startup_outcome: StartupMergeOutcome | None = None,
+                 initial_sheet: str | None = None,
+                 startup_owned_paths: set[str] | None = None,
+                 startup_inputs_prepared: bool = False):
         # Sequential GUI instances are common in smoke tests and can also occur
         # in host integrations. Collect destroyed Tk object cycles on the UI
         # thread before any new background XML parser can trigger that GC.
@@ -29572,6 +38368,11 @@ class SowMergeApp:
         self._exact_broker_pending = None
         self._exact_broker_running = False
         self._exact_broker_thread = None
+        # Background only-diff workers cannot safely mutate Sheet lifecycle
+        # state when the Tk task queue has gone away.  They hand a frozen
+        # terminal-failure record to the main-thread drain instead.
+        self._only_diff_failure_handoff_lock = threading.Lock()
+        self._only_diff_failure_handoffs = deque()
         self._only_diff_progress_owner = None
         self._only_diff_progress_win = None
         self._only_diff_progress_stage_var = None
@@ -29579,21 +38380,81 @@ class SowMergeApp:
         self._only_diff_progress_bar = None
         self._only_diff_progress_cancel_btn = None
         self._only_diff_progress_started = 0.0
+        # A modal progress owner is not sufficient evidence that its window
+        # actually appeared. Keep the short-lived show/watchdog callbacks
+        # token-bound so a stale tab/build can never reveal a detached dialog.
+        self._only_diff_progress_show_after_id = None
+        self._only_diff_progress_show_token = None
+        self._only_diff_progress_watchdog_after_id = None
+        self._only_diff_progress_watchdog_token = None
+        # A Toplevel may report normal before the window manager maps it. Keep
+        # a token-bound confirmation retry within the existing 100 ms watchdog.
+        self._only_diff_progress_confirm_after_id = None
+        self._only_diff_progress_confirm_token = None
+        self._only_diff_progress_visible_token = None
+        self._only_diff_progress_visibility_attempts = deque(maxlen=32)
+        self._only_diff_progress_visibility_attempt_count = 0
         self._only_diff_tab_states = {}
         self._sheet_switch_guard = False
+        self._ui_activity_lock = threading.Lock()
+        self._ui_last_activity_at = time.monotonic()
+        self._ui_activity_seq = 0
+        self._ui_activity_reason = "startup"
+        self._background_yield_events = deque(maxlen=64)
+        self._edit_load_requests = deque(maxlen=64)
+        self._runtime_resource_samples = deque(maxlen=64)
+        self._snapshot_input_identity_lock = threading.Lock()
+        self._snapshot_input_identity_cache: dict[tuple, tuple[str, ...]] = {}
+        self._snapshot_child_lock = threading.RLock()
+        self._snapshot_child_owner = None
+        self._snapshot_child_temp_paths: set[str] = set()
+        self._snapshot_child_events = deque(maxlen=64)
+        # Only outputs created while normalising this instance's startup
+        # inputs are eligible for shutdown deletion.  Never infer ownership
+        # from a broad TEMP path or filename prefix.
+        self._owned_startup_temp_paths: set[str] = (
+            startup_owned_paths if startup_owned_paths is not None else set()
+        )
+        self._owned_startup_temp_cleanup_evidence: list[dict] = []
+        self._startup_inputs_prepared = bool(startup_inputs_prepared)
+
+        def _prepare_startup_input(raw_path):
+            if not raw_path:
+                return raw_path
+            if self._startup_inputs_prepared:
+                return raw_path
+            before = os.path.normcase(os.path.abspath(os.fspath(raw_path)))
+            effective = _ensure_xlsx_copy(
+                raw_path,
+                owned_paths=self._owned_startup_temp_paths,
+            )
+            after = os.path.normcase(os.path.abspath(os.fspath(effective)))
+            if after != before:
+                self._owned_startup_temp_paths.add(after)
+            return effective
+
         # GUI callers may construct the app directly with SVN sidecars whose
         # trailing ``.rN`` hides the real workbook extension from openpyxl.
         # Stable copies are an implementation detail; raw identities stay in
         # the launch context/labels below.
-        self.file_a = _ensure_xlsx_copy(file_a) if file_a else file_a
-        self.file_b = _ensure_xlsx_copy(file_b) if file_b else file_b
-        self.base_path = _ensure_xlsx_copy(base_path) if base_path else base_path
+        self.file_a = _prepare_startup_input(file_a)
+        self.file_b = _prepare_startup_input(file_b)
+        self.base_path = _prepare_startup_input(base_path)
         self.has_base = bool(base_path and os.path.exists(base_path))
         self.raw_base = raw_base
         self.raw_mine = raw_mine
         self.raw_theirs = raw_theirs
         self.launch_context = launch_context
         self.startup_outcome = startup_outcome or StartupMergeOutcome()
+        # A caller with an explicit review target may select it before the
+        # first worker starts.  The hint changes *which* tab is selected; it
+        # must not decide whether an ordinary GUI launch gets the lightweight
+        # selected-Sheet gate.  Without this distinction the normal entry
+        # point eagerly materialised every workbook just because it did not
+        # know a tab name in advance.
+        self._initial_sheet_hint = str(initial_sheet or "")
+        self._snapshot_startup_lightweight = bool(_LARGE_SHEET_SNAPSHOT_ENGINE_ENABLED)
+        self._snapshot_initial_cache_active = False
         self.merge_candidate_path = file_a if (startup_outcome and startup_outcome.candidate_path) else None
         self.workspace_chrome_color = WORKSPACE_CHROME_COLORS.get(
             getattr(launch_context, "scenario", MergeScenario.TWO_WAY),
@@ -29632,8 +38493,12 @@ class SowMergeApp:
         self.sheet_level_summary: list[str] = []
         self._merge_mine_snapshot = None
         self.undo_stack = []
+        self.redo_stack = []
+        self._redo_replaying = False
         self._undo_group_capture = None
         self._auto_recalc_started = False
+        self._formula_cache_scan_started = False
+        self._formula_cache_prompt_shown = False
         # append debug session marker each run (do not truncate old evidence)
         try:
             with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
@@ -29663,8 +38528,10 @@ class SowMergeApp:
         self._wb_base_edit = None
         self._edit_loaded_event = threading.Event()
         self._initial_sheet_ready_event = threading.Event()
+        self._ui_interaction_surface_ready_event = threading.Event()
         self._edit_preload_active_event = threading.Event()
         self._edit_loading_started = False
+        self._edit_preload_target = None
         self._edit_fallback_lock = threading.Lock()
         self._wb_a_val = None
         self._wb_b_val = None
@@ -29689,6 +38556,13 @@ class SowMergeApp:
                     queue_ui = getattr(self, "_queue_ui_task", None)
                     if callable(queue_ui):
                         queue_ui(self._refresh_loaded_views_after_edit_ready)
+                elif not self._is_closing and not self._edit_workbooks_ready():
+                    # A failed explicit editable-load attempt must not strand
+                    # the one-owner guard. Keep the rejected mutation
+                    # rejected, but permit a later user retry to start one new
+                    # asynchronous owner; never fall back to a Tk-thread load.
+                    self._edit_loading_started = False
+                    _dlog("preload edit failed; explicit retry is eligible")
                 self._edit_loaded_event.set()
                 _dlog("preload edit workbooks (background) done")
 
@@ -29697,20 +38571,32 @@ class SowMergeApp:
                 report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(self.file_a)}", 8)
                 t0 = datetime.now()
                 self._file_a_val_path = _prepare_val_path(self.file_a)
-                self._wb_a_val = load_workbook(self._file_a_val_path, data_only=True)
+                self._wb_a_val = load_workbook(
+                    self._file_a_val_path,
+                    data_only=True,
+                    read_only=self._snapshot_startup_lightweight,
+                )
                 _dlog(f"load wb_a_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 report("正在打开 Excel 合并工具", f"加载 theirs：{os.path.basename(self.file_b)}", 30)
                 t0 = datetime.now()
                 self._file_b_val_path = _prepare_val_path(self.file_b)
-                self._wb_b_val = load_workbook(self._file_b_val_path, data_only=True)
+                self._wb_b_val = load_workbook(
+                    self._file_b_val_path,
+                    data_only=True,
+                    read_only=self._snapshot_startup_lightweight,
+                )
                 _dlog(f"load wb_b_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                 if self.has_base:
                     report("正在打开 Excel 合并工具", f"加载 base：{os.path.basename(self.base_path)}", 52)
                     t0 = datetime.now()
                     self._file_base_val_path = _prepare_val_path(self.base_path)
-                    self._wb_base_val = load_workbook(self._file_base_val_path, data_only=True)
+                    self._wb_base_val = load_workbook(
+                        self._file_base_val_path,
+                        data_only=True,
+                        read_only=self._snapshot_startup_lightweight,
+                    )
                     _dlog(f"load wb_base_val: {(datetime.now()-t0).total_seconds():.3f}s")
 
                     report("正在准备三方合并", "创建 mine 安全快照...", 68)
@@ -29729,11 +38615,10 @@ class SowMergeApp:
                 report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 76)
                 self._refresh_sheet_catalog()
                 if self._wb_a_edit is None or self._wb_b_edit is None or (self.has_base and self._wb_base_edit is None):
-                    self._edit_loading_started = True
-                    self._edit_preload_thread = self._start_background_thread(
-                        _preload_edit,
-                        name="sow-edit-preload",
-                    )
+                    # Viewing must not materialize editable workbook graphs.
+                    # Keep the single-owner loader for the first edit/save demand.
+                    self._edit_preload_target = _preload_edit
+                    self._edit_preload_thread = None
                 else:
                     self._edit_loaded_event.set()
                 report(
@@ -29755,6 +38640,7 @@ class SowMergeApp:
         self.modified_b = False
         self.modified_sheets_a = set()
         self.modified_sheets_b = set()
+        self.sheet_operation_overlays: dict[str, SheetOperationOverlay] = {}
 
         self.root = _take_startup_progress_root()
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
@@ -29780,6 +38666,10 @@ class SowMergeApp:
         self._ui_heartbeat_last = time.perf_counter()
         self._ui_heartbeat_max_gap = 0.0
         self._ui_heartbeat_samples = 0
+        self._ui_heartbeat_gaps_ms = deque(maxlen=256)
+        self._runtime_resource_next_sample = time.monotonic()
+        self._runtime_resource_wall_last = time.monotonic()
+        self._runtime_resource_cpu_last = time.process_time()
 
         def _ui_heartbeat():
             if self._is_closing:
@@ -29789,6 +38679,8 @@ class SowMergeApp:
             self._ui_heartbeat_last = now
             self._ui_heartbeat_max_gap = max(self._ui_heartbeat_max_gap, gap)
             self._ui_heartbeat_samples += 1
+            self._ui_heartbeat_gaps_ms.append(gap * 1000.0)
+            self._sample_runtime_resources(now)
             if gap > 0.2:
                 try:
                     _dlog(
@@ -29812,6 +38704,12 @@ class SowMergeApp:
                 self.root.deiconify()
                 self.root.state(self._intended_window_state)
                 self.root.update_idletasks()
+                # Start the measurement and parser only after the native window
+                # is actually mapped and its first layout is complete.  Otherwise
+                # the deliberate hidden->visible transition becomes a fake
+                # interaction heartbeat gap and can overlap child start-up.
+                self._ui_heartbeat_last = time.perf_counter()
+                self._ui_interaction_surface_ready_event.set()
                 _dlog(
                     f"WINDOW_STATE stage=after-show state={self.root.state()} "
                     f"geometry={self.root.geometry()}"
@@ -29821,7 +38719,7 @@ class SowMergeApp:
 
         self._safe_root_after(0, _show_main_window_after_layout)
         self._safe_root_after(50, _ui_heartbeat)
-        self._schedule_auto_recalc()
+        self._schedule_formula_cache_prompt()
 
     def _configure_workspace_chrome(self):
         """Install styles for surrounding UI chrome without touching sheet cells."""
@@ -30077,6 +38975,111 @@ class SowMergeApp:
                 return None
             raise
 
+    def _note_ui_activity(self, reason: str) -> None:
+        """Record one cheap foreground activity marker for hidden-work yield."""
+        try:
+            with self._ui_activity_lock:
+                self._ui_last_activity_at = time.monotonic()
+                self._ui_activity_seq += 1
+                self._ui_activity_reason = str(reason or "interaction")
+        except Exception:
+            pass
+
+    def _record_background_yield(
+        self, reason: str, active_sheet: str, selected_sheet: str
+    ) -> None:
+        """Bounded worker-side trace for quiet-window/preemption acceptance."""
+        try:
+            with self._ui_activity_lock:
+                self._background_yield_events.append(
+                    (
+                        time.monotonic(),
+                        str(reason or "yield"),
+                        str(active_sheet or ""),
+                        str(selected_sheet or ""),
+                        int(self._ui_activity_seq),
+                    )
+                )
+        except Exception:
+            pass
+
+    def _ui_activity_age(self) -> float:
+        try:
+            with self._ui_activity_lock:
+                return max(0.0, time.monotonic() - float(self._ui_last_activity_at))
+        except Exception:
+            return float("inf")
+
+    def _record_edit_load_request(self, reason: str, caller: str) -> None:
+        entry = {
+            "at": round(time.monotonic(), 6),
+            "reason": str(reason or "explicit mutation/save"),
+            "caller": str(caller or "unknown"),
+            "ready": bool(self._edit_workbooks_ready()),
+        }
+        try:
+            self._edit_load_requests.append(entry)
+        except Exception:
+            pass
+        _dlog(
+            "EDIT_LOAD_REQUEST "
+            f"reason={entry['reason']} caller={entry['caller']} ready={entry['ready']}"
+        )
+
+    def _sample_runtime_resources(self, now: float | None = None) -> None:
+        """Sample process CPU/RSS at most once per second for diagnosis only."""
+        now = float(now if now is not None else time.monotonic())
+        if now < float(getattr(self, "_runtime_resource_next_sample", 0.0)):
+            return
+        previous_wall = float(getattr(self, "_runtime_resource_wall_last", now))
+        previous_cpu = float(getattr(self, "_runtime_resource_cpu_last", time.process_time()))
+        cpu_now = time.process_time()
+        wall_delta = max(0.001, now - previous_wall)
+        rss_mb = None
+        try:
+            class _ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+            counters = _ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                rss_mb = round(float(counters.WorkingSetSize) / (1024.0 * 1024.0), 3)
+        except Exception:
+            pass
+        try:
+            self._runtime_resource_samples.append({
+                "at": round(now, 3),
+                "cpu_pct_one_core": round(100.0 * max(0.0, cpu_now - previous_cpu) / wall_delta, 2),
+                "rss_mb": rss_mb,
+            })
+        except Exception:
+            pass
+        self._runtime_resource_next_sample = now + 1.0
+        self._runtime_resource_wall_last = now
+        self._runtime_resource_cpu_last = cpu_now
+
+    @staticmethod
+    def _p95(values) -> float:
+        samples = sorted(float(value) for value in (values or ()))
+        if not samples:
+            return 0.0
+        return samples[min(len(samples) - 1, max(0, math.ceil(len(samples) * 0.95) - 1))]
+
     def _start_background_thread(self, target, *, name: str):
         """Start and track a worker so shutdown cannot orphan workbook/Tk state."""
         if getattr(self, "_is_closing", False):
@@ -30188,6 +39191,9 @@ class SowMergeApp:
             self._priority_exact_owner = (view, int(build_seq))
         if previous and previous[0] is not view:
             old_view, _old_seq = previous
+            restore_prior = getattr(old_view, "_restore_only_diff_prior_exact", None)
+            if callable(restore_prior):
+                restore_prior(int(_old_seq))
             old_view._only_diff_async_build_seq += 1
             old_view._only_diff_async_building = False
             old_view._only_diff_async_build_key = None
@@ -30212,6 +39218,242 @@ class SowMergeApp:
         with self._priority_diff_lock:
             if self._priority_exact_owner == (view, int(build_seq)):
                 self._priority_exact_owner = None
+
+    def _enqueue_only_diff_failure_handoff(
+        self,
+        view,
+        *,
+        sheet: str,
+        build_seq: int,
+        generation: int,
+        stage: str,
+        reason: str,
+        outcome: str,
+    ) -> bool:
+        """Record a worker-side only-diff terminal failure for Tk to apply.
+
+        The tuple is immutable and contains no callback: its only consumer is
+        the main-thread UI drain below.  In particular, a worker never writes
+        a Sheet exact registry or touches a modal after queue rejection.
+        """
+        record = (
+            view,
+            str(sheet),
+            int(build_seq),
+            int(generation),
+            str(stage),
+            str(reason),
+            str(outcome),
+        )
+        try:
+            with self._only_diff_failure_handoff_lock:
+                self._only_diff_failure_handoffs.append(record)
+            _dlog(
+                f"ONLY_DIFF_FAILURE_HANDOFF queue sheet={record[1]} seq={record[2]} "
+                f"generation={record[3]} outcome={record[6]}"
+            )
+            return True
+        except Exception as exc:
+            _dlog(
+                f"only-diff failure handoff unavailable sheet={record[1]} "
+                f"seq={record[2]}: {type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _drain_only_diff_failure_handoffs(self) -> bool:
+        """On Tk, terminally fail only current handoffs; stale records drop."""
+        try:
+            with self._only_diff_failure_handoff_lock:
+                records = tuple(self._only_diff_failure_handoffs)
+                self._only_diff_failure_handoffs.clear()
+        except Exception as exc:
+            _dlog(f"only-diff failure handoff drain failed: {type(exc).__name__}: {exc}")
+            return False
+        if not records:
+            return False
+        closing = bool(getattr(self, "_is_closing", False))
+        for record in records:
+            view, sheet, build_seq, generation, stage, reason, outcome = record
+            clear_prior = getattr(view, "_clear_only_diff_prior_exact", None)
+            try:
+                current_entry = dict(self._sheet_exact_entry(sheet) or {})
+                current = bool(
+                    not closing
+                    and getattr(view, "sheet", None) == sheet
+                    and getattr(self, "sheet_views", {}).get(sheet) is view
+                    and int(getattr(view, "_only_diff_async_build_seq", -1))
+                    == int(build_seq)
+                    and int(getattr(self, "_sheet_compute_generation", {}).get(sheet, -1))
+                    == int(generation)
+                    and int(current_entry.get("generation", -1)) == int(generation)
+                    and str(current_entry.get("state") or "")
+                    == _SHEET_EXACT_CALCULATING
+                )
+            except Exception:
+                current = False
+            if current:
+                try:
+                    view._fail_only_diff_exact_transition(
+                        int(build_seq),
+                        stage=str(stage),
+                        reason=str(reason),
+                        outcome=str(outcome),
+                    )
+                    _dlog(
+                        f"ONLY_DIFF_FAILURE_HANDOFF applied sheet={sheet} "
+                        f"seq={build_seq} outcome={outcome}"
+                    )
+                    continue
+                except Exception as exc:
+                    _dlog(
+                        f"only-diff failure handoff apply failed sheet={sheet} "
+                        f"seq={build_seq}: {type(exc).__name__}: {exc}"
+                    )
+            # A stale/new-generation/closing record must never overwrite state.
+            # Clear only a matching prior record; a newer token remains intact.
+            if callable(clear_prior):
+                try:
+                    clear_prior(int(build_seq))
+                except Exception:
+                    pass
+            _dlog(
+                f"ONLY_DIFF_FAILURE_HANDOFF dropped sheet={sheet} seq={build_seq} "
+                f"closing={closing}"
+            )
+        return True
+
+    def _clear_only_diff_shutdown_state(self) -> None:
+        """Atomically revoke only-diff ownership while the Tk app is closing."""
+        try:
+            self._clear_only_diff_progress_schedule()
+        except Exception:
+            pass
+        self._only_diff_progress_visible_token = None
+        self._only_diff_progress_owner = None
+        self._only_diff_progress_started = 0.0
+        try:
+            self._only_diff_tab_states.clear()
+        except Exception:
+            self._only_diff_tab_states = {}
+        try:
+            with self._only_diff_failure_handoff_lock:
+                self._only_diff_failure_handoffs.clear()
+        except Exception:
+            pass
+        try:
+            with self._exact_broker_lock:
+                self._exact_broker_pending = None
+        except Exception:
+            pass
+        try:
+            with self._priority_diff_lock:
+                self._priority_exact_owner = None
+        except Exception:
+            pass
+        for view in list(getattr(self, "sheet_views", {}).values()):
+            if view is None:
+                continue
+            try:
+                build_seq = int(getattr(view, "_only_diff_async_build_seq", 0))
+                clear_prior = getattr(view, "_clear_only_diff_prior_exact", None)
+                if callable(clear_prior):
+                    clear_prior(build_seq)
+                view._only_diff_async_build_seq = build_seq + 1
+                view._only_diff_async_building = False
+                view._only_diff_async_build_key = None
+                view._only_diff_preview_full = False
+                view._pending_exact_render = False
+                view._only_diff_async_thread = None
+            except Exception:
+                pass
+
+    def _clear_only_diff_progress_schedule(self, token=None):
+        """Cancel token-owned dialog timers without touching a newer owner."""
+        for id_name, token_name in (
+            ("_only_diff_progress_show_after_id", "_only_diff_progress_show_token"),
+            (
+                "_only_diff_progress_watchdog_after_id",
+                "_only_diff_progress_watchdog_token",
+            ),
+            (
+                "_only_diff_progress_confirm_after_id",
+                "_only_diff_progress_confirm_token",
+            ),
+        ):
+            scheduled_token = getattr(self, token_name, None)
+            if token is not None and scheduled_token != token:
+                continue
+            after_id = getattr(self, id_name, None)
+            setattr(self, id_name, None)
+            setattr(self, token_name, None)
+            if after_id is None:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            try:
+                self._root_after_ids.discard(after_id)
+            except Exception:
+                pass
+
+    def _fail_only_diff_progress_show(self, view, build_seq: int, reason: str):
+        """Fail a still-current modal request back to its stable full view.
+
+        Showing the progress dialog is part of the public click contract. A
+        missing Tk timer, a failed map, or a watchdog expiry must therefore
+        release the exact owner just like an explicit Cancel rather than leave
+        a checked, disabled only-diff control with no visible way out.
+        """
+        token = (view, int(build_seq))
+        if self._only_diff_progress_owner != token:
+            return False
+        self._clear_only_diff_progress_schedule(token)
+        _dlog(
+            f"ONLY_DIFF_PROGRESS_SHOW_FAIL sheet={getattr(view, 'sheet', '')} "
+            f"seq={build_seq} reason={reason}"
+        )
+        try:
+            view._cancel_only_diff_calculation(
+                int(build_seq), outcome=f"dialog-{reason}"
+            )
+            return True
+        except Exception as exc:
+            # The normal cancel path is intentionally the first choice because
+            # it restores the original full mode and UI state. Its emergency
+            # fallback still clears every ownership primitive fail-closed.
+            _dlog(
+                f"only-diff progress fail cleanup sheet={getattr(view, 'sheet', '')} "
+                f"seq={build_seq}: {type(exc).__name__}: {exc}"
+            )
+            try:
+                restore = getattr(view, "_restore_only_diff_prior_exact", None)
+                if callable(restore):
+                    restore(int(build_seq))
+                view._only_diff_async_build_seq += 1
+                view._only_diff_async_building = False
+                view._only_diff_async_build_key = None
+                view._only_diff_preview_full = False
+                view._pending_exact_render = False
+                origin = int(getattr(view, "_only_diff_request_origin_value", 0))
+                view.only_diff_var.set(origin)
+                view._last_only_diff_value = origin
+                view._prefer_only_diff_when_ready = bool(origin)
+            except Exception:
+                pass
+            try:
+                self._release_priority_exact(view, int(build_seq))
+            except Exception:
+                pass
+            self._finish_only_diff_progress(
+                view, int(build_seq), outcome=f"dialog-{reason}-fallback"
+            )
+            try:
+                view._refresh_diff_block_ui()
+                view._refresh_interaction_gate()
+            except Exception:
+                pass
+            return True
 
     def _cancel_current_only_diff_progress(self, _event=None):
         owner = self._only_diff_progress_owner
@@ -30279,7 +39521,7 @@ class SowMergeApp:
             return None
 
     def _begin_only_diff_progress(self, view, build_seq: int):
-        """Claim input immediately, then show the prebuilt dialog."""
+        """Claim input and make the modal visible within the 100 ms contract."""
         token = (view, int(build_seq))
         if self._only_diff_progress_owner == token:
             return
@@ -30289,14 +39531,198 @@ class SowMergeApp:
 
         self._only_diff_progress_owner = token
         self._only_diff_progress_started = time.monotonic()
+        self._clear_only_diff_progress_schedule()
+        self._only_diff_progress_visible_token = None
+        try:
+            self._only_diff_progress_visibility_attempts.clear()
+        except Exception:
+            self._only_diff_progress_visibility_attempts = deque(maxlen=32)
+        self._only_diff_progress_visibility_attempt_count = 0
+
+        def _progress_token_is_current() -> bool:
+            if self._only_diff_progress_owner != token or self._is_closing:
+                return False
+            try:
+                if int(getattr(view, "_only_diff_async_build_seq", -1)) != int(build_seq):
+                    return False
+                generation = int(self._sheet_compute_generation.get(view.sheet, -1))
+                entry = dict(self._sheet_exact_entry(view.sheet) or {})
+                return bool(
+                    int(entry.get("generation", -1)) == generation
+                    and str(entry.get("state") or "") == _SHEET_EXACT_CALCULATING
+                )
+            except Exception:
+                return False
+
+        def _visibility_facts(win):
+            facts = {
+                "child_state": None,
+                "child_mapped": None,
+                "child_viewable": None,
+                "child_grabbed": None,
+                "root_state": None,
+                "root_mapped": None,
+                "root_viewable": None,
+            }
+            try:
+                facts.update(
+                    {
+                        "child_state": str(win.state()),
+                        "child_mapped": bool(win.winfo_ismapped()),
+                        "child_viewable": bool(win.winfo_viewable()),
+                        "child_grabbed": bool(win.grab_current() == win),
+                    }
+                )
+            except Exception as exc:
+                facts["child_error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                facts.update(
+                    {
+                        "root_state": str(self.root.state()),
+                        "root_mapped": bool(self.root.winfo_ismapped()),
+                        "root_viewable": bool(self.root.winfo_viewable()),
+                    }
+                )
+            except Exception as exc:
+                facts["root_error"] = f"{type(exc).__name__}: {exc}"
+            return facts
+
+        def _record_visibility_attempt(phase: str, win):
+            try:
+                self._only_diff_progress_visibility_attempt_count = (
+                    int(self._only_diff_progress_visibility_attempt_count) + 1
+                )
+                attempts = self._only_diff_progress_visibility_attempts
+            except Exception:
+                attempts = deque(maxlen=32)
+                self._only_diff_progress_visibility_attempts = attempts
+                self._only_diff_progress_visibility_attempt_count = 1
+            facts = _visibility_facts(win)
+            attempts.append(
+                {
+                    "token": (str(view.sheet), int(build_seq)),
+                    "attempt": int(self._only_diff_progress_visibility_attempt_count),
+                    "phase": str(phase),
+                    "elapsed_ms": round(
+                        max(0.0, time.monotonic() - self._only_diff_progress_started)
+                        * 1000.0,
+                        3,
+                    ),
+                    **facts,
+                }
+            )
+            return facts
+
+        def _child_is_mapped(facts) -> bool:
+            return bool(
+                facts.get("child_state") == "normal"
+                and facts.get("child_mapped")
+                and facts.get("child_viewable")
+            )
+
+        def _commit_visible_after_mapping(win, phase: str, facts) -> str:
+            if not _child_is_mapped(facts):
+                return "retry"
+            try:
+                win.grab_set()
+            except Exception as exc:
+                _dlog(
+                    f"only-diff progress grab failed sheet={view.sheet}: {exc}"
+                )
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), f"{phase}-grab"
+                )
+                return "failed"
+            if not _progress_token_is_current():
+                return "stale"
+            try:
+                win.focus_set()
+            except Exception as exc:
+                _dlog(
+                    f"only-diff progress focus failed sheet={view.sheet}: {exc}"
+                )
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), f"{phase}-focus"
+                )
+                return "failed"
+            if not _progress_token_is_current():
+                return "stale"
+            committed_facts = _record_visibility_attempt(f"{phase}-post-grab", win)
+            if _child_is_mapped(committed_facts) and bool(
+                committed_facts.get("child_grabbed")
+            ):
+                self._only_diff_progress_visible_token = token
+                self._clear_only_diff_progress_schedule(token)
+                return "committed"
+            return "retry"
+
+        def _try_progress_visibility(win, phase: str) -> str:
+            try:
+                # A transient child can otherwise remain behind a zoomed parent
+                # on Windows even though `deiconify` has returned.
+                win.lift()
+            except Exception as exc:
+                _dlog(
+                    f"only-diff progress lift failed sheet={view.sheet}: {exc}"
+                )
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), f"{phase}-lift"
+                )
+                return "failed"
+            facts = _record_visibility_attempt(f"{phase}-pre-grab", win)
+            if not _child_is_mapped(facts):
+                return "retry"
+            return _commit_visible_after_mapping(win, phase, facts)
+
+        def _schedule_visibility_confirm() -> bool:
+            if not _progress_token_is_current():
+                return False
+            if self._only_diff_progress_confirm_token == token:
+                return True
+            self._only_diff_progress_confirm_token = token
+            try:
+                after_id = self._safe_root_after(10, _confirm_visibility)
+            except Exception:
+                after_id = None
+            self._only_diff_progress_confirm_after_id = after_id
+            if after_id is None:
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), "confirm-schedule"
+                )
+                return False
+            return True
+
+        def _confirm_visibility():
+            if self._only_diff_progress_confirm_token == token:
+                self._only_diff_progress_confirm_after_id = None
+                self._only_diff_progress_confirm_token = None
+            if not _progress_token_is_current():
+                return
+            try:
+                win = self._only_diff_progress_win
+                if win is None or not win.winfo_exists():
+                    raise RuntimeError("dialog-unavailable")
+                disposition = _try_progress_visibility(win, "confirm")
+                if disposition == "retry":
+                    _schedule_visibility_confirm()
+            except Exception as exc:
+                _dlog(
+                    f"only-diff progress confirm failed sheet={view.sheet}: {exc}"
+                )
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), "confirm-failed"
+                )
 
         def _show_dialog():
-            if self._only_diff_progress_owner != token or self._is_closing:
+            if self._only_diff_progress_show_token == token:
+                self._only_diff_progress_show_after_id = None
+                self._only_diff_progress_show_token = None
+            if not _progress_token_is_current():
                 return
             try:
                 win = self._ensure_only_diff_progress_dialog()
                 if win is None:
-                    return
+                    raise RuntimeError("dialog-unavailable")
                 win.title(f"正在计算差异 — {view.sheet}")
                 self._only_diff_progress_stage_var.set(
                     f"正在准备“{view.sheet}”的精确差异"
@@ -30310,20 +39736,49 @@ class SowMergeApp:
                     state="normal",
                 )
                 win.deiconify()
-                win.grab_set()
-                win.focus_set()
                 width = win.winfo_reqwidth()
                 height = win.winfo_reqheight()
                 win.geometry(
                     f"+{max(0, self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2)}"
                     f"+{max(0, self.root.winfo_rooty() + (self.root.winfo_height() - height) // 2)}"
                 )
+                win.update_idletasks()
+                disposition = _try_progress_visibility(win, "show")
+                if disposition == "retry":
+                    _schedule_visibility_confirm()
             except Exception as exc:
                 _dlog(
                     f"only-diff progress show failed sheet={view.sheet}: {exc}"
                 )
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), "show-failed"
+                )
 
-        self._safe_root_after(0, _show_dialog)
+        def _show_watchdog():
+            if self._only_diff_progress_watchdog_token == token:
+                self._only_diff_progress_watchdog_after_id = None
+                self._only_diff_progress_watchdog_token = None
+            if (
+                self._only_diff_progress_owner == token
+                and self._only_diff_progress_visible_token != token
+            ):
+                self._fail_only_diff_progress_show(
+                    view, int(build_seq), "show-timeout"
+                )
+
+        self._only_diff_progress_show_token = token
+        show_after_id = self._safe_root_after(0, _show_dialog)
+        self._only_diff_progress_show_after_id = show_after_id
+        if show_after_id is None:
+            self._fail_only_diff_progress_show(view, int(build_seq), "show-schedule")
+            return
+        self._only_diff_progress_watchdog_token = token
+        watchdog_after_id = self._safe_root_after(100, _show_watchdog)
+        self._only_diff_progress_watchdog_after_id = watchdog_after_id
+        if watchdog_after_id is None:
+            self._fail_only_diff_progress_show(
+                view, int(build_seq), "watchdog-schedule"
+            )
 
     def _update_only_diff_progress(
         self,
@@ -30353,8 +39808,14 @@ class SowMergeApp:
     def _finish_only_diff_progress(self, view, build_seq: int, *, outcome: str):
         """Close only the matching dialog and release its input ownership."""
         token = (view, int(build_seq))
+        clear_prior = getattr(view, "_clear_only_diff_prior_exact", None)
         if self._only_diff_progress_owner != token:
+            if callable(clear_prior):
+                clear_prior(int(build_seq))
             return False
+        self._clear_only_diff_progress_schedule(token)
+        if self._only_diff_progress_visible_token == token:
+            self._only_diff_progress_visible_token = None
         win = self._only_diff_progress_win
         try:
             if win is not None and win.winfo_exists():
@@ -30367,6 +39828,8 @@ class SowMergeApp:
         except Exception:
             pass
         self._only_diff_progress_owner = None
+        if callable(clear_prior):
+            clear_prior(int(build_seq))
         self._only_diff_tab_states.clear()
         _dlog(
             f"ONLY_DIFF_PROGRESS_END sheet={view.sheet} "
@@ -30379,11 +39842,16 @@ class SowMergeApp:
             owner = self._priority_exact_owner
         if owner and getattr(owner[0], "sheet", None) != active_sheet:
             old_view = owner[0]
+            restore_prior = getattr(old_view, "_restore_only_diff_prior_exact", None)
+            if callable(restore_prior):
+                restore_prior(int(owner[1]))
             old_view._only_diff_async_build_seq += 1
             old_view._only_diff_async_building = False
             old_view._only_diff_async_build_key = None
             old_view._only_diff_preview_full = False
+            old_view._pending_exact_render = False
             old_view._lifecycle_canceled = True
+            self._release_priority_exact(old_view, int(owner[1]))
             self._finish_only_diff_progress(
                 old_view,
                 owner[1],
@@ -30475,10 +39943,20 @@ class SowMergeApp:
                     pass
             if getattr(self, "_is_closing", False):
                 return
+            callback_started = time.perf_counter() if _UI_CALLBACK_TIMING_DIAGNOSTIC else None
             callback()
+            if callback_started is not None:
+                callback_elapsed_ms = (time.perf_counter() - callback_started) * 1000.0
+                if callback_elapsed_ms > 20.0:
+                    _dlog(
+                        f"UI_CALLBACK_SLOW ms={callback_elapsed_ms:.1f} "
+                        f"callback={getattr(callback, '__qualname__', repr(callback))}"
+                    )
 
         try:
             aid = self.root.after(int(delay_ms), _wrapped)
+            if aid is None:
+                return None
             holder["id"] = aid
             self._root_after_ids.add(aid)
             return aid
@@ -30500,10 +39978,383 @@ class SowMergeApp:
             except Exception:
                 pass
 
+    def _snapshot_child_tree_pids(self, owner: dict | None) -> set[int]:
+        """Return the owned child PID plus its last observed private tree."""
+        process = owner.get("process") if isinstance(owner, dict) else None
+        tree_pids = {int(getattr(process, "pid", 0) or 0)}
+        resources = owner.get("last_resources") if isinstance(owner, dict) else None
+        for value in (resources or {}).get("tree_pids") or ():
+            try:
+                tree_pids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        tree_pids.discard(0)
+        return tree_pids
+
+    def _snapshot_child_terminal_primitives(self, owner: dict | None):
+        """Return this owner's private terminal mutex and completion fence."""
+        if not isinstance(owner, dict):
+            return None, None
+        with getattr(self, "_snapshot_child_lock", threading.RLock()):
+            record_lock = owner.get("terminal_record_lock")
+            if not (
+                hasattr(record_lock, "acquire")
+                and hasattr(record_lock, "release")
+            ):
+                record_lock = threading.Lock()
+                owner["terminal_record_lock"] = record_lock
+            recorded = owner.get("terminal_recorded_event")
+            if not (
+                hasattr(recorded, "set")
+                and hasattr(recorded, "wait")
+                and hasattr(recorded, "is_set")
+            ):
+                recorded = threading.Event()
+                owner["terminal_recorded_event"] = recorded
+            return record_lock, recorded
+
+    def _claim_snapshot_child_terminal(
+        self,
+        owner: dict | None,
+        event: str,
+        *,
+        reason: str | None = None,
+        exception: str | None = None,
+    ) -> bool:
+        """Claim one terminal event for the current isolated-child owner.
+
+        A runner can outlive a cancellation or a newer owner.  Object identity
+        (rather than a reusable token) makes the old runner a strict no-op and
+        prevents a second terminal event from polluting the new generation.
+        """
+        if event not in {"terminated", "finished", "failed"}:
+            raise ValueError(f"unsupported snapshot terminal event: {event}")
+        if not isinstance(owner, dict):
+            return False
+        with getattr(self, "_snapshot_child_lock", threading.RLock()):
+            record_lock, _recorded = self._snapshot_child_terminal_primitives(owner)
+            if owner.get("terminal_event") is not None:
+                return False
+            if getattr(self, "_snapshot_child_owner", None) is not owner:
+                return False
+            # The winner holds this private mutex through termination, IPC
+            # cleanup, event append, and process.close.  A stale runner sees
+            # the claim under the global lock and waits only on the fence; it
+            # never touches the winner's IPC or process handle.
+            record_lock.acquire()
+            try:
+                owner["terminal_event"] = event
+                owner["terminal_reason"] = str(reason or "")
+                owner["terminal_exception"] = str(exception or "")
+                owner["terminal_claimed_at"] = time.monotonic()
+                owner["terminal_record_lock_held"] = True
+                self._snapshot_child_owner = None
+                result_path = owner.get("result_path")
+                if result_path:
+                    getattr(self, "_snapshot_child_temp_paths", set()).discard(result_path)
+                return True
+            except BaseException:
+                record_lock.release()
+                raise
+
+    def _cleanup_snapshot_child_terminal_paths(self, owner: dict | None) -> dict:
+        """Collect real IPC existence evidence, then remove this owner's files."""
+        process = owner.get("process") if isinstance(owner, dict) else None
+        result_path = owner.get("result_path") if isinstance(owner, dict) else None
+        partial_path = owner.get("partial_path") if isinstance(owner, dict) else None
+        result_exists_before = bool(result_path and os.path.exists(result_path))
+        partial_exists_before = bool(partial_path and os.path.exists(partial_path))
+        for path in (result_path, partial_path):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        if result_path:
+            with getattr(self, "_snapshot_child_lock", threading.RLock()):
+                getattr(self, "_snapshot_child_temp_paths", set()).discard(result_path)
+        return {
+            "pid": int(getattr(process, "pid", 0) or 0),
+            "tree_pids": tuple(sorted(self._snapshot_child_tree_pids(owner))),
+            "exitcode": getattr(process, "exitcode", None),
+            "result_path": result_path,
+            "partial_path": partial_path,
+            "result_existed_before_cleanup": result_exists_before,
+            "partial_existed_before_cleanup": partial_exists_before,
+            "result_exists_after_cleanup": bool(result_path and os.path.exists(result_path)),
+            "partial_exists_after_cleanup": bool(partial_path and os.path.exists(partial_path)),
+        }
+
+    def _snapshot_child_terminal_fallback_evidence(self, owner: dict | None) -> dict:
+        """Fail-closed cleanup evidence if the normal cleanup helper raises."""
+        process = owner.get("process") if isinstance(owner, dict) else None
+        result_path = owner.get("result_path") if isinstance(owner, dict) else None
+        partial_path = owner.get("partial_path") if isinstance(owner, dict) else None
+        result_exists_before = bool(result_path and os.path.exists(result_path))
+        partial_exists_before = bool(partial_path and os.path.exists(partial_path))
+        for path in (result_path, partial_path):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        try:
+            tree_pids = tuple(sorted(self._snapshot_child_tree_pids(owner)))
+        except Exception:
+            tree_pids = ()
+        return {
+            "pid": int(getattr(process, "pid", 0) or 0),
+            "tree_pids": tree_pids,
+            "exitcode": getattr(process, "exitcode", None),
+            "result_path": result_path,
+            "partial_path": partial_path,
+            "result_existed_before_cleanup": result_exists_before,
+            "partial_existed_before_cleanup": partial_exists_before,
+            "result_exists_after_cleanup": bool(result_path and os.path.exists(result_path)),
+            "partial_exists_after_cleanup": bool(partial_path and os.path.exists(partial_path)),
+        }
+
+    def _record_snapshot_child_terminal(
+        self,
+        owner: dict | None,
+        event: str,
+        *,
+        reason: str | None = None,
+        exception: str | None = None,
+        result_decoded: bool = False,
+    ) -> dict:
+        """Record an already-claimed terminal and always release its fence.
+
+        The winner owns the private record lock set by
+        :meth:`_claim_snapshot_child_terminal`.  Any cleanup, close, or event
+        recording exception is converted into one fail-closed ``failed``
+        record rather than allowing a detached owner with no terminal proof.
+        """
+        record_lock, recorded = self._snapshot_child_terminal_primitives(owner)
+        original_event = str(event)
+        record_error = (
+            str(owner.get("terminal_record_error") or "")
+            if isinstance(owner, dict)
+            else ""
+        )
+        process = owner.get("process") if isinstance(owner, dict) else None
+        try:
+            owner_generation = int(owner.get("generation", -1)) if isinstance(owner, dict) else -1
+        except (TypeError, ValueError):
+            owner_generation = -1
+        try:
+            try:
+                evidence = self._cleanup_snapshot_child_terminal_paths(owner)
+            except BaseException as exc:
+                record_error = f"cleanup:{type(exc).__name__}: {exc}"
+                evidence = self._snapshot_child_terminal_fallback_evidence(owner)
+            try:
+                if process is not None and not process.is_alive():
+                    process.close()
+            except BaseException as exc:
+                record_error = record_error or f"close:{type(exc).__name__}: {exc}"
+            if isinstance(owner, dict) and owner.get("terminal_record_timeout"):
+                record_error = record_error or str(owner["terminal_record_timeout"])
+            emitted_event = "failed" if record_error else original_event
+            emitted_reason = (
+                "terminal-record-failure" if record_error else str(reason or "")
+            )
+            emitted_exception = (
+                record_error if record_error else str(exception or "")
+            )
+            record = {
+                "event": emitted_event,
+                "original_event": original_event,
+                "reason": emitted_reason,
+                "exception": emitted_exception,
+                "terminal_record_error": record_error,
+                "result_decoded": bool(result_decoded and not record_error),
+                # ``token`` remains the established child-protocol field.
+                # The explicit name lets external foreground audits join a
+                # preemption to this terminal without token-name inference.
+                "request_token": str(owner.get("token") or "") if isinstance(owner, dict) else "",
+                "token": str(owner.get("token") or "") if isinstance(owner, dict) else "",
+                "sheet": str(owner.get("sheet") or "") if isinstance(owner, dict) else "",
+                "generation": owner_generation,
+                "at": time.monotonic(),
+                **evidence,
+            }
+            try:
+                self._snapshot_child_events.append(record)
+            except BaseException as exc:
+                # A custom/failed event sink must not drop the terminal proof.
+                # Replace only that sink with a normal bounded deque and retain
+                # earlier inspectable records where possible.
+                record["event"] = "failed"
+                record["reason"] = "terminal-record-failure"
+                record["terminal_record_error"] = (
+                    f"event-append:{type(exc).__name__}: {exc}"
+                )
+                record["exception"] = record["terminal_record_error"]
+                record["result_decoded"] = False
+                try:
+                    prior = list(getattr(self, "_snapshot_child_events", ()))
+                except Exception:
+                    prior = []
+                replacement = deque(prior, maxlen=64)
+                replacement.append(record)
+                self._snapshot_child_events = replacement
+            return record
+        except BaseException as exc:
+            # Keep the terminal fence fail-closed even if a future edit makes
+            # record construction itself fail.  This fallback intentionally
+            # records only observed facts; it never synthesizes cleanup proof.
+            fallback_error = f"record:{type(exc).__name__}: {exc}"
+            try:
+                evidence = self._snapshot_child_terminal_fallback_evidence(owner)
+            except BaseException:
+                evidence = {
+                    "pid": int(getattr(process, "pid", 0) or 0),
+                    "tree_pids": (),
+                    "exitcode": getattr(process, "exitcode", None),
+                    "result_path": owner.get("result_path") if isinstance(owner, dict) else None,
+                    "partial_path": owner.get("partial_path") if isinstance(owner, dict) else None,
+                    "result_existed_before_cleanup": False,
+                    "partial_existed_before_cleanup": False,
+                    "result_exists_after_cleanup": None,
+                    "partial_exists_after_cleanup": None,
+                }
+            record = {
+                "event": "failed",
+                "original_event": original_event,
+                "reason": "terminal-record-failure",
+                "exception": fallback_error,
+                "terminal_record_error": fallback_error,
+                "result_decoded": False,
+                "request_token": str(owner.get("token") or "") if isinstance(owner, dict) else "",
+                "token": str(owner.get("token") or "") if isinstance(owner, dict) else "",
+                "sheet": str(owner.get("sheet") or "") if isinstance(owner, dict) else "",
+                "generation": owner_generation,
+                "at": time.monotonic(),
+                **evidence,
+            }
+            try:
+                self._snapshot_child_events.append(record)
+            except BaseException:
+                self._snapshot_child_events = deque((record,), maxlen=64)
+            return record
+        finally:
+            if isinstance(owner, dict):
+                owner["terminal_record_lock_held"] = False
+            if recorded is not None:
+                recorded.set()
+            if record_lock is not None:
+                try:
+                    record_lock.release()
+                except RuntimeError:
+                    pass
+
+    def _finalize_snapshot_child_runner(
+        self,
+        owner: dict | None,
+        *,
+        normal_result_verified: bool,
+        result_decoded: bool,
+        failure_reason: str = "",
+    ) -> dict | None:
+        """Finish a child runner without duplicating a cancel/preempt event."""
+        process = owner.get("process") if isinstance(owner, dict) else None
+        result_path = owner.get("result_path") if isinstance(owner, dict) else None
+        normal = bool(
+            normal_result_verified
+            and result_decoded
+            and getattr(process, "exitcode", None) == 0
+            and result_path
+            and os.path.isfile(result_path)
+        )
+        event = "finished" if normal else "failed"
+        reason = "normal-result-verified" if normal else (failure_reason or "snapshot-child-terminal-invariant")
+        claimed = self._claim_snapshot_child_terminal(
+            owner,
+            event,
+            reason=reason,
+            exception="" if normal else reason,
+        )
+        if not claimed:
+            _record_lock, recorded = self._snapshot_child_terminal_primitives(owner)
+            if isinstance(owner, dict) and owner.get("terminal_event") is not None:
+                # A winner is still responsible for process/IPC/event cleanup.
+                # Do not close its process from this stale runner; wait only
+                # for a bounded record fence so a broken winner is visible.
+                if recorded is not None and not recorded.wait(timeout=5.0):
+                    owner["terminal_record_timeout"] = (
+                        "terminal record fence timeout observed by stale runner"
+                    )
+                    _dlog(
+                        f"SNAPSHOT_CHILD terminal fence timeout sheet={owner.get('sheet')} "
+                        f"generation={owner.get('generation')}"
+                    )
+                return None
+            # This owner has never claimed a terminal and is no longer current:
+            # it is a replaced stale owner with a unique IPC path.  Its runner
+            # may clean that private path and close only its own dead process,
+            # but it deliberately emits no event against the newer owner.
+            try:
+                self._cleanup_snapshot_child_terminal_paths(owner)
+            finally:
+                try:
+                    if process is not None and not process.is_alive():
+                        process.close()
+                except Exception:
+                    pass
+            return None
+        return self._record_snapshot_child_terminal(
+            owner,
+            event,
+            reason=reason,
+            exception="" if normal else reason,
+            result_decoded=result_decoded,
+        )
+
+    def _terminate_snapshot_child(self, reason: str = "cancel"):
+        """Claim, terminate, and record the one owned parser child exactly once."""
+        with getattr(self, "_snapshot_child_lock", threading.RLock()):
+            owner = getattr(self, "_snapshot_child_owner", None)
+        if not self._claim_snapshot_child_terminal(owner, "terminated", reason=reason):
+            return False
+        process = owner.get("process") if isinstance(owner, dict) else None
+        try:
+            if process is not None and process.is_alive():
+                _dlog(
+                    f"SNAPSHOT_CHILD terminate pid={process.pid} sheet={owner.get('sheet')} "
+                    f"generation={owner.get('generation')} reason={reason}"
+                )
+                process.terminate()
+                process.join(timeout=1.5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=1.0)
+        except Exception as exc:
+            _dlog(f"SNAPSHOT_CHILD terminate failed reason={reason} err={type(exc).__name__}:{exc}")
+            owner["terminal_record_error"] = f"terminate:{type(exc).__name__}: {exc}"
+        self._record_snapshot_child_terminal(owner, "terminated", reason=reason)
+        return True
+
     def _shutdown_root(self):
         if getattr(self, "_is_closing", False):
             return
         self._is_closing = True
+        clear_foreground = getattr(self, "_foreground_resume_clear", None)
+        if callable(clear_foreground):
+            try:
+                clear_foreground("close")
+            except Exception:
+                pass
+        try:
+            self._terminate_snapshot_child("shutdown")
+        except Exception:
+            pass
         try:
             self._initial_sheet_ready_event.set()
         except Exception:
@@ -30516,6 +40367,10 @@ class SowMergeApp:
                     owner[1],
                     outcome="closing",
                 )
+        except Exception:
+            pass
+        try:
+            self._clear_only_diff_shutdown_state()
         except Exception:
             pass
         self._cancel_root_afters()
@@ -30535,9 +40390,11 @@ class SowMergeApp:
             for view in list(getattr(self, "sheet_views", {}).values()):
                 if view is None:
                     continue
-                view._only_diff_async_build_seq += 1
-                view._only_diff_async_building = False
-                view._only_diff_async_build_key = None
+                try:
+                    view._cancel_virtual_2d_publish("close")
+                except Exception:
+                    pass
+
                 try:
                     view._hide_loading()
                 except Exception:
@@ -30623,38 +40480,22 @@ class SowMergeApp:
         except Exception:
             pass
         try:
-            startup_temp_paths = {
-                getattr(self, "merge_candidate_path", None),
-                getattr(self, "file_a", None),
-                getattr(self, "file_b", None),
-                getattr(self, "base_path", None),
-            }
-            context = getattr(self, "launch_context", None)
-            for identity in getattr(context, "identities", {}).values():
-                stable_path = getattr(identity, "stable_path", None)
-                original_path = getattr(identity, "path", None)
-                if stable_path and (
-                    not original_path
-                    or os.path.abspath(stable_path) != os.path.abspath(original_path)
-                ):
-                    startup_temp_paths.add(stable_path)
-            temp_root = os.path.abspath(tempfile.gettempdir())
-            for temp_path in startup_temp_paths:
-                if not temp_path:
-                    continue
-                candidate = os.path.abspath(temp_path)
-                if (
-                    os.path.commonpath((temp_root, candidate)) != temp_root
-                    or not os.path.basename(candidate).lower().startswith(APP_NAME.lower())
-                ):
-                    continue
-                try:
-                    if os.path.isfile(candidate):
-                        os.remove(candidate)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            evidence = _consume_owned_startup_temp_paths(
+                self._owned_startup_temp_paths,
+                self._owned_startup_temp_cleanup_evidence,
+            )
+            for item in evidence:
+                if item.get("error") or item.get("exists_after"):
+                    _dlog(
+                        "STARTUP_TEMP cleanup failed "
+                        f"path={item.get('path')} error={item.get('error')}"
+                    )
+        except Exception as exc:
+            self._owned_startup_temp_cleanup_evidence.append({
+                "path": "", "mode_before": None, "readonly_before": None,
+                "chmod_attempted": False, "removed": False,
+                "exists_after": None, "error": f"cleanup:{type(exc).__name__}:{exc}",
+            })
         try:
             if self.root.winfo_exists():
                 # Ensure Tk mainloop exits and the window is actually closed.
@@ -30667,25 +40508,38 @@ class SowMergeApp:
             pass
 
     def _edit_workbooks_ready(self) -> bool:
+        """Whether a mutation can safely use both edit and cached-value books.
+
+        Snapshot-first viewing keeps the initial cached-value workbooks in
+        read-only mode.  Existing copy/undo code writes cached values as part
+        of the established formula-cache contract, so editable workbooks alone
+        are not enough to unlock a mutation.  Treat both stores as one lazy
+        recovery unit instead of exposing a ReadOnlyWorksheet to a first edit.
+        """
+        def _writable(attr: str) -> bool:
+            workbook = getattr(self, attr, None)
+            return bool(workbook is not None and not getattr(workbook, "read_only", False))
+
         return bool(
             self._wb_a_edit is not None
             and self._wb_b_edit is not None
             and (not self.has_base or self._wb_base_edit is not None)
+            and _writable("_wb_a_val")
+            and _writable("_wb_b_val")
+            and (not self.has_base or _writable("_wb_base_val"))
         )
 
     def _guard_active_sheet_mutation(self, action: str) -> bool:
         view = getattr(self, "sheet_views", {}).get(getattr(self, "selected_sheet", ""))
         if view is None:
-            self.show_nonblocking_notice(
-                f"{action}暂不可用。当前 Sheet 尚未加载完成。",
-                duration_ms=6000,
-            )
+            self._show_exact_readiness_modal(action, getattr(self, "selected_sheet", "当前 Sheet"))
             return False
         return bool(view._guard_mutation_ready(action))
 
     def _guard_sheet_mutation(self, sheet: str, action: str) -> bool:
         view = getattr(self, "sheet_views", {}).get(str(sheet))
         if view is None:
+            self._show_exact_readiness_modal(action, sheet)
             return False
         # A handler acquires readiness before entering BUSY. Deeper workbook
         # primitives may revalidate that same owner/generation without being
@@ -30738,10 +40592,15 @@ class SowMergeApp:
 
     def _guard_save_readiness(self, action: str, target_side: str) -> bool:
         if not self._edit_workbooks_ready():
-            self.show_nonblocking_notice(
-                f"{action}暂不可用。可编辑工作簿仍在后台加载。",
-                duration_ms=6000,
+            # Snapshot-only viewing intentionally defers editable workbook
+            # materialization.  A save request is the explicit demand signal;
+            # keep this first click non-blocking while the single-owner loader
+            # begins, then preserve the existing readiness gate.
+            self._request_edit_preload(
+                reason=f"save:{action}",
+                caller="_guard_save_readiness",
             )
+            self._show_exact_readiness_modal(action, sorted(self._pending_mutation_sheets(target_side)))
             return False
         blocked = []
         for sheet in sorted(self._pending_mutation_sheets(target_side)):
@@ -30750,20 +40609,29 @@ class SowMergeApp:
                 state = "未加载" if view is None else view._derive_lifecycle_state()
                 blocked.append(f"{sheet}({state})")
         if blocked:
-            self.show_nonblocking_notice(
-                f"{action}暂不可用。以下相关 Sheet 尚未 READY："
-                + "、".join(blocked[:8]),
-                duration_ms=8000,
-            )
+            self._show_exact_readiness_modal(action, [item.split("(", 1)[0] for item in blocked])
             return False
         return True
 
-    def _request_edit_preload(self):
-        """Release the existing preload worker without starting a second parser."""
+    def _request_edit_preload(
+        self,
+        *,
+        reason: str = "explicit mutation/save",
+        caller: str = "unknown",
+    ):
+        """Start the one owner loader only after an edit/save demand."""
         try:
             self._initial_sheet_ready_event.set()
         except Exception:
             pass
+        self._record_edit_load_request(reason, caller)
+        if self._edit_workbooks_ready() or getattr(self, "_edit_loading_started", False):
+            return
+        target = getattr(self, "_edit_preload_target", None)
+        if callable(target):
+            self._edit_loading_started = True
+            self._edit_loaded_event.clear()
+            self._edit_preload_thread = self._start_background_thread(target, name="sow-edit-preload")
 
     def _refresh_loaded_views_after_edit_ready(self):
         """Publish edit readiness without performing a Tk-thread rescan.
@@ -30859,43 +40727,63 @@ class SowMergeApp:
                     else:
                         loaded_here.append(candidate)
                     _dlog(f"load wb_base_edit owned: {(datetime.now()-t0).total_seconds():.3f}s")
+                # The compact first-open path deliberately owns read-only
+                # cached-value books.  Operations still update cached values
+                # for formula semantics, so promote those handles together
+                # with the normal edit books on the first edit/save demand.
+                for attr, path_attr in (
+                    ("_wb_a_val", "_file_a_val_path"),
+                    ("_wb_b_val", "_file_b_val_path"),
+                    ("_wb_base_val", "_file_base_val_path"),
+                ):
+                    if attr == "_wb_base_val" and not self.has_base:
+                        continue
+                    current = getattr(self, attr, None)
+                    if current is not None and not getattr(current, "read_only", False):
+                        continue
+                    value_path = getattr(self, path_attr, None)
+                    if not value_path:
+                        raise RuntimeError(f"value workbook path unavailable: {attr}")
+                    t0 = datetime.now()
+                    candidate = load_workbook(value_path, data_only=True)
+                    # We hold the single ownership lock, but retain the
+                    # compare-and-set/close shape used for edit workbooks so
+                    # shutdown cannot leak a duplicate handle.
+                    installed = getattr(self, attr, None)
+                    if (installed is None or getattr(installed, "read_only", False)) and not self._is_closing:
+                        setattr(self, attr, candidate)
+                        _wbs_close(installed)
+                    else:
+                        loaded_here.append(candidate)
+                    _dlog(f"load {attr} writable owned: {(datetime.now()-t0).total_seconds():.3f}s")
                 return self._edit_workbooks_ready()
         finally:
             self._edit_preload_active_event.clear()
             _wbs_close(*loaded_here)
 
-    def _ensure_edit_loaded(self):
+    def _ensure_edit_loaded(self, *, reason: str = "explicit mutation/save", caller: str = "unknown"):
         if self._edit_workbooks_ready():
             return
-
-        if getattr(self, "_edit_loading_started", False):
-            self._request_edit_preload()
-            _dlog("waiting for single-owner background edit preload")
-            while not self._edit_loaded_event.wait(timeout=0.1):
-                if self._is_closing:
-                    raise RuntimeError("应用正在关闭，已取消可编辑工作簿加载。")
-            if self._edit_workbooks_ready():
-                return
-
-        _dlog("loading edit workbooks (single-owner fallback)")
-        if not self._load_edit_workbooks_owned():
-            raise RuntimeError("可编辑工作簿加载失败。")
-        self._edit_loaded_event.set()
+        # Never synchronously parse four normal-mode workbooks in a Tk
+        # callback. Guards reject the initiating mutation/save, start the
+        # single-owner worker, and require the user to retry after readiness.
+        self._request_edit_preload(reason=reason, caller=caller or "_ensure_edit_loaded")
+        raise RuntimeError("可编辑工作簿正在后台准备；请在准备完成后重试该操作。")
 
     def ws_a_edit(self, sheet: str):
-        self._ensure_edit_loaded()
+        self._ensure_edit_loaded(reason="editable accessor", caller="ws_a_edit")
         if self._wb_a_edit is None:
             raise KeyError("file_a edit workbook not available")
         return self._wb_a_edit[sheet]
 
     def ws_b_edit(self, sheet: str):
-        self._ensure_edit_loaded()
+        self._ensure_edit_loaded(reason="editable accessor", caller="ws_b_edit")
         if self._wb_b_edit is None:
             raise KeyError("file_b edit workbook not available")
         return self._wb_b_edit[sheet]
 
     def ws_base_edit(self, sheet: str):
-        self._ensure_edit_loaded()
+        self._ensure_edit_loaded(reason="editable accessor", caller="ws_base_edit")
         if self._wb_base_edit is None:
             raise KeyError("base workbook not available")
         return self._wb_base_edit[sheet]
@@ -30915,6 +40803,49 @@ class SowMergeApp:
             raise KeyError("base workbook not available")
         return self._wb_base_val[sheet]
 
+    def selected_sheet_snapshot(self, side: str, sheet: str, *, mutation_generation: int = 0, cancel_check=None) -> SheetSnapshot | None:
+        """Return one generation-safe immutable snapshot without scanning siblings.
+
+        Callers may invoke this from a worker.  It has no Tk interaction and
+        drops a parse completed after the Sheet generation changed instead of
+        publishing stale logical coordinates.
+        """
+        side = str(side or "").upper()
+        if side == "A":
+            value_path, formula_path = self._file_a_val_path, self.file_a
+        elif side == "B":
+            value_path, formula_path = self._file_b_val_path, self.file_b
+        elif side == "BASE" and getattr(self, "has_base", False):
+            value_path, formula_path = self._file_base_val_path, self.base_path
+        else:
+            raise KeyError(f"unsupported snapshot side: {side}")
+        generation = int(getattr(self, "_sheet_compute_generation", {}).get(sheet, 0))
+        version = _selected_sheet_snapshot_version(
+            value_path,
+            topology_generation=generation,
+            mutation_generation=mutation_generation,
+        )
+        key = (side, str(sheet), version)
+        lock = getattr(self, "_selected_sheet_snapshot_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            cached = self._selected_sheet_snapshot_cache.get(key)
+        if cached is not None:
+            return cached
+        snapshot = _stream_selected_sheet_snapshot(
+            value_path, formula_path, sheet, side,
+            topology_generation=generation,
+            mutation_generation=mutation_generation,
+            cancel_check=cancel_check,
+        )
+        if generation != int(getattr(self, "_sheet_compute_generation", {}).get(sheet, 0)):
+            _dlog(f"drop stale selected snapshot sheet={sheet} side={side} generation={generation}")
+            return None
+        with lock:
+            self._selected_sheet_snapshot_cache[key] = snapshot
+        return snapshot
+
     def record_manual_a_cell(self, sheet: str, r: int, c: int, edit_value):
         try:
             key = (sheet, int(r), int(c))
@@ -30922,6 +40853,45 @@ class SowMergeApp:
             self.manual_a_formula_cache_ops.pop(key, None)
         except Exception:
             pass
+
+    def sheet_operation_overlay(self, sheet: str) -> SheetOperationOverlay:
+        """Return the isolated content overlay for one logical Sheet."""
+        key = str(sheet)
+        overlay = self.sheet_operation_overlays.get(key)
+        if overlay is None:
+            overlay = SheetOperationOverlay()
+            self.sheet_operation_overlays[key] = overlay
+        return overlay
+
+    def apply_sheet_operation_overlay(self, sheet: str, deltas) -> OverlayTransaction:
+        """Mirror an already-applied content edit; save remains manual-op based."""
+        return self.sheet_operation_overlay(sheet).apply_batch(deltas)
+
+    def revert_sheet_operation_overlay(self, sheet: str, transaction: OverlayTransaction | None) -> None:
+        overlay = self.sheet_operation_overlays.get(str(sheet))
+        if overlay is not None:
+            overlay.revert_transaction(transaction)
+
+    def mark_sheet_operation_overlay_structural(self, sheet: str) -> None:
+        """Invalidate physical-coordinate content deltas after structure changes."""
+        self.sheet_operation_overlay(sheet).mark_structural_change()
+        with getattr(self, "_selected_sheet_snapshot_lock", threading.Lock()):
+            stale = [key for key in self._selected_sheet_snapshot_cache if key[1] == str(sheet)]
+            for key in stale:
+                self._selected_sheet_snapshot_cache.pop(key, None)
+
+    def validate_sheet_operation_overlay_for_save(self, target_side: str, manual_ops: dict, cache_ops: dict) -> None:
+        """Prove overlay content is represented in the existing save journal."""
+        side = str(target_side or "").upper()
+        for sheet, overlay in (getattr(self, "sheet_operation_overlays", {}) or {}).items():
+            for delta in overlay.cells.values():
+                if str(delta.side).upper() != side:
+                    continue
+                key = (sheet, int(delta.physical_row), int(delta.physical_col))
+                if key not in manual_ops and key not in cache_ops:
+                    raise RuntimeError(
+                        f"操作叠加层与保存日志不一致：{sheet}!R{delta.physical_row}C{delta.physical_col}"
+                    )
 
     def record_manual_a_formula_cache(self, sheet: str, r: int, c: int, cached_value):
         try:
@@ -31373,6 +41343,8 @@ class SowMergeApp:
             self.manual_b_column_ops.clear()
         else:
             return
+        for overlay in self.sheet_operation_overlays.values():
+            overlay.clear_side(side)
         self._clear_sheet_ops_for_target(side)
         remaining_a = set(getattr(self, "modified_sheets_a", set()))
         remaining_b = set(getattr(self, "modified_sheets_b", set()))
@@ -31424,6 +41396,7 @@ class SowMergeApp:
             column_ops=column_ops,
         )
         formula_cache_values = dict(getattr(self, "manual_a_formula_cache_ops", {}) or {})
+        self.validate_sheet_operation_overlay_for_save("A", manual_ops, formula_cache_values)
         literal_text_values = {
             key: value for key, value in manual_ops.items()
             if isinstance(value, _LiteralText)
@@ -31574,6 +41547,7 @@ class SowMergeApp:
             column_ops=column_ops,
         )
         formula_cache_values = dict(getattr(self, "manual_b_formula_cache_ops", {}) or {})
+        self.validate_sheet_operation_overlay_for_save("B", manual_ops, formula_cache_values)
         literal_text_values = {
             key: value for key, value in manual_ops.items()
             if isinstance(value, _LiteralText)
@@ -31751,6 +41725,367 @@ class SowMergeApp:
         except Exception:
             return None
 
+    def _sheet_exact_entry(self, sheet: str) -> dict:
+        """Return the current-generation exact state without inferring equality."""
+        sheet = str(sheet or "")
+        generation = int(getattr(self, "_sheet_compute_generation", {}).get(sheet, 0))
+        registry = getattr(self, "_sheet_exact_states", {}) or {}
+        entry = dict(registry.get(sheet) or {})
+        if int(entry.get("generation", -1)) != generation:
+            return {
+                "generation": generation,
+                "state": _SHEET_EXACT_PENDING,
+                "stage": "等待精确比较",
+                "processed": 0,
+                "total": max(1, len(getattr(self, "compare_sheets", ()) or ())),
+                "reason": "当前 generation 尚未发布最终精确结果",
+                "request_started_at": None,
+                "request_start_state": None,
+                "full_detail_terminal": False,
+                "full_detail_terminal_at": None,
+                "request_to_full_detail_ms": None,
+            }
+        return entry
+
+    def _is_sheet_exact_current(self, sheet: str) -> bool:
+        return str(self._sheet_exact_entry(sheet).get("state") or "") in _SHEET_EXACT_TERMINAL
+
+    def _set_sheet_exact_state(
+        self,
+        sheet: str,
+        state: str,
+        *,
+        generation: int | None = None,
+        stage: str = "",
+        processed: int | None = None,
+        total: int | None = None,
+        reason: str = "",
+        refresh: bool = True,
+        only_diff_reopen_capability=None,
+    ) -> bool:
+        """Publish one generation-matched Sheet state; stale workers cannot unlock UI."""
+        sheet = str(sheet or "")
+        if not sheet:
+            return False
+        current_generation = int(getattr(self, "_sheet_compute_generation", {}).get(sheet, 0))
+        generation = current_generation if generation is None else int(generation)
+        if generation != current_generation:
+            stale_clear = getattr(self, "_foreground_resume_clear", None)
+            if callable(stale_clear):
+                try:
+                    stale_clear(
+                        "stale-generation-state-drop",
+                        sheet=sheet,
+                        generation=generation,
+                    )
+                except Exception:
+                    pass
+            _dlog(
+                f"drop stale exact state sheet={sheet} state={state} "
+                f"generation={generation} current={current_generation}"
+            )
+            return False
+        if state not in (
+            _SHEET_EXACT_PENDING, _SHEET_EXACT_CALCULATING, _SHEET_EXACT_SAME,
+            _SHEET_EXACT_CHANGED, _SHEET_EXACT_UNRESOLVED, _SHEET_EXACT_FAILED,
+        ):
+            raise ValueError(f"unknown exact Sheet state: {state}")
+        previous = self._sheet_exact_entry(sheet)
+        previous_generation = int(previous.get("generation", -1))
+        previous_state = str(previous.get("state") or "")
+        # Alias evidence belongs to one validated child/cache generation only.
+        # Clear it as soon as a new request/generation starts or the current
+        # generation becomes blocked, so a later harness/UI observer cannot
+        # confuse a prior successful Base wrapper with pending work.
+        clear_snapshot_alias = (
+            previous_generation != generation
+            or state in (_SHEET_EXACT_UNRESOLVED, _SHEET_EXACT_FAILED)
+            or (
+                state in (_SHEET_EXACT_PENDING, _SHEET_EXACT_CALCULATING)
+                and previous_state not in (
+                    _SHEET_EXACT_PENDING,
+                    _SHEET_EXACT_CALCULATING,
+                )
+            )
+        )
+        if clear_snapshot_alias:
+            alias_view = getattr(self, "sheet_views", {}).get(sheet)
+            if alias_view is not None:
+                alias_view._snapshot_alias_telemetry = None
+                metrics = dict(
+                    getattr(alias_view, "_snapshot_child_metrics", {}) or {}
+                )
+                metrics.pop("base_alias_telemetry", None)
+                alias_view._snapshot_child_metrics = metrics
+        if int(previous.get("generation", -1)) != int(generation):
+            stale_view = getattr(self, "sheet_views", {}).get(sheet)
+            if stale_view is not None:
+                # A pending two-dimensional draw owns immutable data from the
+                # prior generation. Cancel its runnable after(0) owner before
+                # exposing the new exact-state generation.
+                stale_view._cancel_virtual_2d_publish("generation")
+        if (
+            int(previous.get("generation", -1)) == generation
+            and str(previous.get("state") or "") in _SHEET_EXACT_TERMINAL
+            and str(state) == _SHEET_EXACT_CALCULATING
+        ):
+            ready_view = getattr(self, "sheet_views", {}).get(sheet)
+            if (
+                ready_view is not None
+                and bool(getattr(ready_view, "_prepared_complete", False))
+                and bool(getattr(ready_view, "_data_ready", False))
+                and not bool(getattr(ready_view, "_pending_exact_render", False))
+            ):
+                reopen_allowed = False
+                try:
+                    (
+                        capability_view,
+                        capability_seq,
+                        capability_key,
+                        capability_generation,
+                        capability_prior,
+                    ) = only_diff_reopen_capability
+                    prior_record = getattr(
+                        ready_view, "_only_diff_async_prior_exact", None
+                    )
+                    saved_entry = (
+                        dict(prior_record.get("entry") or {})
+                        if isinstance(prior_record, dict)
+                        else {}
+                    )
+                    reopen_allowed = bool(
+                        capability_view is ready_view
+                        and str(getattr(capability_view, "sheet", "")) == sheet
+                        and int(capability_generation) == generation
+                        and int(getattr(ready_view, "_only_diff_async_build_seq", -1))
+                        == int(capability_seq)
+                        and bool(
+                            getattr(ready_view, "_only_diff_async_building", False)
+                        )
+                        and bool(capability_key)
+                        and getattr(ready_view, "_only_diff_async_build_key", None)
+                        == capability_key
+                        and int(prior_record.get("build_seq", -1))
+                        == int(capability_seq)
+                        and int(prior_record.get("generation", -1))
+                        == generation
+                        and saved_entry == previous
+                        and dict(capability_prior or {}) == previous
+                    )
+                except Exception:
+                    reopen_allowed = False
+                if reopen_allowed:
+                    _dlog(
+                        f"allow only-diff terminal reopen sheet={sheet} "
+                        f"generation={generation} seq={capability_seq}"
+                    )
+                else:
+                    _dlog(
+                        f"drop redundant terminal-to-calculating state sheet={sheet} "
+                        f"generation={generation}"
+                    )
+                    return False
+        if (
+            int(previous.get("generation", -1)) == generation
+            and str(previous.get("state") or "") == str(state)
+            and str(state) in _SHEET_EXACT_TERMINAL
+        ):
+            duplicate_view = getattr(self, "sheet_views", {}).get(sheet)
+            promote_summary_to_full_detail = bool(
+                not previous.get("full_detail_terminal")
+                and duplicate_view is not None
+                and bool(getattr(duplicate_view, "_prepared_complete", False))
+                and bool(getattr(duplicate_view, "_data_ready", False))
+                and not bool(getattr(duplicate_view, "_pending_exact_render", False))
+            )
+            if promote_summary_to_full_detail:
+                _dlog(
+                    f"promote terminal summary to full detail sheet={sheet} "
+                    f"generation={generation} state={state}"
+                )
+            else:
+                # Terminal publication is the atomic observer barrier for one
+                # Sheet generation. A second SAME->SAME or CHANGED->CHANGED
+                # call carries no new fact unless it upgrades a hidden summary
+                # to an installed full-detail surface.
+                _dlog(
+                    f"drop duplicate terminal exact state sheet={sheet} "
+                    f"generation={generation} state={state}"
+                )
+                return False
+        entry = {
+            "generation": generation,
+            "state": state,
+            "stage": stage or previous.get("stage") or "等待精确比较",
+            "processed": max(0, int(processed if processed is not None else previous.get("processed", 0))),
+            "total": max(1, int(total if total is not None else previous.get("total", len(getattr(self, "compare_sheets", ()) or ()) or 1))),
+            "reason": reason or "",
+            "updated_at": time.monotonic(),
+        }
+        # Keep request-to-current-generation full-detail telemetry adjacent to
+        # the state it describes. A terminal summary for an unopened tab is
+        # deliberately not counted until its prepared surface is installed.
+        now = entry["updated_at"]
+        request_started_at = previous.get("request_started_at")
+        request_start_state = previous.get("request_start_state")
+        if state in (_SHEET_EXACT_PENDING, _SHEET_EXACT_CALCULATING) and (
+            previous_generation != generation
+            or previous_state not in (_SHEET_EXACT_PENDING, _SHEET_EXACT_CALCULATING)
+            or not isinstance(request_started_at, (int, float))
+        ):
+            request_started_at = now
+            request_start_state = state
+        entry["request_started_at"] = request_started_at
+        entry["request_start_state"] = request_start_state
+        full_detail_terminal_at = previous.get("full_detail_terminal_at")
+        request_to_full_detail_ms = previous.get("request_to_full_detail_ms")
+        full_detail = False
+        detail_view = getattr(self, "sheet_views", {}).get(sheet)
+        if state in _SHEET_EXACT_TERMINAL and detail_view is not None:
+            full_detail = (
+                bool(getattr(detail_view, "_prepared_complete", False))
+                and bool(getattr(detail_view, "_data_ready", False))
+                and not bool(getattr(detail_view, "_pending_exact_render", False))
+            )
+            if full_detail and isinstance(request_started_at, (int, float)):
+                full_detail_terminal_at = now
+                request_to_full_detail_ms = round(
+                    (now - float(request_started_at)) * 1000.0, 3
+                )
+        entry["full_detail_terminal"] = bool(full_detail)
+        entry["full_detail_terminal_at"] = full_detail_terminal_at
+        entry["request_to_full_detail_ms"] = request_to_full_detail_ms
+        self._sheet_exact_states[sheet] = entry
+        foreground_state_changed = getattr(
+            self, "_foreground_resume_on_exact_state", None
+        )
+        if callable(foreground_state_changed):
+            try:
+                foreground_state_changed(sheet, entry, previous)
+            except Exception as exc:
+                _dlog(
+                    f"foreground resume exact-state hook failed sheet={sheet}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        _dlog(
+            f"EXACT_SHEET_STATE sheet={sheet} generation={generation} "
+            f"{previous.get('state')}->{state} stage={entry['stage']}"
+        )
+        if refresh:
+            self._update_exact_status_ui()
+            self.refresh_sheet_nav()
+        return True
+
+    def _exact_workbook_summary(self) -> tuple[int, int, int, str | None]:
+        sheets = tuple(getattr(self, "compare_sheets", ()) or ())
+        exact = changed = 0
+        calculating = None
+        for sheet in sheets:
+            entry = self._sheet_exact_entry(sheet)
+            state = entry.get("state")
+            if state in _SHEET_EXACT_TERMINAL:
+                exact += 1
+                changed += int(state == _SHEET_EXACT_CHANGED)
+            elif calculating is None and state == _SHEET_EXACT_CALCULATING:
+                calculating = sheet
+        return exact, len(sheets), changed, calculating
+
+    def _update_exact_status_ui(self):
+        label = getattr(self, "exact_status_var", None)
+        if label is None:
+            return
+        exact, total, changed, calculating = self._exact_workbook_summary()
+        blocked = 0
+        for sheet in tuple(getattr(self, "compare_sheets", ()) or ()):
+            if self._sheet_exact_entry(sheet).get("state") in (
+                _SHEET_EXACT_UNRESOLVED,
+                _SHEET_EXACT_FAILED,
+            ):
+                blocked += 1
+        suffix = f"；正在计算 {calculating}" if calculating else ""
+        if blocked:
+            suffix += f"；{blocked} 个未解决/失败"
+        elif exact < total and not calculating:
+            suffix += f"；{total - exact} 个等待计算"
+        label.set(f"精确工作簿状态：{exact}/{total} 已完成，{changed} 个已变更{suffix}")
+        widget = getattr(self, "exact_status_label", None)
+        if widget is not None:
+            try:
+                widget.configure(
+                    foreground=("#A40000" if blocked else "#1565C0" if exact < total else "#1B5E20")
+                )
+            except Exception:
+                pass
+
+    def _exact_state_detail(self, sheet: str) -> str:
+        entry = self._sheet_exact_entry(sheet)
+        state = str(entry.get("state") or _SHEET_EXACT_PENDING)
+        labels = {
+            _SHEET_EXACT_PENDING: "等待计算",
+            _SHEET_EXACT_CALCULATING: "正在计算",
+            _SHEET_EXACT_SAME: "精确相同",
+            _SHEET_EXACT_CHANGED: "精确有差异",
+            _SHEET_EXACT_UNRESOLVED: "无法证明精确结果",
+            _SHEET_EXACT_FAILED: "计算失败",
+        }
+        reason = entry.get("reason") or (
+            "精确比较已完成"
+            if state in _SHEET_EXACT_TERMINAL
+            else "尚未得到当前 generation 的最终精确结果"
+        )
+        return (
+            f"Sheet：{sheet}\n状态：{labels.get(state, state)}\n"
+            f"阶段：{entry.get('stage') or '等待精确比较'}\n"
+            f"进度：{entry.get('processed', 0)}/{entry.get('total', 1)}\n"
+            f"原因：{reason}"
+        )
+
+    def _show_exact_readiness_modal(self, action: str, sheets) -> None:
+        sheet_list = [str(sheet) for sheet in (sheets if isinstance(sheets, (list, tuple, set)) else (sheets,)) if sheet]
+        if not sheet_list:
+            sheet_list = [str(getattr(self, "selected_sheet", "当前 Sheet") or "当前 Sheet")]
+        details = "\n\n".join(self._exact_state_detail(sheet) for sheet in sheet_list[:8])
+        deferred_edit = any(
+            bool(getattr(getattr(self, "sheet_views", {}).get(sheet), "_last_mutation_started_edit_preload", False))
+            for sheet in sheet_list
+        )
+        all_terminal = all(
+            str(self._sheet_exact_entry(sheet).get("state") or "") in _SHEET_EXACT_TERMINAL
+            for sheet in sheet_list
+        )
+        edit_backend_pending = all_terminal and not self._edit_workbooks_ready()
+        if edit_backend_pending and deferred_edit:
+            for sheet in sheet_list:
+                view = getattr(self, "sheet_views", {}).get(sheet)
+                if view is not None:
+                    view._last_mutation_started_edit_preload = False
+            message = (
+                f"{action}未执行。为加快打开，可编辑工作簿此前尚未加载；"
+                "本次首次操作已启动后台加载，但不会执行或自动重试。\n\n"
+                f"{details}\n\n"
+                "加载完成后请手动重试。本次未记录覆盖/接受/区域/结构/撤销/重做/保存操作。"
+            )
+            title = "正在加载可编辑工作簿"
+        elif edit_backend_pending:
+            message = (
+                f"{action}未执行。可编辑工作簿仍在后台加载，本次不会执行或自动重试。\n\n"
+                f"{details}\n\n"
+                "加载完成后请手动重试。本次未记录覆盖/接受/区域/结构/撤销/重做/保存操作。"
+            )
+            title = "正在加载可编辑工作簿"
+        else:
+            message = (
+                f"{action}未执行。为保证单元格、行列结构和保存目标准确，"
+                "必须等待当前 generation 的精确比较完成。\n\n"
+                f"{details}\n\n"
+                "未记录覆盖/接受/区域/结构/撤销/重做/保存操作，也不会在完成后自动重试。"
+                "请在状态变为“精确相同”或“精确有差异”后手动重试。"
+            )
+            title = "等待精确比较"
+        try:
+            messagebox.showwarning(title, message, parent=self.root)
+        except Exception:
+            _dlog(f"EXACT_READINESS_MODAL action={action} sheets={sheet_list}")
     def _set_task_status(
         self,
         message: str,
@@ -32147,6 +42482,17 @@ class SowMergeApp:
         self.task_progress.pack(side="right", padx=(12, 0))
         self.task_progress.start(12)
 
+        # Exact readiness is deliberately persistent: a fast precheck or a
+        # missing cache must never look like a final unchanged Sheet.
+        self.exact_status_var = tk.StringVar(value="精确工作簿状态：0/0 已完成")
+        self.exact_status_label = ttk.Label(
+            self.root,
+            textvariable=self.exact_status_var,
+            foreground="#A40000",
+            style="MergeChrome.TLabel",
+        )
+        self.exact_status_label.pack(fill="x", padx=12, pady=(0, 3))
+
         # Non-modal startup/merge reminder. It is packed only when needed and
         # never grabs focus, so workbook loading and user interaction continue.
         self.notice_frame = tk.Frame(self.root, bg="#E8F2FF", bd=1, relief="solid")
@@ -32207,6 +42553,14 @@ class SowMergeApp:
             self.nb.add(container, text=s)
             self.sheet_views[s] = None
             self._sheet_loaded[s] = False
+        initial_container = self._sheet_containers.get(
+            getattr(self, "_initial_sheet_hint", "")
+        )
+        if initial_container is not None:
+            try:
+                self.nb.select(initial_container)
+            except Exception:
+                pass
 
         # Background compute queue for sheet diffs
         self._compute_lock = threading.Lock()
@@ -32219,9 +42573,54 @@ class SowMergeApp:
         self._compute_thread = None
         self._compute_total = max(1, len(self.compare_sheets))
         self._compute_done = 0
+        self._remaining_sheet_schedule_token = 0
+        self._remaining_sheet_resume_after_id = None
+        self._remaining_sheet_resume_install_queued = False
+        self._remaining_sheet_resume_install_epoch = None
+        self._remaining_sheet_resume_after_epoch = None
+        # A confirmed foreground selection may survive a cooperative hidden
+        # preemption.  It is intentionally separate from compute-inflight:
+        # a CALCULATING cache awaiting the UI queue is not runnable worker work.
+        self._foreground_resume_coordinator = _ForegroundResumeCoordinator()
+        # Compatibility/read-only diagnostic aliases.  Scheduler ownership is
+        # centralized in `_foreground_resume_coordinator`.
+        self._foreground_resume_lock = self._foreground_resume_coordinator.lock
+        self._foreground_resume_ledger = self._foreground_resume_coordinator.ledger
+        self._foreground_resume_after_id = None
+        self._foreground_resume_active_ticket = None
+        self._foreground_resume_events = deque(maxlen=128)
+        self._hidden_resume_events = deque(maxlen=64)
+        self._hidden_worker_events = deque(maxlen=128)
+        # Metadata is not a result: every supported comparison Sheet starts
+        # explicitly pending until this exact generation publishes a terminal
+        # result. Missing entries therefore never imply unchanged.
+        self._sheet_exact_states = {
+            sheet: {
+                "generation": int(self._sheet_compute_generation.get(sheet, 0)),
+                "state": _SHEET_EXACT_PENDING,
+                "stage": "等待选中 Sheet 的精确比较",
+                "processed": 0,
+                "total": self._compute_total,
+                "reason": "尚未开始当前 generation 的精确比较",
+                "updated_at": time.monotonic(),
+                "request_started_at": None,
+                "request_start_state": None,
+                "full_detail_terminal": False,
+                "full_detail_terminal_at": None,
+                "request_to_full_detail_ms": None,
+            }
+            for sheet in self.compare_sheets
+        }
+        self._active_compute_sheet = None
+        self._update_exact_status_ui()
         # Keep completed background results for tabs that have not been opened yet.
         # Discarding them forced a second full scan on first tab activation.
         self._sheet_cache_store: dict[str, dict] = {}
+        # Immutable parser output is separate from legacy render caches.  The
+        # dark snapshot engine keys this by side/Sheet/version and will only
+        # publish entries whose generation still matches the selected view.
+        self._selected_sheet_snapshot_cache: dict[tuple, SheetSnapshot] = {}
+        self._selected_sheet_snapshot_lock = threading.Lock()
         self._ui_task_lock = threading.Lock()
         self._ui_tasks = []
 
@@ -32261,6 +42660,370 @@ class SowMergeApp:
                 else:
                     self._compute_queue.append(sheet)
 
+        def _schedule_remaining_exact_sheets(selected_sheet: str):
+            """Run hidden exact work only after a foreground quiet window."""
+            selected_sheet = str(selected_sheet or "")
+            self._note_ui_activity("selected-sheet-ready")
+            self._remaining_sheet_schedule_token += 1
+            schedule_token = int(self._remaining_sheet_schedule_token)
+
+            def _start_when_quiet():
+                if self._is_closing or schedule_token != int(self._remaining_sheet_schedule_token):
+                    return
+                quiet_remaining = max(
+                    0.0,
+                    _BACKGROUND_SHEET_QUIET_WINDOW_SEC - self._ui_activity_age(),
+                )
+                if quiet_remaining > 0.0:
+                    self._safe_root_after(
+                        max(20, int(quiet_remaining * 1000.0)), _start_when_quiet
+                    )
+                    return
+                for candidate in self.compare_sheets:
+                    candidate_state = str(
+                        self._sheet_exact_entry(candidate).get("state") or ""
+                    )
+                    if (
+                        candidate == selected_sheet
+                        or candidate_state in _SHEET_EXACT_TERMINAL
+                        or candidate_state in (
+                            _SHEET_EXACT_UNRESOLVED,
+                            _SHEET_EXACT_FAILED,
+                        )
+                    ):
+                        continue
+                    _enqueue_sheet(candidate, front=False)
+                _kick_worker()
+
+            self._safe_root_after(
+                int(_BACKGROUND_SHEET_QUIET_WINDOW_SEC * 1000.0),
+                _start_when_quiet,
+            )
+
+        def _hidden_sheet_quiet_delay(sheet: str) -> float:
+            if str(sheet) == str(getattr(self, "selected_sheet", "") or ""):
+                return 0.0
+            # A main-thread priority ticket is the one intentional exception
+            # to the hidden quiet window.  It represents an earlier confirmed
+            # foreground request after the *current* selected tab reached a
+            # full terminal surface; it never stands for a CALCULATING cache
+            # that merely awaits UI application.
+            generation = int(self._sheet_compute_generation.get(str(sheet), -1))
+            foreground_check = getattr(
+                self, "_foreground_resume_ticket_is_active", None
+            )
+            if callable(foreground_check) and foreground_check(str(sheet), generation):
+                return 0.0
+            return max(
+                0.0,
+                _BACKGROUND_SHEET_QUIET_WINDOW_SEC - self._ui_activity_age(),
+            )
+
+        def _foreground_resume_entries_snapshot() -> tuple[dict[str, dict], dict[str, int]]:
+            entries = {
+                str(sheet): dict(self._sheet_exact_entry(sheet) or {})
+                for sheet in tuple(getattr(self, "compare_sheets", ()) or ())
+            }
+            generations = {
+                str(sheet): int(self._sheet_compute_generation.get(sheet, 0))
+                for sheet in tuple(getattr(self, "compare_sheets", ()) or ())
+            }
+            return entries, generations
+
+        def _foreground_resume_preempt_pid() -> int | None:
+            try:
+                with self._snapshot_child_lock:
+                    owner = getattr(self, "_snapshot_child_owner", None)
+                    process = owner.get("process") if isinstance(owner, dict) else None
+                    pid = int(getattr(process, "pid", 0) or 0)
+                    return pid or None
+            except Exception:
+                return None
+
+        def _record_foreground_resume_event(
+            event: str,
+            *,
+            request: _ForegroundResumeRequest | None = None,
+            visit: _ForegroundResumeVisit | None = None,
+            ticket: _ForegroundResumeTicket | None = None,
+            reason: str = "",
+            **extra,
+        ) -> None:
+            request = request or (ticket.request if ticket is not None else None)
+            record = {
+                "event": str(event),
+                "reason": str(reason or ""),
+                "at": time.monotonic(),
+                "thread": threading.current_thread().name,
+                "thread_id": threading.get_ident(),
+                "priority": bool(ticket is not None),
+                "request": (
+                    {
+                        "sheet": request.sheet,
+                        "generation": int(request.generation),
+                        "request_started_at": float(request.request_started_at),
+                        "deadline_at": float(request.deadline_at),
+                        "request_token": int(request.request_token),
+                        "tab_seq": int(request.tab_seq),
+                    }
+                    if request is not None
+                    else None
+                ),
+                "visit": (
+                    {
+                        "sheet": visit.sheet,
+                        "generation": int(visit.generation),
+                        "tab_seq": int(visit.tab_seq),
+                        "confirmed_at": float(visit.confirmed_at),
+                        "visit_token": int(visit.visit_token),
+                    }
+                    if visit is not None
+                    else None
+                ),
+                "ticket_epoch": int(ticket.epoch) if ticket is not None else None,
+                "ticket_seq": int(ticket.ticket_seq) if ticket is not None else None,
+                "preempt_pid": _foreground_resume_preempt_pid(),
+            }
+            record.update(extra)
+            self._foreground_resume_events.append(record)
+            _dlog(
+                "FOREGROUND_RESUME "
+                f"event={record['event']} reason={record['reason']} "
+                f"request={record['request']} visit={record['visit']} "
+                f"ticket={record['ticket_seq']} preempt_pid={record['preempt_pid']}"
+            )
+
+        def _sync_foreground_resume_diagnostics() -> None:
+            coordinator = self._foreground_resume_coordinator
+            self._foreground_resume_after_id = coordinator.priority_after_id
+            self._foreground_resume_active_ticket = coordinator.active_ticket
+            self._remaining_sheet_resume_after_id = coordinator.quiet_after_id
+            self._remaining_sheet_resume_after_epoch = (
+                coordinator.quiet_after_token[0]
+                if coordinator.quiet_after_token is not None
+                else None
+            )
+            self._remaining_sheet_resume_install_queued = bool(
+                coordinator.quiet_install_token is not None
+            )
+            self._remaining_sheet_resume_install_epoch = (
+                coordinator.quiet_install_token[0]
+                if coordinator.quiet_install_token is not None
+                else None
+            )
+
+        def _cancel_foreground_resume_timers(
+            reason: str,
+            *,
+            invalidate_ledger: bool,
+            release_priority: bool = True,
+        ) -> None:
+            with self._compute_lock:
+                self._remaining_sheet_schedule_token += 1
+            priority_after, quiet_after = self._foreground_resume_coordinator.cancel_timers(
+                self.root.after_cancel,
+                invalidate_ledger=invalidate_ledger,
+                release_priority=release_priority,
+            )
+            _sync_foreground_resume_diagnostics()
+            _record_foreground_resume_event(
+                "timer-cancel",
+                reason=reason,
+                priority_after_id=priority_after,
+                quiet_after_id=quiet_after,
+            )
+
+        def _foreground_resume_ticket_is_active(sheet: str, generation: int) -> bool:
+            entries, generations = _foreground_resume_entries_snapshot()
+            active = self._foreground_resume_coordinator.ticket_is_active(
+                sheet,
+                generation,
+                entries,
+                generations,
+                closing=bool(getattr(self, "_is_closing", False)),
+            )
+            _sync_foreground_resume_diagnostics()
+            return active
+
+        def _foreground_resume_has_pending_request() -> bool:
+            entries, generations = _foreground_resume_entries_snapshot()
+            pending = self._foreground_resume_coordinator.has_pending_request(
+                entries, generations
+            )
+            _sync_foreground_resume_diagnostics()
+            return pending
+
+        def _selected_sheet_is_full_detail() -> bool:
+            current_sheet = str(getattr(self, "selected_sheet", "") or "")
+            current_entry = self._sheet_exact_entry(current_sheet)
+            return bool(
+                current_entry.get("full_detail_terminal", False)
+                and str(current_entry.get("state") or "") in _SHEET_EXACT_TERMINAL
+            )
+
+        def _queue_foreground_resume_after_selected_terminal(
+            selected_sheet: str,
+            selected_entry: dict,
+            *,
+            reason: str,
+        ) -> None:
+            with self._compute_lock:
+                self._remaining_sheet_schedule_token += 1
+            ticket = self._foreground_resume_coordinator.request_priority_after_terminal(
+                selected_sheet,
+                selected_entry,
+                snapshot=_foreground_resume_entries_snapshot,
+                closing=lambda: bool(getattr(self, "_is_closing", False)),
+                selected_is_full=_selected_sheet_is_full_detail,
+                after=self._safe_root_after,
+                after_cancel=self.root.after_cancel,
+                enqueue_front=lambda sheet: _enqueue_sheet(sheet, front=True),
+                kick_worker=_kick_worker,
+                emit=_record_foreground_resume_event,
+            )
+            _sync_foreground_resume_diagnostics()
+            if ticket is not None:
+                _record_foreground_resume_event(
+                    "priority-request", ticket=ticket, reason=reason
+                )
+
+        def _confirm_foreground_resume_selection(sheet: str) -> None:
+            sheet = str(sheet or "")
+            entry = self._sheet_exact_entry(sheet)
+            generation = int(self._sheet_compute_generation.get(sheet, 0))
+            with self._compute_lock:
+                self._remaining_sheet_schedule_token += 1
+            visit = self._foreground_resume_coordinator.confirm_selection(
+                sheet,
+                generation,
+                entry,
+                after_cancel=self.root.after_cancel,
+            )
+            _sync_foreground_resume_diagnostics()
+            _record_foreground_resume_event(
+                "tab-confirmed", visit=visit, reason="NotebookTabChanged"
+            )
+
+        def _foreground_resume_exact_state_changed(
+            sheet: str,
+            entry: dict,
+            previous: dict | None = None,
+        ) -> None:
+            del previous
+            sheet = str(sheet or "")
+            generation = int(entry.get("generation", self._sheet_compute_generation.get(sheet, 0)))
+            state = str(entry.get("state") or "")
+            if state in (_SHEET_EXACT_PENDING, _SHEET_EXACT_CALCULATING):
+                # A request can start after its tab was left.  The retained
+                # per-generation visit, not the current selection, is proof
+                # that this is a previously foreground request.
+                request = self._foreground_resume_coordinator.note_request_started(
+                    sheet, generation, entry
+                )
+                _sync_foreground_resume_diagnostics()
+                if request is not None:
+                    _record_foreground_resume_event(
+                        "request-ledger", request=request, reason=state
+                    )
+                return
+            if state in _SHEET_EXACT_TERMINAL or state in (
+                _SHEET_EXACT_UNRESOLVED,
+                _SHEET_EXACT_FAILED,
+            ):
+                with self._compute_lock:
+                    self._remaining_sheet_schedule_token += 1
+                self._foreground_resume_coordinator.clear(
+                    sheet, generation, after_cancel=self.root.after_cancel
+                )
+                _sync_foreground_resume_diagnostics()
+                _record_foreground_resume_event(
+                    "terminal", reason=state, sheet=sheet, generation=generation
+                )
+                if (
+                    sheet == str(getattr(self, "selected_sheet", "") or "")
+                    and state in _SHEET_EXACT_TERMINAL
+                    and bool(entry.get("full_detail_terminal", False))
+                ):
+                    _queue_foreground_resume_after_selected_terminal(
+                        sheet, entry, reason="selected-full-terminal"
+                    )
+
+        def _clear_foreground_resume_ledger(
+            reason: str,
+            *,
+            sheet: str | None = None,
+            generation: int | None = None,
+        ) -> None:
+            with self._compute_lock:
+                self._remaining_sheet_schedule_token += 1
+            self._foreground_resume_coordinator.clear(
+                sheet, generation, after_cancel=self.root.after_cancel
+            )
+            _sync_foreground_resume_diagnostics()
+            _record_foreground_resume_event(
+                "ledger-clear", reason=reason, sheet=sheet, generation=generation
+            )
+
+        self._foreground_resume_ticket_is_active = _foreground_resume_ticket_is_active
+        self._foreground_resume_confirm_selection = _confirm_foreground_resume_selection
+        self._foreground_resume_on_exact_state = _foreground_resume_exact_state_changed
+        self._foreground_resume_clear = _clear_foreground_resume_ledger
+
+        def _resume_hidden_sheet_worker_after(delay_sec: float) -> None:
+            """Request a hidden-worker resume from the Tk thread only.
+
+            This helper is called by the background comparison worker after a
+            cooperative preemption. Calling ``root.after`` there is unsafe on
+            Windows/Tk: the timer can disappear while no exception is raised.
+            Queue a tiny main-thread installer instead, then let its timer
+            re-enter the worker after the foreground quiet window.
+            """
+            if self._is_closing:
+                return
+            requested_delay_ms = max(20, int(max(0.0, delay_sec) * 1000.0))
+            coordinator = self._foreground_resume_coordinator
+            token = coordinator.claim_quiet_install()
+            _sync_foreground_resume_diagnostics()
+            if token is None:
+                return
+
+            def _emit_quiet(event: str, **details) -> None:
+                _record_foreground_resume_event(event, **details)
+                hidden_event = {
+                    "event": str(event).replace("quiet-", ""),
+                    "reason": str(details.get("reason") or ""),
+                    "token": details.get("token"),
+                    "delay_ms": details.get("delay_ms"),
+                    "thread": threading.current_thread().name,
+                    "thread_id": threading.get_ident(),
+                    "at": time.monotonic(),
+                }
+                self._hidden_resume_events.append(hidden_event)
+
+            def _install_resume_timer():
+                # UI activity can continue after the background thread made
+                # its preemption decision. Re-evaluate on the Tk thread; the
+                # worker also checks again before it opens a hidden Sheet.
+                actual_delay_ms = max(
+                    requested_delay_ms,
+                    max(20, int(_hidden_sheet_quiet_delay("") * 1000.0)),
+                )
+                coordinator.install_quiet_timer(
+                    token,
+                    actual_delay_ms,
+                    snapshot=_foreground_resume_entries_snapshot,
+                    closing=lambda: bool(getattr(self, "_is_closing", False)),
+                    after=self._safe_root_after,
+                    after_cancel=self.root.after_cancel,
+                    kick_worker=_kick_worker,
+                    emit=_emit_quiet,
+                )
+                _sync_foreground_resume_diagnostics()
+
+            if not _queue_ui_task(_install_resume_timer):
+                coordinator.abandon_quiet_install(token)
+                _sync_foreground_resume_diagnostics()
+                _emit_quiet("quiet-bail", reason="ui-installer-unavailable", token=token)
         def _queue_ui_task(fn):
             if self._is_closing:
                 return False
@@ -32273,6 +43036,7 @@ class SowMergeApp:
         def _drain_ui_tasks():
             if self._is_closing:
                 return
+            handoff_ran = self._drain_only_diff_failure_handoffs()
             tasks = []
             try:
                 with self._ui_task_lock:
@@ -32281,12 +43045,25 @@ class SowMergeApp:
                         self._ui_tasks = []
             except Exception:
                 tasks = []
-            ran = bool(tasks)
+            ran = bool(tasks or handoff_ran)
+            cache_tasks = [
+                str(getattr(task, "_sow_cache_sheet", ""))
+                for task in tasks
+                if getattr(task, "_sow_cache_sheet", None)
+            ]
+            if cache_tasks:
+                _dlog(
+                    f"UI_TASK_DRAIN cache_sheets={cache_tasks} batch={len(tasks)}"
+                )
             for fn in tasks:
                 try:
                     fn()
                 except Exception as e:
                     _dlog(f"ui task failed: {e}")
+            # A task can race a worker queue rejection in the same polling turn.
+            # Drain once more before choosing the next adaptive interval.
+            handoff_ran = self._drain_only_diff_failure_handoffs() or handoff_ran
+            ran = bool(ran or handoff_ran)
             try:
                 # Adaptive delay: poll frequently while work is flowing, back off when idle.
                 delay = 50 if ran else 150
@@ -32297,6 +43074,60 @@ class SowMergeApp:
         def _check_bg_cancel():
             if self._is_closing:
                 raise InterruptedError("background compute cancelled during shutdown")
+            # A normal launch does not know the review Sheet before the tab
+            # widget exists.  If the user immediately selects another Sheet,
+            # abandon the old *unpublished* background preview at its next
+            # bounded checkpoint.  Otherwise a small/ambiguous first tab can
+            # keep the sole worker busy with a legacy scan while the selected
+            # large Sheet waits in the queue.  The selected Sheet is already
+            # front-queued by _on_tab_changed; the worker below continues to
+            # it rather than treating this as an application shutdown.
+            selected_sheet = str(getattr(self, "selected_sheet", "") or "")
+            selected_exact_state = str(
+                self._sheet_exact_entry(selected_sheet).get("state")
+                if selected_sheet else ""
+            )
+            with self._compute_lock:
+                active_sheet = str(
+                    getattr(self, "_active_compute_sheet", "") or ""
+                )
+                compute_queue_snapshot = tuple(self._compute_queue)
+            if _selected_sheet_should_preempt_background(
+                active_sheet,
+                selected_sheet,
+                selected_exact_state,
+                compute_queue_snapshot,
+            ):
+                self._record_background_yield(
+                    "selected-preempt", active_sheet, selected_sheet
+                )
+                raise InterruptedError(
+                    f"background compute superseded active={active_sheet} selected={selected_sheet}"
+                )
+            # Hidden work is opportunistic. A hover, wheel, click, thumb drag,
+            # or tab activation must let its worker return at the next bounded
+            # parser/alignment checkpoint instead of holding the GIL through a
+            # long legacy fallback while the foreground is visibly stale.
+            active_generation = int(
+                self._sheet_compute_generation.get(active_sheet, -1)
+            )
+            priority_active = _foreground_resume_ticket_is_active(
+                active_sheet, active_generation
+            )
+            if (
+                active_sheet
+                and selected_sheet
+                and active_sheet != selected_sheet
+                and not priority_active
+                and self._ui_activity_age() < _BACKGROUND_ACTIVITY_YIELD_SEC
+            ):
+                self._record_background_yield(
+                    "ui-activity", active_sheet, selected_sheet
+                )
+                raise InterruptedError(
+                    f"background compute yielded for UI activity active={active_sheet} "
+                    f"selected={selected_sheet}"
+                )
             # Openpyxl XML parsing is CPU/GIL heavy. Yield while a user-triggered
             # overwrite/insert or active-Sheet exact diff is running so button
             # feedback and the selected Sheet always win over unopened tabs.
@@ -32686,6 +43517,741 @@ class SowMergeApp:
                 return True
             return False
 
+        def _snapshot_result_to_sheet_cache(
+            sheet: str,
+            result: SnapshotComparisonResult,
+            mine: SheetSnapshot,
+            theirs: SheetSnapshot,
+            base: SheetSnapshot | None,
+        ) -> dict | None:
+            """Adapt a fully-resolved immutable result to the established cache ABI.
+
+            This deliberately publishes the same prepared parts and logical
+            comparison cache as the legacy worker.  An unresolved snapshot is
+            never approximated: the caller falls back to the worksheet path.
+            """
+            def _unresolved_snapshot_cache(reason: str) -> dict:
+                # Preserve the safe, explicit non-actionable outcome.  An
+                # alignment ambiguity is not a technical parser failure and
+                # must never be silently retried through legacy mapping.
+                return {
+                    "sheet": sheet,
+                    "snapshot_engine": True,
+                    "unresolved_reason": str(reason),
+                    "prepared_complete": False,
+                    "has_diff": True,
+                    "completeness": {
+                        "formula_aware": False,
+                        "row_model_exact": False,
+                        "column_projection_exact": False,
+                        "sheet_summary_exact": False,
+                        "ab_diff_exact": False,
+                        "base_diff_exact": False,
+                        "only_diff_rows_exact": False,
+                        "mode": "snapshot-unresolved",
+                    },
+                }
+
+            if result.unresolved:
+                _dlog(f"snapshot cache unresolved; publish blocked state sheet={sheet}")
+                return _unresolved_snapshot_cache("快照行或列映射存在歧义，无法证明精确结果")
+            row_pairs = list(result.row_pairs)
+            max_col = max(1, int(mine.max_col), int(theirs.max_col), int(base.max_col) if base else 1)
+            max_r_a = max(1, int(mine.max_row))
+            max_r_b = max(1, int(theirs.max_row))
+            max_r_base = max(1, int(base.max_row)) if base is not None else 0
+            max_row = max(max_r_a, max_r_b, max_r_base)
+
+            def _payload(snapshot, physical_row):
+                if snapshot is None or physical_row is None:
+                    return (None,) * max_col, (None,) * max_col
+                values, formulas = _snapshot_row_payload(snapshot, physical_row)
+                return (
+                    tuple(values[:max_col]) + (None,) * max(0, max_col - len(values)),
+                    tuple(formulas[:max_col]) + (None,) * max(0, max_col - len(formulas)),
+                )
+
+            pair_diff_cols = {
+                idx: set(cols) for idx, cols in enumerate(result.pair_diff_cols)
+            }
+            pair_base_diff_cols = {
+                idx: set(cols) for idx, cols in enumerate(result.pair_base_diff_cols)
+            }
+            pair_parts_a, pair_parts_b, pair_parts_base = {}, {}, {}
+            col_char_widths = {}
+            row_a_to_pair_idx, row_b_to_pair_idx = {}, {}
+            for idx, (ra, rb) in enumerate(row_pairs):
+                if (idx & 127) == 0:
+                    _check_bg_cancel()
+                if ra is not None:
+                    row_a_to_pair_idx[int(ra)] = idx
+                if rb is not None:
+                    row_b_to_pair_idx[int(rb)] = idx
+                a_values, a_formulas = _payload(mine, ra)
+                b_values, b_formulas = _payload(theirs, rb)
+                parts_a, parts_b = [], []
+                for ci in range(max_col):
+                    da, db, _equal = _cell_display_and_equal_from_values(
+                        a_values[ci], b_values[ci], a_formulas[ci], b_formulas[ci]
+                    )
+                    sa, sb = _val_to_str(da), _val_to_str(db)
+                    parts_a.append(sa)
+                    parts_b.append(sb)
+                    col = ci + 1
+                    col_char_widths[col] = max(
+                        int(col_char_widths.get(col, 0)),
+                        min(max(len(sa), len(sb)), _COL_MAX_DISPLAY_WIDTH),
+                    )
+                pair_parts_a[idx], pair_parts_b[idx] = parts_a, parts_b
+                if base is not None:
+                    base_row = result.base_rows_by_pair[idx]
+                    base_values, _base_formulas = _payload(base, base_row)
+                    parts_base = [_val_to_str(value) for value in base_values]
+                    pair_parts_base[idx] = parts_base
+                    for ci, text_value in enumerate(parts_base, start=1):
+                        col_char_widths[ci] = max(
+                            int(col_char_widths.get(ci, 0)),
+                            min(len(text_value), _COL_MAX_DISPLAY_WIDTH),
+                        )
+            for col in range(1, max_col + 1):
+                col_char_widths[col] = max(4, int(col_char_widths.get(col, 1)))
+
+            mine_to_base_row, theirs_to_base_row, pair_base_row_override = {}, {}, {}
+            if base is not None:
+                if result.physical_identity:
+                    # Do not submit an identical Base snapshot to the general
+                    # key matcher: duplicate keys are correctly conservative
+                    # there, but cannot invalidate a proven byte-identical
+                    # physical coordinate map.
+                    mine_to_base_row = {
+                        int(row): int(row)
+                        for row in range(1, min(max_r_a, max_r_base) + 1)
+                    }
+                    theirs_to_base_row = {
+                        int(row): int(row)
+                        for row in range(1, min(max_r_b, max_r_base) + 1)
+                    }
+                else:
+                    mine_base_alignment = _align_selected_sheet_snapshots(mine, base)
+                    theirs_base_alignment = _align_selected_sheet_snapshots(theirs, base)
+                    # These alignments are also part of the confidence gate. Do
+                    # not emit a partial three-way view if either is ambiguous.
+                    if mine_base_alignment.unresolved or theirs_base_alignment.unresolved:
+                        _dlog(f"snapshot base alignment unresolved; publish blocked state sheet={sheet}")
+                        return _unresolved_snapshot_cache("快照 Base 行映射存在歧义，无法证明精确结果")
+                    mine_to_base_row = {
+                        int(left): int(right)
+                        for left, right in mine_base_alignment.row_pairs
+                        if left is not None and right is not None
+                    }
+                    theirs_to_base_row = {
+                        int(left): int(right)
+                        for left, right in theirs_base_alignment.row_pairs
+                        if left is not None and right is not None
+                    }
+                pair_base_row_override = {
+                    int(idx): int(row)
+                    for idx, row in enumerate(result.base_rows_by_pair)
+                    if row is not None
+                }
+
+            structural_cols = {
+                int(col) for col in result.column_cache.structural_diff_cols if int(col) > 0
+            }
+            resolved_common_insertions = {
+                slot.logical_idx + 1
+                for slot in result.column_cache.model.slots
+                if (
+                    slot.base_col is None and slot.mine_col is not None
+                    and slot.theirs_col is not None and slot.state != "unresolved"
+                    and not slot.confidence.ambiguous
+                )
+            }
+            only_diff_rows = []
+            for idx in range(len(row_pairs)):
+                visual_cols = set(pair_diff_cols.get(idx, set())) | set(pair_base_diff_cols.get(idx, set()))
+                visual_cols.difference_update(structural_cols)
+                visual_cols.difference_update(
+                    col for col in resolved_common_insertions if col not in pair_diff_cols.get(idx, set())
+                )
+                if visual_cols:
+                    only_diff_rows.append(idx)
+            common_sheet_added_vs_base = bool(getattr(self, "has_base", False) and base is None)
+            has_diff = bool(
+                result.column_cache.structural_diff_cols
+                or any(pair_diff_cols.values())
+                or any(pair_base_diff_cols.values())
+                or common_sheet_added_vs_base
+            )
+            return {
+                "sheet": sheet,
+                "max_row": max_row,
+                "max_row_a": max_r_a,
+                "max_row_b": max_r_b,
+                "max_row_base": max_r_base,
+                "max_col": max_col,
+                "col_max_a": max(1, int(mine.max_col)),
+                "col_max_base": max(1, int(base.max_col)) if base is not None else 1,
+                "col_max_b": max(1, int(theirs.max_col)),
+                "row_pairs": row_pairs,
+                "pair_diff_cols": pair_diff_cols,
+                "pair_base_diff_cols": pair_base_diff_cols,
+                "pair_parts_a": pair_parts_a,
+                "pair_parts_b": pair_parts_b,
+                "pair_parts_base": pair_parts_base,
+                "col_char_widths": col_char_widths,
+                "row_a_to_pair_idx": row_a_to_pair_idx,
+                "row_b_to_pair_idx": row_b_to_pair_idx,
+                "mine_to_base_row": mine_to_base_row,
+                "theirs_to_base_row": theirs_to_base_row,
+                "pair_base_row_override": pair_base_row_override,
+                "column_comparison_cache": result.column_cache,
+                "sheet_structural_diff": common_sheet_added_vs_base,
+                "has_diff": has_diff,
+                "only_diff_rows": only_diff_rows,
+                "prepared_complete": True,
+                "snapshot_engine": True,
+                "completeness": {
+                    "formula_aware": True,
+                    "row_model_exact": True,
+                    "column_projection_exact": True,
+                    "sheet_summary_exact": True,
+                    "ab_diff_exact": True,
+                    "base_diff_exact": True,
+                    "only_diff_rows_exact": True,
+                    "mode": "snapshot-full",
+                },
+            }
+
+        def _run_isolated_snapshot_child(sheet: str, generation: int) -> dict | None:
+            """Run one immutable snapshot/cache build outside the GUI process."""
+            if not _ISOLATED_SNAPSHOT_PROCESS_ENABLED:
+                return None
+            surface_ready = getattr(self, "_ui_interaction_surface_ready_event", None)
+            while isinstance(surface_ready, threading.Event) and not surface_ready.wait(timeout=0.05):
+                _check_bg_cancel()
+            inputs = {
+                "A": {
+                    "value_path": str(self._file_a_val_path),
+                    "formula_path": str(self.file_a),
+                    "mutation_generation": 0,
+                    "sheet": str(sheet),
+                    "generation": int(generation),
+                    "topology_generation": int(generation),
+                    "parser": 1,
+                    "loader": _SNAPSHOT_ALIAS_LOADER,
+                    "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                },
+                "B": {
+                    "value_path": str(self._file_b_val_path),
+                    "formula_path": str(self.file_b),
+                    "mutation_generation": 0,
+                    "sheet": str(sheet),
+                    "generation": int(generation),
+                    "topology_generation": int(generation),
+                    "parser": 1,
+                    "loader": _SNAPSHOT_ALIAS_LOADER,
+                    "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                },
+            }
+            if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                inputs["BASE"] = {
+                    "value_path": str(self._file_base_val_path),
+                    "formula_path": str(self.base_path),
+                    "mutation_generation": 0,
+                    "sheet": str(sheet),
+                    "generation": int(generation),
+                    "topology_generation": int(generation),
+                    "parser": 1,
+                    "loader": _SNAPSHOT_ALIAS_LOADER,
+                    "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                }
+            paths = []
+            for side in ("A", "B", "BASE"):
+                spec = inputs.get(side)
+                if spec:
+                    paths.extend((spec["value_path"], spec["formula_path"]))
+            # Parent proof before launch and after receipt protects against
+            # file replacement, stale generations, and a child result from a
+            # previous selected tab.  A pickle is transport only, never trust.
+            before = _snapshot_input_fingerprints(paths)
+            token = hashlib.sha256(
+                f"{sheet}|{generation}|{time.monotonic_ns()}|{threading.get_ident()}".encode()
+            ).hexdigest()
+            handle, result_path = tempfile.mkstemp(
+                prefix="sow_snapshot_child_", suffix=".pickle"
+            )
+            os.close(handle)
+            request = {
+                "protocol": _SNAPSHOT_CHILD_PROTOCOL,
+                "token": token,
+                "sheet": str(sheet),
+                "generation": int(generation),
+                "has_base": bool(getattr(self, "has_base", False)),
+                "inputs": inputs,
+                "result_path": result_path,
+            }
+            context = multiprocessing.get_context("spawn")
+            process = context.Process(
+                target=_isolated_snapshot_child_entry,
+                args=(request,),
+                name=f"sow-snapshot-{generation}",
+            )
+            owner = {
+                "token": token,
+                "sheet": str(sheet),
+                "generation": int(generation),
+                "process": process,
+                "result_path": result_path,
+                "phase": "spawn",
+                "started": time.monotonic(),
+                # The owner-local mutex/fence covers the entire terminal
+                # protocol after a global owner claim.  It is created before
+                # publication so a cancelled runner can never manufacture a
+                # competing terminal event or close the winner's process.
+                "terminal_record_lock": threading.Lock(),
+                "terminal_recorded_event": threading.Event(),
+            }
+            with self._snapshot_child_lock:
+                active = self._snapshot_child_owner
+                if active is not None:
+                    active_process = active.get("process") if isinstance(active, dict) else None
+                    if active_process is not None and active_process.is_alive():
+                        raise RuntimeError("another isolated snapshot child is already owned")
+                self._snapshot_child_owner = owner
+                self._snapshot_child_temp_paths.add(result_path)
+            normal_result_verified = False
+            result_decoded = False
+            failure_reason = ""
+            try:
+                process.start()
+                owner["partial_path"] = f"{result_path}.{process.pid}.partial"
+                owner["phase"] = "snapshot-compare-adapter"
+                _dlog(
+                    f"SNAPSHOT_CHILD start pid={process.pid} sheet={sheet} generation={generation}"
+                )
+                next_telemetry = time.monotonic() + 1.0
+                while process.is_alive():
+                    process.join(timeout=0.05)
+                    try:
+                        _check_bg_cancel()
+                    except InterruptedError:
+                        self._terminate_snapshot_child("cancel-or-preempt")
+                        raise
+                    elapsed = time.monotonic() - owner["started"]
+                    if elapsed > _ISOLATED_SNAPSHOT_CHILD_TIMEOUT_SEC:
+                        _dlog(
+                            f"SNAPSHOT_CHILD timeout pid={process.pid} sheet={sheet} "
+                            f"generation={generation} phase={owner['phase']} elapsed={elapsed:.3f}s"
+                        )
+                        self._terminate_snapshot_child("timeout")
+                        raise RuntimeError("isolated snapshot child timed out")
+                    if time.monotonic() >= next_telemetry:
+                        resources = _snapshot_child_resource_sample(process.pid)
+                        owner["last_resources"] = resources
+                        owner["peak_rss_bytes"] = max(
+                            int(owner.get("peak_rss_bytes", 0)),
+                            int(resources.get("rss_bytes", 0)),
+                        )
+                        _dlog(
+                            f"SNAPSHOT_CHILD progress pid={process.pid} sheet={sheet} "
+                            f"generation={generation} phase={owner['phase']} elapsed={elapsed:.3f}s "
+                            f"rss={resources.get('rss_bytes', 0)} cpu_ms={resources.get('cpu_ms', 0.0)}"
+                        )
+                        next_telemetry += 1.0
+                process.join(timeout=0.1)
+                if process.exitcode != 0:
+                    raise RuntimeError(
+                        f"isolated snapshot child exited={process.exitcode}"
+                    )
+                if not os.path.isfile(result_path):
+                    raise RuntimeError(
+                        f"isolated snapshot child exited={process.exitcode} without result"
+                    )
+                ipc_bytes = int(os.path.getsize(result_path))
+                ipc_started = time.perf_counter()
+                with open(result_path, "rb") as stream:
+                    payload = pickle.load(stream)
+                result_decoded = True
+                ipc_decode_ms = (time.perf_counter() - ipc_started) * 1000.0
+                if _UI_CALLBACK_TIMING_DIAGNOSTIC:
+                    _dlog(
+                        f"SNAPSHOT_CHILD_IPC decode_ms={ipc_decode_ms:.1f} bytes={ipc_bytes} "
+                        f"sheet={sheet} generation={generation}"
+                    )
+                if not isinstance(payload, dict):
+                    raise RuntimeError("isolated snapshot payload is not a mapping")
+                if (
+                    int(payload.get("protocol", -1)) != _SNAPSHOT_CHILD_PROTOCOL
+                    or payload.get("token") != token
+                    or str(payload.get("sheet")) != str(sheet)
+                    or int(payload.get("generation", -1)) != int(generation)
+                ):
+                    raise RuntimeError("isolated snapshot payload identity mismatch")
+                if not bool(payload.get("ok", False)):
+                    raise RuntimeError(str(payload.get("error") or "isolated snapshot child failed"))
+                freshness_started = time.perf_counter()
+                after = _snapshot_input_fingerprints(paths)
+                freshness_ms = (time.perf_counter() - freshness_started) * 1000.0
+                if _UI_CALLBACK_TIMING_DIAGNOSTIC:
+                    _dlog(
+                        f"SNAPSHOT_CHILD_IPC freshness_ms={freshness_ms:.1f} "
+                        f"inputs={len(paths)} sheet={sheet} generation={generation}"
+                    )
+                if before != after or tuple(payload.get("input_fingerprints") or ()) != before:
+                    raise RuntimeError("isolated snapshot input freshness mismatch")
+                if int(self._sheet_compute_generation.get(sheet, -1)) != int(generation):
+                    raise InterruptedError("isolated snapshot generation became stale")
+                versions = payload.get("snapshot_versions") or {}
+                for side, spec in inputs.items():
+                    expected = _selected_sheet_snapshot_version(
+                        spec["value_path"], topology_generation=generation,
+                        mutation_generation=int(spec.get("mutation_generation", 0)),
+                    )
+                    if versions.get(side) != expected:
+                        raise RuntimeError(f"isolated snapshot version mismatch side={side}")
+                cache = payload.get("cache")
+                if not isinstance(cache, dict) or str(cache.get("sheet")) != str(sheet):
+                    raise RuntimeError("isolated snapshot cache ABI mismatch")
+                cache["snapshot_metrics_ms"] = dict(payload.get("metrics_ms") or {})
+                cache["snapshot_base_alias"] = dict(payload.get("base_alias") or {})
+                # This record is created only after the child result has passed
+                # IPC identity, input freshness, current-generation, version,
+                # and cache ABI checks.  It is subsequently copied only by the
+                # matching cache-apply turn, so stale/failed children cannot
+                # masquerade as current alias evidence.
+                cache["snapshot_alias_telemetry"] = {
+                    "sheet": str(sheet),
+                    "generation": int(generation),
+                    "request_token": str(token),
+                    "input_fingerprints_before": tuple(before),
+                    "input_fingerprints_after": tuple(after),
+                    "snapshot_versions": dict(versions),
+                    "base_alias": dict(payload.get("base_alias") or {}),
+                    "base_wrapper": dict(payload.get("base_wrapper") or {}),
+                    "stream_counts": {
+                        str(side): int(count)
+                        for side, count in dict(payload.get("stream_counts") or {}).items()
+                    },
+                }
+                cache["snapshot_parent_ipc"] = {
+                    "bytes": ipc_bytes,
+                    "decode_ms": round(ipc_decode_ms, 3),
+                    "freshness_ms": round(freshness_ms, 3),
+                }
+                cache["snapshot_child"] = {
+                    "pid": int(process.pid or 0),
+                    "protocol": _SNAPSHOT_CHILD_PROTOCOL,
+                    "generation": int(generation),
+                    "tree_pids": tuple((owner.get("last_resources") or {}).get("tree_pids") or (int(process.pid or 0),)),
+                    "last_rss_bytes": int((owner.get("last_resources") or {}).get("rss_bytes", 0)),
+                    "peak_rss_bytes": int(owner.get("peak_rss_bytes", 0)),
+                    "last_cpu_ms": float((owner.get("last_resources") or {}).get("cpu_ms", 0.0)),
+                    "request_token": str(token),
+                    "base_alias_telemetry": copy.deepcopy(
+                        cache["snapshot_alias_telemetry"]
+                    ),
+                }
+                _dlog(
+                    f"SNAPSHOT_CHILD complete pid={process.pid} sheet={sheet} "
+                    f"generation={generation} rows={len(cache.get('row_pairs') or ())}"
+                )
+                # The only normal child terminal is claimed after every IPC,
+                # identity, freshness, generation, version, and cache ABI
+                # proof above has succeeded.  A cancellation that wins first
+                # removes ownership, so this runner cannot append a second
+                # event in its finally block.
+                normal_result_verified = True
+                return cache
+            except BaseException as exc:
+                failure_reason = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                try:
+                    self._finalize_snapshot_child_runner(
+                        owner,
+                        normal_result_verified=normal_result_verified,
+                        result_decoded=result_decoded,
+                        failure_reason=failure_reason,
+                    )
+                except Exception as exc:
+                    # Do not let telemetry cleanup hide the original child
+                    # failure.  The owner claim still prevents a stale runner
+                    # from changing a newer child's lifecycle.
+                    _dlog(
+                        f"SNAPSHOT_CHILD terminal finalize failed sheet={sheet} "
+                        f"generation={generation} err={type(exc).__name__}:{exc}"
+                    )
+
+        def _try_snapshot_sheet_cache(sheet: str):
+            if not _LARGE_SHEET_SNAPSHOT_ENGINE_ENABLED:
+                return None
+            try:
+                metrics_started = time.perf_counter()
+                identity_generation = int(getattr(self, "_sheet_compute_generation", {}).get(sheet, 0))
+                snapshot_inputs = {
+                    "A": {
+                        "value_path": str(self._file_a_val_path),
+                        "formula_path": str(self.file_a),
+                        "mutation_generation": 0,
+                        "sheet": str(sheet),
+                        "generation": int(identity_generation),
+                        "topology_generation": int(identity_generation),
+                        "parser": 1,
+                        "loader": _SNAPSHOT_ALIAS_LOADER,
+                        "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                    },
+                    "B": {
+                        "value_path": str(self._file_b_val_path),
+                        "formula_path": str(self.file_b),
+                        "mutation_generation": 0,
+                        "sheet": str(sheet),
+                        "generation": int(identity_generation),
+                        "topology_generation": int(identity_generation),
+                        "parser": 1,
+                        "loader": _SNAPSHOT_ALIAS_LOADER,
+                        "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                    },
+                }
+                if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                    snapshot_inputs["BASE"] = {
+                        "value_path": str(self._file_base_val_path),
+                        "formula_path": str(self.base_path),
+                        "mutation_generation": 0,
+                        "sheet": str(sheet),
+                        "generation": int(identity_generation),
+                        "topology_generation": int(identity_generation),
+                        "parser": 1,
+                        "loader": _SNAPSHOT_ALIAS_LOADER,
+                        "loader_options": _SNAPSHOT_ALIAS_OPTIONS,
+                    }
+                input_paths = [
+                    str(spec[key])
+                    for side in ("A", "B", "BASE")
+                    for spec in (snapshot_inputs.get(side),)
+                    if isinstance(spec, dict)
+                    for key in ("value_path", "formula_path")
+                ]
+                def _input_hashes_current():
+                    hashes = []
+                    for path in input_paths:
+                        _check_bg_cancel()
+                        hashes.append(_sha256_file(path))
+                    return tuple(hashes)
+
+                def _input_signatures_current():
+                    signatures = []
+                    for path in input_paths:
+                        _check_bg_cancel()
+                        stat = os.stat(path)
+                        signatures.append((int(stat.st_size), int(stat.st_mtime_ns)))
+                    return tuple(signatures)
+
+                # Hash failures, a byte change while this worker is running,
+                # or a generation change all deliberately take the ordinary
+                # exact snapshot path. A fast path must never relax freshness.
+                identity_input_signatures = _input_signatures_current() if input_paths else ()
+                identity_hashes = ()
+                if identity_input_signatures:
+                    with self._snapshot_input_identity_lock:
+                        identity_hashes = self._snapshot_input_identity_cache.get(
+                            identity_input_signatures, ()
+                        )
+                    if not identity_hashes:
+                        identity_hashes = _input_hashes_current()
+                        with self._snapshot_input_identity_lock:
+                            self._snapshot_input_identity_cache[identity_input_signatures] = identity_hashes
+                identical_inputs = bool(identity_hashes) and len(set(identity_hashes)) == 1
+                if not identical_inputs:
+                    identity_input_signatures = ()
+                base_alias = {
+                    "used": False, "source": None, "reason": "no-base-input",
+                    "saved_side": None, "input_signatures": {},
+                    "source_payload_digest": None, "wrapper_payload_digest": None,
+                }
+                if identical_inputs:
+                    # Binary identity proves every value, formula cache, relation and
+                    # worksheet byte equal.  Detail still comes from an immutable
+                    # selected-sheet snapshot; never publish a provisional view.
+                    mine_started = time.perf_counter()
+                    mine = self.selected_sheet_snapshot("A", sheet, cancel_check=_check_bg_cancel)
+                    mine_ms = (time.perf_counter() - mine_started) * 1000.0
+                    expected_version = _selected_sheet_snapshot_version(
+                        self._file_a_val_path,
+                        topology_generation=identity_generation,
+                        mutation_generation=0,
+                    )
+                    identity_still_current = bool(
+                        mine is not None
+                        and mine.version == expected_version
+                        and identity_generation == int(
+                            getattr(self, "_sheet_compute_generation", {}).get(sheet, 0)
+                        )
+                        and _input_signatures_current() == identity_input_signatures
+                        and _input_hashes_current() == identity_hashes
+                    )
+                    if identity_still_current:
+                        theirs = mine
+                        base = None
+                        if "BASE" in snapshot_inputs:
+                            # The physical-identity fast path still needs an
+                            # independently labelled Base snapshot.  Prefer A
+                            # here because it is the only parsed candidate;
+                            # the planner otherwise prefers B deterministically.
+                            identity_plan = _plan_snapshot_base_alias(
+                                snapshot_inputs,
+                                sheet=str(sheet), generation=identity_generation,
+                                available_source_sides=("A",),
+                            )
+                            base, base_alias = _build_snapshot_base_alias(
+                                identity_plan, mine, snapshot_inputs,
+                            )
+                            if base is None:
+                                identity_still_current = False
+                                identical_inputs = False
+                        paired_ingest_ms = mine_ms
+                        theirs_ms = mine_ms
+                        base_ms = 0.0
+                    else:
+                        # Re-enter the ordinary immutable path from fresh side
+                        # snapshots. Do not reuse a snapshot whose file or
+                        # generation signature has become stale.
+                        identical_inputs = False
+                else:
+                    mine = theirs = base = None
+                if not identical_inputs:
+                    isolated_cache = _run_isolated_snapshot_child(
+                        sheet, identity_generation
+                    )
+                    if isolated_cache is not None:
+                        isolated_cache["snapshot_metrics_ms"].setdefault(
+                            "parent_total",
+                            round((time.perf_counter() - metrics_started) * 1000.0, 3),
+                        )
+                        _dlog(
+                            f"snapshot cache prepared sheet={sheet} "
+                            f"rows={len(isolated_cache.get('row_pairs') or ())} isolated=True"
+                        )
+                        _dlog(f"snapshot cache returning sheet={sheet}")
+                        return isolated_cache
+                    # Explicit feature rollback only. The default changed-input
+                    # path is isolated above because thread parsing can starve
+                    # Tk even when every Python loop has checkpoints.
+                    def _inprocess_snapshot_reader(
+                        value_path,
+                        formula_path,
+                        requested_sheet,
+                        side,
+                        *,
+                        topology_generation=0,
+                        mutation_generation=0,
+                        cancel_check=None,
+                    ):
+                        """Generation-safe cache adapter for the shared reader.
+
+                        The shared helper owns all-side before/after fingerprints.
+                        This adapter proves that each cached parse request still
+                        names the current effective value/formula paths and the
+                        exact selected-sheet parser contract before returning a
+                        frozen snapshot.
+                        """
+                        side = str(side or "").upper()
+                        spec = snapshot_inputs.get(side)
+                        if not isinstance(spec, dict):
+                            raise RuntimeError(f"unsupported in-process snapshot side: {side}")
+                        effective_paths = {
+                            "A": (self._file_a_val_path, self.file_a),
+                            "B": (self._file_b_val_path, self.file_b),
+                            "BASE": (getattr(self, "_file_base_val_path", None), getattr(self, "base_path", None)),
+                        }
+                        effective_value, effective_formula = effective_paths.get(side, (None, None))
+                        if (
+                            str(requested_sheet) != str(sheet)
+                            or int(topology_generation) != int(identity_generation)
+                            or int(mutation_generation) != int(spec.get("mutation_generation", 0))
+                            or str(spec.get("loader", _SNAPSHOT_ALIAS_LOADER)) != _SNAPSHOT_ALIAS_LOADER
+                            or tuple(spec.get("loader_options", ())) != _SNAPSHOT_ALIAS_OPTIONS
+                            or os.path.abspath(str(value_path)) != os.path.abspath(str(spec["value_path"]))
+                            or os.path.abspath(str(formula_path)) != os.path.abspath(str(spec["formula_path"]))
+                            or os.path.abspath(str(value_path)) != os.path.abspath(str(effective_value))
+                            or os.path.abspath(str(formula_path)) != os.path.abspath(str(effective_formula))
+                        ):
+                            raise RuntimeError("in-process snapshot request path/options mismatch")
+                        if int(getattr(self, "_sheet_compute_generation", {}).get(sheet, -1)) != int(identity_generation):
+                            raise RuntimeError("in-process snapshot generation became stale")
+                        snapshot = self.selected_sheet_snapshot(
+                            side, sheet,
+                            mutation_generation=int(mutation_generation),
+                            cancel_check=cancel_check,
+                        )
+                        expected_version = _selected_sheet_snapshot_version(
+                            str(value_path),
+                            topology_generation=int(topology_generation),
+                            mutation_generation=int(mutation_generation),
+                        )
+                        if not _snapshot_alias_snapshot_is_complete(
+                            snapshot,
+                            side=side,
+                            sheet=str(requested_sheet),
+                            version=expected_version,
+                        ):
+                            raise RuntimeError("in-process snapshot cache returned stale/incomplete result")
+                        return snapshot
+
+                    snapshots, side_metrics, base_alias, _fallback_before = _read_snapshot_inputs_with_base_alias(
+                        snapshot_inputs,
+                        sheet=str(sheet), generation=identity_generation,
+                        cancel_check=_check_bg_cancel,
+                        stream_snapshot=_inprocess_snapshot_reader,
+                    )
+                    mine = snapshots["A"]
+                    theirs = snapshots["B"]
+                    base = snapshots.get("BASE")
+                    mine_ms = float(side_metrics.get("A", 0.0))
+                    theirs_ms = float(side_metrics.get("B", 0.0))
+                    paired_ingest_ms = mine_ms + theirs_ms
+                    base_ms = float(side_metrics.get("BASE", 0.0))
+                if mine is None or theirs is None:
+                    return None
+                compare_started = time.perf_counter()
+                result = (
+                    _physical_identity_snapshot_comparison(
+                        mine,
+                        three_way=base is not None,
+                    )
+                    if identical_inputs else
+                    _compare_selected_sheet_snapshots(mine, theirs, base)
+                )
+                compare_ms = (time.perf_counter() - compare_started) * 1000.0
+                adapter_started = time.perf_counter()
+                cache = _snapshot_result_to_sheet_cache(sheet, result, mine, theirs, base)
+                adapter_ms = (time.perf_counter() - adapter_started) * 1000.0
+                if cache is not None:
+                    base_alias["ingest_ms"] = {
+                        "A": round(float(mine_ms), 3),
+                        "B": round(float(theirs_ms), 3),
+                        "BASE": round(float(base_ms), 3),
+                    }
+                    cache["snapshot_metrics_ms"] = {
+                        "mine_ingest": round(mine_ms, 3),
+                        "theirs_ingest": round(theirs_ms, 3),
+                        "paired_ingest": round(paired_ingest_ms, 3),
+                        "base_ingest": round(base_ms, 3),
+                        "compare": round(compare_ms, 3),
+                        "adapter": round(adapter_ms, 3),
+                        "total": round((time.perf_counter() - metrics_started) * 1000.0, 3),
+                        "binary_identity_fast_path": bool(identical_inputs),
+                    }
+                    cache["snapshot_base_alias"] = dict(base_alias)
+                    _dlog(f"snapshot cache prepared sheet={sheet} rows={len(result.row_pairs)}")
+                    _dlog(f"snapshot cache returning sheet={sheet}")
+                return cache
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                _dlog(f"snapshot cache failed; legacy fallback sheet={sheet}: {exc}")
+                return None
+
         def _compute_sheet_cache(
             wb_a_val,
             wb_b_val,
@@ -32695,8 +44261,14 @@ class SowMergeApp:
             wb_base_val=None,
             wb_base_edit=None,
             need_exact_only_diff: bool = False,
+            snapshot_only: bool = False,
         ):
             _check_bg_cancel()
+            snapshot_cache = _try_snapshot_sheet_cache(sheet)
+            if snapshot_cache is not None:
+                return snapshot_cache
+            if snapshot_only:
+                return None
             trimmed_rows_cache = {}
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
@@ -32893,13 +44465,12 @@ class SowMergeApp:
             base_row_by_pair: dict[int, int | None] = {}
             if ws_base is not None:
                 for idx, (ra, rb) in enumerate(row_pairs):
-                    if idx in pair_base_row_override:
-                        base_row = pair_base_row_override.get(idx)
-                    elif ra is not None and ra in mine_to_base_row:
+                    base_row = pair_base_row_override.get(idx)
+                    if base_row is None and ra is not None and ra in mine_to_base_row:
                         base_row = mine_to_base_row.get(ra)
-                    elif rb is not None and rb in theirs_to_base_row:
+                    elif base_row is None and rb is not None and rb in theirs_to_base_row:
                         base_row = theirs_to_base_row.get(rb)
-                    else:
+                    elif base_row is None:
                         base_row = None
                     base_row_by_pair[idx] = base_row
                 base_rows_needed = [r for r in base_row_by_pair.values() if r is not None]
@@ -32967,8 +44538,16 @@ class SowMergeApp:
                 if sheet in self._compute_exact_only_diff_requested:
                     need_exact_only_diff = True
                     self._compute_exact_only_diff_requested.discard(sheet)
+            # Virtual scrolling is safe only when every logical row already
+            # has a prepared string and formula-aware diff state.  The worker
+            # is now selected-Sheet driven, so pay that bounded per-Sheet cost
+            # for the requested Sheet instead of retaining preview fragments
+            # for every unopened large worksheet.
+            selected_now = str(getattr(self, "selected_sheet", "") or "")
             large_preview_only = bool(
-                max_row >= _LARGE_SHEET_ROW_THRESHOLD and not need_exact_only_diff
+                max_row >= _LARGE_SHEET_ROW_THRESHOLD
+                and not need_exact_only_diff
+                and (not _LARGE_SHEET_VIRTUALIZATION_ENABLED or sheet != selected_now)
             )
             if large_preview_only:
                 has_diff = bool(column_comparison_cache.structural_diff_cols)
@@ -33253,12 +44832,24 @@ class SowMergeApp:
                 "theirs_to_base_row": theirs_to_base_row,
                 "pair_base_row_override": pair_base_row_override,
                 "column_comparison_cache": column_comparison_cache,
+                "sheet_structural_diff": common_sheet_added_vs_base,
+                "unresolved_reason": (
+                    "逻辑列映射仍有歧义："
+                    + ", ".join(str(col) for col in sorted(column_comparison_cache.unresolved_cols))
+                    if column_comparison_cache.unresolved_cols and has_diff else ""
+                ),
                 "has_diff": has_diff,
                 "only_diff_rows": exact_only_diff_rows,
+                "prepared_complete": not large_preview_only,
                 "completeness": {
                     "formula_aware": True,
                     "row_model_exact": True,
                     "column_projection_exact": True,
+                    # Even preview-shaped hidden caches scan until a proven
+                    # difference is found (or exhaust every aligned row).  The
+                    # workbook navigation summary is therefore exact although
+                    # full per-cell render data remains deferred until select.
+                    "sheet_summary_exact": True,
                     "ab_diff_exact": not large_preview_only,
                     "base_diff_exact": bool(
                         not large_preview_only
@@ -33275,8 +44866,35 @@ class SowMergeApp:
                 },
             }
 
+        def _release_edit_preload_if_needed(cache: dict | None, sheet: str, reason: str) -> None:
+            """Keep snapshot-first viewing workbook-light on every cache branch."""
+            # The first tab may be a small/ambiguous Sheet whose conservative
+            # snapshot gate deliberately falls back to the legacy reader.  It
+            # must not make that incidental fallback an eager-edit signal: a
+            # user can select a large Sheet while that first comparison is
+            # still running.  Starting four normal-mode workbook parses at
+            # that point both competes with the selected paired stream and
+            # retains hundreds of MB before any edit/save was requested.
+            #
+            # A selected snapshot keeps the existing explicit edit/save
+            # promotion.  A selected small/legacy Sheet still retains its
+            # established eager fallback.  Crucially, a cache for a tab the
+            # user has already left never starts that eager promotion.
+            if bool(getattr(self, "_snapshot_startup_lightweight", False)) and (
+                bool((cache or {}).get("snapshot_engine", False))
+                or str(sheet) != str(getattr(self, "selected_sheet", "") or "")
+            ):
+                _dlog(
+                    f"defer editable preload lightweight Sheet={sheet} "
+                    f"snapshot={bool((cache or {}).get('snapshot_engine', False))} "
+                    f"reason={reason}"
+                )
+                return
+            self._initial_sheet_ready_event.set()
+
         def _apply_sheet_cache(cache: dict):
             sheet = cache["sheet"]
+            _dlog(f"SHEET_CACHE_APPLY enter sheet={sheet}")
             cache_generation = int(cache.get("generation", 0))
             current_generation = int(self._sheet_compute_generation.get(sheet, 0))
             if cache_generation != current_generation:
@@ -33285,19 +44903,92 @@ class SowMergeApp:
                     f"cache_generation={cache_generation} current={current_generation}"
                 )
                 return
+            completeness = cache.get("completeness", {}) or {}
+            cache_is_exact = bool(
+                completeness.get("row_model_exact", False)
+                and completeness.get("formula_aware", False)
+                and completeness.get("ab_diff_exact", False)
+                and (
+                    not bool(getattr(self, "has_base", False))
+                    or bool(completeness.get("base_diff_exact", False))
+                )
+            )
+            sheet_summary_exact = bool(
+                completeness.get("sheet_summary_exact", cache_is_exact)
+            )
+            unresolved_reason = str(cache.get("unresolved_reason") or "")
+            cache_is_unresolved = bool(unresolved_reason)
             view = self.sheet_views.get(sheet)
+            if cache_is_unresolved:
+                # Retain the immutable evidence for diagnosis/retry, but never
+                # publish its ambiguous row/column projection as user data.
+                self._sheet_cache_store[sheet] = cache
+                self._set_sheet_exact_state(
+                    sheet,
+                    _SHEET_EXACT_UNRESOLVED,
+                    generation=cache_generation,
+                    stage="精确映射未解决",
+                    processed=self._compute_done,
+                    total=self._compute_total,
+                    reason=unresolved_reason,
+                    refresh=False,
+                )
+                if view is not None:
+                    view._lifecycle_error = None
+                    view._only_diff_preview_full = False
+                    view._only_diff_async_building = False
+                    view._show_exact_unavailable(
+                        f"未解决：{unresolved_reason}。当前只读，修改和保存均已阻止；请刷新后重试。"
+                    )
+                self._update_exact_status_ui()
+                self.refresh_sheet_nav()
+                if sheet == str(getattr(self, "selected_sheet", "") or ""):
+                    _schedule_remaining_exact_sheets(sheet)
+                _release_edit_preload_if_needed(cache, sheet, "unresolved")
+                return
             if view is None:
                 # Preserve the exact result for lazy tab creation. The previous
                 # implementation discarded it and recomputed the whole Sheet.
                 self._sheet_cache_store[sheet] = cache
                 self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+                if sheet_summary_exact:
+                    self._set_sheet_exact_state(
+                        sheet,
+                        _SHEET_EXACT_CHANGED if bool(cache.get("has_diff", False)) else _SHEET_EXACT_SAME,
+                        generation=cache_generation,
+                        stage="精确比较完成（未打开 Sheet）",
+                        processed=self._compute_done,
+                        total=self._compute_total,
+                        reason="",
+                        refresh=False,
+                    )
                 self.refresh_sheet_nav()
+                return
+            is_visible_sheet = getattr(self, "selected_sheet", None) == sheet
+            if sheet_summary_exact and not cache_is_exact and not is_visible_sheet:
+                # Keep only the bounded hidden-Sheet evidence.  Its exact
+                # changed/same summary is already published, while selecting
+                # the tab will apply this cache and start full detail build.
+                self._sheet_cache_store[sheet] = cache
+                self._set_sheet_exact_state(
+                    sheet,
+                    _SHEET_EXACT_CHANGED if bool(cache.get("has_diff", False)) else _SHEET_EXACT_SAME,
+                    generation=cache_generation,
+                    stage="精确比较完成（摘要；明细待打开）",
+                    processed=self._compute_done,
+                    total=self._compute_total,
+                    reason="",
+                    refresh=False,
+                )
+                self._update_exact_status_ui()
+                self.refresh_sheet_nav()
+                _release_edit_preload_if_needed(cache, sheet, "hidden-summary")
                 return
             if getattr(view, "_suppress_bg_apply", False):
                 _dlog(f"skip bg cache apply by user action: sheet={sheet}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
-                self._initial_sheet_ready_event.set()
+                _release_edit_preload_if_needed(cache, sheet, "suppress")
                 return
             if getattr(view, "_column_mapping_stale_reason", ""):
                 _dlog(
@@ -33306,7 +44997,7 @@ class SowMergeApp:
                 )
                 view._hide_loading()
                 self.refresh_sheet_nav()
-                self._initial_sheet_ready_event.set()
+                _release_edit_preload_if_needed(cache, sheet, "stale-column")
                 return
             # Skip if the user has made edits in this view; background data (from read-only copies)
             # would be stale relative to the user's in-memory changes.
@@ -33317,7 +45008,7 @@ class SowMergeApp:
                 _dlog(f"skip stale bg cache after user action: sheet={sheet}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
-                self._initial_sheet_ready_event.set()
+                _release_edit_preload_if_needed(cache, sheet, "user-edit")
                 return
             # Guard against late background cache downgrading an already rendered sheet to no-diff.
             # This has been observed as a delayed "DiffRows -> 0 / rows disappear" regression.
@@ -33333,10 +45024,12 @@ class SowMergeApp:
                 _dlog(f"skip stale cache downgrade: sheet={sheet} old_diff={old_diff_count} new_diff={new_diff_count}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
-                self._initial_sheet_ready_event.set()
+                _release_edit_preload_if_needed(cache, sheet, "stale-downgrade")
                 return
             # From this point we will apply this cache to the visible view.
             self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+            if cache.get("snapshot_engine", False) and sheet == getattr(self, "selected_sheet", ""):
+                self._snapshot_initial_cache_active = True
             view._lifecycle_error = None
             view._lifecycle_canceled = False
             view._invalidate_only_diff_snapshot_cache()
@@ -33361,6 +45054,7 @@ class SowMergeApp:
                 for idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items()
             }
             view.column_comparison_cache = cache.get("column_comparison_cache")
+            view._sheet_structural_diff = bool(cache.get("sheet_structural_diff", False))
             if isinstance(view.column_comparison_cache, LogicalColumnComparisonCache):
                 view._install_column_projection(view.column_comparison_cache)
                 view.column_alignment_2way = view.column_comparison_cache.two_way_alignment
@@ -33372,7 +45066,6 @@ class SowMergeApp:
             view.theirs_to_base_row = cache.get("theirs_to_base_row", {}) or {}
             view.pair_base_row_override = cache.get("pair_base_row_override", {}) or {}
 
-            is_visible_sheet = getattr(self, "selected_sheet", None) == sheet
             pair_parts_a = cache.get("pair_parts_a", {}) or {}
             pair_parts_b = cache.get("pair_parts_b", {}) or {}
             pair_parts_base = cache.get("pair_parts_base", {}) or {}
@@ -33382,9 +45075,7 @@ class SowMergeApp:
                 pair_parts_base,
                 cache.get("col_char_widths", {}),
             )
-            if is_visible_sheet:
-                view._materialize_staged_pair_parts()
-            elif not pair_parts_a and not pair_parts_b:
+            if not pair_parts_a and not pair_parts_b:
                 # Backward-compatible fallback for older cache shape.
                 view.pair_text_a = cache.get("pair_text_a", {})
                 view.pair_text_b = cache.get("pair_text_b", {})
@@ -33394,6 +45085,35 @@ class SowMergeApp:
             view._align_rows_enabled = True
             completeness = cache.get("completeness", {}) or {}
             view._cache_formula_aware = bool(completeness.get("formula_aware", False))
+            view._prepared_complete = bool(cache.get("prepared_complete", False))
+            view._cache_source = "snapshot" if cache.get("snapshot_engine", False) else "legacy"
+            view._snapshot_metrics_ms = dict(cache.get("snapshot_metrics_ms", {}) or {})
+            view._snapshot_child_metrics = dict(cache.get("snapshot_child", {}) or {})
+            alias_telemetry = cache.get("snapshot_alias_telemetry")
+            current_alias_telemetry = None
+            if (
+                cache_is_exact
+                and bool(cache.get("snapshot_engine", False))
+                and isinstance(alias_telemetry, dict)
+                and str(alias_telemetry.get("sheet") or "") == str(sheet)
+                and int(alias_telemetry.get("generation", -1)) == cache_generation
+                and str(alias_telemetry.get("request_token") or "")
+                and int(view._snapshot_child_metrics.get("generation", -1))
+                == cache_generation
+                and str(view._snapshot_child_metrics.get("request_token") or "")
+                == str(alias_telemetry.get("request_token"))
+            ):
+                # The cache came from a successful, freshness-checked child
+                # above.  Copy the compact immutable payload on this matching
+                # UI apply turn rather than leaving a mutable/stale raw cache
+                # reference on the view.
+                current_alias_telemetry = copy.deepcopy(alias_telemetry)
+                current_alias_telemetry["cache_applied_generation"] = cache_generation
+                current_alias_telemetry["cache_applied_at"] = time.monotonic()
+                view._snapshot_child_metrics["base_alias_telemetry"] = (
+                    copy.deepcopy(current_alias_telemetry)
+                )
+            view._snapshot_alias_telemetry = current_alias_telemetry
             view._row_model_exact = bool(completeness.get("row_model_exact", False))
             view._pair_diff_full_exact = bool(completeness.get("ab_diff_exact", False))
             view._base_diff_full_exact = bool(completeness.get("base_diff_exact", False))
@@ -33454,7 +45174,75 @@ class SowMergeApp:
                     view.max_row,
                 )
             view.only_diff_var.set(requested_only_diff)
+            if needs_exact_build:
+                # The cache is useful as an immutable input to the continuing
+                # exact build, but it is not a user-visible result.  Cover the
+                # old/provisional rows until this generation publishes once.
+                self._set_sheet_exact_state(
+                    sheet,
+                    _SHEET_EXACT_CALCULATING,
+                    generation=cache_generation,
+                    stage="正在完成精确差异和只差异结果",
+                    processed=self._compute_done,
+                    total=self._compute_total,
+                    reason="当前 generation 尚未具备完整可操作结果",
+                    refresh=False,
+                )
+                view._pending_exact_render = True
+                if is_visible_sheet:
+                    view._show_loading(
+                        f"正在精确计算 {sheet}；完成前不会显示临时比较行。"
+                    )
+                    # A hidden summary proves only its nav state; it omits
+                    # most physical rows/text. The only-diff worker cannot
+                    # safely promote that preview to a selected terminal
+                    # result, so rebuild this Sheet through the full cache
+                    # path before publishing SAME/CHANGED.
+                    view._full_detail_upgrade_required = True
+                    view._data_ready = False
+                    _enqueue_sheet(
+                        sheet,
+                        front=True,
+                        exact_only_diff=bool(requested_only_diff),
+                        force_recompute=True,
+                    )
+                    _kick_worker()
+                self._update_exact_status_ui()
+                self.refresh_sheet_nav()
+                _release_edit_preload_if_needed(cache, sheet, "exact-build")
+                return
+            # Install complete immutable raw fragments/maps before either a
+            # visible publication or a hidden terminal summary.  An empty
+            # selection makes this install-only: it transfers raw parts,
+            # widths, and missing-side markers, but formats no display text.
+            # This lets a later tab promotion render directly from prepared
+            # evidence instead of reopening a worksheet.
+            install_only_started = time.perf_counter()
+            view._materialize_staged_pair_parts(())
+            view._last_snapshot_install_only_ms = (
+                time.perf_counter() - install_only_started
+            ) * 1000.0
+            view._snapshot_install_only_samples_ms.append(
+                view._last_snapshot_install_only_ms
+            )
+            _dlog(
+                f"SHEET_CACHE_APPLY raw-cache-installed sheet={sheet} "
+                f"install_only_ms={view._last_snapshot_install_only_ms:.2f}"
+            )
             if not is_visible_sheet:
+                # A fully populated non-visible view may publish its final
+                # state now. Only the deliberately bounded hidden-summary
+                # branch above is allowed to publish without detail.
+                self._set_sheet_exact_state(
+                    sheet,
+                    _SHEET_EXACT_CHANGED if bool(cache.get("has_diff", False)) else _SHEET_EXACT_SAME,
+                    generation=cache_generation,
+                    stage="精确比较完成",
+                    processed=self._compute_done,
+                    total=self._compute_total,
+                    reason="",
+                    refresh=False,
+                )
                 view._pending_exact_render = True
                 view._hide_loading()
                 view._refresh_interaction_gate()
@@ -33463,7 +45251,7 @@ class SowMergeApp:
                     f"exact_only_diff={view._only_diff_rows_exact}"
                 )
                 self.refresh_sheet_nav()
-                self._initial_sheet_ready_event.set()
+                _release_edit_preload_if_needed(cache, sheet, "hidden-view")
                 return
             self._reserve_ui_transition_window(350)
             # Preserve viewport/cursor when background cache is applied; otherwise
@@ -33477,7 +45265,42 @@ class SowMergeApp:
                 prev_insert = view.left.index("insert")
             except Exception:
                 pass
-            view.refresh(row_only=None, rescan=False)
+            view._prepared_cache_publish_active = True
+            if view._wide_column_virtual_active():
+                # A bounded wide surface owns horizontal position in logical
+                # columns.  ``Text.xview`` belongs only to the short current
+                # document and must not reset the cache publication to column
+                # zero or queue a stale post-terminal repaint.
+                prev_x = view._wide_column_scroll_fractions()[0]
+            staged_first_surface = False
+            try:
+                if int(getattr(view, "_staged_virtual_surface_ready_generation", -1)) == cache_generation:
+                    # A prior staged frame has already installed all bounded
+                    # rows/tags under the opaque calculating overlay.  Re-enter
+                    # only to run the atomic terminal publication below.
+                    view._staged_virtual_surface_ready_generation = -1
+                else:
+                    def _finish_staged_surface(v=view, c=cache, gen=cache_generation):
+                        v._staged_virtual_surface_ready_generation = int(gen)
+                        _apply_sheet_cache(c)
+
+                    staged_first_surface = (
+                        view._publish_prepared_cache_surface(
+                            on_staged_complete=_finish_staged_surface
+                        )
+                        == "staged"
+                    )
+                    if not staged_first_surface:
+                        # The call above already published the ordinary bounded
+                        # surface when staging was not required.
+                        pass
+            finally:
+                if not staged_first_surface:
+                    view._prepared_cache_publish_active = False
+            if staged_first_surface:
+                _dlog(f"SHEET_CACHE_APPLY staged-first-surface sheet={sheet}")
+                return
+            _dlog(f"SHEET_CACHE_APPLY refresh-done sheet={sheet}")
             try:
                 view.left.yview_moveto(prev_first)
                 if view._is_three_way_enabled():
@@ -33486,8 +45309,11 @@ class SowMergeApp:
             except Exception:
                 pass
             try:
-                view._sync_main_x_to_frac(prev_x)
-                view._sync_c_x_to_frac(prev_x)
+                if view._wide_column_virtual_active():
+                    view._set_wide_column_scrollbars()
+                else:
+                    view._sync_main_x_to_frac(prev_x)
+                    view._sync_c_x_to_frac(prev_x)
             except Exception:
                 pass
             try:
@@ -33513,15 +45339,31 @@ class SowMergeApp:
             except Exception:
                 pass
             view._update_cursor_lines()
-            view._hide_loading()
             if needs_exact_build:
                 view._start_async_large_only_diff_build()
+            else:
+                # Selected-Sheet terminal state is the publication barrier:
+                # all rows, Base mappings, column projection, cached text,
+                # exactness flags, and the bounded render have been installed
+                # before observers may see SAME/CHANGED.
+                view._pending_exact_render = False
+                view._full_detail_upgrade_required = False
+                self._set_sheet_exact_state(
+                    sheet,
+                    _SHEET_EXACT_CHANGED if bool(cache.get("has_diff", False)) else _SHEET_EXACT_SAME,
+                    generation=cache_generation,
+                    stage="精确比较完成",
+                    processed=self._compute_done,
+                    total=self._compute_total,
+                    reason="",
+                    refresh=False,
+                )
+                view._hide_loading()
+                _schedule_remaining_exact_sheets(sheet)
             view._refresh_interaction_gate()
             self.refresh_sheet_nav()
-            # The first useful Sheet is now visible.  Let editable-workbook
-            # preload begin while unopened-tab scans yield via
-            # _edit_preload_active_event.
-            self._initial_sheet_ready_event.set()
+            _release_edit_preload_if_needed(cache, sheet, "visible-ready")
+            _dlog(f"SHEET_CACHE_APPLY exit sheet={sheet}")
 
         def _mark_sheet_compute_failed(
             sheet: str,
@@ -33534,18 +45376,30 @@ class SowMergeApp:
                     f"generation={generation}"
                 )
                 return
+            self._set_sheet_exact_state(
+                sheet,
+                _SHEET_EXACT_FAILED,
+                generation=generation,
+                stage="精确比较失败",
+                processed=self._compute_done,
+                total=self._compute_total,
+                reason=str(error_text or "后台计算失败"),
+                refresh=False,
+            )
+            if sheet == str(getattr(self, "selected_sheet", "") or ""):
+                _schedule_remaining_exact_sheets(sheet)
             view = self.sheet_views.get(sheet)
             if view is None:
+                self._update_exact_status_ui()
+                self.refresh_sheet_nav()
                 return
             view._lifecycle_error = str(error_text or "后台计算失败")
             view._only_diff_preview_full = False
             view._only_diff_async_building = False
-            try:
-                view.info.configure(text=f"计算失败：{view._lifecycle_error}")
-            except Exception:
-                pass
-            view._hide_loading()
-            view._refresh_interaction_gate()
+            view._show_exact_unavailable(
+                f"计算失败：{view._lifecycle_error}。当前只读，修改和保存均已阻止；请刷新后重试。"
+            )
+            self._update_exact_status_ui()
             self.refresh_sheet_nav()
 
         def _compute_worker():
@@ -33556,35 +45410,30 @@ class SowMergeApp:
             wb_b_e = None
             wb_base_e = None
             try:
-                try:
-                    # Use separate read-only workbooks to avoid threading issues
-                    wb_a_ro = load_workbook(self._file_a_val_path, data_only=True, read_only=True)
-                    wb_b_ro = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
-                    if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
-                        wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
-                    wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
-                    wb_b_e = load_workbook(self.file_b, data_only=False, read_only=True)
-                    if getattr(self, "has_base", False) and getattr(self, "base_path", None):
-                        wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
-                except Exception as e:
-                    _dlog(f"bg compute open read-only failed: {e}")
-                    with self._compute_lock:
-                        failed_jobs = [
-                            (name, int(self._sheet_compute_generation.get(name, 0)))
-                            for name in dict.fromkeys(
-                                list(self._compute_queue) + list(self._compute_inflight)
-                            )
-                        ]
-                    for failed_sheet, failed_generation in failed_jobs:
-                        _queue_ui_task(
-                            lambda s=failed_sheet, err=str(e), gen=failed_generation: (
-                                _mark_sheet_compute_failed(s, err, gen)
-                            )
-                        )
-                    return
-                if wb_a_ro is None or wb_b_ro is None or wb_a_e is None or wb_b_e is None:
-                    _dlog("bg compute read-only workbooks not available; skip background compute")
-                    return
+                def _ensure_legacy_workbooks():
+                    """Open broad workbook readers only after the narrow path declines.
+
+                    A selected large Sheet can therefore become interactive
+                    without retaining six workbook XML readers for every tab.
+                    """
+                    nonlocal wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e
+                    if wb_a_ro is not None and wb_b_ro is not None and wb_a_e is not None and wb_b_e is not None:
+                        return True
+                    try:
+                        wb_a_ro = load_workbook(self._file_a_val_path, data_only=True, read_only=True)
+                        wb_b_ro = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
+                        if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                            wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
+                        wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
+                        wb_b_e = load_workbook(self.file_b, data_only=False, read_only=True)
+                        if getattr(self, "has_base", False) and getattr(self, "base_path", None):
+                            wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
+                    except Exception as exc:
+                        _dlog(f"bg compute open read-only failed: {exc}")
+                        _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
+                        wb_a_ro = wb_b_ro = wb_base_ro = wb_a_e = wb_b_e = wb_base_e = None
+                        return False
+                    return wb_a_ro is not None and wb_b_ro is not None and wb_a_e is not None and wb_b_e is not None
 
                 while True:
                     if self._is_closing:
@@ -33601,8 +45450,68 @@ class SowMergeApp:
                             self._sheet_compute_generation.get(sheet, 0)
                         )
                         self._compute_inflight.add(sheet)
+                        self._active_compute_sheet = sheet
                         progress_current = min(self._compute_done + 1, self._compute_total)
                         progress_total = self._compute_total
+                    if str(sheet) != str(getattr(self, "selected_sheet", "") or ""):
+                        self._hidden_worker_events.append(
+                            {
+                                "event": "start",
+                                "sheet": str(sheet),
+                                "selected_sheet": str(
+                                    getattr(self, "selected_sheet", "") or ""
+                                ),
+                                "at": time.monotonic(),
+                            }
+                        )
+                    quiet_delay = _hidden_sheet_quiet_delay(sheet)
+                    if quiet_delay > 0.0:
+                        # Do not even open a hidden Sheet while the foreground
+                        # is active. Put it back unchanged and terminate this
+                        # worker; the timer resumes it after a full quiet span.
+                        with self._compute_lock:
+                            self._compute_inflight.discard(sheet)
+                            if getattr(self, "_active_compute_sheet", None) == sheet:
+                                self._active_compute_sheet = None
+                            if need_exact_only_diff:
+                                self._compute_exact_only_diff_requested.add(sheet)
+                            if sheet not in self._compute_queue:
+                                self._compute_queue.append(sheet)
+                        _resume_hidden_sheet_worker_after(quiet_delay)
+                        break
+                    ready_view = self.sheet_views.get(sheet)
+                    if (
+                        self._is_sheet_exact_current(sheet)
+                        and ready_view is not None
+                        and bool(getattr(ready_view, "_prepared_complete", False))
+                        and bool(getattr(ready_view, "_data_ready", False))
+                        and not bool(getattr(ready_view, "_pending_exact_render", False))
+                    ):
+                        # A summary->detail promotion can race with a second
+                        # pre-existing queue entry. Once the first full detail
+                        # is terminal, that entry is redundant and must not
+                        # downgrade the same generation back to CALCULATING.
+                        with self._compute_lock:
+                            self._compute_inflight.discard(sheet)
+                            if getattr(self, "_active_compute_sheet", None) == sheet:
+                                self._active_compute_sheet = None
+                        _dlog(
+                            f"skip redundant exact-ready queue entry sheet={sheet} "
+                            f"generation={compute_generation}"
+                        )
+                        continue
+                    _queue_ui_task(
+                        lambda s=sheet, gen=compute_generation, cur=progress_current, total=progress_total: self._set_sheet_exact_state(
+                            s,
+                            _SHEET_EXACT_CALCULATING,
+                            generation=gen,
+                            stage="正在生成当前 generation 的精确比较",
+                            processed=max(0, cur - 1),
+                            total=total,
+                            reason="",
+                            refresh=False,
+                        )
+                    )
                     _queue_ui_task(
                         lambda s=sheet, cur=progress_current, total=progress_total: self._set_task_status(
                             f"正在加载 Sheet：{s}（{cur}/{total}）",
@@ -33612,24 +45521,169 @@ class SowMergeApp:
                         )
                     )
                     try:
+                        count_compute_done = True
                         _dlog(f"bg compute sheet: {sheet}")
-                        cache = _compute_sheet_cache(
-                            wb_a_ro,
-                            wb_b_ro,
-                            wb_a_e,
-                            wb_b_e,
-                            sheet,
-                            wb_base_ro,
-                            wb_base_e,
-                            need_exact_only_diff=need_exact_only_diff,
-                        )
+                        cache = None
+                        # Hidden sheets must take the same cancellable immutable
+                        # snapshot path as the selected sheet.  Restricting it
+                        # to the current tab fell through to one monolithic
+                        # legacy/openpyxl load: a wheel or tab preemption could
+                        # not be observed until that load released the GIL.
+                        if _LARGE_SHEET_SNAPSHOT_ENGINE_ENABLED:
+                            cache = _compute_sheet_cache(
+                                None, None, None, None, sheet,
+                                need_exact_only_diff=need_exact_only_diff,
+                                snapshot_only=True,
+                            )
+                        if cache is None:
+                            # Only a technical snapshot failure reaches this
+                            # branch: semantic ambiguity returned an explicit
+                            # UNRESOLVED cache above. Never auto-start the
+                            # monolithic legacy reader for a hidden tab: once
+                            # openpyxl owns a large XML parse it cannot honour
+                            # hover/wheel/tab checkpoints. Publish a clear
+                            # non-actionable failure instead; a later explicit
+                            # tab selection is the only route that may request
+                            # the compatibility fallback.
+                            if str(sheet) != str(getattr(self, "selected_sheet", "") or ""):
+                                reason = (
+                                    "后台精确快照技术失败，已停止自动兼容读取以保持交互响应；"
+                                    "请选择此 Sheet 后重试。"
+                                )
+                                _dlog(
+                                    f"hidden snapshot technical failure; "
+                                    f"legacy blocked sheet={sheet}"
+                                )
+                                _queue_ui_task(
+                                    lambda s=sheet, err=reason, gen=compute_generation: (
+                                        _mark_sheet_compute_failed(s, err, gen)
+                                    )
+                                )
+                                continue
+                            _check_bg_cancel()
+                            if not _ensure_legacy_workbooks():
+                                raise RuntimeError("后台只读工作簿加载失败")
+                            _check_bg_cancel()
+                            cache = _compute_sheet_cache(
+                                wb_a_ro,
+                                wb_b_ro,
+                                wb_a_e,
+                                wb_b_e,
+                                sheet,
+                                wb_base_ro,
+                                wb_base_e,
+                                need_exact_only_diff=need_exact_only_diff,
+                            )
                         cache["generation"] = compute_generation
                         if self._is_closing:
                             break
                         # Never call tkinter APIs from background threads.
-                        _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
+                        def _apply_cache_task(c=cache):
+                            _apply_sheet_cache(c)
+
+                        _apply_cache_task._sow_cache_sheet = sheet
+                        accepted = _queue_ui_task(_apply_cache_task)
+                        with self._ui_task_lock:
+                            pending_ui_tasks = len(self._ui_tasks)
+                        _dlog(
+                            f"UI_TASK_QUEUE cache_sheet={sheet} accepted={accepted} "
+                            f"pending={pending_ui_tasks}"
+                        )
                     except InterruptedError:
-                        break
+                        # Selection preemption is intentionally local to the
+                        # current Sheet.  Keep the worker alive so the
+                        # front-queued active Sheet starts immediately; only
+                        # shutdown terminates the worker.
+                        if self._is_closing:
+                            break
+                        count_compute_done = False
+                        # Preemption is not completion.  Put the interrupted
+                        # Sheet behind the already front-queued selection so the
+                        # whole-workbook exact map eventually covers it.
+                        _enqueue_sheet(
+                            sheet,
+                            front=False,
+                            exact_only_diff=need_exact_only_diff,
+                            force_recompute=True,
+                        )
+                        self._hidden_worker_events.append(
+                            {
+                                "event": "requeue",
+                                "sheet": str(sheet),
+                                "selected_sheet": str(
+                                    getattr(self, "selected_sheet", "") or ""
+                                ),
+                                "at": time.monotonic(),
+                            }
+                        )
+                        # Do not immediately dequeue the same hidden Sheet
+                        # while the activity-yield interval is still open.
+                        # That used to turn one wheel tick into a hot
+                        # interrupt/requeue loop which starved the Tk
+                        # heartbeat and delayed the eventual exact result.
+                        # A newly selected PENDING/CALCULATING tab is already
+                        # front-queued and must instead start without delay.
+                        selected_sheet = str(
+                            getattr(self, "selected_sheet", "") or ""
+                        )
+                        selected_state = str(
+                            self._sheet_exact_entry(selected_sheet).get("state")
+                            if selected_sheet else ""
+                        )
+                        with self._compute_lock:
+                            # This worker is currently handling ``sheet``.
+                            # A selected Sheet can be listed in inflight while
+                            # its completed cache merely waits for the UI
+                            # queue. Only a selected *front queue item* is
+                            # runnable next and may justify continuing now.
+                            selected_is_queue_front = bool(
+                                selected_sheet
+                                and self._compute_queue
+                                and str(self._compute_queue[0]) == selected_sheet
+                            )
+                            queue_head = (
+                                str(self._compute_queue[0])
+                                if self._compute_queue
+                                else ""
+                            )
+                        if _hidden_interrupt_must_defer(
+                            selected_state,
+                            selected_is_queue_front,
+                        ):
+                            # A selected CALCULATING Sheet can already have a
+                            # completed cache waiting in the main-thread UI
+                            # queue. It is not worker work. Continuing here
+                            # would hot-spin this hidden Sheet and starve that
+                            # cache apply; defer until the UI publishes it.
+                            _dlog(
+                                f"defer interrupted hidden sheet={sheet} "
+                                f"quiet_remaining={_hidden_sheet_quiet_delay(sheet):.3f}s "
+                                f"selected={selected_sheet} "
+                                f"queue_head={queue_head} "
+                                f"selected_queue_front={selected_is_queue_front}"
+                            )
+                            self._hidden_worker_events.append(
+                                {
+                                    "event": "defer",
+                                    "sheet": str(sheet),
+                                    "selected_sheet": selected_sheet,
+                                    "selected_state": selected_state,
+                                    "current_sheet": str(sheet),
+                                    "queue_head": queue_head,
+                                    "selected_is_queue_front": selected_is_queue_front,
+                                    "at": time.monotonic(),
+                                }
+                            )
+                            # Safety belt: a selected CALCULATING cache can be
+                            # waiting for UI publication and is not runnable
+                            # worker work.  Even after the quiet period has
+                            # elapsed, yield to the Tk drain for at least one
+                            # bounded timer turn instead of bare ``continue``.
+                            _resume_hidden_sheet_worker_after(
+                                max(0.020, _hidden_sheet_quiet_delay(sheet))
+                            )
+                            break
+                        continue
                     except Exception as e:
                         _dlog(f"bg compute failed {sheet}: {e}")
                         _queue_ui_task(
@@ -33640,10 +45694,19 @@ class SowMergeApp:
                     finally:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
-                            self._compute_done = min(self._compute_total, self._compute_done + 1)
+                            if getattr(self, "_active_compute_sheet", None) == sheet:
+                                self._active_compute_sheet = None
+                            if count_compute_done:
+                                self._compute_done = min(self._compute_total, self._compute_done + 1)
                             progress_done = self._compute_done
                             progress_total = self._compute_total
                             all_done = not self._compute_queue and not self._compute_inflight
+                        self._foreground_resume_coordinator.release_worker_turn(
+                            sheet,
+                            compute_generation,
+                            emit=_record_foreground_resume_event,
+                        )
+                        _sync_foreground_resume_diagnostics()
                         if all_done:
                             _queue_ui_task(
                                 lambda done=progress_done, total=progress_total: self._set_task_status(
@@ -33656,7 +45719,8 @@ class SowMergeApp:
                             # Queue behind the final cache-apply callback. This
                             # keeps editable-workbook parsing from contending
                             # with the first usable render and checkbox actions.
-                            _queue_ui_task(self._initial_sheet_ready_event.set)
+                            if not bool(getattr(self, "_snapshot_startup_lightweight", False)):
+                                _queue_ui_task(self._initial_sheet_ready_event.set)
             finally:
                 _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
                 with self._compute_lock:
@@ -33681,6 +45745,7 @@ class SowMergeApp:
         self._queue_ui_task = _queue_ui_task
         self._enqueue_sheet = _enqueue_sheet
         self._kick_worker = _kick_worker
+        self._schedule_remaining_exact_sheets = _schedule_remaining_exact_sheets
 
         # Lazy-create SheetView UI immediately; compute diff in background.
         def _on_tab_changed(_evt=None):
@@ -33705,6 +45770,23 @@ class SowMergeApp:
                         )
                         return
                 self.selected_sheet = tab_text
+                self._note_ui_activity("tab")
+                # The Notebook has now confirmed the selection.  Keep its
+                # original exact-request clock in the foreground ledger; a
+                # later cooperative preemption must not restart that clock.
+                foreground_confirm = getattr(
+                    self, "_foreground_resume_confirm_selection", None
+                )
+                if callable(foreground_confirm):
+                    foreground_confirm(tab_text)
+                # A previously selected view may have an after(0) viewport
+                # callback queued. It is not allowed to render behind this
+                # newly selected tab; terminalise its pending request for
+                # latency accounting.
+                for stale_sheet, stale_view in tuple(self.sheet_views.items()):
+                    if stale_sheet == tab_text or stale_view is None:
+                        continue
+                    stale_view._cancel_virtual_2d_publish("selected-sheet")
                 self._cancel_priority_exact_for_hidden(tab_text)
                 self.refresh_sheet_nav()
                 if tab_text in self._sheet_containers and not self._sheet_loaded.get(tab_text, False):
@@ -33722,16 +45804,129 @@ class SowMergeApp:
                         view._show_loading()
                 active_view = self.sheet_views.get(tab_text)
                 if active_view is not None:
-                    active_view._materialize_staged_pair_parts()
+                    retained = self._sheet_cache_store.pop(tab_text, None)
+                    if retained is not None:
+                        _dlog(f"apply retained cache to existing view: {tab_text}")
+                        _apply_sheet_cache(retained)
+                    # Tab activation is strictly view-only.  Formatting even
+                    # the first bounded rows here can normalize hundreds of
+                    # long cell strings synchronously and starve the Tk
+                    # heartbeat before a user has issued any viewport input.
+                    # Cache application installs the opaque first surface;
+                    # later viewport publication is the only on-demand,
+                    # generation-checked formatter.
                     if (
                         bool(getattr(active_view, "_pending_exact_render", False))
+                        and self._is_sheet_exact_current(tab_text)
                         and (
                             not bool(active_view.only_diff_var.get())
                             or active_view._has_valid_only_diff_snapshot_cache()
                         )
                     ):
-                        active_view._pending_exact_render = False
-                        active_view._refresh_mode_switch_preserving_selection(rescan=False)
+                        # A hidden full cache already owns immutable row,
+                        # column and raw-cell evidence.  Promoting it to the
+                        # selected tab must use that prepared evidence only:
+                        # ``refresh(rescan=False)`` still has legacy
+                        # Worksheet gateways for mutation paths.
+                        promotion_generation = int(
+                            self._sheet_compute_generation.get(tab_text, 0)
+                        )
+                        install_only_started = time.perf_counter()
+                        # A complete hidden result may have been retained
+                        # before this view was constructed. Install any staged
+                        # raw fragments now with an empty materialisation set;
+                        # this is data transfer only, never a formatted row.
+                        active_view._materialize_staged_pair_parts(())
+                        active_view._last_snapshot_install_only_ms = (
+                            time.perf_counter() - install_only_started
+                        ) * 1000.0
+                        active_view._snapshot_install_only_samples_ms.append(
+                            active_view._last_snapshot_install_only_ms
+                        )
+                        _dlog(
+                            f"TAB_PREPARED_PROMOTION raw-cache-installed "
+                            f"sheet={tab_text} "
+                            f"install_only_ms="
+                            f"{active_view._last_snapshot_install_only_ms:.2f}"
+                        )
+                        self._set_sheet_exact_state(
+                            tab_text,
+                            _SHEET_EXACT_CALCULATING,
+                            generation=promotion_generation,
+                            stage="正在发布已完成的精确结果",
+                            processed=self._compute_done,
+                            total=self._compute_total,
+                            reason="正在生成完整只读视图",
+                            refresh=False,
+                        )
+                        active_view._show_loading(
+                            f"正在发布 {tab_text} 的精确结果；完成前不会显示临时比较行。"
+                        )
+                        active_view._prepared_cache_publish_active = True
+
+                        def _finish_pending_cache_promotion(
+                            view=active_view,
+                            sheet_name=tab_text,
+                            generation=promotion_generation,
+                        ):
+                            if (
+                                self._is_closing
+                                or self.selected_sheet != sheet_name
+                                or int(self._sheet_compute_generation.get(sheet_name, 0))
+                                != int(generation)
+                            ):
+                                view._prepared_cache_publish_active = False
+                                view._pending_exact_render = True
+                                # The raw cache remains exact, but its staged
+                                # selected surface was superseded by a tab
+                                # switch. Restore the hidden terminal summary
+                                # so selecting it again can start a fresh
+                                # prepared-only promotion instead of being
+                                # stranded in CALCULATING.
+                                if (
+                                    not self._is_closing
+                                    and int(self._sheet_compute_generation.get(sheet_name, 0))
+                                    == int(generation)
+                                ):
+                                    self._set_sheet_exact_state(
+                                        sheet_name,
+                                        _SHEET_EXACT_CHANGED
+                                        if bool(self.sheet_diff_state.get(sheet_name, 0))
+                                        else _SHEET_EXACT_SAME,
+                                        generation=generation,
+                                        stage="精确比较完成（视图发布已取消）",
+                                        processed=self._compute_done,
+                                        total=self._compute_total,
+                                        reason="",
+                                        refresh=False,
+                                    )
+                                    self.refresh_sheet_nav()
+                                view._refresh_interaction_gate()
+                                return
+                            view._prepared_cache_publish_active = False
+                            view._pending_exact_render = False
+                            self._set_sheet_exact_state(
+                                sheet_name,
+                                _SHEET_EXACT_CHANGED
+                                if bool(self.sheet_diff_state.get(sheet_name, 0))
+                                else _SHEET_EXACT_SAME,
+                                generation=generation,
+                                stage="精确比较完成",
+                                processed=self._compute_done,
+                                total=self._compute_total,
+                                reason="",
+                                refresh=False,
+                            )
+                            view._hide_loading()
+                            view._refresh_interaction_gate()
+                            self.refresh_sheet_nav()
+                            _schedule_remaining_exact_sheets(sheet_name)
+
+                        promoted = active_view._publish_prepared_cache_surface(
+                            on_staged_complete=_finish_pending_cache_promotion
+                        )
+                        if promoted != "staged":
+                            _finish_pending_cache_promotion()
                     if (
                         bool(getattr(active_view, "_data_ready", False))
                         and (
@@ -33757,9 +45952,16 @@ class SowMergeApp:
                     meta = self.get_sheet_meta(tab_text)
                     if meta.get("view_mode") == "missing_sheet":
                         if _view and (not getattr(_view, "_data_ready", False)):
-                            _view.refresh(row_only=None, rescan=True)
-                            _view._update_cursor_lines()
-                            _view._hide_loading()
+                            # Tab activation is view-only. The background
+                            # exact worker owns every worksheet scan, including
+                            # one-sided Sheet structure; keep a clear loading
+                            # surface until it atomically publishes prepared
+                            # data rather than rescanning on Tk.
+                            _view._show_loading(
+                                f"正在后台精确计算 {tab_text}；当前不读取工作表..."
+                            )
+                            _enqueue_sheet(tab_text, front=True)
+                            _kick_worker()
                     elif not (_view and getattr(_view, "_data_ready", False)):
                         _enqueue_sheet(tab_text, front=True)
                         _kick_worker()
@@ -33782,9 +45984,20 @@ class SowMergeApp:
                                     return
                                 with self._compute_lock:
                                     still_background = sheet_name in self._compute_inflight or sheet_name in self._compute_queue
+                                    worker = self._compute_thread
+                                    worker_alive = bool(worker is not None and worker.is_alive())
                                 with self._ui_task_lock:
                                     pending_ui_result = bool(self._ui_tasks)
-                                if not still_background and not pending_ui_result:
+                                if still_background and not worker_alive:
+                                    # A tab can be selected in the narrow gap
+                                    # after a yielded worker clears `active`
+                                    # but before it clears `_compute_thread`.
+                                    # Preserve the front-queued selection and
+                                    # explicitly restart it once that owner is
+                                    # gone instead of waiting for a stale
+                                    # hidden-sheet resume timer.
+                                    _kick_worker()
+                                elif not still_background and not pending_ui_result:
                                     _enqueue_sheet(sheet_name, front=True)
                                     _kick_worker()
                                 v._show_loading(
@@ -33797,6 +46010,10 @@ class SowMergeApp:
                             self._safe_root_after(700, _force_refresh_if_still_loading)
                         except Exception:
                             pass
+                        # The initial kick may race the just-interrupted
+                        # worker's final cleanup.  A short retry gives the
+                        # foreground tab priority without synchronous work.
+                        self._safe_root_after(80, _kick_worker)
             except Exception as e:
                 _dlog(f"tab changed handler failed: {e}")
 
@@ -34009,23 +46226,50 @@ class SowMergeApp:
         else:
             self._fast_tabmark_thread = None
 
-        # Enqueue all sheets for background confirmation (slow compute)
+        # Large workbooks are selected-Sheet driven.  The active tab has
+        # already been queued by `_on_tab_changed`; leaving unopened Sheets as
+        # metadata prevents their worksheet XML from being scanned at startup.
+        # The legacy eager queue remains available behind the rollback flag.
         try:
-            for s in self.compare_sheets:
-                _enqueue_sheet(s, front=False)
-            if self.compare_sheets:
+            if (not _LARGE_SHEET_VIRTUALIZATION_ENABLED):
+                for s in self.compare_sheets:
+                    _enqueue_sheet(s, front=False)
+            if self._compute_queue:
                 _kick_worker()
-            else:
+            elif not self.compare_sheets:
                 self._set_task_status("数据加载完成：没有需要逐行计算的同名 Sheet", active=False)
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
 
     def push_undo(self, action: dict):
         try:
+            if (
+                isinstance(action, dict)
+                and action.get("target") in ("A", "B")
+                and action.get("cells")
+                and "overlay_transaction" not in action
+            ):
+                view = getattr(self, "sheet_views", {}).get(action.get("sheet"))
+                if view is not None:
+                    transaction = view._overlay_transaction_for_cells(
+                        action.get("target"), action.get("cells")
+                    )
+                    if transaction is not None:
+                        action["overlay_transaction"] = transaction
+                target = action.get("target")
+                if target in ("A", "B") and action.get("cells") and "redo_cells" not in action:
+                    ws_edit = self.ws_a_edit(action["sheet"]) if target == "A" else self.ws_b_edit(action["sheet"])
+                    ws_val = self.ws_a_val(action["sheet"]) if target == "A" else self.ws_b_val(action["sheet"])
+                    action["redo_cells"] = [
+                        (int(row), int(col), ws_edit.cell(int(row), int(col)).value, ws_val.cell(int(row), int(col)).value)
+                        for row, col, _old_edit, _old_value in action["cells"]
+                    ]
             capture = getattr(self, "_undo_group_capture", None)
             if capture is not None:
                 capture["actions"].append(action)
                 return
+            if not self._redo_replaying:
+                self.redo_stack.clear()
             self.undo_stack.append(action)
             if len(self.undo_stack) > 20:
                 self.undo_stack.pop(0)
@@ -34096,15 +46340,13 @@ class SowMergeApp:
                 return
 
     def refresh_sheet_nav(self):
-        # Skip the (expensive) destroy/rebuild of all sheet buttons when nothing
-        # that affects them has changed. refresh() calls this on every full
-        # render, so for large sheets this avoids rebuilding the whole nav bar
-        # on edits/scroll-driven refreshes where the sheet set is unchanged.
+        """Refresh Sheet badges without rebuilding unchanged navigation widgets."""
         try:
             nav_sig = (
                 tuple(self.display_sheets),
                 tuple((s, self.get_sheet_meta(s).get("view_mode")) for s in self.display_sheets),
                 tuple((s, int(self.sheet_diff_state.get(s, 0))) for s in self.display_sheets),
+                tuple((s, self._sheet_exact_entry(s).get("generation"), self._sheet_exact_entry(s).get("state")) for s in self.display_sheets),
                 getattr(self, "selected_sheet", None),
                 getattr(
                     getattr(self, "_only_diff_progress_owner", (None,))[0]
@@ -34121,9 +46363,6 @@ class SowMergeApp:
             return
         self._nav_sig = nav_sig
 
-        for child in list(self.nav_inner.winfo_children()):
-            child.destroy()
-
         try:
             from tkinter import font as tkfont
             if not hasattr(self, "_nav_font"):
@@ -34134,7 +46373,27 @@ class SowMergeApp:
             self._nav_font = None
             self._nav_font_bold = None
 
-        def add_btn(label: str, tab_text: str, kind: str, state: int = 0):
+        def _exact_badge(sheet: str) -> str:
+            state = str(self._sheet_exact_entry(sheet).get("state") or _SHEET_EXACT_PENDING)
+            return {
+                _SHEET_EXACT_PENDING: "等待",
+                _SHEET_EXACT_CALCULATING: "计算中",
+                _SHEET_EXACT_SAME: "精确相同",
+                _SHEET_EXACT_CHANGED: "精确变更",
+                _SHEET_EXACT_UNRESOLVED: "未解决",
+                _SHEET_EXACT_FAILED: "失败",
+            }.get(state, state)
+        nav_buttons = getattr(self, "_nav_buttons", None)
+        if not isinstance(nav_buttons, dict):
+            nav_buttons = {}
+            self._nav_buttons = nav_buttons
+        current_sheets = tuple(self.display_sheets)
+        if tuple(nav_buttons) != current_sheets:
+            for child in list(self.nav_inner.winfo_children()):
+                child.destroy()
+            nav_buttons.clear()
+
+        def configure_btn(tab_text: str, kind: str, state: int = 0):
             if kind == "missing":
                 bg = "#FFE5E5"
             else:
@@ -34145,37 +46404,61 @@ class SowMergeApp:
                     bg = "#FFF3B0"  # pale yellow
                 else:
                     bg = "#F2F2F2"
+            exact_state = str(self._sheet_exact_entry(tab_text).get("state") or _SHEET_EXACT_PENDING)
+            if exact_state == _SHEET_EXACT_CHANGED:
+                bg = "#FFB300"
+            elif exact_state == _SHEET_EXACT_SAME:
+                bg = "#C8E6C9"
+            elif exact_state == _SHEET_EXACT_CALCULATING:
+                bg = "#BBDEFB"
+            elif exact_state in (_SHEET_EXACT_UNRESOLVED, _SHEET_EXACT_FAILED):
+                bg = "#FFCDD2"
             is_selected = (tab_text == getattr(self, "selected_sheet", None))
             if is_selected:
                 bg = "#D9D9D9"
-            b = tk.Button(self.nav_inner, text=label,
-                          relief="sunken" if is_selected else "groove",
-                          bd=2 if is_selected else 1,
-                          padx=8, pady=2, bg=bg,
-                          command=lambda: self._select_tab(tab_text))
+            b = nav_buttons.get(tab_text)
+            if b is None or not b.winfo_exists():
+                b = tk.Button(
+                    self.nav_inner,
+                    padx=8,
+                    pady=2,
+                    command=lambda target=tab_text: self._select_tab(target),
+                )
+                nav_buttons[tab_text] = b
+                b.pack(side="left", padx=4)
             progress_owner = getattr(self, "_only_diff_progress_owner", None)
             if progress_owner is not None and tab_text != getattr(
                 progress_owner[0],
                 "sheet",
                 None,
             ):
-                b.configure(state="disabled")
+                button_state = "disabled"
+            else:
+                button_state = "normal"
             try:
                 if is_selected and self._nav_font_bold:
-                    b.configure(font=self._nav_font_bold)
+                    font = self._nav_font_bold
                 elif self._nav_font:
-                    b.configure(font=self._nav_font)
+                    font = self._nav_font
+                else:
+                    font = None
             except Exception:
-                pass
-            b.pack(side="left", padx=4)
+                font = None
+            options = {
+                "text": f"{tab_text} · {_exact_badge(tab_text)}",
+                "relief": "sunken" if is_selected else "groove",
+                "bd": 2 if is_selected else 1,
+                "bg": bg,
+                "state": button_state,
+            }
+            if font is not None:
+                options["font"] = font
+            b.configure(**options)
 
         for s in self.display_sheets:
             meta = self.get_sheet_meta(s)
             kind = "missing" if meta.get("view_mode") == "missing_sheet" else "common"
-            add_btn(s, s, kind, state=int(self.sheet_diff_state.get(s, 0)))
-
-        self.nav_canvas.update_idletasks()
-        self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
+            configure_btn(s, kind, state=int(self.sheet_diff_state.get(s, 0)))
 
     def open_textdiff(self):
         try:
@@ -34698,16 +46981,152 @@ class SowMergeApp:
             )
             return
 
-        def _do_recalc():
-            new_a = _maybe_recalc_and_prepare_val_path(self.file_a, force=True)
-            new_b = _maybe_recalc_and_prepare_val_path(self.file_b, force=True)
-            new_base = _maybe_recalc_and_prepare_val_path(self.base_path, force=True) if getattr(self, "has_base", False) else None
-            self._apply_recalc_results(new_a=new_a, new_b=new_b, new_base=new_base)
-
         try:
-            self._with_progress("重算中", "正在重算并刷新，请稍候...", _do_recalc)
+            results, failed = self._recalculate_formula_value_paths(
+                self._formula_cache_input_paths(),
+                title="重算中",
+                message="正在重算并刷新，请稍候...",
+            )
+            self._apply_recalc_results(
+                new_a=results.get("mine"),
+                new_b=results.get("theirs"),
+                new_base=results.get("base"),
+            )
+            if failed:
+                messagebox.showwarning(
+                    "部分文件未能重算",
+                    "以下文件无法通过本机 Excel 取得最新计算结果，已保留原显示：\n\n"
+                    + "\n".join(failed),
+                    parent=self.root,
+                )
         except Exception as e:
             messagebox.showerror("重算失败", f"重算失败：\n{e}")
+
+    def _formula_cache_input_paths(self) -> list[tuple[str, str, str]]:
+        """Return stable keys, user labels and source paths for value refresh."""
+        paths = [
+            ("mine", "Mine", self.file_a),
+            ("theirs", "Theirs", self.file_b),
+        ]
+        if getattr(self, "has_base", False):
+            paths.append(("base", "Base", self.base_path))
+        return [(key, label, path) for key, label, path in paths if path]
+
+    def _schedule_formula_cache_prompt(self):
+        """Detect missing formula caches in the background, then ask once."""
+        if self._formula_cache_scan_started or not _USE_CACHED_VALUES_ONLY:
+            return
+        self._formula_cache_scan_started = True
+        inputs = self._formula_cache_input_paths()
+
+        def _worker():
+            missing_named = _find_missing_formula_cache_paths(
+                [(label, path) for _key, label, path in inputs]
+            )
+            if not missing_named or self._is_closing:
+                return
+            missing_paths = {path for _label, path in missing_named}
+            missing = [item for item in inputs if item[2] in missing_paths]
+            if not missing:
+                return
+
+            def _prompt():
+                if self._is_closing or self._formula_cache_prompt_shown:
+                    return
+                self._formula_cache_prompt_shown = True
+                filenames = "\n".join(
+                    f"- {label}: {os.path.basename(path)}" for _key, label, path in missing
+                )
+                should_recalc = messagebox.askyesno(
+                    "检测到公式没有计算结果",
+                    "以下文件包含尚未保存计算结果的公式：\n\n"
+                    f"{filenames}\n\n"
+                    "是否调用本机 Excel 重新计算，并按最终值刷新对比？\n"
+                    "重算只操作临时副本，不会修改原文件。",
+                    icon="question",
+                    parent=self.root,
+                )
+                if not should_recalc:
+                    return
+                if self.modified_a or self.modified_b:
+                    messagebox.showwarning(
+                        "存在未保存操作",
+                        "为保护当前合并结果，不能在已有未保存操作后重新读取磁盘文件。请先保存后再点击“重算并刷新”。",
+                        parent=self.root,
+                    )
+                    return
+                try:
+                    results, failed = self._recalculate_formula_value_paths(
+                        missing,
+                        title="正在重新计算公式",
+                        message="Excel 正在重新计算公式并刷新对比。完成前请勿操作窗口...",
+                    )
+                    self._apply_recalc_results(
+                        new_a=results.get("mine"),
+                        new_b=results.get("theirs"),
+                        new_base=results.get("base"),
+                    )
+                    if failed:
+                        messagebox.showwarning(
+                            "部分文件未能重算",
+                            "以下文件未能通过本机 Excel 重算，已保留公式文本显示：\n\n"
+                            + "\n".join(failed),
+                            parent=self.root,
+                        )
+                except Exception as e:
+                    messagebox.showerror("重算失败", f"重算失败：\n{e}", parent=self.root)
+
+            # Tk must only create modal dialogs on its UI thread.  Worker
+            # threads use the application's drained UI-task queue instead of
+            # calling ``root.after`` directly (which can silently fail in
+            # some Windows/Tk builds).
+            queue_ui = getattr(self, "_queue_ui_task", None)
+            if callable(queue_ui):
+                queue_ui(_prompt)
+            else:
+                _dlog("formula cache prompt skipped: UI task queue unavailable")
+
+        self._formula_cache_scan_thread = self._start_background_thread(
+            _worker,
+            name="sow-formula-cache-scan",
+        )
+
+    def _recalculate_formula_value_paths(self, inputs, *, title: str, message: str):
+        """Recalculate selected input copies under a modal, non-interactive dialog."""
+        inputs = list(inputs or ())
+
+        def _do_recalc(report):
+            results = {}
+            failed = []
+            total = max(1, len(inputs))
+            for index, (key, label, path) in enumerate(inputs, start=1):
+                report(
+                    "正在重新计算公式",
+                    f"正在通过 Excel 重算 {label}：{os.path.basename(path)} ({index}/{total})",
+                    (index - 1) * 100.0 / total,
+                )
+                tmp = _recalc_and_prepare_val_path(path)
+                if tmp:
+                    results[key] = tmp
+                else:
+                    failed.append(f"{label}: {os.path.basename(path)}")
+                report(
+                    "正在重新计算公式",
+                    f"已完成 {label}：{os.path.basename(path)} ({index}/{total})",
+                    index * 100.0 / total,
+                )
+            return results, failed
+
+        # _with_progress uses grab_set and the interactive-action gate.  Its
+        # worker mode keeps the progress window alive while Excel runs, rather
+        # than freezing the UI thread behind a synchronous COM process.
+        return self._with_progress(
+            title,
+            message,
+            _do_recalc,
+            run_in_background=True,
+            pass_reporter=True,
+        )
 
     def _schedule_auto_recalc(self):
         if not (_AUTO_RECALC_ON_OPEN and _USE_CACHED_VALUES_ONLY):
@@ -35088,6 +47507,9 @@ class SowMergeApp:
 
     def _refresh_current_view_after_val_reload(self):
         try:
+            clear_foreground = getattr(self, "_foreground_resume_clear", None)
+            if callable(clear_foreground):
+                clear_foreground("value-reload")
             self._refresh_sheet_catalog()
             self._sheet_diff_confirmed.clear()
             for s in self.compare_sheets:
@@ -35101,14 +47523,24 @@ class SowMergeApp:
                 self._compute_total = max(1, len(self.compare_sheets))
                 self._compute_done = 0
                 self._sheet_cache_store.clear()
+            with self._selected_sheet_snapshot_lock:
+                self._selected_sheet_snapshot_cache.clear()
             for sheet, view in list(getattr(self, "sheet_views", {}).items()):
                 if view is None:
                     continue
+                # This path increments generations directly (rather than via
+                # `_set_sheet_exact_state`), so it must explicitly revoke the
+                # after(0) viewport owner from the old value workbook.
+                view._cancel_virtual_2d_publish("generation")
                 view._data_ready = False
                 view._row_model_exact = False
                 view._pair_diff_full_exact = False
                 view._base_diff_full_exact = False
                 view._only_diff_rows_exact = False
+                view._snapshot_alias_telemetry = None
+                metrics = dict(getattr(view, "_snapshot_child_metrics", {}) or {})
+                metrics.pop("base_alias_telemetry", None)
+                view._snapshot_child_metrics = metrics
                 view._invalidate_only_diff_snapshot_cache()
                 view._refresh_interaction_gate()
                 if sheet == getattr(self, "selected_sheet", None):
@@ -35833,6 +48265,11 @@ class SowMergeApp:
 
 
 def main():
+    # This ledger owns only paths created during this invocation.  Before the
+    # UI exists main cleans it; after construction the app takes the same set
+    # over and closes it exactly once during shutdown.
+    startup_owned_paths: set[str] = set()
+    startup_ownership_transferred = False
     try:
         try:
             _trace_launch("=" * 72)
@@ -36049,7 +48486,10 @@ def main():
                     report("正在识别 SVN 三方角色", launch_context.classification_reason, 8)
                     report("正在读取本地 WC pristine 和作者", "仅查询 .svn/wc.db，不访问网络...", 22)
                     report("正在比较 OOXML 包", "逐成员比较 Base、Mine、Theirs 和 target pristine...", 45)
-                    result = run_startup_merge_analysis(launch_context)
+                    result = run_startup_merge_analysis(
+                        launch_context,
+                        owned_startup_paths=startup_owned_paths,
+                    )
                     report(
                         "三方启动分析完成",
                         f"自动处理 {result.outcome.merged_count} 项；未解决 {result.outcome.unresolved_count} 项",
@@ -36105,7 +48545,10 @@ def main():
                 raw_theirs=raw_theirs_arg,
                 launch_context=launch_context,
                 startup_outcome=analysis.outcome if analysis else None,
+                startup_owned_paths=startup_owned_paths,
+                startup_inputs_prepared=True,
             )
+            startup_ownership_transferred = True
             try:
                 _dlog("open UI: five-identity merge mode")
             except Exception:
@@ -36139,17 +48582,13 @@ def main():
                 # prevent an ordinary 2-way comparison from opening.
                 _dlog(f"2-way author metadata unavailable: {type(exc).__name__}:{exc}")
 
-        # Two-way diff inputs can also be raw SVN sidecars such as
-        # ``Book.xlsx.r123``.  Preserve their diagnostic identities, but give
-        # openpyxl stable workbook-suffixed copies just as the three-way path
-        # does.  This is normalization only; it never re-exports or substitutes
-        # content from the working copy.
-        if a:
-            a = _ensure_xlsx_copy(a)
-        if b:
-            b = _ensure_xlsx_copy(b)
-
         if args.textdiff:
+            # Text-only dispatch has no SowMergeApp to take ownership.  It is
+            # the sole two-way exception: normalize raw sidecars here, record
+            # the exact copies in main's ledger, and let the non-transferred
+            # ``finally`` clean them after TortoiseMerge is launched.
+            a = _ensure_xlsx_copy(a, owned_paths=startup_owned_paths)
+            b = _ensure_xlsx_copy(b, owned_paths=startup_owned_paths)
             try:
                 temp_root = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Temp", "TortoiseXlsTemp")
                 os.makedirs(temp_root, exist_ok=True)
@@ -36171,7 +48610,9 @@ def main():
             raw_mine=raw_mine_arg,
             raw_theirs=raw_theirs_arg,
             launch_context=two_way_context,
+            startup_owned_paths=startup_owned_paths,
         )
+        startup_ownership_transferred = True
         app.run()
 
     except Exception:
@@ -36185,9 +48626,28 @@ def main():
         except Exception:
             print(err, file=sys.stderr)
         sys.exit(1)
+    finally:
+        if not startup_ownership_transferred and startup_owned_paths:
+            try:
+                _cleanup_unclaimed_startup_temp_paths(
+                    startup_owned_paths,
+                    reason="main-pre-app",
+                )
+            except Exception as exc:
+                try:
+                    _dlog(
+                        "startup owned-temp cleanup failed before UI transfer: "
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
+    # Required for Windows spawn and PyInstaller --onefile: the helper child
+    # must enter multiprocessing's bootstrap instead of recursively creating
+    # this GUI application.
+    multiprocessing.freeze_support()
     if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-author-query":
         raise SystemExit(_run_tortoise_svn_author_probe_entrypoint(sys.argv[2:]))
     main()

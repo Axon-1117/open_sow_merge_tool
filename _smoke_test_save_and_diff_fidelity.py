@@ -2,21 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tempfile
 import zipfile
 from types import SimpleNamespace
 
 from openpyxl import Workbook, load_workbook
 
 import sow_merge_tool as mod
-from _test_temp_utils import make_temp_dir
 
 
 SHEET = "GunshipsMaster@design"
 REPORTED_COORDINATES = ("F5", "H5", "H6", "H7", "H9", "H10", "H11")
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _record_input_hash(input_hashes: dict[str, str], path: str):
+    path = os.path.abspath(path)
+    assert os.path.isfile(path), path
+    input_hashes[path] = _sha256(path)
 
 
 def _make_book(path: str, *, blank_kind: str):
@@ -59,7 +74,9 @@ def _write_without_worksheet_dimension(source: str, output: str):
             dst.writestr(info, payload)
 
 
-def _test_missing_dimension_recovers_actual_scan_bounds(root: str):
+def _test_missing_dimension_recovers_actual_scan_bounds(
+    root: str, input_hashes: dict[str, str]
+):
     source = os.path.join(root, "normal-dimension.xlsx")
     dimensionless = os.path.join(root, "missing-dimension.xlsx")
     wb = Workbook()
@@ -71,6 +88,8 @@ def _test_missing_dimension_recovers_actual_scan_bounds(root: str):
     wb.save(source)
     wb.close()
     _write_without_worksheet_dimension(source, dimensionless)
+    _record_input_hash(input_hashes, source)
+    _record_input_hash(input_hashes, dimensionless)
 
     loaded = mod.load_workbook(dimensionless, read_only=True, data_only=False)
     try:
@@ -82,10 +101,11 @@ def _test_missing_dimension_recovers_actual_scan_bounds(root: str):
         loaded.close()
 
 
-def _test_utf8_native_payload_reader(root: str):
+def _test_utf8_native_payload_reader(root: str, input_hashes: dict[str, str]):
     payload_path = os.path.join(root, "ops.json")
     with open(payload_path, "w", encoding="utf-8", newline="") as stream:
         json.dump({"value": "中文保存 / 护山神兽"}, stream, ensure_ascii=False)
+    _record_input_hash(input_hashes, payload_path)
 
     script = (
         "$ErrorActionPreference='Stop';"
@@ -101,15 +121,17 @@ def _test_utf8_native_payload_reader(root: str):
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "中文保存 / 护山神兽", repr(result.stdout)
 
 
-def _test_native_script_uses_explicit_utf8(root: str):
-    source = os.path.join(root, "source.xlsx")
+def _test_native_script_uses_explicit_utf8(root: str, input_hashes: dict[str, str]):
+    source = os.path.join(root, "native-script-source.xlsx")
     output = os.path.join(root, "native-output.xlsx")
     _make_book(source, blank_kind="none")
+    _record_input_hash(input_hashes, source)
     captured = {}
     original_runner = mod._run_excel_powershell_with_transient_retry
 
@@ -129,9 +151,11 @@ def _test_native_script_uses_explicit_utf8(root: str):
     assert "ReadAllText($opsPath,[System.Text.Encoding]::UTF8)" in captured["script"]
 
 
-def _test_native_sheet_copy_payload_is_utf8_and_positioned(root: str):
-    source = os.path.join(root, "source.xlsx")
-    source_b = os.path.join(root, "source-b.xlsx")
+def _test_native_sheet_copy_payload_is_utf8_and_positioned(
+    root: str, input_hashes: dict[str, str]
+):
+    source = os.path.join(root, "sheet-copy-source.xlsx")
+    source_b = os.path.join(root, "sheet-copy-source-b.xlsx")
     output = os.path.join(root, "sheet-copy-native.xlsx")
     _make_book(source, blank_kind="none")
     _make_book(source_b, blank_kind="none")
@@ -141,6 +165,8 @@ def _test_native_sheet_copy_payload_is_utf8_and_positioned(root: str):
         wb.save(source_b)
     finally:
         wb.close()
+    _record_input_hash(input_hashes, source)
+    _record_input_hash(input_hashes, source_b)
 
     captured = {}
     original_runner = mod._run_excel_powershell_with_transient_retry
@@ -177,12 +203,15 @@ def _test_native_sheet_copy_payload_is_utf8_and_positioned(root: str):
     assert "targetIndex" in captured["script"]
 
 
-def _test_cell_only_and_fallback_unicode_saves(root: str):
-    source = os.path.join(root, "source.xlsx")
+def _test_cell_only_and_fallback_unicode_saves(
+    root: str, input_hashes: dict[str, str]
+):
+    source = os.path.join(root, "unicode-save-source.xlsx")
     cell_only_2way = os.path.join(root, "cell-only-2way.xlsx")
     cell_only_3way = os.path.join(root, "cell-only-3way.xlsx")
     fallback = os.path.join(root, "fallback.xlsx")
     _make_book(source, blank_kind="none")
+    _record_input_hash(input_hashes, source)
 
     for output in (cell_only_2way, cell_only_3way):
         mod._build_manual_merge_xlsx_via_zip(
@@ -263,14 +292,39 @@ def _test_blank_equivalence_and_conservative_diffs():
 
 
 def main():
-    root = make_temp_dir("sow_save_diff_fidelity_")
-    _test_missing_dimension_recovers_actual_scan_bounds(root)
-    _test_utf8_native_payload_reader(root)
-    _test_native_script_uses_explicit_utf8(root)
-    _test_native_sheet_copy_payload_is_utf8_and_positioned(root)
-    _test_cell_only_and_fallback_unicode_saves(root)
-    _test_blank_equivalence_and_conservative_diffs()
-    print("SMOKE_SAVE_AND_DIFF_FIDELITY_OK")
+    temporary = tempfile.TemporaryDirectory(prefix="sow_save_diff_fidelity_")
+    root = temporary.name
+    input_hashes: dict[str, str] = {}
+    primary = None
+    try:
+        _test_missing_dimension_recovers_actual_scan_bounds(root, input_hashes)
+        _test_utf8_native_payload_reader(root, input_hashes)
+        _test_native_script_uses_explicit_utf8(root, input_hashes)
+        _test_native_sheet_copy_payload_is_utf8_and_positioned(root, input_hashes)
+        _test_cell_only_and_fallback_unicode_saves(root, input_hashes)
+        _test_blank_equivalence_and_conservative_diffs()
+        print("SMOKE_SAVE_AND_DIFF_FIDELITY_OK")
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup_errors = []
+        for path, before_hash in input_hashes.items():
+            try:
+                assert _sha256(path) == before_hash, path
+            except BaseException as exc:
+                cleanup_errors.append(f"input SHA {path!r}: {exc!r}")
+        try:
+            temporary.cleanup()
+            assert not os.path.lexists(root), root
+        except BaseException as exc:
+            cleanup_errors.append(f"owned temporary root: {exc!r}")
+        if cleanup_errors:
+            message = "save-and-diff fidelity cleanup failed: " + "; ".join(cleanup_errors)
+            if primary is not None:
+                primary.add_note(message)
+            else:
+                raise AssertionError(message)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,134 @@
+{
+  "fixture": "WorldMonster",
+  "fresh_process": true,
+  "phases": {
+    "cached_revisit": {
+      "errors": [],
+      "heartbeat_max_gap_p95_ms": 153.443,
+      "p50_ms": 70.339,
+      "p95_ms": 70.339,
+      "rss_peak_p95_bytes": 218112000,
+      "samples": [
+        {
+          "fixture": "WorldMonster",
+          "phase": "cached_revisit",
+          "pid": 41656,
+          "rss_after_bytes": 218112000,
+          "rss_delta_bytes": 143450112,
+          "rss_peak_bytes": 218112000,
+          "sheet": "WorldMonsterSurvivor@design",
+          "snapshot_metrics_ms": {
+            "adapter": 557.781,
+            "base_ingest": 0.0,
+            "binary_identity_fast_path": true,
+            "compare": 2.695,
+            "mine_ingest": 3071.302,
+            "paired_ingest": 3071.302,
+            "theirs_ingest": 3071.302,
+            "total": 3707.79
+          },
+          "status": "ok",
+          "timings_ms": {
+            "cached_revisit": 70.339,
+            "selected_ready": 8201.806,
+            "startup": 1304.251
+          },
+          "ui_heartbeat_max_gap_ms": 153.443,
+          "virtual_publish_ms": 50.712,
+          "virtual_publish_phases_ms": {
+            "delete": 6.383900006767362,
+            "headers": 50.612199993338436,
+            "insert": 12.392000004183501,
+            "row_cell_tags": 50.66759997862391,
+            "total": 50.711599993519485
+          }
+        }
+      ],
+      "viewport_publish_p95_ms": 50.712
+    },
+    "scroll": {
+      "errors": [],
+      "heartbeat_max_gap_p95_ms": 66.539,
+      "p50_ms": 10.847,
+      "p95_ms": 10.847,
+      "rss_peak_p95_bytes": 217636864,
+      "samples": [
+        {
+          "fixture": "WorldMonster",
+          "phase": "scroll",
+          "pid": 13144,
+          "rss_after_bytes": 217636864,
+          "rss_delta_bytes": 142557184,
+          "rss_peak_bytes": 217636864,
+          "sheet": "WorldMonsterSurvivor@design",
+          "snapshot_metrics_ms": {
+            "adapter": 569.626,
+            "base_ingest": 0.0,
+            "binary_identity_fast_path": true,
+            "compare": 3.399,
+            "mine_ingest": 3035.614,
+            "paired_ingest": 3035.614,
+            "theirs_ingest": 3035.614,
+            "total": 3693.375
+          },
+          "status": "ok",
+          "timings_ms": {
+            "scroll": 10.847,
+            "scroll_request_settle": 129.934,
+            "selected_ready": 8099.82,
+            "startup": 1343.218
+          },
+          "ui_heartbeat_max_gap_ms": 66.539,
+          "virtual_publish_ms": 10.847,
+          "virtual_publish_phases_ms": {
+            "delete": 1.8063000170513988,
+            "headers": 10.758699994767085,
+            "insert": 2.5422000035177916,
+            "row_cell_tags": 10.808599996380508,
+            "total": 10.847300000023097
+          }
+        }
+      ],
+      "viewport_publish_p95_ms": 10.847
+    },
+    "selected_ready": {
+      "errors": [],
+      "heartbeat_max_gap_p95_ms": 0.0,
+      "p50_ms": 8037.309,
+      "p95_ms": 8037.309,
+      "rss_peak_p95_bytes": 218308608,
+      "samples": [
+        {
+          "fixture": "WorldMonster",
+          "phase": "selected_ready",
+          "pid": 9416,
+          "rss_after_bytes": 218308608,
+          "rss_delta_bytes": 143749120,
+          "rss_peak_bytes": 218308608,
+          "sheet": "WorldMonsterSurvivor@design",
+          "snapshot_metrics_ms": {
+            "adapter": 568.052,
+            "base_ingest": 0.0,
+            "binary_identity_fast_path": true,
+            "compare": 2.469,
+            "mine_ingest": 2961.594,
+            "paired_ingest": 2961.594,
+            "theirs_ingest": 2961.594,
+            "total": 3633.452
+          },
+          "status": "ok",
+          "timings_ms": {
+            "selected_ready": 8037.309,
+            "startup": 1314.164
+          },
+          "ui_heartbeat_max_gap_ms": 0.0,
+          "virtual_publish_ms": 0.0,
+          "virtual_publish_phases_ms": {}
+        }
+      ],
+      "viewport_publish_p95_ms": 0.0
+    }
+  },
+  "runs": 1,
+  "schema": "large-sheet-phase-baseline-v1"
+}
