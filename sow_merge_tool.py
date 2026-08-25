@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-25.update77"
-APP_BUILD_TAG = "new154-column-sheet-row-identity"
+APP_VERSION = "2026-08-25.update78"
+APP_BUILD_TAG = "new155-retained-cache-main-surface"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -18114,6 +18114,14 @@ class SheetView:
         if bool(getattr(self, "_virtual_widgets_warmed", False)):
             return
         self._virtual_widgets_warmed = True
+        # A retained hidden-Sheet cache can be applied synchronously while the
+        # SheetView constructor is still returning. In that path the exact
+        # surface is already populated before this after-idle warmup runs.
+        # Never erase a published surface merely to preallocate Tk storage.
+        if bool(getattr(self, "_data_ready", False)) or bool(
+            getattr(self, "display_rows", ())
+        ):
+            return
         for widget in (
             getattr(self, "left", None), getattr(self, "base", None), getattr(self, "right", None),
             getattr(self, "left_ln", None), getattr(self, "base_ln", None), getattr(self, "right_ln", None),
