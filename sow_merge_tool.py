@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-25.update79"
-APP_BUILD_TAG = "new156-strict-implicit-row-identity"
+APP_VERSION = "2026-08-25.update80"
+APP_BUILD_TAG = "new157-region-c-hover-cache-sync"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -30285,14 +30285,15 @@ class SheetView:
         return cache
 
     def _cache_base_line_from_row_values(self, pair_idx: int, row_vals) -> str:
-        line = self._render_line_from_raw_parts(
-            self._raw_parts_from_row_values(
-                row_vals, max(self.max_col, int(getattr(self, "col_max_base", 1) or 1))
-            ),
-            "BASE",
-        )
-        self.pair_text_base[int(pair_idx)] = line
+        pair_idx = int(pair_idx)
+        raw = tuple(self._raw_parts_from_row_values(
+            row_vals, max(self.max_col, int(getattr(self, "col_max_base", 1) or 1))
+        ))
+        line = self._render_line_from_raw_parts(raw, "BASE")
+        self.pair_raw_parts_base[pair_idx] = raw
+        self.pair_text_base[pair_idx] = line
         return line
+
 
     def _quick_diff_cols_from_value_rows(
         self,
@@ -30669,7 +30670,7 @@ class SheetView:
         )
         for pair_idx in targets:
             ra, rb = self.row_pairs[pair_idx]
-            line_a, line_b, cols = self._build_row_and_diff_pair_from_values(
+            raw_a, raw_b, cols = self._build_row_parts_and_diff_pair_from_values(
                 _row_from_cache(rows_a_val, ra, self.max_col),
                 _row_from_cache(rows_b_val, rb, self.max_col),
                 ra=ra,
@@ -30678,8 +30679,10 @@ class SheetView:
                 row_b_edit_vals=_row_from_cache(rows_b_edit, rb, self.max_col),
             )
             self.pair_diff_cols[pair_idx] = cols
-            self.pair_text_a[pair_idx] = line_a
-            self.pair_text_b[pair_idx] = line_b
+            self.pair_raw_parts_a[pair_idx] = tuple(raw_a)
+            self.pair_raw_parts_b[pair_idx] = tuple(raw_b)
+            self.pair_text_a[pair_idx] = self._render_line_from_raw_parts(raw_a, "A")
+            self.pair_text_b[pair_idx] = self._render_line_from_raw_parts(raw_b, "B")
 
         if self._is_three_way_enabled() and getattr(self.app, "has_base", False):
             for pair_idx in targets:
@@ -30709,11 +30712,21 @@ class SheetView:
             for pair_idx, base_row in zip(targets, base_rows_needed):
                 if base_row is None:
                     self.pair_text_base[pair_idx] = ""
+                    self.pair_raw_parts_base.pop(pair_idx, None)
                 else:
                     self._cache_base_line_from_row_values(
                         pair_idx,
                         _row_from_cache(rows_base_val, base_row, self.max_col),
                     )
+        # Formatted row text, C-area inspection and hover comparison must
+        # switch to the same exact generation after an in-memory mutation.
+        # Reset same-target dedupe keys so a stationary pointer cannot reuse
+        # a payload assembled from the pre-adoption raw fragments.
+        self._last_hover_payload_request_key = None
+        self._last_hover_payload_request_value = None
+        self._last_hover_target_key = None
+        self._last_hover_compare_key = None
+        self._hover_payload_cache.clear()
         return len(targets)
 
     def _all_logical_diff_cols_for_pair(self, pair_idx: int) -> set[int]:

@@ -381,6 +381,60 @@ def test_explicit_applicable_region_writes_immediately():
         app._shutdown_root()
 
 
+
+def test_region_adoption_refreshes_c_area_and_hover_payload():
+    with _typed_region_case("sow_region_c_hover_") as owned:
+        mine, theirs = _ordinary_diff_rows(typed_schema=True)
+        app, view = _open_view(mine, theirs, owned_case=owned)
+        _request_edit_backend_for_completed_operation(app)
+        view._set_copy_scope_mode("region")
+        target_row = next(
+            row
+            for row in range(1, app.ws_a_val("Data").max_row + 1)
+            if app.ws_a_val("Data").cell(row=row, column=1).value == "id-2"
+        )
+        pair_idx = view.row_a_to_pair_idx[target_row]
+        view._select_line(view.row_to_line[pair_idx])
+        view.update_hover_driven_panels(
+            pair_idx, 2, "A", force_panel=True, refresh_c_area=False
+        )
+        assert "same-2" in view.hover_cmp_text.get("1.0", "end-1c")
+        assert view._last_hover_payload_request_key is not None
+
+        view._run_copy_action_by_mode("B2A")
+        _pump(app.root)
+        assert view._last_hover_payload_request_key is None
+        assert view._last_hover_payload_request_value is None
+        assert view._last_hover_target_key is None
+        assert app.ws_a_val("Data").cell(row=target_row, column=2).value == "changed-2"
+        view._update_cursor_lines()
+
+        c_lines = view.cursor_cmp.get("1.0", "end-1c").splitlines()
+        assert len(c_lines) >= 2, c_lines
+        assert "changed-2" in visible_render_text(
+            c_lines[0], placeholder=smt._TK_INDEX_PLACEHOLDER
+        ), c_lines
+        assert "changed-2" in visible_render_text(
+            c_lines[1], placeholder=smt._TK_INDEX_PLACEHOLDER
+        ), c_lines
+        assert view._prepared_value_for_logical_cell(pair_idx, "A", 2) == "changed-2"
+        view.update_hover_driven_panels(
+            pair_idx, 2, "A", force_panel=True, refresh_c_area=False
+        )
+        hover_text = view.hover_cmp_text.get("1.0", "end-1c")
+        assert "changed-2" in hover_text
+        assert "same-2" not in hover_text
+
+        view._undo_last_action()
+        _pump(app.root)
+        assert app.ws_a_val("Data").cell(row=target_row, column=2).value == "same-2"
+        assert view._prepared_value_for_logical_cell(pair_idx, "A", 2) == "same-2"
+
+        view._redo_last_action()
+        _pump(app.root)
+        assert app.ws_a_val("Data").cell(row=target_row, column=2).value == "changed-2"
+        assert view._prepared_value_for_logical_cell(pair_idx, "A", 2) == "changed-2"
+
 def test_explicit_theirs_deleted_region_deletes_mine_rows_and_undo_reapplies():
     mine = [
         ("id-1",),
@@ -1139,6 +1193,7 @@ def main(argv=None):
         test_region_target_resolver_uses_nearest_block_and_earlier_tie_break,
         test_region_target_resolver_filters_blocks_by_copy_direction,
         test_explicit_applicable_region_writes_immediately,
+        test_region_adoption_refreshes_c_area_and_hover_payload,
         test_explicit_theirs_deleted_region_deletes_mine_rows_and_undo_reapplies,
         test_explicit_mine_deleted_region_symmetrically_deletes_theirs_rows,
         test_region_fallback_first_click_only_locates_second_click_applies_and_undo_reapplies,
