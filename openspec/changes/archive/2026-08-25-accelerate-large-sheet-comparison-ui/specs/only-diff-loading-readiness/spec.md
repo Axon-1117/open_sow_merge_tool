@@ -62,6 +62,8 @@ The system MUST perform large-Sheet snapshot ingestion, row and column alignment
 - **WHEN** the selected Sheet is exact-ready and hidden Sheets remain pending
 - **THEN** remaining work starts only after a 1–2 second UI quiet window, yields at bounded checkpoints for recent UI activity, and a newly selected non-ready Sheet preempts hidden work
 
+## ADDED Requirements
+
 ### Requirement: Non-ready Sheets never expose provisional comparison results
 The system MUST present only generation-matched final exact comparison results as actionable data and MUST clearly cover or replace stale/provisional content while calculation is active.
 
