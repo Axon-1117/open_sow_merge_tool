@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-25.update78"
-APP_BUILD_TAG = "new155-retained-cache-main-surface"
+APP_VERSION = "2026-08-25.update79"
+APP_BUILD_TAG = "new156-strict-implicit-row-identity"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -6910,6 +6910,91 @@ def _snapshot_column_row_pairs(
     )
     return tuple(pairs)
 
+def _snapshot_implicit_first_column_contract(snapshot: SheetSnapshot):
+    """Return a strict standard-table header count and unique row records.
+
+    Some legacy config tables declare record identity as a plain first-column
+    key or id instead of using @id/@const. Their physical contract reserves
+    rows 1-4 for names, types, comments and defaults/separators. Admit that
+    convention only when every semantic row after the prefix has a literal,
+    non-blank, unique scalar key. Leading completely blank padding after row
+    4 is part of the header; internal blank/continuation rows, formulas and
+    duplicate keys fail closed.
+    """
+    if not snapshot.fields or len(snapshot.rows) <= 4:
+        return None
+    if any(field.markers & {"id", "const"} for field in snapshot.fields):
+        return None
+    declaration = re.sub(
+        r"@.*$", "", str(snapshot.fields[0].declaration or "").strip()
+    ).casefold()
+    if declaration not in {"id", "key"}:
+        return None
+
+    candidates = list(snapshot.rows[4:])
+    while candidates and all(
+        cell.cached_value is None and cell.formula_value is None
+        for cell in candidates[0].cells
+    ):
+        candidates.pop(0)
+    if not candidates:
+        return None
+
+    records = []
+    seen = set()
+    for row in candidates:
+        if not row.cells:
+            return None
+        cell = row.cells[0]
+        value = cell.cached_value
+        if cell.formula_kind != "literal" or isinstance(value, bool):
+            return None
+        if not isinstance(value, (str, int, float)):
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        key = ("IMPLICIT_FIRST_COLUMN", _snapshot_cell_identity(cell))
+        if key in seen:
+            return None
+        seen.add(key)
+        records.append((key, (row,)))
+    return int(candidates[0].physical_row) - 1, tuple(records)
+
+
+def _snapshot_implicit_first_column_row_pairs(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+) -> tuple[tuple[int | None, int | None], ...] | None:
+    """Align two fully proven standard tables by plain first-column identity."""
+    left_contract = _snapshot_implicit_first_column_contract(left)
+    right_contract = _snapshot_implicit_first_column_contract(right)
+    if left_contract is None or right_contract is None:
+        return None
+    left_header_rows, left_records = left_contract
+    right_header_rows, right_records = right_contract
+    if left_header_rows != right_header_rows:
+        return None
+
+    pairs = [(row, row) for row in range(1, left_header_rows + 1)]
+    right_by_key = {key: rows[0] for key, rows in right_records}
+    matched_right = set()
+    for key, left_rows in left_records:
+        left_row = left_rows[0]
+        right_row = right_by_key.get(key)
+        pairs.append((
+            left_row.physical_row,
+            None if right_row is None else right_row.physical_row,
+        ))
+        if right_row is not None:
+            matched_right.add(right_row.physical_row)
+    pairs.extend(
+        (None, rows[0].physical_row)
+        for _key, rows in right_records
+        if rows[0].physical_row not in matched_right
+    )
+    return tuple(pairs)
+
+
 
 def _snapshot_legacy_row_pairs(left: SheetSnapshot, right: SheetSnapshot) -> tuple[tuple[int | None, int | None], ...]:
     """Run the legacy deterministic signature matcher from immutable rows only."""
@@ -7010,6 +7095,16 @@ def _snapshot_row_pairs_are_complete_and_keyed(
         left_records = _snapshot_declared_records(left)
         right_records = _snapshot_declared_records(right)
         header_rows = 2
+    if left_records is None or right_records is None:
+        left_contract = _snapshot_implicit_first_column_contract(left)
+        right_contract = _snapshot_implicit_first_column_contract(right)
+        if left_contract is None or right_contract is None:
+            return False
+        left_header_rows, left_records = left_contract
+        right_header_rows, right_records = right_contract
+        if left_header_rows != right_header_rows:
+            return False
+        header_rows = left_header_rows
     if left_records is None or right_records is None:
         return False
 
@@ -7288,6 +7383,34 @@ def _align_selected_sheet_snapshots(left: SheetSnapshot, right: SheetSnapshot) -
             # validates the logical-column cache and every physical pair.
             unresolved, proof,
         )
+
+    implicit_identity_expected = any(
+        snapshot.fields
+        and not any(
+            field.markers & {"id", "const"} for field in snapshot.fields
+        )
+        and re.sub(
+            r"@.*$", "", str(snapshot.fields[0].declaration or "").strip()
+        ).casefold() in {"id", "key"}
+        for snapshot in (left, right)
+    )
+    implicit_row_pairs = _snapshot_implicit_first_column_row_pairs(left, right)
+    if implicit_row_pairs is not None:
+        provisional = SnapshotAlignment(
+            tuple(field_pairs), implicit_row_pairs, True, unresolved
+        )
+        proof = (
+            _try_snapshot_duplicate_field_identity_proof(
+                left, right, provisional
+            )
+            if unresolved
+            else None
+        )
+        return SnapshotAlignment(
+            tuple(field_pairs), implicit_row_pairs, True, unresolved, proof
+        )
+    if implicit_identity_expected:
+        unresolved = True
 
     left_data = list(left.rows[2:])
     right_data = list(right.rows[2:])
