@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-20.update76"
-APP_BUILD_TAG = "new153-dynamic-full-height-viewport"
+APP_VERSION = "2026-08-25.update77"
+APP_BUILD_TAG = "new154-column-sheet-row-identity"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -6839,6 +6839,78 @@ def _snapshot_declared_records(snapshot: SheetSnapshot):
     return tuple((key, tuple(rows)) for key, rows in records)
 
 
+def _snapshot_column_records(snapshot: SheetSnapshot):
+    """Return unique `@column` records keyed by their first cell.
+
+    Vertical config sheets use row 1 as their only header and store one
+    independent config record per row from row 2 onward. They therefore do
+    not carry the ordinary row-1/row-2 `@id` declaration pair. Admit the
+    sheet-name convention only when every physical data row has a literal,
+    non-blank, unique string key; otherwise fail closed and leave the normal
+    conservative matcher in charge.
+    """
+    if not str(snapshot.sheet or "").strip().casefold().endswith("@column"):
+        return None
+    records = []
+    seen = set()
+    for row in snapshot.rows:
+        if int(row.physical_row) <= 1:
+            continue
+        if not row.cells:
+            return None
+        cell = row.cells[0]
+        if cell.formula_kind != "literal" or not isinstance(cell.cached_value, str):
+            return None
+        key_text = cell.cached_value.strip()
+        if not key_text:
+            return None
+        key = ("COLUMN_KEY", key_text)
+        if key in seen:
+            return None
+        seen.add(key)
+        records.append((key, (row,)))
+    return tuple(records)
+
+
+def _snapshot_column_row_pairs(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+) -> tuple[tuple[int | None, int | None], ...] | None:
+    """Align valid vertical-config records by their explicit first-column key."""
+    left_records = _snapshot_column_records(left)
+    right_records = _snapshot_column_records(right)
+    if left_records is None or right_records is None:
+        return None
+
+    pairs = []
+    left_header = next(
+        (row.physical_row for row in left.rows if row.physical_row == 1), None
+    )
+    right_header = next(
+        (row.physical_row for row in right.rows if row.physical_row == 1), None
+    )
+    if left_header is not None or right_header is not None:
+        pairs.append((left_header, right_header))
+
+    right_by_key = {key: rows[0] for key, rows in right_records}
+    matched_right = set()
+    for key, left_rows in left_records:
+        left_row = left_rows[0]
+        right_row = right_by_key.get(key)
+        pairs.append((
+            left_row.physical_row,
+            None if right_row is None else right_row.physical_row,
+        ))
+        if right_row is not None:
+            matched_right.add(right_row.physical_row)
+    pairs.extend(
+        (None, rows[0].physical_row)
+        for _key, rows in right_records
+        if rows[0].physical_row not in matched_right
+    )
+    return tuple(pairs)
+
+
 def _snapshot_legacy_row_pairs(left: SheetSnapshot, right: SheetSnapshot) -> tuple[tuple[int | None, int | None], ...]:
     """Run the legacy deterministic signature matcher from immutable rows only."""
     max_left = max(1, int(left.max_row or 1))
@@ -6931,8 +7003,13 @@ def _snapshot_row_pairs_are_complete_and_keyed(
     row_pairs: tuple[tuple[int | None, int | None], ...],
 ) -> bool:
     """Require validated declared owners and a complete one-to-one row map."""
-    left_records = _snapshot_declared_records(left)
-    right_records = _snapshot_declared_records(right)
+    left_records = _snapshot_column_records(left)
+    right_records = _snapshot_column_records(right)
+    header_rows = 1
+    if left_records is None or right_records is None:
+        left_records = _snapshot_declared_records(left)
+        right_records = _snapshot_declared_records(right)
+        header_rows = 2
     if left_records is None or right_records is None:
         return False
 
@@ -6959,7 +7036,7 @@ def _snapshot_row_pairs_are_complete_and_keyed(
             return False
         seen_left.add(left_row)
         seen_right.add(right_row)
-        if left_row <= 2 or right_row <= 2:
+        if left_row <= header_rows or right_row <= header_rows:
             if left_row != right_row:
                 return False
             continue
@@ -7176,6 +7253,17 @@ def _align_selected_sheet_snapshots(left: SheetSnapshot, right: SheetSnapshot) -
             state = "reordered" if state == "matched" else state
         field_pairs.append((a_col, b_col, state))
     unresolved = duplicate_left or duplicate_right
+    column_identity_expected = (
+        str(left.sheet or "").strip().casefold().endswith("@column")
+        and str(right.sheet or "").strip().casefold().endswith("@column")
+    )
+    column_row_pairs = _snapshot_column_row_pairs(left, right)
+    if column_row_pairs is not None:
+        return SnapshotAlignment(
+            tuple(field_pairs), column_row_pairs, True, unresolved
+        )
+    if column_identity_expected:
+        unresolved = True
     left_records = _snapshot_declared_records(left)
     right_records = _snapshot_declared_records(right)
     row_pairs = [(row.physical_row, row.physical_row) for row in left.rows[:2] if row.physical_row <= len(right.rows)]
