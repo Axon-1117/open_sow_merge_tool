@@ -151,12 +151,12 @@ def _assert_selection_preserved(view,pair_idx:int,row_a:int,row_b:int)->None:
 def _assert_initial_full_virtual(view,full_rows:tuple[int,...],pair_idx:int)->None:
     assert tuple(view._full_display_rows)==full_rows
     assert len(full_rows)>sm._VIRTUAL_VIEWPORT_MAX_ROWS and view._virtual_mode_active()
-    cap=min(sm._VIRTUAL_VIEWPORT_MAX_ROWS,len(full_rows)); assert view._virtual_window_start==0; assert tuple(view.display_rows)==full_rows[:cap]; assert pair_idx in view.display_rows,(pair_idx,cap,view.display_rows[:3])
+    cap=min(view._virtual_viewport_row_capacity(),len(full_rows)); assert view._virtual_window_start==0; assert tuple(view.display_rows)==full_rows[:cap]; assert pair_idx in view.display_rows,(pair_idx,cap,view.display_rows[:3])
 
 def _assert_disabled_full_virtual(view,full_rows:tuple[int,...],pair_idx:int)->None:
     assert tuple(view._full_display_rows)==full_rows
     assert len(full_rows)>sm._VIRTUAL_VIEWPORT_MAX_ROWS and view._virtual_mode_active()
-    cap=min(sm._VIRTUAL_VIEWPORT_MAX_ROWS,len(full_rows)); selected_index=full_rows.index(pair_idx); expected_start=max(0,min(selected_index,max(0,len(full_rows)-cap)))
+    cap=min(view._virtual_viewport_row_capacity(),len(full_rows)); selected_index=full_rows.index(pair_idx); expected_start=max(0,min(selected_index,max(0,len(full_rows)-cap)))
     assert view._virtual_window_start==expected_start; assert tuple(view.display_rows)==full_rows[expected_start:expected_start+cap]; assert pair_idx in view.display_rows
 
 def _assert_base_insert_contract(view,pair_idx:int,row_a:int,row_b:int)->None:

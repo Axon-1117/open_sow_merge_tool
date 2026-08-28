@@ -137,105 +137,75 @@ def _copy(source: Path, destination: Path) -> None:
     shutil.copy2(source, destination)
 
 
-def _test_ambiguous_language_shape_is_unpublishable(root: Path) -> None:
+def _test_keyed_language_shape_is_publishable(root: Path) -> None:
     source = root / "source.xlsx"
     _write_fixture(source, duplicate_payload=True)
     before = gate._sha256(source)
-
-    original_manifest = sm.snapshot_comparison_oracle_manifest
-    original_direct = gate._assert_direct_pair_parity
-    original_frozen = gate._assert_frozen_three_way_parity
-    original_capture_legacy = gate.capture_legacy
-    original_direct_manifest = gate._direct_legacy_manifest
-    original_assert_target = gate._assert_target
-    original_dual_column = gate._assert_dual_column_conflict_blocked
-    direct_calls = []
-    target_calls = []
-    sm.snapshot_comparison_oracle_manifest = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("expected-safe-unresolved must not publish a candidate manifest")
-    )
-    gate._assert_direct_pair_parity = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("expected-safe-unresolved must not call exact direct parity")
-    )
-    gate._assert_frozen_three_way_parity = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("expected-safe-unresolved must not call exact frozen parity")
-    )
-    gate.capture_legacy = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("expected-safe-unresolved must not wait for frozen legacy READY")
-    )
-    gate._assert_dual_column_conflict_blocked = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("Language:column expected-safe-unresolved must not enter dual conflict")
-    )
-
-    def traced_direct(mine_path, theirs_path, base_path, sheet, *, absolute_deadline=None):
-        direct_calls.append((Path(mine_path), Path(theirs_path), base_path, sheet, absolute_deadline))
-        return original_direct_manifest(
-            mine_path, theirs_path, base_path, sheet, absolute_deadline=absolute_deadline
-        )
-
-    def traced_target(manifest, target, *, side):
-        target_calls.append((target, side))
-        return original_assert_target(manifest, target, side=side)
-
-    gate._direct_legacy_manifest = traced_direct
-    gate._assert_target = traced_target
-    expected_direct = []
-    expected_targets = []
     deadline = time.monotonic() + 45.0
-    try:
-        for label, mutator in gate._MUTATORS:
-            if label == "column":
-                continue
-            case_root = root / label
-            base, mine, theirs = (
-                case_root / "base.xlsx",
-                case_root / "mine.xlsx",
-                case_root / "theirs.xlsx",
-            )
-            for destination in (base, mine, theirs):
-                _copy(source, destination)
-            target_theirs = mutator(
-                theirs, _SHEET, f"__SOW_FIDELITY_Language_{label}_THEIRS__"
-            )
-            target_mine = mutator(
-                mine, _SHEET, f"__SOW_FIDELITY_Language_{label}_MINE__"
-            )
-            evidence = gate._assert_language_expected_safe_unresolved(
-                label,
-                mine,
-                theirs,
-                base,
-                _SHEET,
-                target_mine,
-                target_theirs,
-                absolute_deadline=deadline,
-            )
-            assert evidence["legacy"] == "two-way-targets-verified-only"
-            assert evidence["direct_marker_pairs"] == 2
-            assert evidence["column_marker"] is None
-            for route in ("two_way", "three_way"):
-                assert evidence[route]["state"] == "expected-safe-unresolved"
-                assert evidence[route]["blank_duplicate_proof"] == "rejected-nonblank-content"
-                assert evidence[route]["nonblank_duplicate_groups"]
-            expected_direct.append((base, theirs, None, _SHEET))
-            expected_targets.append((target_theirs, "theirs"))
-            if target_mine is not None:
-                expected_direct.append((base, mine, None, _SHEET))
-                expected_targets.append((target_mine, "theirs"))
-            assert gate._sha256(source) == before
-    finally:
-        sm.snapshot_comparison_oracle_manifest = original_manifest
-        gate._assert_direct_pair_parity = original_direct
-        gate._assert_frozen_three_way_parity = original_frozen
-        gate.capture_legacy = original_capture_legacy
-        gate._direct_legacy_manifest = original_direct_manifest
-        gate._assert_target = original_assert_target
-        gate._assert_dual_column_conflict_blocked = original_dual_column
-    assert [(left, right, base_path, sheet) for left, right, base_path, sheet, _deadline in direct_calls] == expected_direct
-    assert target_calls == expected_targets
-    assert len(direct_calls) == len(target_calls) == 6
-    assert gate._sha256(source) == before
 
+    for label, mutator in gate._MUTATORS:
+        if label == "column":
+            continue
+        case_root = root / label
+        base, mine, theirs = (
+            case_root / "base.xlsx",
+            case_root / "mine.xlsx",
+            case_root / "theirs.xlsx",
+        )
+        for destination in (base, mine, theirs):
+            _copy(source, destination)
+        target_theirs = mutator(
+            theirs, _SHEET, f"__SOW_FIDELITY_Language_{label}_THEIRS__"
+        )
+        target_mine = mutator(
+            mine, _SHEET, f"__SOW_FIDELITY_Language_{label}_MINE__"
+        )
+        snapshots = tuple(
+            sm._stream_selected_sheet_snapshot(str(path), str(path), _SHEET, side)
+            for path, side in (
+                (mine, "A"), (theirs, "B"), (base, "BASE")
+            )
+        )
+        mine_snapshot, theirs_snapshot, base_snapshot = snapshots
+        two_way = sm._compare_selected_sheet_snapshots(
+            base_snapshot, theirs_snapshot
+        )
+        three_way = sm._compare_selected_sheet_snapshots(
+            mine_snapshot, theirs_snapshot, base_snapshot
+        )
+        assert not two_way.unresolved
+        assert not three_way.unresolved
+        assert two_way.column_cache.model.confidence.reason == (
+            "snapshot-duplicate-keyed-payload-proof"
+        )
+        # Mine/Theirs can independently provide a stronger exact top-column
+        # model for value/formula edits; either way the final model must be
+        # resolved and bijective rather than carrying the old pending state.
+        assert not three_way.column_cache.unresolved_cols
+        assert sm._snapshot_duplicate_proof_cache_is_bijective(
+            three_way.column_cache,
+            mine_snapshot,
+            theirs_snapshot,
+            base_snapshot,
+        )
+        prepared = sm._snapshot_result_to_sheet_cache_immutable(
+            _SHEET,
+            three_way,
+            mine_snapshot,
+            theirs_snapshot,
+            base_snapshot,
+            has_base=True,
+        )
+        assert prepared["prepared_complete"]
+        assert (
+            any(prepared["pair_diff_cols"].values())
+            or any(prepared["pair_base_diff_cols"].values())
+        )
+        assert target_mine is not None and target_theirs is not None
+        gate._remaining_case_seconds(
+            deadline, f"keyed Language snapshot comparison for {label}"
+        )
+        assert gate._sha256(source) == before
 
 def _test_column_mutation_stays_raw_and_nonactionable(root: Path) -> None:
     source = root / "column-raw-source.xlsx"
@@ -413,7 +383,7 @@ def _test_run_fixture_column_append_is_non_actionable(root: Path) -> None:
 def run_case() -> None:
     with tempfile.TemporaryDirectory(prefix="sow_fidelity_language_unresolved_") as raw_root:
         root = Path(raw_root)
-        _test_ambiguous_language_shape_is_unpublishable(root)
+        _test_keyed_language_shape_is_publishable(root)
         _test_column_mutation_stays_raw_and_nonactionable(root)
         _test_nonactionable_column_marker_rejects_invalid_manifest()
         _test_all_empty_duplicate_tail_stays_resolved(root)

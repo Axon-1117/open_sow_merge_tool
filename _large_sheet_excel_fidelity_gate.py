@@ -1303,10 +1303,11 @@ def _run_fixture(
             mine, sheet, f"__SOW_FIDELITY_{fixture.name}_{label}_MINE__"
         )
 
-        # The Language structural fixture deliberately ends in its expected
-        # safe-unresolved route and has no dual-conflict Oracle.  Every other
-        # column route constructs all four disposable inputs before the first
-        # immutable snapshot so its case-local cache can never observe a write.
+        # Language's undeclared tail is now actionable when unique row keys and
+        # keyed payload digests prove it.  Only a real column append remains on
+        # the expected safe-unresolved route and has no dual-conflict Oracle.
+        # Every other column route constructs all four disposable inputs before
+        # the first immutable snapshot so its cache can never observe a write.
         mine_conflict = None
         snapshot_cache = None
         if label == "column" and fixture.name != "Language":
@@ -1319,7 +1320,7 @@ def _run_fixture(
             )
             snapshot_cache = {}
 
-        if fixture.name == "Language" and label in _MUTATORS_BY_LABEL:
+        if fixture.name == "Language" and label == "column":
             if _sha256(source) != source_copy_hash:
                 raise AssertionError(f"Language:{label} changed the immutable fixture copy")
             expected_unresolved = _assert_language_expected_safe_unresolved(

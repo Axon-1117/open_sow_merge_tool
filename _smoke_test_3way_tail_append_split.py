@@ -120,10 +120,10 @@ def _theirs_tail_b2a_save(root: Path) -> None:
         print("SMOKE_3WAY_TAIL_APPEND_SPLIT_STAGE b2a", flush=True)
         assert view._copy_selected_row("B2A", override_pair_idx=theirs_pair), "B2A on theirs-only tail failed"
         assert [app.ws_a_val(_SHEET).cell(row=row, column=1).value for row in range(1, 7)] == [
-            "id@id", "int", 1, 2, 4, 3,
+            "id@id", "int", 1, 2, 3, 4,
         ]
-        assert app.ws_a_val(_SHEET).cell(row=5, column=2).value == "b"
-        assert app.ws_a_val(_SHEET).cell(row=6, column=2).value == "a"
+        assert app.ws_a_val(_SHEET).cell(row=5, column=2).value == "a"
+        assert app.ws_a_val(_SHEET).cell(row=6, column=2).value == "b"
 
         print("SMOKE_3WAY_TAIL_APPEND_SPLIT_STAGE save-reopen", flush=True)
         output = Path(app.build_manual_merge_output_file())
@@ -133,10 +133,10 @@ def _theirs_tail_b2a_save(root: Path) -> None:
         try:
             worksheet = workbook[_SHEET]
             assert [worksheet.cell(row=row, column=1).value for row in range(1, 7)] == [
-                "id@id", "int", 1, 2, 4, 3,
+                "id@id", "int", 1, 2, 3, 4,
             ]
-            assert worksheet.cell(row=5, column=2).value == "b"
-            assert worksheet.cell(row=6, column=2).value == "a"
+            assert worksheet.cell(row=5, column=2).value == "a"
+            assert worksheet.cell(row=6, column=2).value == "b"
             assert worksheet.cell(row=5, column=3).value == "=1"
             assert worksheet.cell(row=6, column=3).value == "=1"
         finally:

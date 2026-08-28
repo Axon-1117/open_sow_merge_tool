@@ -213,7 +213,7 @@ def _test_tail_identical_append_stays_paired():
             ws_theirs,
             1,
         )
-        assert pairs == [(1, 1), (None, 2), (None, 3), (2, None), (3, None)], pairs
+        assert pairs == [(1, 1), (2, None), (3, None), (None, 2), (None, 3)], pairs
     finally:
         wb_mine.close()
         wb_theirs.close()

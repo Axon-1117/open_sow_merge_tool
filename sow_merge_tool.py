@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-25.update80"
-APP_BUILD_TAG = "new157-region-c-hover-cache-sync"
+APP_VERSION = "2026-08-28.update89"
+APP_BUILD_TAG = "new166-language-missing-duplicate-tail-proof"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -4544,6 +4544,8 @@ def _reconcile_three_way_row_pairs_by_base(
     ws_mine=None,
     ws_theirs=None,
     max_col: int | None = None,
+    *,
+    rows_equal=None,
 ) -> list[tuple[int | None, int | None]]:
     """Prevent Mine/Theirs rows with different Base identities from pairing.
 
@@ -4552,7 +4554,8 @@ def _reconcile_three_way_row_pairs_by_base(
     different Base records, or a Base record paired with an independent
     insertion, must remain separate structural rows.  Independent insertions
     on both sides are merged only when exact row equality proves they are the
-    same addition.
+    same addition.  Immutable snapshot callers can provide ``rows_equal`` so
+    the same Base-authoritative reconciliation runs without Worksheet access.
     """
     pairs = list(display_pairs or ())
     mine_map = mine_to_base or {}
@@ -4573,7 +4576,12 @@ def _reconcile_three_way_row_pairs_by_base(
     width = max(1, int(max_col or 1))
     mine_rows = {}
     theirs_rows = {}
-    if independent_pairs and ws_mine is not None and ws_theirs is not None:
+    if (
+        independent_pairs
+        and rows_equal is None
+        and ws_mine is not None
+        and ws_theirs is not None
+    ):
         mine_rows = _read_rows_into_cache(
             ws_mine,
             [ra for ra, _rb in independent_pairs],
@@ -4607,7 +4615,12 @@ def _reconcile_three_way_row_pairs_by_base(
             continue
 
         rows_proven_equal = False
-        if mine_rows and theirs_rows:
+        if rows_equal is not None:
+            try:
+                rows_proven_equal = bool(rows_equal(ra, rb))
+            except Exception:
+                rows_proven_equal = False
+        elif mine_rows and theirs_rows:
             mine_signature = _row_signature(
                 _row_from_cache(mine_rows, ra, width)
             )
@@ -4622,6 +4635,53 @@ def _reconcile_three_way_row_pairs_by_base(
     return out
 
 
+def _normalize_tail_independent_addition_order(
+    display_pairs: list[tuple[int | None, int | None]],
+    mine_to_base: dict[int, int] | None,
+    theirs_to_base: dict[int, int] | None,
+) -> list[tuple[int | None, int | None]]:
+    """Group a terminal independent-addition run as Mine then Theirs.
+
+    The comparison surface starts from Mine and applies incoming Theirs
+    changes.  Keeping Mine's existing tail first preserves its physical order
+    and leaves the incoming side's final physical row at the logical bottom,
+    so the synchronized 3-way scrollbar can actually reach that row.
+    """
+    out = list(display_pairs or ())
+    mine_map = mine_to_base or {}
+    theirs_map = theirs_to_base or {}
+    if not out or not mine_map or not theirs_map:
+        return out
+    try:
+        last_mine_mapped = max(int(r) for r in mine_map if r is not None)
+        last_theirs_mapped = max(int(r) for r in theirs_map if r is not None)
+    except Exception:
+        return out
+
+    suffix_start = len(out)
+    while suffix_start > 0:
+        ra, rb = out[suffix_start - 1]
+        if (ra is None) == (rb is None):
+            break
+        if ra is not None:
+            if ra in mine_map or int(ra) <= last_mine_mapped:
+                break
+        else:
+            if rb in theirs_map or int(rb) <= last_theirs_mapped:
+                break
+        suffix_start -= 1
+    suffix = out[suffix_start:]
+    if (
+        suffix
+        and any(ra is not None for ra, _rb in suffix)
+        and any(rb is not None for _ra, rb in suffix)
+    ):
+        mine_suffix = [(ra, None) for ra, _rb in suffix if ra is not None]
+        theirs_suffix = [(None, rb) for _ra, rb in suffix if rb is not None]
+        out[suffix_start:] = mine_suffix + theirs_suffix
+    return out
+
+
 def _split_tail_independent_append_pairs(
     display_pairs: list[tuple[int | None, int | None]],
     mine_to_base: dict[int, int] | None,
@@ -4630,7 +4690,7 @@ def _split_tail_independent_append_pairs(
     ws_theirs=None,
     max_col: int | None = None,
 ) -> list[tuple[int | None, int | None]]:
-    """Split safe 3-way tail append pairs into independent theirs/mine blocks.
+    """Split safe 3-way tail append pairs into independent mine/theirs blocks.
 
     Conservative rule:
     - only consider pairs where both mine/theirs rows exist
@@ -4638,7 +4698,7 @@ def _split_tail_independent_append_pairs(
     - both rows are strictly after their respective last mapped base row
     - require each side to have at least one mapped base row first
 
-    Output order is fixed as: theirs block first, mine block second.
+    Output order is fixed as: mine block first, theirs block second.
     """
     pairs = list(display_pairs or [])
     if not pairs:
@@ -4705,10 +4765,11 @@ def _split_tail_independent_append_pairs(
             end = idx
             while end + 1 < len(pairs) and (end + 1) in split_indices:
                 end += 1
-            # Keep the agreed deterministic order for an independent tail block:
-            # all theirs rows first, followed by all mine rows.
-            out.extend((None, pairs[pos][1]) for pos in range(idx, end + 1))
+            # Preserve Mine's physical tail before appending the incoming
+            # Theirs block.  This also makes Theirs' final row the logical
+            # bottom of the synchronized 3-way viewport.
             out.extend((pairs[pos][0], None) for pos in range(idx, end + 1))
+            out.extend((None, pairs[pos][1]) for pos in range(idx, end + 1))
             idx = end + 1
     else:
         out = list(pairs)
@@ -4734,9 +4795,9 @@ def _split_tail_independent_append_pairs(
         and any(ra is not None for ra, _rb in suffix)
         and any(rb is not None for _ra, rb in suffix)
     ):
-        theirs_suffix = [(None, rb) for _ra, rb in suffix if rb is not None]
         mine_suffix = [(ra, None) for ra, _rb in suffix if ra is not None]
-        out[suffix_start:] = theirs_suffix + mine_suffix
+        theirs_suffix = [(None, rb) for _ra, rb in suffix if rb is not None]
+        out[suffix_start:] = mine_suffix + theirs_suffix
     return out
 
 
@@ -6555,6 +6616,7 @@ class SnapshotDuplicateFieldProof:
 
     occurrences: tuple[SnapshotDuplicateFieldOccurrence, ...]
     three_way: bool = False
+    keyed_payload: bool = False
 
     def __post_init__(self):
         occurrences = tuple(self.occurrences)
@@ -6811,6 +6873,29 @@ def _snapshot_cell_identity(cell: SnapshotCell) -> str:
     return _merge_cmp_value(cell.cached_value)
 
 
+def _snapshot_declared_key_cell_identity(cell: SnapshotCell) -> str | None:
+    """Return one authoritative declared-key component.
+
+    Formula-backed key columns such as ``ConditionData.key@constid`` expose
+    both the formula and its evaluated cache.  The cache is the record key;
+    the formula merely describes how that key was generated.  Two shifted
+    records can carry the same row-relative formula text while evaluating to
+    different keys, so formula-first identity silently pairs the wrong rows.
+
+    A formula without a cache cannot prove a record identity.  Return ``None``
+    so the caller fails closed instead of publishing a guessed exact model.
+    """
+    cached_identity = _merge_cmp_value(cell.cached_value)
+    if cached_identity != "BLANK:":
+        return cached_identity
+    if (
+        _special_formula_signature(cell.formula_value) is not None
+        or _formula_text(cell.formula_value)
+    ):
+        return None
+    return "BLANK:"
+
+
 def _snapshot_declared_records(snapshot: SheetSnapshot):
     """Return `(key, rows)` groups, preserving blank-key continuations."""
     key_offsets = [field.physical_col - 1 for field in snapshot.fields if field.markers & {"id", "const"}]
@@ -6819,10 +6904,16 @@ def _snapshot_declared_records(snapshot: SheetSnapshot):
     records = []
     current = None
     for row in snapshot.rows[2:]:
-        key = tuple(
-            _snapshot_cell_identity(row.cells[offset]) if offset < len(row.cells) else "BLANK:"
-            for offset in key_offsets
-        )
+        key_parts = []
+        for offset in key_offsets:
+            identity = (
+                _snapshot_declared_key_cell_identity(row.cells[offset])
+                if offset < len(row.cells) else "BLANK:"
+            )
+            if identity is None:
+                return None
+            key_parts.append(identity)
+        key = tuple(key_parts)
         blank = all(value == "BLANK:" for value in key)
         if blank and current is not None:
             current[1].append(row)
@@ -6837,6 +6928,75 @@ def _snapshot_declared_records(snapshot: SheetSnapshot):
     if len({key for key, _rows in records}) != len(records):
         return None
     return tuple((key, tuple(rows)) for key, rows in records)
+
+
+def _snapshot_declared_record_row_pairs(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+    left_records=None,
+    right_records=None,
+) -> tuple[tuple[int | None, int | None], ...] | None:
+    """Align complete unique declared records by their authoritative key.
+
+    A global content matcher must never pair two different @id/@const records
+    merely because they occupy the same unmatched tail gap. Blank-key
+    continuation rows are owned by the preceding record, so content alignment
+    is intentionally bounded to the matching owner's continuation group.
+    """
+    if left_records is None:
+        left_records = _snapshot_declared_records(left)
+    if right_records is None:
+        right_records = _snapshot_declared_records(right)
+    if left_records is None or right_records is None:
+        return None
+
+    pairs: list[tuple[int | None, int | None]] = []
+    for physical_row in (1, 2):
+        left_row = physical_row if physical_row <= len(left.rows) else None
+        right_row = physical_row if physical_row <= len(right.rows) else None
+        if left_row is not None or right_row is not None:
+            pairs.append((left_row, right_row))
+
+    record_pairs = _compute_row_pairs_from_signatures(
+        [_UNIQUE_ROW_KEY_SIGNATURE_PREFIX + repr(key) for key, _rows in left_records],
+        [_UNIQUE_ROW_KEY_SIGNATURE_PREFIX + repr(key) for key, _rows in right_records],
+    )
+    for left_record, right_record in record_pairs:
+        if left_record is None:
+            _right_key, right_rows = right_records[int(right_record) - 1]
+            pairs.extend((None, row.physical_row) for row in right_rows)
+            continue
+        if right_record is None:
+            _left_key, left_rows = left_records[int(left_record) - 1]
+            pairs.extend((row.physical_row, None) for row in left_rows)
+            continue
+
+        left_key, left_rows = left_records[int(left_record) - 1]
+        right_key, right_rows = right_records[int(right_record) - 1]
+        if left_key != right_key:
+            return None
+        # The nonblank owner is proven by the complete composite key. Only
+        # its blank-key continuations require a bounded local content match.
+        pairs.append((left_rows[0].physical_row, right_rows[0].physical_row))
+        left_continuations = tuple(left_rows[1:])
+        right_continuations = tuple(right_rows[1:])
+        if left_continuations or right_continuations:
+            local_pairs = _compute_row_pairs_from_signatures(
+                [row.row_hash for row in left_continuations],
+                [row.row_hash for row in right_continuations],
+            )
+            for left_local, right_local in local_pairs:
+                pairs.append((
+                    (
+                        left_continuations[int(left_local) - 1].physical_row
+                        if left_local is not None else None
+                    ),
+                    (
+                        right_continuations[int(right_local) - 1].physical_row
+                        if right_local is not None else None
+                    ),
+                ))
+    return tuple(pairs)
 
 
 def _snapshot_column_records(snapshot: SheetSnapshot):
@@ -7082,6 +7242,126 @@ def _snapshot_blank_column_digest(snapshot: SheetSnapshot, physical_col: int) ->
     ).hexdigest()
 
 
+def _snapshot_keyed_duplicate_column_digest(
+    snapshot: SheetSnapshot,
+    physical_col: int,
+) -> str | None:
+    """Digest nonblank payload by authoritative record key and row ordinal.
+
+    Blank cells are deliberately omitted so a one-sided record whose duplicate
+    fields are all blank does not invalidate an otherwise stable column proof.
+    Literal empty strings and formulas remain payload, matching the strict
+    blank semantics used by ``_snapshot_blank_column_digest``.
+    """
+    column = int(physical_col)
+    if column < 1 or column > int(snapshot.max_col or 0):
+        return None
+    records = _snapshot_declared_records(snapshot)
+    if records is None:
+        return None
+    tokens = []
+    for key, rows in records:
+        for ordinal, row in enumerate(rows):
+            cell = (
+                row.cells[column - 1]
+                if column <= len(row.cells)
+                else _SNAPSHOT_BLANK_CELL
+            )
+            if cell.cached_value is None and cell.formula_value is None:
+                continue
+            tokens.append((
+                key,
+                int(ordinal),
+                str(cell.cached_type or ""),
+                _merge_cmp_value(cell.cached_value),
+                str(cell.formula_type or ""),
+                repr(
+                    _special_formula_signature(cell.formula_value)
+                    or _formula_text(cell.formula_value)
+                    or cell.formula_value
+                ),
+                str(cell.formula_kind or ""),
+                bool(cell.external_link),
+            ))
+    return hashlib.sha256(
+        repr(tuple(tokens)).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _snapshot_row_pairs_are_keyed_with_blank_duplicate_additions(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+    row_pairs: tuple[tuple[int | None, int | None], ...],
+    left_duplicate_cols,
+    right_duplicate_cols,
+) -> bool:
+    """Validate unique-key row identity while admitting blank side additions."""
+    left_records = _snapshot_declared_records(left)
+    right_records = _snapshot_declared_records(right)
+    if left_records is None or right_records is None:
+        return False
+
+    def _owners(records):
+        return {
+            int(row.physical_row): key
+            for key, rows in records
+            for row in rows
+        }
+
+    def _duplicate_payload_is_blank(snapshot, row_number, columns):
+        if row_number is None or not (1 <= int(row_number) <= len(snapshot.rows)):
+            return False
+        row = snapshot.rows[int(row_number) - 1]
+        for physical_col in columns:
+            column = int(physical_col)
+            cell = (
+                row.cells[column - 1]
+                if 1 <= column <= len(row.cells)
+                else _SNAPSHOT_BLANK_CELL
+            )
+            if cell.cached_value is not None or cell.formula_value is not None:
+                return False
+        return True
+
+    left_owner = _owners(left_records)
+    right_owner = _owners(right_records)
+    left_rows = {int(row.physical_row) for row in left.rows}
+    right_rows = {int(row.physical_row) for row in right.rows}
+    seen_left, seen_right = set(), set()
+    for left_row, right_row in row_pairs:
+        if left_row is None and right_row is None:
+            return False
+        if left_row is not None:
+            left_row = int(left_row)
+            if left_row not in left_rows or left_row in seen_left:
+                return False
+            seen_left.add(left_row)
+        if right_row is not None:
+            right_row = int(right_row)
+            if right_row not in right_rows or right_row in seen_right:
+                return False
+            seen_right.add(right_row)
+        if left_row is not None and left_row <= 2:
+            if left_row != right_row:
+                return False
+            continue
+        if right_row is not None and right_row <= 2:
+            return False
+        if left_row is not None and right_row is not None:
+            if left_owner.get(left_row) != right_owner.get(right_row):
+                return False
+        elif left_row is not None:
+            if left_owner.get(left_row) is None or not _duplicate_payload_is_blank(
+                left, left_row, left_duplicate_cols
+            ):
+                return False
+        elif right_owner.get(right_row) is None or not _duplicate_payload_is_blank(
+            right, right_row, right_duplicate_cols
+        ):
+            return False
+    return seen_left == left_rows and seen_right == right_rows
+
+
 def _snapshot_row_pairs_are_complete_and_keyed(
     left: SheetSnapshot,
     right: SheetSnapshot,
@@ -7140,7 +7420,11 @@ def _snapshot_row_pairs_are_complete_and_keyed(
     return seen_left == left_rows and seen_right == right_rows
 
 
-def _snapshot_duplicate_run_descriptors(snapshot: SheetSnapshot):
+def _snapshot_duplicate_run_descriptors(
+    snapshot: SheetSnapshot,
+    *,
+    keyed_payload: bool = False,
+):
     """Describe duplicate occurrences using only immutable schema/payload data.
 
     A descriptor is per contiguous duplicate run.  Independent occurrences of
@@ -7186,7 +7470,15 @@ def _snapshot_duplicate_run_descriptors(snapshot: SheetSnapshot):
             right_anchor, right_position = _anchor(run[-1].physical_col, 1)
             interval_width = int(right_position) - int(left_position) - 1
             for ordinal, field in enumerate(run):
-                digest = _snapshot_blank_column_digest(snapshot, field.physical_col)
+                digest = (
+                    _snapshot_keyed_duplicate_column_digest(
+                        snapshot, field.physical_col
+                    )
+                    if keyed_payload
+                    else _snapshot_blank_column_digest(
+                        snapshot, field.physical_col
+                    )
+                )
                 if digest is None:
                     return None
                 descriptor = (
@@ -7220,27 +7512,109 @@ def _build_snapshot_duplicate_field_identity_proof(
 
     This builder intentionally does *not* clear an alignment result on its
     own.  Its caller must seed the candidate into the final logical-column
-    cache and prove every slot is resolved and bijective.
+    cache and prove every slot is resolved and bijective.  In three-way mode
+    Base anchors each duplicate occurrence: branch payloads may change in
+    place, but a payload that exactly matches a different Base occurrence is
+    treated as cross-position evidence and remains unresolved.
     """
-    if not _snapshot_row_pairs_are_complete_and_keyed(
-        mine, theirs, alignment.row_pairs
+    if base is not None and (
+        mine_base_alignment is None or theirs_base_alignment is None
     ):
         return None
-    if base is not None:
-        if mine_base_alignment is None or theirs_base_alignment is None:
-            return None
-        if not _snapshot_row_pairs_are_complete_and_keyed(
-            mine, base, mine_base_alignment.row_pairs
-        ) or not _snapshot_row_pairs_are_complete_and_keyed(
-            theirs, base, theirs_base_alignment.row_pairs
+
+    mine_groups = _snapshot_field_groups(mine)
+    theirs_groups = _snapshot_field_groups(theirs)
+    base_groups = _snapshot_field_groups(base) if base is not None else {}
+    all_duplicates = {
+        identity
+        for groups in (mine_groups, theirs_groups, base_groups)
+        for identity, fields in groups.items()
+        if len(fields) > 1
+    }
+    if not all_duplicates:
+        return None
+
+    strict_rows = _snapshot_row_pairs_are_complete_and_keyed(
+        mine, theirs, alignment.row_pairs
+    ) and (
+        base is None
+        or (
+            _snapshot_row_pairs_are_complete_and_keyed(
+                mine, base, mine_base_alignment.row_pairs
+            )
+            and _snapshot_row_pairs_are_complete_and_keyed(
+                theirs, base, theirs_base_alignment.row_pairs
+            )
+        )
+    )
+    mine_data = (
+        _snapshot_duplicate_run_descriptors(mine) if strict_rows else None
+    )
+    theirs_data = (
+        _snapshot_duplicate_run_descriptors(theirs) if strict_rows else None
+    )
+    base_data = (
+        _snapshot_duplicate_run_descriptors(base)
+        if strict_rows and base is not None else None
+    )
+    keyed_payload = bool(
+        mine_data is None
+        or theirs_data is None
+        or (base is not None and base_data is None)
+    )
+    if keyed_payload:
+        def _duplicate_columns(groups):
+            return tuple(
+                int(field.physical_col)
+                for identity in all_duplicates
+                for field in groups.get(identity, ())
+            )
+
+        mine_duplicate_cols = _duplicate_columns(mine_groups)
+        theirs_duplicate_cols = _duplicate_columns(theirs_groups)
+        base_duplicate_cols = _duplicate_columns(base_groups)
+        if not _snapshot_row_pairs_are_keyed_with_blank_duplicate_additions(
+            mine,
+            theirs,
+            alignment.row_pairs,
+            mine_duplicate_cols,
+            theirs_duplicate_cols,
         ):
             return None
-
-    mine_data = _snapshot_duplicate_run_descriptors(mine)
-    theirs_data = _snapshot_duplicate_run_descriptors(theirs)
-    base_data = _snapshot_duplicate_run_descriptors(base) if base is not None else None
-    if mine_data is None or theirs_data is None or (base is not None and base_data is None):
+        if base is not None and (
+            not _snapshot_row_pairs_are_keyed_with_blank_duplicate_additions(
+                mine,
+                base,
+                mine_base_alignment.row_pairs,
+                mine_duplicate_cols,
+                base_duplicate_cols,
+            )
+            or not _snapshot_row_pairs_are_keyed_with_blank_duplicate_additions(
+                theirs,
+                base,
+                theirs_base_alignment.row_pairs,
+                theirs_duplicate_cols,
+                base_duplicate_cols,
+            )
+        ):
+            return None
+        mine_data = _snapshot_duplicate_run_descriptors(
+            mine, keyed_payload=True
+        )
+        theirs_data = _snapshot_duplicate_run_descriptors(
+            theirs, keyed_payload=True
+        )
+        base_data = (
+            _snapshot_duplicate_run_descriptors(base, keyed_payload=True)
+            if base is not None else None
+        )
+    if (
+        mine_data is None
+        or theirs_data is None
+        or (base is not None and base_data is None)
+    ):
         return None
+
     mine_groups, mine_duplicates, mine_descriptors = mine_data
     theirs_groups, theirs_duplicates, theirs_descriptors = theirs_data
     all_duplicates = set(mine_duplicates) | set(theirs_duplicates)
@@ -7249,8 +7623,6 @@ def _build_snapshot_duplicate_field_identity_proof(
         all_duplicates |= set(base_duplicates)
     else:
         base_descriptors = {}
-    if not all_duplicates:
-        return None
 
     pairs = []
     for identity in sorted(all_duplicates):
@@ -7280,17 +7652,29 @@ def _build_snapshot_duplicate_field_identity_proof(
             }
             if set(mine_entries) != set(base_entries) or len(base_entries) != mine_count:
                 return None
+            base_descriptors_by_digest = {}
+            for base_descriptor, base_payload in base_entries.items():
+                base_descriptors_by_digest.setdefault(
+                    base_payload[1], set()
+                ).add(base_descriptor)
         else:
             base_entries = {}
+            base_descriptors_by_digest = {}
         for descriptor in sorted(mine_entries, key=repr):
             mine_field, mine_digest, mine_left, mine_right = mine_entries[descriptor]
             theirs_field, theirs_digest, theirs_left, theirs_right = theirs_entries[descriptor]
-            if mine_digest != theirs_digest:
-                return None
             if base_data is not None:
                 base_field, base_digest, base_left, base_right = base_entries[descriptor]
-                if mine_digest != base_digest:
-                    return None
+                for branch_digest in (mine_digest, theirs_digest):
+                    if branch_digest == base_digest:
+                        continue
+                    if any(
+                        candidate_descriptor != descriptor
+                        for candidate_descriptor in base_descriptors_by_digest.get(
+                            branch_digest, ()
+                        )
+                    ):
+                        return None
                 pairs.append(SnapshotDuplicateFieldOccurrence(
                     descriptor=descriptor,
                     mine_col=int(mine_field.physical_col),
@@ -7301,6 +7685,8 @@ def _build_snapshot_duplicate_field_identity_proof(
                     base_bounds=(base_left, base_right),
                 ))
             else:
+                if mine_digest != theirs_digest:
+                    return None
                 pairs.append(SnapshotDuplicateFieldOccurrence(
                     descriptor=descriptor,
                     mine_col=int(mine_field.physical_col),
@@ -7309,7 +7695,11 @@ def _build_snapshot_duplicate_field_identity_proof(
                     mine_bounds=(mine_left, mine_right),
                     theirs_bounds=(theirs_left, theirs_right),
                 ))
-    return SnapshotDuplicateFieldProof(tuple(pairs), three_way=base is not None)
+    return SnapshotDuplicateFieldProof(
+        tuple(pairs),
+        three_way=base is not None,
+        keyed_payload=keyed_payload,
+    )
 
 
 def _try_snapshot_duplicate_field_identity_proof(*args, **kwargs):
@@ -7361,13 +7751,37 @@ def _align_selected_sheet_snapshots(left: SheetSnapshot, right: SheetSnapshot) -
         unresolved = True
     left_records = _snapshot_declared_records(left)
     right_records = _snapshot_declared_records(right)
+    declared_identity_expected = any(
+        field.markers & {"id", "const"}
+        for snapshot in (left, right)
+        for field in snapshot.fields
+    )
+    if declared_identity_expected and (
+        left_records is None or right_records is None
+    ):
+        # A declared key exists but at least one component is duplicate,
+        # malformed, or a formula without an evaluated cache.  The fallback
+        # row matcher may still provide a bounded preview, but it must never
+        # be advertised as an exact declared-key result.
+        unresolved = True
     row_pairs = [(row.physical_row, row.physical_row) for row in left.rows[:2] if row.physical_row <= len(right.rows)]
     if left_records is not None and right_records is not None:
-        # The legacy identity matcher already uses declared/composite anchors,
-        # including duplicate-key fallback and deterministic equal-count gaps.
-        # Reuse it over immutable payloads to preserve exact independent-row
-        # ordering without a worksheet read or a quadratic fuzzy pass.
-        row_pairs = _snapshot_legacy_row_pairs(left, right)
+        stable_declared_schema = (
+            int(left.max_col) == int(right.max_col)
+            and tuple(_snapshot_field_identity(field) for field in left.fields)
+            == tuple(_snapshot_field_identity(field) for field in right.fields)
+        )
+        if stable_declared_schema:
+            # Complete unique declared keys are authoritative. Matching the
+            # whole unmatched tail by position can otherwise assign unrelated
+            # additions to the same Base row after a conflict is reopened.
+            row_pairs = _snapshot_declared_record_row_pairs(
+                left, right, left_records, right_records,
+            )
+        else:
+            # Preserve the established structural-header Oracle when the field
+            # schema itself differs; record keys alone cannot settle columns.
+            row_pairs = _snapshot_legacy_row_pairs(left, right)
         provisional = SnapshotAlignment(
             tuple(field_pairs), row_pairs, True, unresolved
         )
@@ -7446,10 +7860,10 @@ class SnapshotComparisonResult:
     pair_base_diff_cols: tuple[frozenset[int], ...]
     conflict_cols: tuple[frozenset[int], ...]
     unresolved: bool
-    # A whole-workbook SHA-256 identity proof is stronger than schema/key
+    # Complete selected-sheet physical identity is stronger than schema/key
     # alignment. Keep that fact explicit instead of asking a self-comparison
-    # to rediscover it (duplicate declared keys are intentionally ambiguous in
-    # the general matcher).
+    # to rediscover it (duplicate or content-ambiguous records are intentionally
+    # unresolved in the general matcher).
     physical_identity: bool = False
 
 
@@ -7684,15 +8098,15 @@ def _physical_identity_snapshot_comparison(
     *,
     three_way: bool = False,
 ) -> SnapshotComparisonResult:
-    """Return an exact physical 1:1 result for proven byte-identical inputs.
+    """Return an exact physical 1:1 result for proven identical Sheet inputs.
 
     This is deliberately not a shortcut through ``_align_selected_sheet_snapshots``:
     duplicate ``@id`` fields, blank continuations, and repeated column
-    declarations are correctly ambiguous for ordinary *different-file*
-    comparisons, but cannot be ambiguous when every input workbook has the
-    same complete-file SHA-256. The one immutable selected-sheet snapshot is
-    therefore safe to represent A/B/(Base), with every operation coordinate
-    preserved as its physical Excel coordinate.
+    declarations are correctly ambiguous for ordinary different-content
+    comparisons, but cannot be ambiguous when every immutable selected-sheet
+    field and typed value/formula row is equal. The one snapshot is therefore
+    safe to represent A/B/(Base), with every operation coordinate preserved as
+    its physical Excel coordinate.
     """
     max_row = max(1, int(snapshot.max_row or 1))
     max_col = max(1, int(snapshot.max_col or 1))
@@ -7734,8 +8148,28 @@ def _physical_identity_snapshot_comparison(
     )
 
 
+def _snapshot_physical_contents_equal(
+    left: SheetSnapshot,
+    right: SheetSnapshot,
+) -> bool:
+    """Prove exact selected-sheet equality without workbook metadata bytes."""
+    return (
+        int(left.max_row) == int(right.max_row)
+        and int(left.max_col) == int(right.max_col)
+        and left.fields == right.fields
+        and left.rows == right.rows
+    )
+
+
 def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot, base: SheetSnapshot | None = None) -> SnapshotComparisonResult:
     """Produce 2-way or Base-anchored 3-way results with no Worksheet access."""
+    if _snapshot_physical_contents_equal(mine, theirs) and (
+        base is None or _snapshot_physical_contents_equal(mine, base)
+    ):
+        return _physical_identity_snapshot_comparison(
+            mine,
+            three_way=base is not None,
+        )
     alignment = _align_selected_sheet_snapshots(mine, theirs)
     row_pairs = alignment.row_pairs
     mine_payloads = tuple(_snapshot_row_payload(mine, a) for a, _b in row_pairs)
@@ -7788,6 +8222,35 @@ def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot
     theirs_base = _align_selected_sheet_snapshots(theirs, base)
     mine_to_base = {a: b for a, b in mine_base.row_pairs if a is not None and b is not None}
     theirs_to_base = {a: b for a, b in theirs_base.row_pairs if a is not None and b is not None}
+    # Mine<->Theirs is only a display alignment. Base mappings are the
+    # authoritative row identities in 3-way mode, so never let a pairwise
+    # replacement block collapse unrelated additions made on both branches.
+    row_pairs = tuple(_reconcile_three_way_row_pairs_by_base(
+        list(row_pairs),
+        mine_to_base,
+        theirs_to_base,
+        rows_equal=lambda mine_row, theirs_row: _same_snapshot_row(
+            mine,
+            mine_row,
+            theirs,
+            theirs_row,
+            stable_ab_columns,
+        ),
+    ))
+    row_pairs = tuple(_normalize_tail_independent_addition_order(
+        list(row_pairs),
+        mine_to_base,
+        theirs_to_base,
+    ))
+    # Re-project payloads after Base reconciliation. The initial A/B payload
+    # tuples describe the pairwise alignment and are no longer positionally
+    # valid when independent additions have been split into one-sided rows.
+    mine_payloads = tuple(_snapshot_row_payload(mine, a) for a, _b in row_pairs)
+    theirs_payloads = tuple(_snapshot_row_payload(theirs, b) for _a, b in row_pairs)
+    mine_values = tuple(payload[0] for payload in mine_payloads)
+    mine_formulas = tuple(payload[1] for payload in mine_payloads)
+    theirs_values = tuple(payload[0] for payload in theirs_payloads)
+    theirs_formulas = tuple(payload[1] for payload in theirs_payloads)
     base_rows = tuple(mine_to_base.get(a, theirs_to_base.get(b)) for a, b in row_pairs)
     base_payloads = tuple(_snapshot_row_payload(base, row) for row in base_rows)
     base_values = tuple(payload[0] for payload in base_payloads)
@@ -7822,6 +8285,20 @@ def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot
                 cache = proof_cache
                 # The all-side candidate and final Base-aware bijection are
                 # both proven.  Do not carry a duplicate-only pending reason.
+                alignment_unresolved = False
+        if alignment_unresolved:
+            missing_duplicate_cache = (
+                _try_apply_snapshot_base_anchored_missing_duplicate_fields_to_column_cache(
+                    cache,
+                    mine,
+                    theirs,
+                    base,
+                )
+            )
+            if missing_duplicate_cache is not None:
+                cache = missing_duplicate_cache
+                # Preserve the structural deletion after the Base-anchored
+                # missing-side proof clears duplicate-only mapping ambiguity.
                 alignment_unresolved = False
     diffs, base_diffs, conflicts = [], [], []
     for index, (mine_row, theirs_row) in enumerate(row_pairs):
@@ -9588,6 +10065,210 @@ def _snapshot_duplicate_proof_matches_exact_top_cache(
     )
 
 
+def _apply_snapshot_keyed_duplicate_field_proof_to_column_cache(
+    cache: LogicalColumnComparisonCache,
+    proof: SnapshotDuplicateFieldProof,
+    replacement_by_pair: dict,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot | None,
+) -> LogicalColumnComparisonCache | None:
+    """Resolve only duplicate-run ambiguity proven by keyed payload digests."""
+    if not proof.keyed_payload or bool(base is not None) != bool(proof.three_way):
+        return None
+    alignment = (
+        cache.three_way_alignment if proof.three_way
+        else cache.two_way_alignment
+    )
+    if alignment is None or cache.structural_diff_cols:
+        return None
+    proof_slots = set(replacement_by_pair.values())
+    slots_by_logical = {
+        int(slot.logical_idx): slot for slot in cache.model.slots
+    }
+    if len(slots_by_logical) != len(cache.model.slots):
+        return None
+    ambiguous_slots = {
+        int(slot.logical_idx) for slot in cache.model.slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    }
+    fallback_slots = set(getattr(alignment, "fallback_slot_indices", ()))
+    if not (
+        ambiguous_slots
+        and ambiguous_slots == fallback_slots
+        and ambiguous_slots.issubset(proof_slots)
+        and set(cache.unresolved_cols)
+        == {logical + 1 for logical in ambiguous_slots}
+        and bool(getattr(alignment, "used_physical_fallback", False))
+    ):
+        return None
+    allowed_causes = {
+        COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+        COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+        COLUMN_MAPPING_CAUSE_FORMULA_MISMATCH,
+    }
+    for logical in ambiguous_slots:
+        causes = set(slots_by_logical[logical].confidence.cause_codes)
+        if not causes or not causes.issubset(allowed_causes):
+            return None
+
+    snapshots = (("mine", mine), ("theirs", theirs)) + (
+        (("base", base),) if proof.three_way and base is not None else ()
+    )
+    descriptor_data = {}
+    for side, snapshot in snapshots:
+        data = _snapshot_duplicate_run_descriptors(
+            snapshot, keyed_payload=True
+        )
+        if data is None:
+            return None
+        descriptor_data[side] = data[2]
+    base_descriptors_by_digest = {}
+    if proof.three_way:
+        for descriptor, payload in descriptor_data.get("base", {}).items():
+            base_descriptors_by_digest.setdefault(
+                (descriptor[0], payload[1]), set()
+            ).add(descriptor)
+    for occurrence in proof.occurrences:
+        logical = replacement_by_pair.get(occurrence.pair)
+        slot = slots_by_logical.get(int(logical)) if logical is not None else None
+        if slot is None or not _snapshot_duplicate_proof_slot_matches(
+            slot, occurrence.pair, three_way=proof.three_way
+        ):
+            return None
+        digests = []
+        for side_index, (side, snapshot) in enumerate(snapshots):
+            physical = occurrence.pair[side_index]
+            payload = descriptor_data[side].get(occurrence.descriptor)
+            if physical is None or payload is None:
+                return None
+            field, digest, left_anchor, right_anchor = payload
+            descriptor_bounds = (
+                occurrence.mine_bounds if side == "mine" else
+                occurrence.theirs_bounds if side == "theirs" else
+                occurrence.base_bounds
+            )
+            current_digest = _snapshot_keyed_duplicate_column_digest(
+                snapshot, int(physical)
+            )
+            if not (
+                descriptor_bounds is not None
+                and int(field.physical_col) == int(physical)
+                and (int(left_anchor), int(right_anchor))
+                == tuple(map(int, descriptor_bounds))
+                and current_digest is not None
+                and current_digest == digest
+            ):
+                return None
+            digests.append(digest)
+        if proof.three_way:
+            base_digest = digests[2]
+            for branch_digest in digests[:2]:
+                if branch_digest == base_digest:
+                    continue
+                if any(
+                    candidate_descriptor != occurrence.descriptor
+                    for candidate_descriptor in base_descriptors_by_digest.get(
+                        (occurrence.descriptor[0], branch_digest), ()
+                    )
+                ):
+                    return None
+        elif len(set(digests)) != 1:
+            return None
+
+    proof_method = (
+        "snapshot-duplicate-base-anchored-payload-proof"
+        if proof.three_way
+        else "snapshot-duplicate-keyed-payload-proof"
+    )
+    proof_causes = (
+        (
+            "unique-declared-row-key",
+            "blank-one-sided-additions",
+            "same-anchor-interval",
+            "same-run-ordinal",
+            "base-anchored-keyed-payload",
+            "no-cross-position-base-payload-match",
+        )
+        if proof.three_way
+        else (
+            "unique-declared-row-key",
+            "blank-one-sided-additions",
+            "same-anchor-interval",
+            "same-run-ordinal",
+            "all-side-keyed-payload-digest",
+        )
+    )
+    normalized_slots = []
+    for slot in cache.model.slots:
+        if int(slot.logical_idx) not in proof_slots:
+            normalized_slots.append(slot)
+            continue
+        normalized_slots.append(ColumnSlot(
+            logical_idx=slot.logical_idx,
+            mine_col=slot.mine_col,
+            base_col=slot.base_col,
+            theirs_col=slot.theirs_col,
+            state="retained",
+            confidence=ColumnMappingConfidence(
+                1.0,
+                False,
+                proof_method,
+                proof_causes,
+            ),
+            base_boundary=slot.base_boundary,
+            origin_side=slot.origin_side,
+        ))
+    normalized_slots = tuple(normalized_slots)
+    model = ColumnModel.from_slots(
+        cache.model.cache_key,
+        normalized_slots,
+        blocks=_build_column_blocks(normalized_slots),
+        confidence=ColumnMappingConfidence(
+            min((slot.confidence.score for slot in normalized_slots), default=1.0),
+            False,
+            proof_method,
+            (proof_method,),
+        ),
+    )
+    if proof.three_way:
+        normalized_alignment = ColumnAlignment3WayResult(
+            model,
+            alignment.mine_to_base,
+            alignment.theirs_to_base,
+            (),
+            False,
+            "",
+        )
+        normalized = LogicalColumnComparisonCache(
+            model=model,
+            three_way_alignment=normalized_alignment,
+            structural_diff_cols=frozenset(),
+            unresolved_cols=frozenset(),
+        )
+    else:
+        normalized_alignment = ColumnAlignmentResult(
+            model,
+            alignment.anchor_pairs,
+            (),
+            False,
+            "",
+        )
+        normalized = LogicalColumnComparisonCache(
+            model=model,
+            two_way_alignment=normalized_alignment,
+            structural_diff_cols=frozenset(),
+            unresolved_cols=frozenset(),
+        )
+    return (
+        normalized
+        if _snapshot_duplicate_proof_cache_is_bijective(
+            normalized, mine, theirs, base
+        )
+        else None
+    )
+
+
 def _apply_snapshot_duplicate_field_proof_to_column_cache(
     cache: LogicalColumnComparisonCache,
     proof: SnapshotDuplicateFieldProof,
@@ -9626,6 +10307,15 @@ def _apply_snapshot_duplicate_field_proof_to_column_cache(
         cache, proof, replacement_by_pair, mine, theirs, base
     ):
         return cache
+    if proof.keyed_payload:
+        return _apply_snapshot_keyed_duplicate_field_proof_to_column_cache(
+            cache,
+            proof,
+            replacement_by_pair,
+            mine,
+            theirs,
+            base,
+        )
 
     ambiguous_slots = {
         slot.logical_idx for slot in cache.model.slots
@@ -9771,6 +10461,250 @@ def _try_apply_snapshot_duplicate_field_proof_to_column_cache(*args, **kwargs):
     """A malformed candidate/cache remains unresolved rather than guessed."""
     try:
         return _apply_snapshot_duplicate_field_proof_to_column_cache(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _apply_snapshot_base_anchored_missing_duplicate_fields_to_column_cache(
+    cache: LogicalColumnComparisonCache,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    base: SheetSnapshot,
+) -> LogicalColumnComparisonCache | None:
+    """Resolve a complete one-branch deletion of a Base duplicate identity.
+
+    One branch must contain none of the identity, the other branch must retain
+    every Base occurrence with the same keyed payload digest, and the existing
+    three-way cache must already expose exactly those Base-anchored slots with
+    the missing branch coordinate set to None. Partial deletion,
+    delete-versus-modify, or any unrelated unresolved slot remains terminal.
+    """
+    alignment = cache.three_way_alignment
+    if alignment is None or not cache.unresolved_cols or not cache.structural_diff_cols:
+        return None
+
+    allowed_causes = {
+        COLUMN_MAPPING_CAUSE_BLANK_COLUMN,
+        COLUMN_MAPPING_CAUSE_DUPLICATE_SIGNATURE,
+    }
+    model_causes = set(cache.model.confidence.cause_codes)
+    if (
+        not cache.model.confidence.ambiguous
+        or not model_causes
+        or not model_causes.issubset(allowed_causes)
+    ):
+        return None
+
+    snapshots = (mine, theirs, base)
+    for snapshot in snapshots:
+        records = _snapshot_declared_records(snapshot)
+        if not records:
+            return None
+        keys = tuple(key for key, _rows in records)
+        if len(set(keys)) != len(keys):
+            return None
+
+    mine_data = _snapshot_duplicate_run_descriptors(
+        mine, keyed_payload=True
+    )
+    theirs_data = _snapshot_duplicate_run_descriptors(
+        theirs, keyed_payload=True
+    )
+    base_data = _snapshot_duplicate_run_descriptors(
+        base, keyed_payload=True
+    )
+    if mine_data is None or theirs_data is None or base_data is None:
+        return None
+    mine_groups, _mine_duplicates, mine_descriptors = mine_data
+    theirs_groups, _theirs_duplicates, theirs_descriptors = theirs_data
+    base_groups, base_duplicates, base_descriptors = base_data
+
+    candidates = []
+    for identity in sorted(base_duplicates, key=repr):
+        base_count = len(base_groups.get(identity, ()))
+        mine_count = len(mine_groups.get(identity, ()))
+        theirs_count = len(theirs_groups.get(identity, ()))
+        if base_count < 2:
+            continue
+        if mine_count == 0 and theirs_count == base_count:
+            missing_side = "mine"
+            present_descriptors = theirs_descriptors
+        elif theirs_count == 0 and mine_count == base_count:
+            missing_side = "theirs"
+            present_descriptors = mine_descriptors
+        else:
+            continue
+
+        base_entries = {
+            descriptor: payload
+            for descriptor, payload in base_descriptors.items()
+            if descriptor[0] == identity
+        }
+        present_entries = {
+            descriptor: payload
+            for descriptor, payload in present_descriptors.items()
+            if descriptor[0] == identity
+        }
+        if (
+            len(base_entries) != base_count
+            or set(base_entries) != set(present_entries)
+        ):
+            return None
+        for descriptor in sorted(base_entries, key=repr):
+            base_field, base_digest, _base_left, _base_right = (
+                base_entries[descriptor]
+            )
+            present_field, present_digest, _present_left, _present_right = (
+                present_entries[descriptor]
+            )
+            if present_digest != base_digest:
+                return None
+            if missing_side == "mine":
+                candidates.append((
+                    None,
+                    int(base_field.physical_col),
+                    int(present_field.physical_col),
+                    missing_side,
+                ))
+            else:
+                candidates.append((
+                    int(present_field.physical_col),
+                    int(base_field.physical_col),
+                    None,
+                    missing_side,
+                ))
+    if not candidates:
+        return None
+
+    candidate_slots = {}
+    for mine_col, base_col, theirs_col, missing_side in candidates:
+        matches = [
+            slot for slot in cache.model.slots
+            if (
+                slot.mine_col == mine_col
+                and slot.base_col == base_col
+                and slot.theirs_col == theirs_col
+            )
+        ]
+        if len(matches) != 1:
+            return None
+        slot = matches[0]
+        causes = set(slot.confidence.cause_codes)
+        if (
+            slot.state != "unresolved"
+            or not slot.confidence.ambiguous
+            or not causes
+            or not causes.issubset(allowed_causes)
+        ):
+            return None
+        if slot.logical_idx in candidate_slots:
+            return None
+        candidate_slots[int(slot.logical_idx)] = missing_side
+
+    candidate_logicals = set(candidate_slots)
+    unresolved_logicals = {
+        int(slot.logical_idx)
+        for slot in cache.model.slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    }
+    candidate_columns = {
+        logical + 1 for logical in candidate_logicals
+    }
+    if not (
+        unresolved_logicals == candidate_logicals
+        and set(cache.unresolved_cols) == candidate_columns
+        and set(cache.structural_diff_cols) == candidate_columns
+        and set(alignment.fallback_slot_indices) == candidate_logicals
+        and alignment.used_physical_fallback
+    ):
+        return None
+
+    normalized_slots = []
+    for slot in cache.model.slots:
+        missing_side = candidate_slots.get(int(slot.logical_idx))
+        if missing_side is None:
+            if slot.state == "unresolved" or slot.confidence.ambiguous:
+                return None
+            normalized_slots.append(slot)
+            continue
+        normalized_slots.append(ColumnSlot(
+            logical_idx=slot.logical_idx,
+            mine_col=slot.mine_col,
+            base_col=slot.base_col,
+            theirs_col=slot.theirs_col,
+            state=f"{missing_side}-deleted",
+            confidence=ColumnMappingConfidence(
+                1.0,
+                False,
+                "snapshot-duplicate-base-anchored-missing-side-proof",
+                (
+                    "unique-declared-row-key",
+                    "complete-duplicate-identity-missing-on-one-side",
+                    "same-anchor-interval",
+                    "same-run-ordinal",
+                    "present-side-keyed-payload-equals-base",
+                    "existing-base-anchored-missing-side-slot",
+                ),
+            ),
+            base_boundary=slot.base_boundary,
+            origin_side=slot.origin_side,
+        ))
+    normalized_slots = tuple(normalized_slots)
+    model = ColumnModel.from_slots(
+        cache.model.cache_key,
+        normalized_slots,
+        blocks=_build_column_blocks(normalized_slots),
+        confidence=ColumnMappingConfidence(
+            min(
+                (slot.confidence.score for slot in normalized_slots),
+                default=1.0,
+            ),
+            False,
+            "snapshot-duplicate-base-anchored-missing-side-proof",
+            ("snapshot-duplicate-base-anchored-missing-side-proof",),
+        ),
+    )
+    normalized_alignment = ColumnAlignment3WayResult(
+        model,
+        alignment.mine_to_base,
+        alignment.theirs_to_base,
+        (),
+        False,
+        "",
+    )
+    normalized = LogicalColumnComparisonCache(
+        model=model,
+        three_way_alignment=normalized_alignment,
+        structural_diff_cols=frozenset(candidate_columns),
+        unresolved_cols=frozenset(),
+    )
+
+    for field_name, snapshot in (
+        ("mine_col", mine),
+        ("theirs_col", theirs),
+        ("base_col", base),
+    ):
+        physical = [
+            int(value)
+            for slot in normalized.model.slots
+            if (value := getattr(slot, field_name)) is not None
+        ]
+        expected = set(range(1, int(snapshot.max_col or 0) + 1))
+        if len(physical) != len(set(physical)) or set(physical) != expected:
+            return None
+    return normalized
+
+
+def _try_apply_snapshot_base_anchored_missing_duplicate_fields_to_column_cache(
+    *args, **kwargs
+):
+    """A malformed missing-side candidate remains unresolved."""
+    try:
+        return (
+            _apply_snapshot_base_anchored_missing_duplicate_fields_to_column_cache(
+                *args, **kwargs
+            )
+        )
     except Exception:
         return None
 
@@ -18154,11 +19088,13 @@ class SheetView:
         # Tk sends duplicate motion/tooltip events for the same cell.
         self._last_hover_payload_request_key = None
         self._last_hover_payload_request_value = None
-        # Hover throttle: dedup identical targets and debounce heavy panel refresh.
+        # Hover throttle: dedup identical targets and coalesce heavy panel refresh.
         self._last_hover_target_key = None
         self._hover_debounce_id = None
         self._pending_hover_args = None
-        self._hover_debounce_ms = 30
+        # Publish on the next regular timer turn. Unlike an idle task, this
+        # remains runnable while continuous <Motion> traffic is arriving.
+        self._hover_debounce_ms = 0
         self.hover_cmp_host = ttk.Frame(self.lower_area, height=self._hover_compare_reserved_height())
         self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 2))
         try:
@@ -18674,6 +19610,20 @@ class SheetView:
             pass
         self._update_sheet_role_labels()
         self._refresh_column_action_buttons()
+        # The first exact immutable surface is already safe to inspect and has
+        # complete physical operation targets, but snapshot-first startup may
+        # still have the editable workbook graphs deferred.  Warm those graphs
+        # now so the user's first normal mutation does not have to act as the
+        # loader button.  Only the transition owner requests the preload;
+        # repeated widget refreshes cannot append duplicate requests.
+        if previous != current and current == "EDIT_DEFERRED":
+            request_auto_preload = getattr(
+                self.app,
+                "_request_edit_preload_for_exact_view",
+                None,
+            )
+            if callable(request_auto_preload):
+                request_auto_preload(self)
 
     def _hide_identity_label_tooltip(self):
         after_id = getattr(self, "_identity_tooltip_after_id", None)
@@ -19384,12 +20334,21 @@ class SheetView:
         return self._has_complete_prepared_rows_for(self._full_display_rows)
 
     def _virtual_viewport_row_capacity(self) -> int:
-        """Return the row count needed to cover the visible main Text area.
+        """Return the number of complete rows visible in the main Text area.
 
         Tk reports a one-pixel height before the first layout pass, so retain
         the fixed initial fallback until a real Text display line is available.
-        One extra row covers a partially visible final line without exposing a
-        white strip at the bottom of the pane.
+        Once laid out, ``dlineinfo`` includes the Text widget's real top inset.
+        Its reported line height does *not* necessarily include the configured
+        inter-line spacing, so prefer the pixel pitch between two consecutive
+        display lines. Counting only the glyph height made the logical window
+        one or two rows taller than the real viewport on compact 2-way sheets;
+        the scrollbar could reach 100% while the final logical row remained
+        below the lower border.
+
+        The top inset is symmetric for the Tk Text surface, so exclude it from
+        both ends. Only complete display-line slots belong in the recycled
+        window.
         """
         fallback = int(_VIRTUAL_VIEWPORT_MAX_ROWS)
         widget = getattr(self, "left", None)
@@ -19398,15 +20357,125 @@ class SheetView:
         try:
             height = int(widget.winfo_height())
             line_info = widget.dlineinfo("1.0")
-            line_height = int(line_info[3]) if line_info is not None else 0
-            if height <= 1 or line_height <= 0:
+            if height <= 1 or line_info is None or int(line_info[3]) <= 0:
                 return fallback
-            return max(fallback, int(math.ceil(height / line_height)) + 1)
+            top_inset = max(0, int(line_info[1]))
+            measurement_key = (height, top_inset)
+            if (
+                getattr(self, "_virtual_row_capacity_measurement_key", None)
+                != measurement_key
+            ):
+                self._virtual_row_capacity_measurement_key = measurement_key
+                self._virtual_measured_row_capacity = None
+            sample_infos = []
+            for line_number in range(1, 9):
+                sample = widget.dlineinfo(f"{line_number}.0")
+                if sample is None:
+                    break
+                displayed_height = int(sample[3])
+                baseline = int(sample[4])
+                if displayed_height > 0 and baseline < displayed_height:
+                    sample_infos.append(sample)
+            sample_heights = sorted(int(info[3]) for info in sample_infos)
+            line_height = (
+                sample_heights[len(sample_heights) // 2]
+                if sample_heights
+                else int(line_info[3])
+            )
+            sample_pitches = sorted(
+                int(current[1]) - int(previous[1])
+                for previous, current in zip(sample_infos, sample_infos[1:])
+                if int(current[1]) > int(previous[1])
+            )
+            line_pitch = (
+                sample_pitches[len(sample_pitches) // 2]
+                if sample_pitches
+                else line_height
+            )
+            line_pitch = max(1, line_height, line_pitch)
+            usable_height = max(
+                line_height,
+                int(height - top_inset - top_inset),
+            )
+            estimated_capacity = max(1, int(usable_height // line_pitch))
+
+            # Compact tables can mix glyph fallback metrics even under one Text
+            # font. Inspect the already bounded document when it reaches the
+            # lower edge: dlineinfo reports a reduced height for a clipped last
+            # line, which gives us Tk's authoritative complete-row capacity.
+            try:
+                document_last_line = int(str(widget.index("end-1c")).split(".", 1)[0])
+            except Exception:
+                document_last_line = 0
+            complete_lines = 0
+            viewport_limited = False
+            probe_limit = min(
+                max(0, document_last_line),
+                max(2, estimated_capacity + 3),
+            )
+            bottom_limit = max(top_inset, height - top_inset)
+            for line_number in range(1, probe_limit + 1):
+                info = widget.dlineinfo(f"{line_number}.0")
+                if info is None:
+                    if line_number <= document_last_line:
+                        viewport_limited = True
+                    break
+                displayed_height = int(info[3])
+                baseline = int(info[4])
+                if (
+                    displayed_height <= 0
+                    or baseline >= displayed_height
+                    or int(info[1]) + displayed_height > bottom_limit
+                ):
+                    viewport_limited = True
+                    break
+                complete_lines += 1
+            if viewport_limited and complete_lines > 0:
+                prior_measured = getattr(
+                    self, "_virtual_measured_row_capacity", None
+                )
+                measured_capacity = (
+                    min(int(prior_measured), complete_lines)
+                    if prior_measured is not None
+                    else complete_lines
+                )
+                self._virtual_measured_row_capacity = measured_capacity
+                return measured_capacity
+            prior_measured = getattr(self, "_virtual_measured_row_capacity", None)
+            if prior_measured is not None:
+                return max(1, min(estimated_capacity, int(prior_measured)))
+            return estimated_capacity
         except Exception:
             return fallback
 
+    def _virtual_tail_row_capacity(
+        self,
+        total: int | None = None,
+        *,
+        capacity: int | None = None,
+    ) -> int:
+        """Return the data-row capacity at the logical end of the result.
+
+        Every bounded Text document already carries a trailing blank display
+        line. Reserve one viewport slot for that line plus one boundary guard:
+        diff-block/current-row styling can make the first line of the tail
+        window taller than the ordinary rows used by the preceding capacity
+        measurement. This keeps the final spreadsheet row and one complete
+        blank line visible without changing non-tail window capacity.
+        """
+        if total is None:
+            total = len(getattr(self, "_full_display_rows", ()) or ())
+        if capacity is None:
+            capacity = self._virtual_viewport_row_capacity()
+        capacity = min(max(0, int(capacity)), max(0, int(total)))
+        if int(total) > capacity and capacity > 1:
+            return max(1, capacity - 2)
+        return capacity
+
     def _on_main_viewport_configure(self, _event=None) -> None:
         """Republish the current immutable window after a height change."""
+        if bool(getattr(self.app, "_is_closing", False)):
+            return
         capacity = self._virtual_viewport_row_capacity()
         previous = int(getattr(
             self, "_virtual_viewport_row_cap", _VIRTUAL_VIEWPORT_MAX_ROWS
@@ -19937,6 +21006,8 @@ class SheetView:
         combined target.  The immutable raw model lets us safely hold both
         desired coordinates until this one short frame callback runs.
         """
+        if bool(getattr(self.app, "_is_closing", False)):
+            return
         if getattr(self, "_virtual_publish_after_id", None) is not None:
             return
 
@@ -20153,7 +21224,10 @@ class SheetView:
             return list(self._full_display_rows)
         if start is None:
             start = self._virtual_window_start
-        start = max(0, min(int(start or 0), total - cap))
+        start = self._canonical_virtual_row_start(int(start or 0))
+        tail_cap = self._virtual_tail_row_capacity(total, capacity=cap)
+        if tail_cap < cap and start >= total - tail_cap:
+            cap = tail_cap
         self._virtual_window_start = start
         return list(self._full_display_rows[start:start + cap])
 
@@ -20169,6 +21243,13 @@ class SheetView:
         """Return the only valid bounded row-window start for this snapshot."""
         total = len(getattr(self, "_full_display_rows", ()) or ())
         cap = min(self._virtual_viewport_row_capacity(), total)
+        tail_cap = self._virtual_tail_row_capacity(total, capacity=cap)
+        if (
+            total > cap
+            and tail_cap < cap
+            and int(start) >= max(0, total - cap)
+        ):
+            return max(0, total - tail_cap)
         return max(0, min(int(start), max(0, total - cap)))
 
     def _queue_virtual_window(
@@ -21995,30 +23076,55 @@ class SheetView:
     def _schedule_hover_panels(self, pair_idx, target_col, side, *,
                                popup_force_show=False, x_root=None, y_root=None,
                                refresh_c_area=True):
-        """Throttle hover-driven panel refreshes.
+        """Coalesce hover-driven panel refreshes with a bounded wait.
 
         - Dedup: skip work entirely when the hovered (pair, col, side) is unchanged.
-        - Debounce: coalesce rapid cross-cell motion into a single refresh.
+        - Throttle: publish the freshest target within one short timer interval.
         """
-        key = (pair_idx, target_col, str(side), bool(refresh_c_area))
-        # Always remember the freshest request so the debounced call uses latest position.
+        pair_idx = self._normalize_pair_idx(pair_idx)
+        try:
+            target_col = int(target_col) if target_col is not None else None
+        except Exception:
+            target_col = None
+        normalized_side = str(side or "").upper()
+        key = (
+            pair_idx,
+            target_col,
+            normalized_side,
+            bool(refresh_c_area),
+            int(getattr(self, "_data_version", 0) or 0),
+            int(getattr(self, "_column_projection_generation", 0) or 0),
+            int(getattr(self, "_virtual_column_window_generation", 0) or 0),
+        )
+        # Publish the lightweight logical target immediately. Consumers that
+        # resolve the active C row should never observe the previous cell while
+        # the heavier Text/tag refresh is being coalesced.
+        self.hover_pair_idx = pair_idx
+        self.hover_col_idx = target_col
+        self.hover_side = normalized_side or None
+        same_target = key == getattr(self, "_last_hover_target_key", None)
+        timer_pending = getattr(self, "_hover_debounce_id", None) is not None
+        if same_target and not timer_pending:
+            return
+        # Always remember the freshest request so the timer uses latest position.
         self._pending_hover_args = (
-            pair_idx, target_col, side, bool(popup_force_show),
+            pair_idx, target_col, normalized_side, bool(popup_force_show),
             x_root, y_root, bool(refresh_c_area),
         )
-        if key == getattr(self, "_last_hover_target_key", None):
+        if same_target:
             return
         self._last_hover_target_key = key
-        # Coalesce bursts of Motion events: run the heavy panel refresh once when
-        # the event loop next goes idle, instead of on every pixel of movement.
-        aid = getattr(self, "_hover_debounce_id", None)
-        if aid is not None:
-            try:
-                self.frame.after_cancel(aid)
-            except Exception:
-                pass
+        # Never cancel/reschedule an existing timer. Repeated cancellation made
+        # the old after_idle callback wait indefinitely during continuous mouse
+        # movement. The pending args above still make the one scheduled call
+        # publish the newest target.
+        if timer_pending:
+            return
         try:
-            self._hover_debounce_id = self.frame.after_idle(self._run_pending_hover_panels)
+            delay_ms = max(0, int(getattr(self, "_hover_debounce_ms", 0) or 0))
+            self._hover_debounce_id = self.frame.after(
+                delay_ms, self._run_pending_hover_panels
+            )
         except Exception:
             self._hover_debounce_id = None
             self._run_pending_hover_panels()
@@ -22026,6 +23132,7 @@ class SheetView:
     def _run_pending_hover_panels(self):
         self._hover_debounce_id = None
         args = getattr(self, "_pending_hover_args", None)
+        self._pending_hover_args = None
         if not args:
             return
         try:
@@ -27863,6 +28970,7 @@ class SheetView:
                 f"采用{direction_text}",
                 direction=direction,
                 row_count=total_region_rows,
+                comparison_before=self._capture_compound_comparison_state(),
             )
             undo_group_active = True
             # Collect all undo cells into one list so the entire region is a
@@ -35983,6 +37091,93 @@ class SheetView:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _compound_redo_child_supported(action: dict) -> bool:
+        """Whether an existing child action has an exact redo implementation."""
+        if not isinstance(action, dict):
+            return False
+        if action.get("kind") == "column_action":
+            return True
+        target = action.get("target")
+        if target in (
+            "A_INSERT_ROW", "B_INSERT_ROW", "A_DELETE_ROW", "B_DELETE_ROW",
+        ):
+            return True
+        return target in ("A", "B") and bool(action.get("redo_cells"))
+
+    def _capture_compound_comparison_state(self) -> dict:
+        """Capture the exact visible row/Base model around a region action."""
+        return {
+            "row_pairs": tuple(getattr(self, "row_pairs", ()) or ()),
+            "mine_to_base_row": tuple(sorted(
+                (getattr(self, "mine_to_base_row", {}) or {}).items()
+            )),
+            "theirs_to_base_row": tuple(sorted(
+                (getattr(self, "theirs_to_base_row", {}) or {}).items()
+            )),
+            "pair_base_row_override": tuple(sorted(
+                (getattr(self, "pair_base_row_override", {}) or {}).items()
+            )),
+            "pair_diff_cols": self._pack_column_diff_map(
+                getattr(self, "pair_diff_cols", {}) or {}
+            ),
+            "pair_base_diff_cols": self._pack_column_diff_map(
+                getattr(self, "pair_base_diff_cols", {}) or {}
+            ),
+            "pair_diff_full_exact": bool(
+                getattr(self, "_pair_diff_full_exact", False)
+            ),
+            "base_diff_full_exact": bool(
+                getattr(self, "_base_diff_full_exact", False)
+            ),
+            "row_model_exact": bool(getattr(self, "_row_model_exact", False)),
+            "diff_partial": bool(getattr(self, "_diff_partial", False)),
+        }
+
+    def _restore_compound_comparison_state(self, state) -> bool:
+        """Restore a captured model only when replay rebuilt the same row pairs."""
+        if not isinstance(state, dict):
+            return False
+        expected_pairs = tuple(state.get("row_pairs") or ())
+        if tuple(self.row_pairs) != expected_pairs:
+            _dlog(
+                f"COMPOUND_COMPARISON_STATE_SKIPPED sheet={self.sheet} "
+                "reason=row-pairs-differ"
+            )
+            return False
+        try:
+            self._invalidate_only_diff_snapshot_cache()
+            self.row_pairs = list(expected_pairs)
+            self.mine_to_base_row = dict(state.get("mine_to_base_row") or ())
+            self.theirs_to_base_row = dict(state.get("theirs_to_base_row") or ())
+            self.pair_base_row_override = dict(
+                state.get("pair_base_row_override") or ()
+            )
+            self.pair_diff_cols = self._unpack_column_diff_map(
+                state.get("pair_diff_cols")
+            )
+            self.pair_base_diff_cols = self._unpack_column_diff_map(
+                state.get("pair_base_diff_cols")
+            )
+            self._pair_diff_full_exact = bool(
+                state.get("pair_diff_full_exact", False)
+            )
+            self._base_diff_full_exact = bool(
+                state.get("base_diff_full_exact", False)
+            )
+            self._row_model_exact = bool(state.get("row_model_exact", False))
+            self._diff_partial = bool(state.get("diff_partial", False))
+            self._rebuild_row_pair_lookup_maps()
+            self._invalidate_render_cache()
+            _dlog(f"COMPOUND_COMPARISON_STATE_RESTORED sheet={self.sheet}")
+            return True
+        except Exception as exc:
+            _dlog(
+                f"COMPOUND_COMPARISON_STATE_SKIPPED sheet={self.sheet} "
+                f"reason={type(exc).__name__}:{exc}"
+            )
+            return False
+
     def _undo_last_action(self, *, _internal_rollback: bool = False):
         pending = self.app.undo_stack[-1] if getattr(self.app, "undo_stack", None) else None
         if not pending:
@@ -36014,6 +37209,10 @@ class SheetView:
                 child_actions = list(action.get("actions") or ())
                 if not child_actions:
                     return
+                if "comparison_after" not in action:
+                    action["comparison_after"] = (
+                        undo_view._capture_compound_comparison_state()
+                    )
                 # Children are chronological. Appending them directly makes
                 # the newest child pop first, so one visible undo command
                 # reverses the complete region transaction.
@@ -36021,12 +37220,30 @@ class SheetView:
                 undone = 0
                 for _child in child_actions:
                     stack_size = len(self.app.undo_stack)
-                    self._undo_last_action(
-                        _internal_rollback=_internal_rollback
-                    )
+                    # A compound owns exactly one visible history entry. Child
+                    # undos still capture their redo snapshots, but must never
+                    # escape as separately clickable redo commands.
+                    self._undo_last_action(_internal_rollback=True)
                     if len(self.app.undo_stack) >= stack_size:
                         raise RuntimeError("复合操作中的子操作未能撤销")
                     undone += 1
+                if (
+                    not _internal_rollback
+                    and all(
+                        undo_view._compound_redo_child_supported(child)
+                        for child in child_actions
+                    )
+                ):
+                    self.app.redo_stack.append(action)
+                comparison_restored = (
+                    undo_view._restore_compound_comparison_state(
+                        action.get("comparison_before")
+                    )
+                )
+                if comparison_restored:
+                    undo_view.refresh(row_only=None, rescan=False)
+                    undo_view._finalize_accepted_common_equality_cache_after_mutation()
+                    undo_view._update_cursor_lines()
                 if "global_conflict_sheet_present" in action:
                     undo_view._restore_global_conflict_snapshot(
                         bool(action.get("global_conflict_sheet_present", False)),
@@ -36470,6 +37687,74 @@ class SheetView:
             self.app.redo_stack.append(action)
             return
         try:
+            if action.get("kind") == "compound":
+                child_actions = list(action.get("actions") or ())
+                if not child_actions:
+                    return
+                if not all(
+                    view._compound_redo_child_supported(child)
+                    for child in child_actions
+                ):
+                    self.app.redo_stack.append(action)
+                    messagebox.showerror(
+                        "重做失败",
+                        "这个复合操作包含无法精确重做的旧动作，未修改数据。",
+                    )
+                    return
+
+                # Children are stored chronologically. Put them on the redo
+                # stack in reverse so the recursive pop replays oldest first.
+                # Each successful child temporarily pushes an undo entry; take
+                # it back immediately and publish only the compound at the end.
+                redo_base = len(self.app.redo_stack)
+                replayed_actions = []
+                try:
+                    self.app.redo_stack.extend(reversed(child_actions))
+                    for _child in child_actions:
+                        undo_depth = len(self.app.undo_stack)
+                        self._redo_last_action()
+                        if len(self.app.undo_stack) != undo_depth + 1:
+                            raise RuntimeError("复合操作中的子操作未能重做")
+                        replayed_actions.append(self.app.undo_stack.pop())
+                    if len(self.app.redo_stack) != redo_base:
+                        raise RuntimeError("复合重做栈未完整消费")
+                except Exception:
+                    del self.app.redo_stack[redo_base:]
+                    if replayed_actions:
+                        self.app.undo_stack.extend(replayed_actions)
+                        for _replayed in replayed_actions:
+                            stack_size = len(self.app.undo_stack)
+                            self._undo_last_action(_internal_rollback=True)
+                            if len(self.app.undo_stack) >= stack_size:
+                                break
+                    self.app.redo_stack.append(action)
+                    raise
+
+                action["actions"] = replayed_actions
+                comparison_restored = view._restore_compound_comparison_state(
+                    action.get("comparison_after")
+                )
+                if comparison_restored:
+                    view.refresh(row_only=None, rescan=False)
+                    view._finalize_accepted_common_equality_cache_after_mutation()
+                    view._update_cursor_lines()
+                self.app.undo_stack.append(action)
+                if len(self.app.undo_stack) > 20:
+                    self.app.undo_stack.pop(0)
+                try:
+                    view.info.configure(
+                        text=(
+                            f"已重做{action.get('label', '复合操作')}"
+                            f"（{len(replayed_actions)} 个步骤）。"
+                        )
+                    )
+                except Exception:
+                    pass
+                _dlog(
+                    f"REDO_COMPOUND sheet={action.get('sheet')} "
+                    f"label={action.get('label')} actions={len(replayed_actions)}"
+                )
+                return
             if action.get("kind") == "column_action":
                 self.app._redo_replaying = True
                 try:
@@ -40845,13 +42130,45 @@ class SowMergeApp:
             return False
         return True
 
+    def _request_edit_preload_for_exact_view(self, view) -> bool:
+        """Warm editable workbooks after one selected exact surface publishes.
+
+        The immutable-view predicate is deliberately stronger than a terminal
+        Sheet badge: hidden summaries, partial render/cache owners, stale
+        generations, unresolved mappings, and non-selected views must never
+        materialize the editable backend.  `_request_edit_preload` retains the
+        single-owner compare-and-set used by explicit mutation/save fallback.
+        """
+        if view is None or bool(getattr(self, "_is_closing", False)):
+            return False
+        sheet = str(getattr(view, "sheet", "") or "")
+        if not sheet or sheet != str(getattr(self, "selected_sheet", "") or ""):
+            return False
+        if getattr(self, "sheet_views", {}).get(sheet) is not view:
+            return False
+        immutable_ready = getattr(view, "_is_exact_immutable_view_ready", None)
+        if not callable(immutable_ready) or not bool(immutable_ready()):
+            return False
+        if self._edit_workbooks_ready() or bool(
+            getattr(self, "_edit_loading_started", False)
+        ):
+            return False
+        self._request_edit_preload(
+            reason=f"automatic-exact-view:{sheet}",
+            caller="SowMergeApp._request_edit_preload_for_exact_view",
+        )
+        started = bool(getattr(self, "_edit_loading_started", False))
+        if started:
+            _dlog(f"automatic editable preload started sheet={sheet}")
+        return started
+
     def _request_edit_preload(
         self,
         *,
         reason: str = "explicit mutation/save",
         caller: str = "unknown",
     ):
-        """Start the one owner loader only after an edit/save demand."""
+        """Start the one-owner loader for automatic warmup or explicit demand."""
         try:
             self._initial_sheet_ready_event.set()
         except Exception:
@@ -45108,10 +46425,11 @@ class SowMergeApp:
             # that point both competes with the selected paired stream and
             # retains hundreds of MB before any edit/save was requested.
             #
-            # A selected snapshot keeps the existing explicit edit/save
-            # promotion.  A selected small/legacy Sheet still retains its
-            # established eager fallback.  Crucially, a cache for a tab the
-            # user has already left never starts that eager promotion.
+            # A selected snapshot is promoted only by the centralized
+            # full-detail immutable-view lifecycle gate. A selected
+            # small/legacy Sheet still retains its established eager fallback.
+            # Crucially, a cache for a tab the user has already left never
+            # starts that fallback promotion.
             if bool(getattr(self, "_snapshot_startup_lightweight", False)) and (
                 bool((cache or {}).get("snapshot_engine", False))
                 or str(sheet) != str(getattr(self, "selected_sheet", "") or "")

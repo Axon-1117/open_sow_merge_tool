@@ -37,3 +37,15 @@ dist_new*/
 dist_tmp*/
 tmp/
 sow_merge_tool_new*.spec
+
+# Local benchmark and corpus outputs
+benchmark_results/
+corpus*.json*
+corpus*_slowest.md
+focused_fast_detail*.json*
+large_sheet_corpus*.json*
+large_sheet_corpus*_slowest.md
+
+# Agent scratch and candidate backups
+*.codex_*.py
+*.codex_candidate_*

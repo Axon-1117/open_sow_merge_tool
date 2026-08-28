@@ -26,6 +26,7 @@ import sow_merge_tool as smt
 
 
 _CASES = (
+    "automatic-edit-preload",
     "non-ready-zero-write",
     "only-diff-pending",
     "edit-ready-no-rescan",
@@ -70,7 +71,7 @@ def _wait_until(root, predicate, message: str, timeout: float = 15.0) -> None:
     raise AssertionError(message)
 
 
-def _open_ready_view(case):
+def _open_ready_view(case, *, automatic_preload: bool = False):
     mine = str(case.root / "mine.xlsx")
     theirs = str(case.root / "theirs.xlsx")
     _make_book(
@@ -96,28 +97,46 @@ def _open_ready_view(case):
         ),
     )
     case.track_inputs(mine, theirs)
-    app = smt.SowMergeApp(mine, theirs)
-    case.track_app(app)
-    app.root.deiconify()
-    app.root.geometry("940x760")
-    app.nb.select(app._sheet_containers["Data"])
+    automatic_original = smt.SowMergeApp._request_edit_preload_for_exact_view
+    if not automatic_preload:
+        smt.SowMergeApp._request_edit_preload_for_exact_view = (
+            lambda _app, _view: False
+        )
+    try:
+        app = smt.SowMergeApp(mine, theirs)
+        case.track_app(app)
+        app.root.deiconify()
+        app.root.geometry("940x760")
+        app.nb.select(app._sheet_containers["Data"])
 
-    _wait_until(
-        app.root,
-        lambda: (
-            app.sheet_views.get("Data") is not None
-            and bool(getattr(app.sheet_views["Data"], "_data_ready", False))
-            and app._is_sheet_exact_current("Data")
-        ),
-        "small test workbook did not publish current exact data",
-    )
+        _wait_until(
+            app.root,
+            lambda: (
+                app.sheet_views.get("Data") is not None
+                and bool(getattr(app.sheet_views["Data"], "_data_ready", False))
+                and app._is_sheet_exact_current("Data")
+            ),
+            "small test workbook did not publish current exact data",
+        )
+    finally:
+        smt.SowMergeApp._request_edit_preload_for_exact_view = automatic_original
     view = app.sheet_views["Data"]
     assert app._is_sheet_exact_current("Data")
     assert view._data_ready
-    # B3 is view-only: exact snapshot readiness must not eagerly materialize
-    # editable workbooks or force a foreground rescan.
-    assert not app._edit_workbooks_ready(), "test setup eagerly loaded edit workbooks"
-    _settle_initial_tab_watchdog(app, view, (mine, theirs))
+    if automatic_preload:
+        _wait_until(
+            app.root,
+            lambda: (
+                app._edit_workbooks_ready()
+                and str(getattr(view, "_lifecycle_state", "")) == "READY"
+            ),
+            "automatic editable preload did not publish mutation readiness",
+        )
+    else:
+        # Synthetic non-ready cases keep the former deferred baseline by
+        # suppressing only the new automatic lifecycle trigger.
+        assert not app._edit_workbooks_ready(), "test setup eagerly loaded edit workbooks"
+        _settle_initial_tab_watchdog(app, view, (mine, theirs))
     return app, view, (mine, theirs)
 
 
@@ -1124,6 +1143,7 @@ def _forced_lifecycle(view, state: str):
         "_suppress_bg_apply": view._suppress_bg_apply,
         "_edit_workbooks_ready": app._edit_workbooks_ready,
         "_is_sheet_exact_current": app._is_sheet_exact_current,
+        "_request_edit_preload_for_exact_view": app._request_edit_preload_for_exact_view,
         "_edit_loading_started": app._edit_loading_started,
         "_edit_preload_thread": getattr(app, "_edit_preload_thread", None),
         "_edit_preload_active": app._edit_preload_active_event.is_set(),
@@ -1137,6 +1157,9 @@ def _forced_lifecycle(view, state: str):
     view._lifecycle_error = None
     view._lifecycle_canceled = False
     view._suppress_bg_apply = True
+    # Forced states test public handler guards, not the automatic exact-view
+    # transition. Dedicated cases exercise the automatic owner.
+    app._request_edit_preload_for_exact_view = lambda _view: False
     # Exercise every non-ready state without loading a real editable workbook.
     app._edit_workbooks_ready = lambda: True
 
@@ -1194,6 +1217,9 @@ def _forced_lifecycle(view, state: str):
         else:
             app._interactive_action_event.clear()
         view._refresh_interaction_gate()
+        app._request_edit_preload_for_exact_view = original[
+            "_request_edit_preload_for_exact_view"
+        ]
 
 
 def _widget_state(widget):
@@ -1379,6 +1405,123 @@ def _assert_preload_call_count(evidence, previous_count: int, *, expected_reques
         "reason": expected_request["request_reason"],
         "caller": expected_request["request_caller"],
     }, observed[0]
+
+
+def test_automatic_preload_gate_rejects_non_actionable_views(case):
+    del case
+    app = object.__new__(smt.SowMergeApp)
+    app._is_closing = False
+    app.selected_sheet = "Data"
+    app.sheet_views = {}
+    app._edit_loading_started = False
+    app._edit_workbooks_ready = lambda: False
+    requests = []
+
+    def _request(**kwargs):
+        requests.append(dict(kwargs))
+        app._edit_loading_started = True
+
+    app._request_edit_preload = _request
+
+    def _view(sheet="Data", *, immutable_ready=False):
+        return SimpleNamespace(
+            sheet=sheet,
+            _is_exact_immutable_view_ready=lambda: bool(immutable_ready),
+        )
+
+    # Partial, unresolved, and stale views all fail the centralized immutable
+    # readiness proof and therefore cannot allocate a loader owner.
+    for label in ("partial", "unresolved", "stale"):
+        candidate = _view(immutable_ready=False)
+        app.sheet_views = {"Data": candidate}
+        app.selected_sheet = "Data"
+        app._edit_loading_started = False
+        assert app._request_edit_preload_for_exact_view(candidate) is False, label
+        assert requests == [], (label, requests)
+
+    hidden = _view("Hidden", immutable_ready=True)
+    app.sheet_views = {"Hidden": hidden}
+    app.selected_sheet = "Data"
+    assert app._request_edit_preload_for_exact_view(hidden) is False
+    assert requests == []
+
+    stale_owner = _view(immutable_ready=True)
+    current_owner = _view(immutable_ready=True)
+    app.sheet_views = {"Data": current_owner}
+    app.selected_sheet = "Data"
+    assert app._request_edit_preload_for_exact_view(stale_owner) is False
+    assert requests == []
+
+    app._edit_loading_started = True
+    assert app._request_edit_preload_for_exact_view(current_owner) is False
+    assert requests == []
+
+    app._edit_loading_started = False
+    assert app._request_edit_preload_for_exact_view(current_owner) is True
+    assert requests == [{
+        "reason": "automatic-exact-view:Data",
+        "caller": "SowMergeApp._request_edit_preload_for_exact_view",
+    }], requests
+    assert app._request_edit_preload_for_exact_view(current_owner) is False
+    assert len(requests) == 1, requests
+
+
+def test_initial_exact_view_preloads_and_first_row_overwrite_runs(case):
+    # The pure gate checks above run first so a GUI success cannot hide an
+    # over-broad trigger that also accepts partial/hidden/stale views.
+    test_automatic_preload_gate_rejects_non_actionable_views(case)
+    app, view, source_paths = _open_ready_view(case, automatic_preload=True)
+    original_modal = app._show_exact_readiness_modal
+    try:
+        automatic_requests = [
+            entry
+            for entry in tuple(getattr(app, "_edit_load_requests", ()) or ())
+            if str(entry.get("reason") or "").startswith("automatic-exact-view:")
+        ]
+        assert len(automatic_requests) == 1, automatic_requests
+        assert automatic_requests[0]["reason"] == "automatic-exact-view:Data"
+        assert automatic_requests[0]["caller"] == (
+            "SowMergeApp._request_edit_preload_for_exact_view"
+        )
+        assert app._edit_workbooks_ready()
+        view._refresh_interaction_gate()
+        assert view._lifecycle_state == "READY", view._lifecycle_state
+
+        pair_idx, logical_col, _line, _row_event, _comparison_event = (
+            _prepare_direct_handler_events(view)
+        )
+        row_a, row_b = view.row_pairs[pair_idx]
+        col_a = view._physical_col_for_logical("A", logical_col)
+        col_b = view._physical_col_for_logical("B", logical_col)
+        assert None not in (row_a, row_b, col_a, col_b)
+        source_value = app.ws_b_edit("Data").cell(int(row_b), int(col_b)).value
+        target_before = app.ws_a_edit("Data").cell(int(row_a), int(col_a)).value
+        assert target_before != source_value, (target_before, source_value)
+
+        modals = []
+        app._show_exact_readiness_modal = (
+            lambda action, sheets: modals.append((action, sheets))
+        )
+        assert view._copy_selected_row(
+            "B2A",
+            override_pair_idx=pair_idx,
+            override_cols={logical_col},
+        ) is True
+        _pump(app.root)
+        assert modals == [], modals
+        assert app.ws_a_edit("Data").cell(int(row_a), int(col_a)).value == source_value
+        assert app.modified_a
+        assert len([
+            entry
+            for entry in tuple(getattr(app, "_edit_load_requests", ()) or ())
+            if str(entry.get("reason") or "").startswith("automatic-exact-view:")
+        ]) == 1
+        assert tuple(_file_digest(path) for path in source_paths) == tuple(
+            case._input_before[path] for path in source_paths
+        )
+    finally:
+        app._show_exact_readiness_modal = original_modal
+        case.close_app(app)
 
 
 def test_non_ready_direct_handlers_have_no_write_side_effects(case):
@@ -2460,6 +2603,7 @@ def main(argv=None):
         return
 
     callbacks = {
+        "automatic-edit-preload": test_initial_exact_view_preloads_and_first_row_overwrite_runs,
         "non-ready-zero-write": test_non_ready_direct_handlers_have_no_write_side_effects,
         "only-diff-pending": test_only_diff_pending_stays_checked_locked_and_keeps_stable_view,
         "edit-ready-no-rescan": test_edit_ready_callback_never_calls_refresh_rescan_true,

@@ -239,6 +239,58 @@ def _test_three_way_blank_proof_preserves_base_coordinates():
     _assert_proof_pairs_share_one_logical_slot(result, proof)
 
 
+def _test_three_way_base_anchors_duplicate_content_edits_but_not_reorders():
+    base = _snapshot("base")
+    mine = _snapshot("mine", value_overrides={(3, 3): "mine-local-change"})
+    theirs = _snapshot(
+        "theirs", value_overrides={(4, 4): "theirs-incoming-change"}
+    )
+    result = sm._compare_selected_sheet_snapshots(mine, theirs, base)
+    _assert_exact(result, mine, theirs, base)
+    assert not any(result.conflict_cols)
+    proof = sm._build_snapshot_duplicate_field_identity_proof(
+        mine,
+        theirs,
+        sm._align_selected_sheet_snapshots(mine, theirs),
+        base,
+        sm._align_selected_sheet_snapshots(mine, base),
+        sm._align_selected_sheet_snapshots(theirs, base),
+    )
+    assert proof is not None and proof.keyed_payload
+    _assert_proof_pairs_share_one_logical_slot(result, proof)
+
+    base_with_payload = _snapshot(
+        "base",
+        value_overrides={(3, 3): "payload-a", (3, 4): "payload-b"},
+    )
+    theirs_with_payload = _snapshot(
+        "theirs",
+        value_overrides={(3, 3): "payload-a", (3, 4): "payload-b"},
+    )
+    mine_with_reorder = _snapshot(
+        "mine",
+        value_overrides={(3, 3): "payload-b", (3, 4): "payload-a"},
+    )
+    reorder_proof = sm._build_snapshot_duplicate_field_identity_proof(
+        mine_with_reorder,
+        theirs_with_payload,
+        sm._align_selected_sheet_snapshots(
+            mine_with_reorder, theirs_with_payload
+        ),
+        base_with_payload,
+        sm._align_selected_sheet_snapshots(
+            mine_with_reorder, base_with_payload
+        ),
+        sm._align_selected_sheet_snapshots(
+            theirs_with_payload, base_with_payload
+        ),
+    )
+    assert reorder_proof is None
+    _assert_unresolved(
+        mine_with_reorder, theirs_with_payload, base_with_payload
+    )
+
+
 def _test_three_way_base_physical_offset_fails_closed_without_target():
     mine = _snapshot("mine", layout="base_offset_mine")
     theirs = _snapshot("theirs", layout="base_offset_mine")
@@ -366,9 +418,20 @@ def _test_three_way_same_position_same_gap_formula_diff_keeps_targets():
 
 
 def _three_way_exact_top_fast_path_fixture():
-    mine = _snapshot("mine", layout="interior_end")
-    theirs = _snapshot("theirs", layout="interior_end")
-    base = _snapshot("base", layout="interior_end")
+    # Keep the comparator out of its stronger all-side physical-identity fast
+    # path so these tests actually exercise the injected logical cache.
+    mine = _snapshot(
+        "mine", layout="interior_end",
+        value_overrides={(3, 2): "shared-declared-value"},
+    )
+    base = _snapshot(
+        "base", layout="interior_end",
+        value_overrides={(3, 2): "shared-declared-value"},
+    )
+    theirs = _snapshot(
+        "theirs", layout="interior_end",
+        value_overrides={(3, 2): "incoming-declared-value"},
+    )
     proof = sm._build_snapshot_duplicate_field_identity_proof(
         mine,
         theirs,
@@ -738,8 +801,14 @@ def _test_negative_proofs_remain_unresolved_and_non_actionable():
 
 
 def _test_builder_or_final_cache_exception_fails_closed():
-    mine = _snapshot("mine")
-    theirs = _snapshot("theirs")
+    # Avoid the all-side physical-identity fast path: this contract injects
+    # failures specifically into duplicate-proof construction/finalization.
+    mine = _snapshot(
+        "mine", value_overrides={(3, 2): "mine-declared-value"}
+    )
+    theirs = _snapshot(
+        "theirs", value_overrides={(3, 2): "theirs-declared-value"}
+    )
     original_builder = sm._build_snapshot_duplicate_field_identity_proof
     original_apply = sm._apply_snapshot_duplicate_field_proof_to_column_cache
     try:
@@ -900,8 +969,14 @@ def _three_way_cache_with_slots(
 
 
 def _test_final_cache_unresolved_and_crosswire_fail_closed():
-    mine = _snapshot("mine")
-    theirs = _snapshot("theirs")
+    # This test injects malformed logical caches, so it must not be bypassed by
+    # the stronger physical-identity comparison shortcut.
+    mine = _snapshot(
+        "mine", value_overrides={(3, 2): "mine-declared-value"}
+    )
+    theirs = _snapshot(
+        "theirs", value_overrides={(3, 2): "theirs-declared-value"}
+    )
     pending = sm._align_selected_sheet_snapshots(mine, theirs)
     proof = pending.duplicate_field_proof
     assert proof is not None
@@ -1091,6 +1166,7 @@ def _test_final_cache_unresolved_and_crosswire_fail_closed():
 def main():
     _test_two_way_blank_interior_end_and_start_proofs()
     _test_three_way_blank_proof_preserves_base_coordinates()
+    _test_three_way_base_anchors_duplicate_content_edits_but_not_reorders()
     _test_three_way_base_physical_offset_fails_closed_without_target()
     _test_three_way_same_position_same_gap_formula_diff_keeps_targets()
     _test_three_way_exact_top_cache_accepts_asymmetric_child_gaps()
