@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-28.update89"
-APP_BUILD_TAG = "new166-language-missing-duplicate-tail-proof"
+APP_VERSION = "2026-08-29.update90"
+APP_BUILD_TAG = "new167-two-way-clear-proof"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -8161,6 +8161,309 @@ def _snapshot_physical_contents_equal(
     )
 
 
+def _snapshot_cell_is_effectively_blank(cell: SnapshotCell) -> bool:
+    """Return whether one frozen cell carries no value or formula evidence."""
+    return _paired_snapshot_cell_is_effectively_blank(
+        cell.cached_value,
+        cell.cached_type,
+        cell.formula_value,
+        cell.formula_type,
+    )
+
+
+def _snapshot_is_semantically_empty(snapshot: SheetSnapshot) -> bool:
+    """Prove that a selected Sheet has no schema, value, or formula content.
+
+    The paired snapshot reader canonicalizes an all-empty Sheet to one retained
+    physical row. Its declared width may still be larger than one when Excel
+    keeps style-only dimensions, so inspect every frozen cell and field.
+    """
+    return bool(
+        int(snapshot.max_row) == 1
+        and len(snapshot.rows) == 1
+        and all(
+            not str(field.declaration or "")
+            and not str(field.type_declaration or "")
+            and not field.markers
+            for field in snapshot.fields
+        )
+        and all(
+            _snapshot_cell_is_effectively_blank(cell)
+            for row in snapshot.rows
+            for cell in row.cells
+        )
+    )
+
+
+def _two_way_empty_side_snapshot_comparison(
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+) -> SnapshotComparisonResult | None:
+    """Return an exact 2-way result when precisely one Sheet is wholly empty.
+
+    The non-empty side is complete immutable evidence, while the empty side
+    owns no semantic record or field that could be paired differently. The
+    canonical empty row remains paired with physical row 1 so the UI exposes
+    the cleared first row; all remaining rows are explicit one-sided rows.
+    """
+    mine_empty = _snapshot_is_semantically_empty(mine)
+    theirs_empty = _snapshot_is_semantically_empty(theirs)
+    if mine_empty == theirs_empty:
+        return None
+
+    cache_key = ColumnModelCacheKey(
+        mine.sheet,
+        mine.version.topology_generation,
+        mine.version.mutation_generation,
+    )
+    width = max(1, int(mine.max_col), int(theirs.max_col))
+    confidence = ColumnMappingConfidence(
+        1.0,
+        False,
+        "snapshot-two-way-empty-side-proof",
+        ("one-side-has-no-schema-value-or-formula-content",),
+    )
+    slots = []
+    anchor_pairs = []
+    structural_cols = set()
+    for logical_idx in range(width):
+        physical_col = logical_idx + 1
+        mine_col = physical_col if physical_col <= int(mine.max_col) else None
+        theirs_col = physical_col if physical_col <= int(theirs.max_col) else None
+        if mine_col is not None and theirs_col is not None:
+            state = "retained"
+            anchor_pairs.append((logical_idx, logical_idx))
+        elif mine_col is not None:
+            state = "deleted"
+            structural_cols.add(physical_col)
+        else:
+            state = "inserted"
+            structural_cols.add(physical_col)
+        slots.append(ColumnSlot(
+            logical_idx=logical_idx,
+            mine_col=mine_col,
+            theirs_col=theirs_col,
+            state=state,
+            confidence=confidence,
+        ))
+    slots = tuple(slots)
+    model = ColumnModel.from_slots(
+        cache_key,
+        slots,
+        blocks=_build_column_blocks(slots),
+        confidence=confidence,
+    )
+    alignment = ColumnAlignmentResult(
+        model,
+        tuple(anchor_pairs),
+        (),
+        False,
+        "",
+    )
+    cache = LogicalColumnComparisonCache(
+        model=model,
+        two_way_alignment=alignment,
+        structural_diff_cols=frozenset(structural_cols),
+        unresolved_cols=frozenset(),
+    )
+
+    row_pairs = [(1, 1)]
+    if mine_empty:
+        row_pairs.extend(
+            (None, physical_row)
+            for physical_row in range(2, int(theirs.max_row) + 1)
+        )
+    else:
+        row_pairs.extend(
+            (physical_row, None)
+            for physical_row in range(2, int(mine.max_row) + 1)
+        )
+    row_pairs = tuple(row_pairs)
+
+    diffs = []
+    for mine_row, theirs_row in row_pairs:
+        if (mine_row is None) != (theirs_row is None):
+            diffs.append(frozenset((-1,)))
+            continue
+        mine_values, mine_formulas = _snapshot_row_payload(mine, mine_row)
+        theirs_values, theirs_formulas = _snapshot_row_payload(theirs, theirs_row)
+        diffs.append(compare_logical_row_2way(
+            cache,
+            mine_values,
+            theirs_values,
+            mine_formulas,
+            theirs_formulas,
+            mine_row=mine_row,
+            theirs_row=theirs_row,
+        ).diff_cols)
+    empty = tuple(frozenset() for _pair in row_pairs)
+    return SnapshotComparisonResult(
+        row_pairs,
+        tuple(None for _pair in row_pairs),
+        cache,
+        tuple(diffs),
+        empty,
+        empty,
+        False,
+    )
+
+
+def _apply_snapshot_two_way_same_ordinal_clear_proof(
+    cache: LogicalColumnComparisonCache,
+    mine: SheetSnapshot,
+    theirs: SheetSnapshot,
+    snapshot_alignment: SnapshotAlignment,
+) -> LogicalColumnComparisonCache | None:
+    """Resolve duplicate blank columns around proven whole-column clears.
+
+    This is narrower than ordinary physical fallback. It requires complete
+    unique-key rows in unchanged physical order, equal widths, a bijective
+    same-ordinal model, and every physical column to be byte-for-byte equal or
+    wholly empty on one side. Shifted or independently edited non-empty content
+    remains unresolved.
+    """
+    alignment = cache.two_way_alignment
+    if alignment is None or not cache.unresolved_cols:
+        return None
+    width = int(mine.max_col)
+    if (
+        width <= 0
+        or width != int(theirs.max_col)
+        or int(mine.max_row) != int(theirs.max_row)
+        or len(mine.rows) != len(theirs.rows)
+        or cache.structural_diff_cols
+    ):
+        return None
+    expected_row_pairs = tuple(
+        (physical_row, physical_row)
+        for physical_row in range(1, int(mine.max_row) + 1)
+    )
+    if (
+        not snapshot_alignment.used_declared_keys
+        or tuple(snapshot_alignment.row_pairs) != expected_row_pairs
+        or not _snapshot_row_pairs_are_complete_and_keyed(
+            mine, theirs, expected_row_pairs
+        )
+    ):
+        return None
+
+    slots = tuple(cache.model.slots)
+    if len(slots) != width:
+        return None
+    unresolved_indices = {
+        int(slot.logical_idx)
+        for slot in slots
+        if slot.state == "unresolved" or slot.confidence.ambiguous
+    }
+    if not unresolved_indices or not (
+        set(cache.unresolved_cols)
+        == {logical_idx + 1 for logical_idx in unresolved_indices}
+        == {int(logical_idx) + 1 for logical_idx in alignment.fallback_slot_indices}
+    ):
+        return None
+    for logical_idx, slot in enumerate(slots):
+        physical_col = logical_idx + 1
+        if (
+            int(slot.logical_idx) != logical_idx
+            or slot.mine_col != physical_col
+            or slot.theirs_col != physical_col
+            or slot.base_col is not None
+        ):
+            return None
+
+    def _column_cells(snapshot: SheetSnapshot, physical_col: int):
+        offset = int(physical_col) - 1
+        return tuple(row.cells[offset] for row in snapshot.rows)
+
+    declared_clear_proven = False
+    for logical_idx in range(width):
+        physical_col = logical_idx + 1
+        mine_cells = _column_cells(mine, physical_col)
+        theirs_cells = _column_cells(theirs, physical_col)
+        if mine_cells == theirs_cells:
+            continue
+        mine_blank = all(
+            _snapshot_cell_is_effectively_blank(cell) for cell in mine_cells
+        )
+        theirs_blank = all(
+            _snapshot_cell_is_effectively_blank(cell) for cell in theirs_cells
+        )
+        if mine_blank == theirs_blank:
+            return None
+        populated_snapshot = theirs if mine_blank else mine
+        empty_snapshot = mine if mine_blank else theirs
+        populated_field = populated_snapshot.fields[logical_idx]
+        empty_field = empty_snapshot.fields[logical_idx]
+        if (
+            (
+                str(populated_field.declaration or "")
+                or str(populated_field.type_declaration or "")
+                or populated_field.markers
+            )
+            and not str(empty_field.declaration or "")
+            and not str(empty_field.type_declaration or "")
+            and not empty_field.markers
+        ):
+            declared_clear_proven = True
+    if not declared_clear_proven:
+        return None
+
+    proof_confidence = ColumnMappingConfidence(
+        1.0,
+        False,
+        "snapshot-two-way-same-ordinal-clear-proof",
+        (
+            "complete-unique-key-row-map",
+            "same-physical-row-order",
+            "same-column-width",
+            "same-ordinal-bijection",
+            "every-column-equal-or-empty-on-one-side",
+            "at-least-one-declared-column-cleared",
+        ),
+    )
+    normalized_slots = tuple(
+        ColumnSlot(
+            logical_idx=slot.logical_idx,
+            mine_col=slot.mine_col,
+            base_col=slot.base_col,
+            theirs_col=slot.theirs_col,
+            state="retained",
+            confidence=proof_confidence,
+            base_boundary=slot.base_boundary,
+            origin_side=slot.origin_side,
+        )
+        if int(slot.logical_idx) in unresolved_indices else slot
+        for slot in slots
+    )
+    model = ColumnModel.from_slots(
+        cache.model.cache_key,
+        normalized_slots,
+        blocks=_build_column_blocks(normalized_slots),
+        confidence=proof_confidence,
+    )
+    normalized_alignment = ColumnAlignmentResult(
+        model,
+        tuple((idx, idx) for idx in range(width)),
+        (),
+        False,
+        "",
+    )
+    return LogicalColumnComparisonCache(
+        model=model,
+        two_way_alignment=normalized_alignment,
+        structural_diff_cols=cache.structural_diff_cols,
+        unresolved_cols=frozenset(),
+    )
+
+
+def _try_apply_snapshot_two_way_same_ordinal_clear_proof(*args, **kwargs):
+    """A malformed clear candidate remains unresolved rather than guessed."""
+    try:
+        return _apply_snapshot_two_way_same_ordinal_clear_proof(*args, **kwargs)
+    except Exception:
+        return None
+
+
 def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot, base: SheetSnapshot | None = None) -> SnapshotComparisonResult:
     """Produce 2-way or Base-anchored 3-way results with no Worksheet access."""
     if _snapshot_physical_contents_equal(mine, theirs) and (
@@ -8170,6 +8473,10 @@ def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot
             mine,
             three_way=base is not None,
         )
+    if base is None:
+        empty_side_result = _two_way_empty_side_snapshot_comparison(mine, theirs)
+        if empty_side_result is not None:
+            return empty_side_result
     alignment = _align_selected_sheet_snapshots(mine, theirs)
     row_pairs = alignment.row_pairs
     mine_payloads = tuple(_snapshot_row_payload(mine, a) for a, _b in row_pairs)
@@ -8207,6 +8514,16 @@ def _compare_selected_sheet_snapshots(mine: SheetSnapshot, theirs: SheetSnapshot
                 # The candidate's exact Mine/Theirs pair membership and every
                 # final cache slot were checked by the normalizer.  This is
                 # the only point at which the duplicate-field reason clears.
+                alignment_unresolved = False
+        if alignment_unresolved:
+            clear_cache = _try_apply_snapshot_two_way_same_ordinal_clear_proof(
+                cache,
+                mine,
+                theirs,
+                alignment,
+            )
+            if clear_cache is not None:
+                cache = clear_cache
                 alignment_unresolved = False
         diffs = []
         for index, (mine_row, theirs_row) in enumerate(row_pairs):

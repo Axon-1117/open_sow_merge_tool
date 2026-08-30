@@ -1,4 +1,4 @@
-"""Regression for Language-style undeclared payload columns in 3-way mode."""
+"""Regression for Language-style undeclared payload columns and clear states."""
 
 from __future__ import annotations
 
@@ -128,6 +128,53 @@ def _without_duplicate_tail(snapshot, side):
     )
 
 
+def _with_cleared_columns(snapshot, side, columns):
+    cleared = {int(column) for column in columns}
+    rows = []
+    for row in snapshot.rows:
+        cells = tuple(
+            _cell() if index in cleared else cell
+            for index, cell in enumerate(row.cells, start=1)
+        )
+        rows.append(
+            sm.SnapshotRow(
+                row.physical_row,
+                cells,
+                sm._snapshot_row_hash(cells),
+            )
+        )
+    fields = tuple(
+        sm.SnapshotField(field.physical_col, "", "", frozenset())
+        if field.physical_col in cleared else field
+        for field in snapshot.fields
+    )
+    return sm.SheetSnapshot(
+        side,
+        snapshot.sheet,
+        snapshot.version,
+        snapshot.max_row,
+        snapshot.max_col,
+        fields,
+        tuple(rows),
+    )
+
+
+def _empty_snapshot(snapshot, side, width=1):
+    cells = tuple(_cell() for _ in range(width))
+    return sm.SheetSnapshot(
+        side,
+        snapshot.sheet,
+        snapshot.version,
+        1,
+        width,
+        tuple(
+            sm.SnapshotField(column, "", "", frozenset())
+            for column in range(1, width + 1)
+        ),
+        (sm.SnapshotRow(1, cells, sm._snapshot_row_hash(cells)),),
+    )
+
+
 def test_language_keyed_duplicate_tail_resolves_with_blank_independent_additions():
     mine, base, theirs = _fixtures()
     result = sm._compare_selected_sheet_snapshots(mine, theirs, base)
@@ -200,6 +247,59 @@ def test_language_complete_duplicate_tail_delete_versus_modify_stays_unresolved(
     assert result.unresolved
 
 
+def test_language_two_way_whole_columns_cleared_is_resolved():
+    _mine, base, _theirs = _fixtures()
+    cleared = _with_cleared_columns(base, "theirs", (4, 5, 6, 9))
+    result = sm._compare_selected_sheet_snapshots(base, cleared)
+    assert not result.unresolved
+    assert result.column_cache.unresolved_cols == frozenset()
+    assert result.column_cache.structural_diff_cols == frozenset()
+    assert result.column_cache.model.confidence.reason == (
+        "snapshot-two-way-same-ordinal-clear-proof"
+    )
+    changed = set().union(*result.pair_diff_cols)
+    assert {4, 5, 6, 9}.issubset(changed)
+
+
+def test_language_two_way_partial_nonblank_replacement_stays_unresolved():
+    _mine, base, _theirs = _fixtures()
+    changed = _with_cleared_columns(base, "theirs", (4, 5, 6, 9))
+    rows = list(changed.rows)
+    cells = list(rows[2].cells)
+    cells[3] = _cell("replacement")
+    rows[2] = sm.SnapshotRow(3, tuple(cells), sm._snapshot_row_hash(tuple(cells)))
+    changed = sm.SheetSnapshot(
+        changed.side,
+        changed.sheet,
+        changed.version,
+        changed.max_row,
+        changed.max_col,
+        changed.fields,
+        tuple(rows),
+    )
+    result = sm._compare_selected_sheet_snapshots(base, changed)
+    assert result.unresolved
+
+
+def test_two_way_whole_sheet_content_cleared_is_resolved_on_either_side():
+    _mine, base, _theirs = _fixtures()
+    empty = _empty_snapshot(base, "empty")
+    for left, right in ((base, empty), (empty, base)):
+        result = sm._compare_selected_sheet_snapshots(left, right)
+        assert not result.unresolved
+        assert result.column_cache.unresolved_cols == frozenset()
+        assert result.column_cache.model.confidence.reason == (
+            "snapshot-two-way-empty-side-proof"
+        )
+        assert len(result.row_pairs) == base.max_row
+        assert any(result.pair_diff_cols)
+        prepared = sm._snapshot_result_to_sheet_cache_immutable(
+            SHEET, result, left, right, None
+        )
+        assert prepared["prepared_complete"]
+        assert prepared["has_diff"]
+
+
 if __name__ == "__main__":
     tests = (
         test_language_keyed_duplicate_tail_resolves_with_blank_independent_additions,
@@ -208,6 +308,9 @@ if __name__ == "__main__":
         test_language_keyed_duplicate_tail_accepts_base_anchored_branch_edit,
         test_language_complete_duplicate_tail_deleted_in_mine_is_resolved,
         test_language_complete_duplicate_tail_delete_versus_modify_stays_unresolved,
+        test_language_two_way_whole_columns_cleared_is_resolved,
+        test_language_two_way_partial_nonblank_replacement_stays_unresolved,
+        test_two_way_whole_sheet_content_cleared_is_resolved_on_either_side,
     )
     for test in tests:
         test()
