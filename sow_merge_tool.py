@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-29.update90"
-APP_BUILD_TAG = "new167-two-way-clear-proof"
+APP_VERSION = "2026-08-31.update91"
+APP_BUILD_TAG = "new168-wide-cell-anchor-sync"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -23952,10 +23952,16 @@ class SheetView:
         except Exception:
             first = 0.0
         x_main = self._logical_horizontal_first()
+        virtual_column_start = None
         try:
             x_c = x_main if self._wide_column_virtual_active() else float((self.cursor_cmp.xview() or (0.0, 1.0))[0])
         except Exception:
             x_c = x_main
+        if self._wide_column_virtual_active():
+            try:
+                virtual_column_start = int(self._virtual_column_window_start)
+            except Exception:
+                virtual_column_start = None
         try:
             parts = str(self.left.index("insert")).split(".")
             line = int(parts[0])
@@ -23963,19 +23969,29 @@ class SheetView:
         except Exception:
             line = 1
             col = 0
-        return (first, x_main, x_c, line, col, pair_idx, row_a, row_b)
+        return (
+            first, x_main, x_c, line, col, pair_idx, row_a, row_b,
+            virtual_column_start,
+        )
 
     def _restore_view_anchor(self, anchor):
         if not anchor:
             return
         # backward compatibility with older anchor tuple shape
-        if len(anchor) >= 8:
+        if len(anchor) >= 9:
+            (
+                first, x_main, x_c, line, col, pair_idx, row_a, row_b,
+                virtual_column_start,
+            ) = anchor
+        elif len(anchor) >= 8:
             first, x_main, x_c, line, col, pair_idx, row_a, row_b = anchor
+            virtual_column_start = None
         else:
             first, line, pair_idx, row_a, row_b = anchor
             x_main = 0.0
             x_c = 0.0
             col = 0
+            virtual_column_start = None
         try:
             self.left.yview_moveto(first)
             if self._is_three_way_enabled():
@@ -23984,8 +24000,16 @@ class SheetView:
         except Exception:
             pass
         try:
-            self._sync_main_x_to_frac(x_main)
-            self._sync_c_x_to_frac(x_main if x_c is None else x_c)
+            if self._wide_column_virtual_active() and virtual_column_start is not None:
+                # x_main is ``window_start / total_columns`` for a virtual
+                # wide sheet. The normal scrollbar converter uses
+                # ``total - window_width`` and would move this window left.
+                self._queue_virtual_column_window(
+                    int(virtual_column_start), reason="anchor-restore"
+                )
+            else:
+                self._sync_main_x_to_frac(x_main)
+                self._sync_c_x_to_frac(x_main if x_c is None else x_c)
         except Exception:
             pass
 
@@ -27317,6 +27341,10 @@ class SheetView:
                 "cell-overwrite",
                 edited_sides=("B",) if direction == "A2B" else ("A",),
             )
+            # A later wide-column viewport switch reconstructs Text lines from
+            # pair_raw_parts. Keep those source fragments in step with this
+            # in-memory edit before a refresh can clear pair_text.
+            self._refresh_pair_indices_exact([pair_idx])
             self._invalidate_render_cache()
             if bool(self.only_diff_var.get()) and self.snapshot_only_diff:
                 self._recalc_row_diff_and_update(dst_r)
