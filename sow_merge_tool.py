@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-31.update91"
-APP_BUILD_TAG = "new168-wide-cell-anchor-sync"
+APP_VERSION = "2026-08-31.update92"
+APP_BUILD_TAG = "new169-wide-hscroll-threeway-sync"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -20328,10 +20328,9 @@ class SheetView:
     def _restore_horizontal_after_cursor_cmp_click(self, saved_x):
         """Restore cursor-click horizontal presentation without retargeting wide windows."""
         if self._wide_column_virtual_active():
-            # ``saved_x`` is the logical scrollbar fraction (start / total),
-            # whereas wide request routing consumes a travel fraction
-            # (start / (total - cap)).  C refresh is already wide-safe and
-            # must not enqueue a synthetic horizontal viewport request.
+            # ``saved_x`` is the logical scrollbar fraction (start / total).
+            # C refresh is already wide-safe and must not enqueue a synthetic
+            # horizontal viewport request.
             self._sync_c_x_to_frac(saved_x)
             return
         self._sync_main_x_to_frac(saved_x)
@@ -21469,14 +21468,20 @@ class SheetView:
     def _queue_virtual_column_window_fraction(
         self, frac: float, *, reason: str = "hscroll", request_id: int | None = None
     ) -> bool:
+        """Queue by the leading-edge fraction published to the scrollbar.
+
+        Wide scrollbars advertise ``window_start / total_columns``.  Their
+        ``moveto`` callback uses that same coordinate, so using the shorter
+        draggable travel distance here would make the thumb snap left after
+        every input.
+        """
         try:
             fraction = max(0.0, min(1.0, float(frac)))
         except Exception:
             return False
         total = max(0, int(self._logical_slot_count() or 0))
-        cap = min(_VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
         return self._queue_virtual_column_window(
-            int(fraction * max(0, total - cap)),
+            int(round(fraction * total)),
             reason=reason,
             request_id=request_id,
         )
@@ -21491,8 +21496,8 @@ class SheetView:
         command = str(args[0])
         if command == "moveto" and len(args) >= 2:
             try:
-                return self._queue_virtual_column_window(
-                    int(float(args[1]) * max(0, total - cap)), reason="hthumb"
+                return self._queue_virtual_column_window_fraction(
+                    float(args[1]), reason="hthumb"
                 )
             except Exception:
                 return True
@@ -24001,9 +24006,8 @@ class SheetView:
             pass
         try:
             if self._wide_column_virtual_active() and virtual_column_start is not None:
-                # x_main is ``window_start / total_columns`` for a virtual
-                # wide sheet. The normal scrollbar converter uses
-                # ``total - window_width`` and would move this window left.
+                # Restore the exact integer window start rather than relying
+                # on a floating-point scrollbar round trip.
                 self._queue_virtual_column_window(
                     int(virtual_column_start), reason="anchor-restore"
                 )

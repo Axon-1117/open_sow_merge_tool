@@ -610,6 +610,18 @@ def _route_hminimap(app, view, fraction, generation, deadline):
     return _route(app, view, "hminimap", lambda: canvas.event_generate("<Button-1>", x=x, y=max(1, int(canvas.winfo_height()) // 2)), generation, deadline)
 
 
+def _route_hthumb(app, view, pane, fraction, generation, deadline):
+    """Invoke one real main-pane scrollbar command in the three-way view."""
+    scrollbar = getattr(view, f"hsb_{pane}")
+    command = str(scrollbar.cget("command") or "").strip()
+    assert command, pane
+    return _route(
+        app, view, "hthumb",
+        lambda: app.root.tk.call(command, "moveto", f"{float(fraction):.12f}"),
+        generation, deadline,
+    )
+
+
 def _route_vminimap_tail(app, view, generation, deadline):
     canvas, y = _wide_vdiff_event(view)
     return _route(app, view, "vminimap", lambda: canvas.event_generate("<Button-1>", x=1, y=y), generation, deadline)
@@ -701,6 +713,27 @@ def _run_wide_3way():
                             _same(hard, _wide_hard(app, view, inputs), f"hminimap-{cycle}-{label}")
                             _assert_inputs(inputs, before_inputs)
                             assert tuple(app._edit_load_requests) == request_baseline and not app._edit_workbooks_ready()
+                    # Invoke each actual bottom main-pane scrollbar in three-way mode.
+                    # The scrollbar leading-edge fraction is start / total; it
+                    # must round-trip to the same logical window start.
+                    total = int(view._logical_slot_count())
+                    column_cap = min(sm._VIRTUAL_VIEWPORT_MAX_COLUMNS, total)
+                    for pane, fraction in (("left", 0.50), ("mid", 0.88), ("right", 0.25)):
+                        record = _route_hthumb(app, view, pane, fraction, generation, deadline)
+                        record["position"] = f"{pane}-thumb-{fraction:.2f}"
+                        routes.append(record)
+                        assert record.get("kind") == "complete" and record.get("counted") and record.get("surface_changed"), record
+                        changed.append(record)
+                        expected_start = max(0, min(int(round(fraction * total)), total - column_cap))
+                        assert int(view._virtual_column_window_start) == expected_start, (pane, fraction, expected_start, view._virtual_column_window_start)
+                        expected_thumb = (expected_start / total, min(total, expected_start + column_cap) / total)
+                        for peer in (view.hsb_left, view.hsb_mid, view.hsb_right):
+                            actual_thumb = tuple(float(value) for value in peer.get())
+                            assert all(math.isclose(actual, expected, abs_tol=1e-6) for actual, expected in zip(actual_thumb, expected_thumb)), (pane, actual_thumb, expected_thumb)
+                        _pump(app.root)
+                        _same(hard, _wide_hard(app, view, inputs), f"hthumb-{pane}-{fraction:.2f}")
+                        _assert_inputs(inputs, before_inputs)
+                        assert tuple(app._edit_load_requests) == request_baseline and not app._edit_workbooks_ready()
                     # A real tail-row vdiff-map action followed by a real last
                     # horizontal hdiff-map action creates the off-screen 2D window.
                     print("WIDE_3WAY_STAGE public-combined-row-column", flush=True)
