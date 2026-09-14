@@ -378,7 +378,53 @@ _ROW_ARROW_LEFT = "⬅"
 
 # Settings (persist UI prefs)
 _SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME, "settings.json")
+SETTINGS_VERSION = 2
 _STARTUP_PROGRESS_ROOT = None
+
+
+def _load_settings_payload(path: str = _SETTINGS_PATH) -> dict:
+    """Load UI preferences with per-field recovery and schema migration."""
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            raw = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        raw = {}
+    result = dict(raw) if isinstance(raw, dict) else {}
+    result["settings_version"] = SETTINGS_VERSION
+
+    def bounded_int(name: str, default: int, low: int, high: int) -> int:
+        value = raw.get(name, default) if isinstance(raw, dict) else default
+        try:
+            return max(low, min(high, int(value)))
+        except (TypeError, ValueError):
+            return default
+
+    only_diff = raw.get("only_diff", 0)
+    result["only_diff"] = 1 if only_diff in {True, 1, "1"} else 0
+    result["sheet_nav_height"] = bounded_int("sheet_nav_height", 34, 24, 460)
+    result["difference_browser_height"] = bounded_int("difference_browser_height", 150, 90, 460)
+    result["difference_browser_collapsed"] = bool(raw.get("difference_browser_collapsed", False))
+    result["difference_browser_unprocessed"] = bool(raw.get("difference_browser_unprocessed", False))
+    result["difference_browser_conflicts"] = bool(raw.get("difference_browser_conflicts", False))
+    query = raw.get("difference_browser_query", "")
+    result["difference_browser_query"] = query if isinstance(query, str) else ""
+    for name in ("pane_sashes", "vertical_sashes"):
+        value = raw.get(name, {})
+        result[name] = value if isinstance(value, dict) else {}
+    return result
+
+
+def _save_settings_payload(payload: dict, path: str = _SETTINGS_PATH) -> None:
+    """Atomically persist migrated settings without exposing a partial JSON."""
+    data = _load_settings_payload(path)
+    if isinstance(payload, dict):
+        data.update(payload)
+    data["settings_version"] = SETTINGS_VERSION
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + f".tmp-{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
 
 
 def _workbook_ext(path: str | None, default: str = ".xlsx") -> str:
@@ -26320,11 +26366,9 @@ class SheetView:
     def _flush_settings(self):
         """Debounced settings write: called 1 s after the last only-diff toggle."""
         try:
-            os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
             settings = dict(getattr(self.app, "settings", {}) or {})
             settings["only_diff"] = int(self.only_diff_var.get())
-            with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
+            _save_settings_payload(settings)
         except Exception as e:
             _dlog(f"settings save failed: {e}")
 
@@ -31119,9 +31163,7 @@ class SowMergeApp:
         self._isolated_cache_disabled_sheets: set[str] = set()
         try:
             os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
-            if os.path.exists(_SETTINGS_PATH):
-                with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                    self.settings = json.load(f) or {}
+            self.settings = _load_settings_payload()
             self.only_diff_default = int(self.settings.get("only_diff", 0))
         except Exception as e:
             _dlog(f"settings load failed: {e}")
@@ -32307,9 +32349,7 @@ class SowMergeApp:
             pass
         try:
             self._persist_difference_browser_preferences()
-            os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
-            with open(_SETTINGS_PATH, "w", encoding="utf-8") as stream:
-                json.dump(getattr(self, "settings", {}) or {}, stream, ensure_ascii=False, indent=2)
+            _save_settings_payload(getattr(self, "settings", {}) or {})
         except Exception as exc:
             _dlog(f"settings close save failed: {exc}")
         try:
@@ -33998,9 +34038,7 @@ class SowMergeApp:
     def _write_layout_settings(self) -> None:
         self._layout_save_after_id = None
         try:
-            os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
-            with open(_SETTINGS_PATH, "w", encoding="utf-8") as stream:
-                json.dump(getattr(self, "settings", {}) or {}, stream, ensure_ascii=False, indent=2)
+            _save_settings_payload(getattr(self, "settings", {}) or {})
         except (OSError, TypeError, ValueError) as exc:
             _dlog(f"layout settings save failed: {exc}")
 
