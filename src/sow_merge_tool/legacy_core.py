@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update100"
+APP_VERSION = "2026-09-14.update101"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -33452,6 +33452,15 @@ class SowMergeApp:
             return out
         raise RuntimeError("B-side structural replay failed")
 
+    @staticmethod
+    def _difference_evidence_payload(**values) -> tuple[tuple[str, str], ...]:
+        """Serialize comparison evidence without retaining workbook objects."""
+        return tuple(
+            (str(key), str(value))
+            for key, value in values.items()
+            if value is not None and str(value) != ""
+        )
+
     def _difference_items_from_view(self, view: "SheetView") -> list[DifferenceItem]:
         """Project the already-built SheetView cache into browser rows."""
         items: list[DifferenceItem] = []
@@ -33519,6 +33528,14 @@ class SowMergeApp:
                         mine_label=mine_value_label,
                         theirs_label=theirs_value_label,
                         processed=sentinel_id in self._difference_processed,
+                        payload=self._difference_evidence_payload(
+                            pair_index=int(pair_idx),
+                            mine_row=ra,
+                            theirs_row=rb,
+                            base_row=base_row,
+                            change="row-presence",
+                            direction="BASE→Mine" if base_map else "Source→Target",
+                        ),
                     ))
                 for logical_col in sorted(int(c) for c in cols if int(c) > 0):
                     conflict = bool(row and logical_col in (conflict_map.get(view.sheet, {}).get(row, {}) or {}))
@@ -33581,6 +33598,17 @@ class SowMergeApp:
                             "theirs" if is_three_way else "base"
                         ),
                         target_side="mine",
+                        payload=self._difference_evidence_payload(
+                            pair_index=int(pair_idx),
+                            mine_row=ra,
+                            theirs_row=rb,
+                            base_row=(
+                                getattr(view, "pair_base_row_override", {}) or {}
+                            ).get(int(pair_idx)) if base_map else None,
+                            logical_column=get_column_letter(logical_col),
+                            comparison="Base/Mine" if base_map else "Source/Target",
+                            conflict="yes" if conflict else "no",
+                        ),
                     ))
         # A structural block has no single cell location; keep it in the same
         # list so users can see why a sheet is not fully resolved.
@@ -33598,6 +33626,11 @@ class SowMergeApp:
                 base_label=base_value_label,
                 mine_label=mine_value_label,
                 theirs_label=theirs_value_label,
+                payload=self._difference_evidence_payload(
+                    logical_column=get_column_letter(logical_col),
+                    comparison="column projection",
+                    change="structure",
+                ),
             ))
         return items
 
@@ -33747,6 +33780,13 @@ class SowMergeApp:
                     mine_label=mine_value_label,
                     theirs_label=theirs_value_label,
                     processed=sentinel_id in self._difference_processed,
+                    payload=self._difference_evidence_payload(
+                        pair_index=idx,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        change="row-presence",
+                        source="cache",
+                    ),
                 ))
             for col in sorted(int(value) for value in cols if int(value) > 0):
                 conflict = bool(row and col in (getattr(self, "merge_conflict_cells_by_sheet", {}).get(sheet, {}).get(row, {}) or {}))
@@ -33777,6 +33817,15 @@ class SowMergeApp:
                     base_value=display_base, mine_value=display_mine, theirs_value=display_theirs,
                     source_side="theirs" if is_three_way else "base",
                     target_side="mine",
+                    payload=self._difference_evidence_payload(
+                        pair_index=idx,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        logical_column=get_column_letter(col),
+                        comparison="Base/Mine" if is_three_way else "Source/Target",
+                        conflict="yes" if conflict else "no",
+                        source="cache",
+                    ),
                 ))
         projection = cache.get("column_comparison_cache")
         for raw_idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items():
@@ -33802,6 +33851,14 @@ class SowMergeApp:
                         cache, idx, col, "B", self._cache_pair_parts(cache, "pair_parts_b", idx)
                     ),
                     source_side="base", target_side="mine",
+                    payload=self._difference_evidence_payload(
+                        pair_index=idx,
+                        mine_row=ra,
+                        theirs_row=rb,
+                        logical_column=get_column_letter(col),
+                        comparison="Base/Mine",
+                        source="cache",
+                    ),
                 ))
         for col in sorted(int(value) for value in getattr(projection, "structural_diff_cols", ()) if int(value) > 0):
             item_id = f"{sheet}:pair:-1:side:structure:kind:structure:row:0:col:{col}"
@@ -33814,6 +33871,11 @@ class SowMergeApp:
                 base_label=base_value_label,
                 mine_label=mine_value_label,
                 theirs_label=theirs_value_label,
+                payload=self._difference_evidence_payload(
+                    logical_column=get_column_letter(col),
+                    change="structure",
+                    source="cache",
+                ),
             ))
         for raw_idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items():
             if -1 not in cols:
@@ -33850,6 +33912,14 @@ class SowMergeApp:
                 mine_label=mine_value_label,
                 theirs_label=theirs_value_label,
                 processed=item_id in self._difference_processed,
+                payload=self._difference_evidence_payload(
+                    pair_index=idx,
+                    mine_row=ra,
+                    theirs_row=rb,
+                    base_row=base_row,
+                    change="row-presence",
+                    source="Base-relative cache",
+                ),
             ))
         return items
 

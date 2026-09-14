@@ -121,6 +121,15 @@ class DifferenceItem:
         right = str(values.get(self.target_side) if values.get(self.target_side) is not None else "")
         return tuple((tag, "".join(left[i1:i2]) + "→" + "".join(right[j1:j2])) for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, left, right).get_opcodes() if tag != "equal")
 
+    @property
+    def evidence_text(self) -> str:
+        """Human-readable, read-only explanation carried by the cache item."""
+        return "；".join(
+            f"{key}：{value}"
+            for key, value in self.payload
+            if str(value) != ""
+        )
+
 
 @dataclass(frozen=True)
 class CommandState:

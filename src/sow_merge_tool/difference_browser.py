@@ -43,7 +43,10 @@ class DifferenceIndex:
                 continue
             if only_conflicts and not item.conflict:
                 continue
-            haystack = f"{item.sheet} {item.kind_label} {item.display_location} {item.summary} {item.role}".casefold()
+            haystack = (
+                f"{item.sheet} {item.kind_label} {item.display_location} "
+                f"{item.summary} {item.role} {item.evidence_text}"
+            ).casefold()
             if needle and needle not in haystack:
                 continue
             result.append(item)
@@ -275,7 +278,9 @@ class DifferenceBrowser:
                     f"{item.base_label}：{item.base_value!s}\n"
                     f"{item.mine_label}：{item.mine_value!s}\n"
                     f"{item.theirs_label}：{item.theirs_value!s}\n"
-                    f"处理方向：{item.role}\n字符级差异：{diffs}\n状态：{item.status_label}"
+                    f"处理方向：{item.role}\n"
+                    f"差异证据：{item.evidence_text or '缓存未提供额外证据'}\n"
+                    f"字符级差异：{diffs}\n状态：{item.status_label}"
                 )
                 if self.on_select:
                     self.on_select(item)
