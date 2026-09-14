@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update104"
+APP_VERSION = "2026-09-14.update105"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -14761,6 +14761,28 @@ class SheetView:
         self._refresh_interaction_gate()
         if getattr(self, "_lifecycle_state", "") == "READY":
             return True
+        if getattr(self, "_lifecycle_state", "") == "DIFFING":
+            # A bounded preview is intentionally view-only.  The first
+            # explicit mutation promotes this Sheet to the exact cache path;
+            # it never performs a synchronous workbook scan on Tk.
+            try:
+                app = self.app
+                requested = getattr(app, "_exact_requested_sheets", None)
+                if isinstance(requested, set):
+                    requested.add(self.sheet)
+                enqueue = getattr(app, "_enqueue_sheet", None)
+                kick = getattr(app, "_kick_worker", None)
+                if callable(enqueue) and callable(kick):
+                    enqueue(
+                        self.sheet,
+                        front=True,
+                        exact_only_diff=bool(self.only_diff_var.get()),
+                        force_recompute=True,
+                        force_align=True,
+                    )
+                    kick()
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError, tk.TclError) as exc:
+                _dlog(f"explicit exact promotion failed sheet={self.sheet}: {exc}")
         if (
             getattr(self, "_lifecycle_state", "")
             in {"EDIT_LOADING", "DIFFING", "BUSY"}
@@ -25324,6 +25346,17 @@ class SheetView:
         if self._has_user_edits_for_current_sheet():
             _dlog(f"only-diff async skipped after user edits: sheet={self.sheet}")
             return False
+        if (
+            bool(getattr(self, "_preview_cache_applied", False))
+            and self.sheet == getattr(self.app, "_initial_sheet_name", None)
+            and not bool(getattr(self.app, "_auto_exact_initial", False))
+            and self.sheet not in getattr(self.app, "_exact_requested_sheets", set())
+            and not user_initiated
+        ):
+            _dlog(
+                f"only-diff async deferred until explicit request: sheet={self.sheet}"
+            )
+            return False
         if not getattr(self, "_data_ready", False):
             self._prefer_only_diff_when_ready = True
             return False
@@ -29929,6 +29962,10 @@ class SheetView:
             rescan
             and not self._is_missing_sheet_view()
             and not self.app._edit_workbooks_ready()
+            and not bool(
+                getattr(self.app, "_initial_preview_applied_event", None)
+                and self.app._initial_preview_applied_event.is_set()
+            )
         ):
             # An explicit refresh/recalculation is an editing intent.  Start
             # deferred editable loading in the background, but keep this
@@ -31073,6 +31110,11 @@ class SowMergeApp:
         self.raw_theirs = raw_theirs
         self.role_mode = str(role_mode or "")
         self._cache_worker_mode = os.environ.get("SOW_CACHE_WORKER", "") == "1"
+        # Exact initial parsing is opt-in after the bounded preview.  Keeping
+        # it out of the normal startup path prevents a large OOXML pass from
+        # freezing the user's desktop; an edit/refresh/explicit exact request
+        # promotes the Sheet and runs the same authoritative calculation.
+        self._auto_exact_initial = os.environ.get("SOW_AUTO_EXACT_INITIAL", "") == "1"
         self._cache_worker_sheet = os.environ.get("SOW_CACHE_WORKER_SHEET", "")
         self._cache_worker_output = os.environ.get("SOW_CACHE_WORKER_OUTPUT", "")
         try:
@@ -31161,6 +31203,7 @@ class SowMergeApp:
         self.only_diff_default = 0
         self.workbook_health: dict[str, dict[str, object]] = {}
         self._isolated_cache_disabled_sheets: set[str] = set()
+        self._exact_requested_sheets: set[str] = set()
         try:
             os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
             self.settings = _load_settings_payload()
@@ -35294,6 +35337,7 @@ class SowMergeApp:
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
         self._compute_exact_only_diff_requested: set[str] = set()
+        self._deferred_exact_sheets: set[str] = set()
         # A force-align request is carried into the background cache builder
         # per Sheet.  Keeping it separate from the view avoids reading Tk
         # objects from the worker and lets the UI return immediately.
@@ -35321,6 +35365,7 @@ class SowMergeApp:
         ):
             if self._is_closing:
                 return
+            exact_request_supplied = exact_only_diff is not None
             queued_view = self.sheet_views.get(sheet)
             if queued_view is None or not getattr(queued_view, "_data_ready", False):
                 self.mark_sheet_loading(sheet)
@@ -35332,6 +35377,10 @@ class SowMergeApp:
                         if queued_view is not None
                         else getattr(self, "only_diff_default", 0)
                     )
+                if exact_request_supplied or force_recompute or force_align:
+                    self._deferred_exact_sheets.discard(sheet)
+                if exact_request_supplied or force_recompute or force_align:
+                    self._exact_requested_sheets.add(sheet)
                 if exact_only_diff:
                     self._compute_exact_only_diff_requested.add(sheet)
                 if force_align is None:
@@ -35372,15 +35421,11 @@ class SowMergeApp:
                 else:
                     self._ui_tasks.append(fn)
                 self._ui_task_wakeup.set()
-            if front:
-                # A preview must not wait behind a 1-second adaptive timer
-                # left by a previous status update.  Tk marshals this call to
-                # the UI thread when it is already servicing events; failures
-                # are harmless because the heartbeat wakeup remains active.
-                try:
-                    self._safe_root_after(0, _drain_ui_tasks)
-                except (tk.TclError, RuntimeError):
-                    pass
+            # Do not call Tk from a worker thread.  tkinter marshals
+            # ``root.after`` synchronously across the Tcl lock on Windows;
+            # that can suspend the UI heartbeat for seconds while the main
+            # thread is painting the preview.  The 50 ms heartbeat observes
+            # this wake flag and drains front-priority tasks on the UI thread.
             return True
 
         def _drain_ui_tasks():
@@ -35417,10 +35462,12 @@ class SowMergeApp:
                 # the entire queue and the Tk heartbeat is starved again.
                 elapsed_ms = (time.perf_counter() - task_started) * 1000.0
                 if pending and ran:
-                    # Keep a real idle slice between expensive cache applies;
-                    # Tk's ``update()`` may otherwise run a timer that became
-                    # due while the preceding refresh was painting.
-                    delay = max(1000, min(1500, int(elapsed_ms * 1.5)))
+                    # Keep a bounded idle slice between cache callbacks.  A
+                    # one-second backoff made the heartbeat look frozen even
+                    # when the pending task was only a status update; heavy
+                    # cache application is already limited to one callback per
+                    # turn and can yield through the normal Tk event loop.
+                    delay = max(80, min(200, int(elapsed_ms * 1.2)))
                 else:
                     delay = 50
                 grace_remaining = max(
@@ -36837,7 +36884,13 @@ class SowMergeApp:
                 # startup budget below.
                 self._ui_preview_grace_until = time.perf_counter() + 5.0
                 try:
-                    view.info.configure(text="首批行已就绪，正在后台生成完整差异…")
+                    view.info.configure(
+                        text=(
+                            "首批行已就绪，编辑/刷新时生成完整差异"
+                            if not bool(getattr(self, "_auto_exact_initial", False))
+                            else "首批行已就绪，正在后台生成完整差异…"
+                        )
+                    )
                 except (AttributeError, tk.TclError):
                     pass
             if not cache_preview:
@@ -36886,6 +36939,7 @@ class SowMergeApp:
             wb_b_e = None
             wb_base_e = None
             previous_switch_interval = sys.getswitchinterval()
+            handoff_to_process = False
             # openpyxl XML parsing is GIL-heavy. A short switch interval keeps
             # the Tk heartbeat responsive while the worker builds cache data.
             sys.setswitchinterval(min(previous_switch_interval, 0.0005))
@@ -36963,6 +37017,7 @@ class SowMergeApp:
                             sheet == getattr(self, "_initial_sheet_name", None)
                             and declared_preview_rows >= _PREVIEW_CACHE_ROWS
                             and not self._cache_worker_mode
+                            and sheet not in getattr(self, "_exact_requested_sheets", set())
                         )
                         if preview_first_sheet:
                             preview_started = time.perf_counter()
@@ -36997,6 +37052,18 @@ class SowMergeApp:
                             )
                             if preview_event is not None:
                                 preview_event.wait(timeout=5.0)
+                            if not bool(getattr(self, "_auto_exact_initial", False)):
+                                # Keep the exact job queued but do not begin it
+                                # until the user explicitly requests an edit,
+                                # refresh, or exact-only view.  The preview is
+                                # already marked read-only/DIFFING, so this is
+                                # a visible state transition rather than a
+                                # silent loss of comparison coverage.
+                                with self._compute_lock:
+                                    self._compute_inflight.discard(sheet)
+                                    self._deferred_exact_sheets.add(sheet)
+                                _dlog(f"SHEET_CACHE_EXACT_DEFERRED sheet={sheet}")
+                                return
                             grace_remaining = max(
                                 0.0,
                                 float(
@@ -37008,6 +37075,17 @@ class SowMergeApp:
                             )
                             if grace_remaining:
                                 time.sleep(grace_remaining)
+                            if (
+                                os.environ.get("SOW_ENABLE_CACHE_PROCESS", "").strip()
+                                == "1"
+                            ):
+                                with self._compute_lock:
+                                    if sheet not in self._compute_queue:
+                                        self._compute_queue.insert(0, sheet)
+                                    self._compute_inflight.discard(sheet)
+                                handoff_to_process = True
+                                _queue_ui_task(lambda: _kick_worker(), front=True)
+                                return
                         if wb_a_e is None or wb_b_e is None:
                             edit_open_started = time.perf_counter()
                             wb_a_e = load_workbook(
@@ -37082,7 +37160,10 @@ class SowMergeApp:
                     finally:
                         with self._compute_lock:
                             self._compute_inflight.discard(sheet)
-                            self._compute_done = min(self._compute_total, self._compute_done + 1)
+                            if not handoff_to_process:
+                                self._compute_done = min(
+                                    self._compute_total, self._compute_done + 1
+                                )
                             progress_done = self._compute_done
                             progress_total = self._compute_total
                             all_done = not self._compute_queue and not self._compute_inflight
@@ -37738,7 +37819,12 @@ class SowMergeApp:
             # while the first visible Sheet gets the CPU.  Switching a tab
             # still enqueues that Sheet immediately through _on_tab_changed.
             if not self._cache_worker_mode:
-                self._safe_root_after(4500, _enqueue_deferred_sheets)
+                # Do not wake the parser merely because the window stayed
+                # open.  Unselected Sheets are queued when the user switches
+                # to them (or explicitly requests a refresh); an automatic
+                # fan-out after a few seconds can reacquire the GIL and make
+                # an otherwise idle desktop appear hung.
+                pass
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
         finally:
