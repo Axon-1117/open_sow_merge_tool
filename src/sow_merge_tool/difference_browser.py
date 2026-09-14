@@ -75,10 +75,30 @@ class DifferenceBrowser:
         ttk.Label(header, textvariable=self.summary_var, style="Difference.Muted.TLabel").pack(side="left", padx=(12, 0))
         self.toggle_button = ttk.Button(header, text="收起", width=6, command=self.toggle)
         self.toggle_button.pack(side="right")
-        self.grip = ttk.Separator(self.frame, orient="horizontal")
+        self.grip = tk.Frame(
+            self.frame,
+            height=8,
+            bg=THEME.border,
+            bd=0,
+            highlightthickness=0,
+            cursor="sb_v_double_arrow",
+        )
         self.grip.pack(fill="x", side="top")
+        self.grip.pack_propagate(False)
+        self.grip_line = tk.Frame(
+            self.grip,
+            height=1,
+            bg=THEME.secondary_text,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.grip_line.pack(fill="x", pady=3)
+        self.grip_line.pack_propagate(False)
         self.grip.bind("<B1-Motion>", self._resize)
-        self.grip.bind("<Button-1>", lambda event: setattr(self, "_resize_origin", (event.y_root, self._height)))
+        self.grip.bind("<Button-1>", self._begin_resize)
+        self.grip.bind("<ButtonRelease-1>", self._end_resize)
+        self.grip.bind("<Enter>", lambda event: self._grip_hover(event, True))
+        self.grip.bind("<Leave>", lambda event: self._grip_hover(event, False))
         self.query_var = tk.StringVar()
         self._query_after = None
         entry = ttk.Entry(header, textvariable=self.query_var, width=22)
@@ -163,6 +183,28 @@ class DifferenceBrowser:
             self.frame.configure(height=self._height)
         if self.on_resize:
             self.on_resize(self._height, self.collapsed)
+
+    def _begin_resize(self, event):
+        self._resize_origin = (event.y_root, self._height)
+        try:
+            self.grip.grab_set()
+        except tk.TclError:
+            pass
+
+    def _end_resize(self, _event=None):
+        try:
+            self.grip.grab_release()
+        except tk.TclError:
+            pass
+
+    def _grip_hover(self, event, active: bool) -> None:
+        try:
+            event.widget.configure(bg=THEME.accent_active if active else THEME.window_bg)
+            children = event.widget.winfo_children()
+            if children:
+                children[0].configure(bg=THEME.accent if active else THEME.border)
+        except tk.TclError:
+            pass
 
     def _schedule_render(self):
         self._page = 0

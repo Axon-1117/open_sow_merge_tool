@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-GRIP_HEIGHT = 8
+GRIP_HEIGHT = 12  # 8px hit target plus the two 2px module paddings
 MIN_LOWER_HEIGHT = 132
 MIN_C_HEIGHT = 64
 MIN_HOVER_HEIGHT = 48

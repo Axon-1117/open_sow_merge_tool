@@ -19,7 +19,8 @@ pytest 和 headless SVN 仓库，不创建真实 Tk/比较器窗口。需要实�
 .\tools\test.ps1 -Profile Visual   # 关键 Tk/Win32 可视抽检，运行前确认没有业务实例
 ```
 
-Native/Visual 只使用临时工作簿/工作副本，并在启动前检查已有
+Native/Visual 默认只运行两套 canonical 场景：1920x1080 @100% 和 900x620 @150%；
+需要完整分辨率/DPI 专项验收时设置 `SOW_NATIVE_FULL_MATRIX=1`。两种模式都只使用临时工作簿/工作副本，并在启动前检查已有
 `sow_merge_tool.exe`；测试脚本不会强杀业务进程。无界面会话测试通过
 `ComparisonSessionManager`/`ComparisonListModel` 注入假的 Popen 和状态轮询，覆盖
 双击、单活动子进程、启动失败、关闭列表不杀子进程和会话状态迁移。

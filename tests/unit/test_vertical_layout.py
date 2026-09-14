@@ -1,4 +1,5 @@
 from sow_merge_tool.vertical_layout import (
+    GRIP_HEIGHT,
     MIN_C_HEIGHT,
     MIN_HOVER_HEIGHT,
     MIN_LOWER_HEIGHT,
@@ -15,7 +16,7 @@ def test_vertical_layout_clamps_saved_sizes_to_window_budget():
     assert normalized.lower_height >= MIN_LOWER_HEIGHT
     assert normalized.hover_height >= MIN_HOVER_HEIGHT
     assert normalized.nav_height >= MIN_NAV_HEIGHT
-    assert normalized.lower_height - normalized.hover_height >= MIN_C_HEIGHT + 8
+    assert normalized.lower_height - normalized.hover_height >= MIN_C_HEIGHT + GRIP_HEIGHT
 
 
 def test_vertical_layout_round_trips_settings_and_three_way_defaults():

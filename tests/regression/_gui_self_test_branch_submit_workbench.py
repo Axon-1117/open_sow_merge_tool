@@ -97,17 +97,28 @@ def main():
             assert app.preflight_button.instate(["disabled"]), "without targets, multi-branch preflight is not applicable"
             assert app.submit_button.instate(["!disabled"]), "without targets, native single-branch submit must be available"
             assert app.submit_button.cget("text") == "SVN 单分支提交"
-            for scale in (1.0, 1.25, 1.5, 2.0):
+            full_matrix = os.environ.get("SOW_NATIVE_FULL_MATRIX", "").strip() == "1"
+            # Keep ordinary Native release checks compact; the full matrix is
+            # still available as an explicit专项 audit via the environment flag.
+            layout_cases = (
+                ((1.0, 1920, 1080), (1.5, 900, 620))
+                if not full_matrix
+                else tuple(
+                    (scale, width, height)
+                    for scale in (1.0, 1.25, 1.5, 2.0)
+                    for width, height in ((900, 620), (1366, 768), (1920, 1080))
+                )
+            )
+            for scale, width, height in layout_cases:
                 root.tk.call("tk", "scaling", scale)
-                for width, height in ((900, 620), (1366, 768), (1920, 1080)):
-                    root.state("normal")
-                    root.geometry(f"{width}x{height}+40+40")
-                    root.update_idletasks()
-                    root.update()
-                    root_bottom = root.winfo_rooty() + root.winfo_height()
-                    for button in (app.preflight_button, app.submit_button):
-                        assert button.winfo_ismapped()
-                        assert button.winfo_rooty() + button.winfo_height() <= root_bottom
+                root.state("normal")
+                root.geometry(f"{width}x{height}+40+40")
+                root.update_idletasks()
+                root.update()
+                root_bottom = root.winfo_rooty() + root.winfo_height()
+                for button in (app.preflight_button, app.submit_button):
+                    assert button.winfo_ismapped()
+                    assert button.winfo_rooty() + button.winfo_height() <= root_bottom
             root.tk.call("tk", "scaling", 1.0)
             root.geometry("1120x760+40+40")
             root.update_idletasks()

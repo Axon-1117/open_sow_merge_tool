@@ -15,6 +15,7 @@ from unittest.mock import patch
 from openpyxl import Workbook
 
 import sow_merge_tool as smt
+from sow_merge_tool.vertical_layout import VerticalLayout
 
 
 def _write_book(path: str, value: str) -> None:
@@ -185,6 +186,40 @@ def _assert_command_layout(app, width: int, height: int, scale: float) -> None:
         assert app.top_save_as_btn.winfo_ismapped(), "100%/1920 另存为按钮不应收纳"
 
 
+def _assert_vertical_module_layout(app, view) -> None:
+    app.root.update_idletasks()
+    paned_bottom = view._main_paned.winfo_rooty() + view._main_paned.winfo_height()
+    lower_top = view.lower_area.winfo_rooty()
+    main_grip_y = view._main_vertical_grip.winfo_rooty()
+    assert view._main_vertical_grip.winfo_height() >= 8
+    assert paned_bottom <= main_grip_y <= lower_top
+
+    c_bottom = view.c_area_host.winfo_rooty() + view.c_area_host.winfo_height()
+    hover_top = view.hover_cmp_host.winfo_rooty()
+    hover_grip_y = view._hover_vertical_grip.winfo_rooty()
+    assert view._hover_vertical_grip.winfo_height() >= 8
+    assert c_bottom <= hover_grip_y <= hover_top
+    assert app._sheet_nav_grip.winfo_height() >= 8
+    assert app.bottom.winfo_rooty() <= app._sheet_nav_grip.winfo_rooty()
+
+    class _Event:
+        def __init__(self, y_root):
+            self.y_root = y_root
+
+    before = int(view._vertical_layout.lower_height)
+    view._on_main_vertical_grip_press(_Event(500))
+    view._on_main_vertical_grip_motion(_Event(300))
+    view._on_vertical_grip_release()
+    assert int(view._vertical_layout.lower_height) >= before
+    saved = app.settings.get("vertical_sashes", {}).get(view._vertical_layout_key, {})
+    assert saved.get("lower_height") == int(view._vertical_layout.lower_height)
+    app._reset_workspace_layout()
+    assert view._vertical_layout == VerticalLayout.default(
+        three_way=view._is_three_way_enabled()
+    )
+    assert app._diff_browser.collapsed is False
+
+
 def _new_app_at_scaling(base_path: str, mine_path: str, *, scale: float, theirs_path: str | None = None):
     """Create the real window only after the requested Tk scaling is active."""
     root = tk.Tk()
@@ -231,6 +266,7 @@ def main() -> None:
         try:
             view = _wait_for_view(app)
             app.root.update_idletasks()
+            _assert_vertical_module_layout(app, view)
             assert view._main_vertical_grip.winfo_ismapped(), "主窗格/C区纵向分隔条未显示"
             assert view._hover_vertical_grip.winfo_ismapped(), "C区/悬停详情纵向分隔条未显示"
             assert app._sheet_nav_grip.winfo_ismapped(), "Sheet导航纵向分隔条未显示"
@@ -257,24 +293,35 @@ def main() -> None:
             app._shutdown_root()
 
         screenshots = Path("tmp/postinstall_acceptance")
-        for scale in (1.0, 1.25, 1.5, 2.0, 2.666):
+        full_matrix = os.environ.get("SOW_NATIVE_FULL_MATRIX", "").strip() == "1"
+        # Native release gate uses one wide and one compact/DPI scene.  Set
+        # SOW_NATIVE_FULL_MATRIX=1 for the explicit 5-scale x 3-size audit.
+        layout_cases = (
+            ((1.0, 1920, 1080), (1.5, 900, 620))
+            if not full_matrix
+            else tuple(
+                (scale, width, height)
+                for scale in (1.0, 1.25, 1.5, 2.0, 2.666)
+                for width, height in ((900, 620), (1366, 768), (1920, 1080))
+            )
+        )
+        for scale, width, height in layout_cases:
             app = _new_app_at_scaling(base_path, mine_path, scale=scale)
             try:
                 _wait_for_view(app)
-                for width, height in ((900, 620), (1366, 768), (1920, 1080)):
-                    _assert_command_layout(app, width, height, scale)
-                    if scale == 1.0:
-                        _write_window_png(
-                            app.root,
-                            screenshots / f"ordinary_{width}_after.png",
-                        )
+                _assert_command_layout(app, width, height, scale)
+                if scale == 1.0:
+                    _write_window_png(
+                        app.root,
+                        screenshots / f"ordinary_{width}_after.png",
+                    )
             finally:
                 app._shutdown_root()
 
         # The three-way layout has the widest semantic labels (Base/Mine/
         # Theirs and the Base direction command), so run the same Native gate
         # against a separately constructed three-way window at every DPI.
-        for scale in (1.0, 1.25, 1.5, 2.0, 2.666):
+        for scale, width, height in layout_cases:
             app = _new_app_at_scaling(
                 base_path,
                 mine_path,
@@ -283,13 +330,12 @@ def main() -> None:
             )
             try:
                 _wait_for_view(app)
-                for width, height in ((900, 620), (1366, 768), (1920, 1080)):
-                    _assert_command_layout(app, width, height, scale)
-                    if scale == 1.0:
-                        _write_window_png(
-                            app.root,
-                            screenshots / f"threeway_{width}_after.png",
-                        )
+                _assert_command_layout(app, width, height, scale)
+                if scale == 1.0:
+                    _write_window_png(
+                        app.root,
+                        screenshots / f"threeway_{width}_after.png",
+                    )
             finally:
                 app._shutdown_root()
     print("PASS: visible workbook paths and aligned compare cards")

@@ -56,7 +56,7 @@ from .ui_foundation import (
 from .difference_browser import DifferenceBrowser
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update98"
+APP_VERSION = "2026-09-14.update99"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -13492,16 +13492,39 @@ class SheetView:
         self.lower_area = ttk.Frame(self.frame)
         self.lower_area.pack(side="bottom", fill="x")
         self.lower_area.pack_propagate(False)
-        self._main_vertical_grip = ttk.Separator(self.frame, orient="horizontal")
-        self._main_vertical_grip.pack(
-            side="bottom", fill="x", padx=8, before=self.lower_area
+        self._main_vertical_grip = tk.Frame(
+            self.frame,
+            height=8,
+            bg=THEME.window_bg,
+            bd=0,
+            highlightthickness=0,
+            cursor="sb_v_double_arrow",
         )
-        self._main_vertical_grip.configure(cursor="sb_v_double_arrow")
+        self._main_vertical_grip.pack(side="bottom", fill="x", padx=8)
+        self._main_vertical_grip.pack_propagate(False)
+        self._main_vertical_grip_line = tk.Frame(
+            self._main_vertical_grip,
+            height=1,
+            bg=THEME.border,
+            bd=0,
+            highlightthickness=0,
+        )
+        self._main_vertical_grip_line.pack(fill="x", pady=3)
+        self._main_vertical_grip_line.pack_propagate(False)
         self._main_vertical_grip.bind(
             "<Button-1>", self._on_main_vertical_grip_press
         )
         self._main_vertical_grip.bind(
             "<B1-Motion>", self._on_main_vertical_grip_motion
+        )
+        self._main_vertical_grip.bind(
+            "<ButtonRelease-1>", self._on_vertical_grip_release
+        )
+        self._main_vertical_grip.bind(
+            "<Enter>", lambda event: self._on_vertical_grip_hover(event, True)
+        )
+        self._main_vertical_grip.bind(
+            "<Leave>", lambda event: self._on_vertical_grip_hover(event, False)
         )
 
         # Panes
@@ -13528,6 +13551,28 @@ class SheetView:
                 getattr(self.app, "raw_theirs", None) or getattr(self.app, "file_b", ""),
             )).encode("utf-8", "ignore")
         ).hexdigest()[:16]
+        def _stable_layout_token(path_value):
+            text = str(path_value or "").strip().strip('"')
+            if not text:
+                return "-"
+            name = os.path.basename(text).casefold()
+            name = re.sub(r"\.merge-(?:left|right)\.r\d+$", "", name)
+            name = re.sub(r"\.r\d+$", "", name)
+            name = re.sub(r"-revbase(?:\.svn\d+)?\.tmp(?=\.[^.]+$)", "", name)
+            name = re.sub(r"-rev\d+\.svn\d+\.tmp(?=\.[^.]+$)", "", name)
+            return name
+
+        vertical_identity = "|".join(
+            (
+                "three-way" if self._is_three_way_enabled() else "two-way",
+                _stable_layout_token(getattr(self.app, "raw_base", None) or self.app.file_a),
+                _stable_layout_token(getattr(self.app, "raw_mine", None) or self.app.file_a),
+                _stable_layout_token(getattr(self.app, "raw_theirs", None) or self.app.file_b),
+            )
+        )
+        self._vertical_layout_key = hashlib.sha1(
+            vertical_identity.encode("utf-8", "ignore")
+        ).hexdigest()[:16]
         vertical_saved = (
             getattr(self.app, "settings", {}).get("vertical_sashes", {})
             if isinstance(getattr(self.app, "settings", {}), dict)
@@ -13536,7 +13581,7 @@ class SheetView:
         from .vertical_layout import VerticalLayout
 
         self._vertical_layout = VerticalLayout.from_mapping(
-            vertical_saved.get(self._pane_settings_key)
+            vertical_saved.get(self._vertical_layout_key)
             if isinstance(vertical_saved, dict)
             else None,
             three_way=self._is_three_way_enabled(),
@@ -14029,9 +14074,11 @@ class SheetView:
         self.right_ln.bind("<Leave>", lambda e: self._clear_row_header_hover(self.right_ln))
 
         # C区: compact cursor compare block + cell-aligned view
-        self.c_area = ttk.Notebook(self.lower_area, style="CompactPanel.TNotebook")
-        self.c_area.pack(fill="x", padx=8, pady=(0, 2))
-        self.c_area.pack_propagate(False)
+        self.c_area_host = ttk.Frame(self.lower_area)
+        self.c_area_host.pack(side="top", fill="x", padx=8, pady=(0, 2))
+        self.c_area_host.pack_propagate(False)
+        self.c_area = ttk.Notebook(self.c_area_host, style="CompactPanel.TNotebook")
+        self.c_area.pack(fill="both", expand=True)
 
         # ---- C1: compact row compare (2 lines in 2-way, 3 lines in 3-way) ----
         c_text_frame = ttk.Frame(self.c_area)
@@ -14143,23 +14190,46 @@ class SheetView:
         self._hover_debounce_id = None
         self._pending_hover_args = None
         self._hover_debounce_ms = 30
-        self.hover_cmp_host = ttk.Frame(self.lower_area, height=self._hover_compare_reserved_height())
-        self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 2))
-        try:
-            self.hover_cmp_host.pack_propagate(False)
-        except Exception:
-            pass
-        self._hover_vertical_grip = ttk.Separator(self.lower_area, orient="horizontal")
-        self._hover_vertical_grip.pack(
-            side="bottom", fill="x", padx=8, before=self.hover_cmp_host
+        self._hover_vertical_grip = tk.Frame(
+            self.lower_area,
+            height=8,
+            bg=THEME.window_bg,
+            bd=0,
+            highlightthickness=0,
+            cursor="sb_v_double_arrow",
         )
-        self._hover_vertical_grip.configure(cursor="sb_v_double_arrow")
+        self._hover_vertical_grip.pack(side="top", fill="x", padx=8)
+        self._hover_vertical_grip.pack_propagate(False)
+        self._hover_vertical_grip_line = tk.Frame(
+            self._hover_vertical_grip,
+            height=1,
+            bg=THEME.border,
+            bd=0,
+            highlightthickness=0,
+        )
+        self._hover_vertical_grip_line.pack(fill="x", pady=3)
+        self._hover_vertical_grip_line.pack_propagate(False)
         self._hover_vertical_grip.bind(
             "<Button-1>", self._on_hover_vertical_grip_press
         )
         self._hover_vertical_grip.bind(
             "<B1-Motion>", self._on_hover_vertical_grip_motion
         )
+        self._hover_vertical_grip.bind(
+            "<ButtonRelease-1>", self._on_vertical_grip_release
+        )
+        self._hover_vertical_grip.bind(
+            "<Enter>", lambda event: self._on_vertical_grip_hover(event, True)
+        )
+        self._hover_vertical_grip.bind(
+            "<Leave>", lambda event: self._on_vertical_grip_hover(event, False)
+        )
+        self.hover_cmp_host = ttk.Frame(self.lower_area, height=self._hover_compare_reserved_height())
+        self.hover_cmp_host.pack(fill="x", padx=8, pady=(0, 2))
+        try:
+            self.hover_cmp_host.pack_propagate(False)
+        except (AttributeError, tk.TclError):
+            pass
         # One heading line carries both the panel purpose and the current
         # Sheet/cell identity. A second LabelFrame title only consumed height.
         hover_cmp_frame = ttk.Frame(self.hover_cmp_host)
@@ -14254,7 +14324,7 @@ class SheetView:
         # Sheet navigation is app-global; keep it out of the per-comparison
         # pane record so restoring one comparison cannot overwrite another.
         mapping.pop("nav_height", None)
-        settings.setdefault("vertical_sashes", {})[self._pane_settings_key] = mapping
+        settings.setdefault("vertical_sashes", {})[self._vertical_layout_key] = mapping
         schedule = getattr(self.app, "_schedule_layout_settings_save", None)
         if callable(schedule):
             schedule()
@@ -14274,7 +14344,7 @@ class SheetView:
                 - self._vertical_layout.hover_height
                 - GRIP_HEIGHT,
             )
-            self.c_area.configure(height=c_height)
+            self.c_area_host.configure(height=c_height)
             self.hover_cmp_host.configure(height=self._vertical_layout.hover_height)
         except (AttributeError, tk.TclError):
             return
@@ -14290,6 +14360,11 @@ class SheetView:
             int(self._vertical_layout.lower_height),
             "lower",
         )
+        self._vertical_grab_widget = self._main_vertical_grip
+        try:
+            self._main_vertical_grip.grab_set()
+        except tk.TclError:
+            pass
 
     def _on_main_vertical_grip_motion(self, event):
         from .vertical_layout import VerticalLayout
@@ -14310,6 +14385,11 @@ class SheetView:
             int(self._vertical_layout.hover_height),
             "hover",
         )
+        self._vertical_grab_widget = self._hover_vertical_grip
+        try:
+            self._hover_vertical_grip.grab_set()
+        except tk.TclError:
+            pass
 
     def _on_hover_vertical_grip_motion(self, event):
         from .vertical_layout import VerticalLayout
@@ -14331,6 +14411,27 @@ class SheetView:
             three_way=self._is_three_way_enabled()
         )
         self._apply_vertical_layout()
+
+    def _on_vertical_grip_release(self, _event=None):
+        widget = getattr(self, "_vertical_grab_widget", None)
+        if widget is not None:
+            try:
+                widget.grab_release()
+            except tk.TclError:
+                pass
+        self._vertical_grab_widget = None
+
+    def _on_vertical_grip_hover(self, event, active: bool) -> None:
+        widget = event.widget
+        try:
+            widget.configure(bg=THEME.accent_active if active else THEME.window_bg)
+            children = widget.winfo_children()
+            if children:
+                children[0].configure(
+                    bg=THEME.accent if active else THEME.border
+                )
+        except tk.TclError:
+            pass
 
     def _hover_compare_reserved_height(self, enabled: bool | None = None) -> int:
         enabled = self._is_three_way_enabled() if enabled is None else bool(enabled)
@@ -33666,6 +33767,10 @@ class SowMergeApp:
             int(event.y_root),
             int(getattr(self, "_sheet_nav_height", 34)),
         )
+        try:
+            self._sheet_nav_grip.grab_set()
+        except tk.TclError:
+            pass
 
     def _on_sheet_nav_grip_motion(self, event) -> None:
         origin_y, origin_height = getattr(
@@ -33675,6 +33780,24 @@ class SowMergeApp:
         )
         self._sheet_nav_height = origin_height + origin_y - int(event.y_root)
         self._apply_sheet_nav_height()
+
+    def _on_sheet_nav_grip_release(self, _event=None) -> None:
+        try:
+            self._sheet_nav_grip.grab_release()
+        except tk.TclError:
+            pass
+
+    def _on_sheet_nav_grip_hover(self, event, active: bool) -> None:
+        widget = event.widget
+        try:
+            widget.configure(bg=THEME.accent_active if active else THEME.window_bg)
+            children = widget.winfo_children()
+            if children:
+                children[0].configure(
+                    bg=THEME.accent if active else THEME.border
+                )
+        except tk.TclError:
+            pass
 
     def _reset_workspace_layout(self) -> None:
         self.settings.pop("vertical_sashes", None)
@@ -34776,11 +34899,34 @@ class SowMergeApp:
         self.bottom = ttk.Frame(self.root, style="MergeChrome.TFrame")
         self.bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         self.bottom.pack_propagate(False)
-        self._sheet_nav_grip = ttk.Separator(self.bottom, orient="horizontal")
+        self._sheet_nav_grip = tk.Frame(
+            self.bottom,
+            height=8,
+            bg=THEME.window_bg,
+            bd=0,
+            highlightthickness=0,
+            cursor="sb_v_double_arrow",
+        )
         self._sheet_nav_grip.pack(side="top", fill="x")
-        self._sheet_nav_grip.configure(cursor="sb_v_double_arrow")
+        self._sheet_nav_grip.pack_propagate(False)
+        self._sheet_nav_grip_line = tk.Frame(
+            self._sheet_nav_grip,
+            height=1,
+            bg=THEME.border,
+            bd=0,
+            highlightthickness=0,
+        )
+        self._sheet_nav_grip_line.pack(fill="x", pady=3)
+        self._sheet_nav_grip_line.pack_propagate(False)
         self._sheet_nav_grip.bind("<Button-1>", self._on_sheet_nav_grip_press)
         self._sheet_nav_grip.bind("<B1-Motion>", self._on_sheet_nav_grip_motion)
+        self._sheet_nav_grip.bind("<ButtonRelease-1>", self._on_sheet_nav_grip_release)
+        self._sheet_nav_grip.bind(
+            "<Enter>", lambda event: self._on_sheet_nav_grip_hover(event, True)
+        )
+        self._sheet_nav_grip.bind(
+            "<Leave>", lambda event: self._on_sheet_nav_grip_hover(event, False)
+        )
 
         self.nav = ttk.Frame(self.bottom, style="MergeChrome.TFrame")
         self.nav.pack(side="left", fill="x", expand=True)
