@@ -120,17 +120,75 @@ def settings_dir() -> str:
     return os.path.join(root, "SowMergeTool", "branch_submit")
 
 
+BRANCH_SETTINGS_VERSION = 2
+
+
+def _default_branch_settings() -> dict:
+    return {
+        "settings_version": BRANCH_SETTINGS_VERSION,
+        "favorite_branches": list(DEFAULT_BRANCHES),
+        "last_targets": {},
+        "window_geometry": "1120x760",
+        "column_widths": {},
+        "recent_messages": [],
+    }
+
+
+def _migrate_branch_settings(value: object) -> dict:
+    """Load branch-workbench preferences defensively and migrate per key.
+
+    A malformed one-off preference must not prevent the SVN workbench from
+    opening.  Unknown keys are retained for forward compatibility, while each
+    known key is validated independently and reset to its safe default.
+    """
+    defaults = _default_branch_settings()
+    raw = value if isinstance(value, dict) else {}
+    result = dict(raw)
+    result["settings_version"] = BRANCH_SETTINGS_VERSION
+    favorites = raw.get("favorite_branches", defaults["favorite_branches"])
+    if not isinstance(favorites, list) or not all(isinstance(item, str) for item in favorites):
+        favorites = defaults["favorite_branches"]
+    result["favorite_branches"] = list(dict.fromkeys(favorites))
+    last_targets = raw.get("last_targets", defaults["last_targets"])
+    if not isinstance(last_targets, dict):
+        last_targets = {}
+    result["last_targets"] = {
+        str(source): list(dict.fromkeys(targets))
+        for source, targets in last_targets.items()
+        if isinstance(targets, list) and all(isinstance(target, str) for target in targets)
+    }
+    geometry = raw.get("window_geometry", defaults["window_geometry"])
+    result["window_geometry"] = geometry if isinstance(geometry, str) and geometry.strip() else defaults["window_geometry"]
+    widths = raw.get("column_widths", defaults["column_widths"])
+    if not isinstance(widths, dict):
+        widths = {}
+    result["column_widths"] = {
+        str(name): max(24, min(1200, int(width)))
+        for name, width in widths.items()
+        if isinstance(name, str) and isinstance(width, (int, float, str))
+        and str(width).strip().lstrip("-").isdigit()
+    }
+    recent = raw.get("recent_messages", defaults["recent_messages"])
+    if not isinstance(recent, list) or not all(isinstance(item, str) for item in recent):
+        recent = defaults["recent_messages"]
+    result["recent_messages"] = list(dict.fromkeys(recent))[:50]
+    return result
+
+
 def load_settings() -> dict:
     try:
         with open(os.path.join(settings_dir(), "settings.json"), "r", encoding="utf-8") as stream:
             value = json.load(stream)
-        return value if isinstance(value, dict) else {}
+        return _migrate_branch_settings(value)
     except (OSError, ValueError):
-        return {}
+        return _default_branch_settings()
 
 
 def save_settings(data: dict) -> None:
-    _safe_json_write(os.path.join(settings_dir(), "settings.json"), data)
+    _safe_json_write(
+        os.path.join(settings_dir(), "settings.json"),
+        _migrate_branch_settings(data),
+    )
 
 
 @dataclass
