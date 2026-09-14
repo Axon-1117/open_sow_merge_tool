@@ -1292,6 +1292,85 @@ class BranchSubmitEngine:
         batch.event("target-file-excluded", target=target, path=relative_path)
         return action
 
+    def exclude_failed_target_file(
+        self,
+        batch: BranchSubmitBatch,
+        target: str,
+        relative_path: str,
+    ) -> BatchFileAction:
+        """Explicitly exclude a failed/blocked action without touching files.
+
+        This is intentionally separate from :meth:`exclude_target_file`, which
+        is reserved for content-overlap confirmations.  A transient SVN or
+        validation failure may be removed from the current target batch only
+        after the user explicitly chooses this action; it is never silently
+        skipped by retry logic.
+        """
+        plan = next((item for item in batch.files if item.relative_path == relative_path), None)
+        if plan is None or target not in plan.actions:
+            raise RuntimeError(f"预检查结果中不存在 {target}/{relative_path}")
+        action = plan.actions[target]
+        if action.state not in {"blocked", "unknown", "failed", "partial"}:
+            raise RuntimeError(f"{target}/{relative_path} 当前不是失败项")
+        action.state = "excluded"
+        action.disposition = "excluded"
+        action.reason = "用户明确排除失败项；本文件不进入该目标分支提交"
+        self._refresh_target_status(batch, target)
+        batch.event("failed-target-file-excluded", target=target, path=relative_path)
+        return action
+
+    def retry_failed_preflight(
+        self,
+        batch: BranchSubmitBatch,
+        *,
+        message: str | None = None,
+    ) -> BranchSubmitBatch:
+        """Re-run only target/file actions that failed the previous preflight.
+
+        Source snapshots are intentionally re-read by ``preflight`` so a
+        changed source invalidates the retry instead of reusing stale content.
+        Successful target/file pairs are omitted from the retry request.
+        """
+        failed_targets = [
+            target for target in batch.target_branches
+            if batch.target_status.get(target) in {"blocked", "unknown", "failed", "partial"}
+            or any(
+                plan.actions.get(target) is not None
+                and plan.actions[target].state in {"blocked", "unknown", "failed", "partial"}
+                for plan in batch.files
+            )
+        ]
+        failed_paths = {
+            plan.relative_path
+            for plan in batch.files
+            if any(
+                plan.actions.get(target) is not None
+                and plan.actions[target].state in {"blocked", "unknown", "failed", "partial"}
+                for target in failed_targets
+            )
+        }
+        if not failed_targets or not failed_paths:
+            raise RuntimeError("当前批次没有可重试的失败项")
+        batch.event(
+            "retry-failed-preflight-start",
+            targets=list(failed_targets),
+            paths=sorted(failed_paths),
+        )
+        retried = self.preflight(
+            batch.source_branch,
+            failed_targets,
+            sorted(failed_paths),
+            batch.message if message is None else message,
+            scope_path=batch.scope_path,
+        )
+        retried.event(
+            "retry-failed-preflight-complete",
+            source_batch=batch.batch_id,
+            targets=list(failed_targets),
+            paths=sorted(failed_paths),
+        )
+        return retried
+
     def _source_snapshot(self, batch: BranchSubmitBatch, item: SvnChangeItem) -> FilePlan:
         core = self._load_core()
         relative = _validate_relative_file(item.relative_path)
@@ -1583,6 +1662,64 @@ class BranchSubmitEngine:
             batch.error = str(exc)
             batch.event("preflight-failed", error=batch.error)
             raise
+
+    def retry_preflight(
+        self,
+        batch: BranchSubmitBatch,
+        *,
+        targets: Iterable[str] | None = None,
+        relative_paths: Iterable[str] | None = None,
+    ) -> BranchSubmitBatch:
+        """Re-run freshness and action checks only for invalidated paths.
+
+        The source snapshot and target update scope are rebuilt from the
+        selected relative paths; no repository-wide HEAD or unrelated target
+        files are scanned.  A fresh batch is returned so the old audit trail
+        remains recoverable if the retry fails or is cancelled.
+        """
+        if batch.abandoned or batch.superseded_by:
+            raise RuntimeError("该批次已放弃或被替代，不能重试预检查")
+        target_names = list(targets or batch.target_branches)
+        target_names = [name for name in target_names if name in batch.target_branches]
+        if not target_names:
+            raise ValueError("没有需要重试的目标分支")
+        requested_paths = {
+            str(path).replace("\\", "/").strip("/")
+            for path in (relative_paths or ())
+            if str(path).strip()
+        }
+        if not requested_paths:
+            requested_paths = {
+                str(plan.relative_path).replace("\\", "/").strip("/")
+                for plan in batch.files
+            }
+        source_scope = batch.scope_path or os.path.join(
+            batch.wc_root, batch.source_branch
+        )
+        scanned = scan_changes(self.wc_root, batch.source_branch, source_scope)
+        selected = [
+            item
+            for item in scanned
+            if str(item.relative_path).replace("\\", "/").strip("/")
+            in requested_paths
+        ]
+        if not selected:
+            raise RuntimeError("重试路径已不在源分支扫描结果中，请重新扫描并选择")
+        retried = self.preflight(
+            batch.source_branch,
+            target_names,
+            selected,
+            batch.message,
+            scope_path=source_scope,
+        )
+        retried.event(
+            "preflight-retry",
+            parent_batch=batch.batch_id,
+            targets=target_names,
+            relative_paths=sorted(requested_paths),
+            incremental=True,
+        )
+        return retried
 
     def _source_status_map(self, batch: BranchSubmitBatch) -> dict[str, SvnStatusRecord]:
         scope = batch.scope_path if _is_within(batch.scope_path, os.path.join(batch.wc_root, batch.source_branch)) else os.path.join(batch.wc_root, batch.source_branch)
@@ -4174,6 +4311,22 @@ class BranchSubmitWorkbench:
                 target, plan = entry; action = plan.actions[target]
                 detail.set(f"{target} / {plan.relative_path} · {state_labels.get(action.state, action.state)}：{_action_reason_text(plan, action)}")
         tree.bind("<<TreeviewSelect>>", show_detail)
+        failed_actions = {
+            action.state
+            for plan in batch.files
+            for action in plan.actions.values()
+        } & {"blocked", "unknown", "failed", "partial"}
+        if failed_actions:
+            self.ttk.Button(
+                footer,
+                text="排除失败项后继续",
+                command=self._exclude_failed_items,
+            ).pack(side="right", padx=(6, 0))
+            self.ttk.Button(
+                footer,
+                text="仅重试失败项",
+                command=self._retry_failed_preflight,
+            ).pack(side="right", padx=(6, 0))
         self.ttk.Button(footer, text="查看目标修改点", command=show_preview).pack(side="right", padx=(6, 0))
         if self._confirmation_entries():
             self.ttk.Button(footer, text="处理人工确认", style="Danger.TButton", command=self._open_confirmation_dialog).pack(side="right", padx=(6, 0))
@@ -4182,6 +4335,75 @@ class BranchSubmitWorkbench:
         if first:
             tree.selection_set(first[0]); tree.focus(first[0]); show_detail()
         return True
+
+    def _retry_failed_preflight(self) -> None:
+        """Reduce the request to failed target/file pairs and re-run preflight."""
+        batch = self.current_batch
+        if batch is None or self._ui_busy():
+            return
+        failed_targets = {
+            target for target in batch.target_branches
+            if batch.target_status.get(target) in {"blocked", "unknown", "failed", "partial"}
+            or any(
+                plan.actions.get(target) is not None
+                and plan.actions[target].state in {"blocked", "unknown", "failed", "partial"}
+                for plan in batch.files
+            )
+        }
+        failed_paths = {
+            plan.relative_path
+            for plan in batch.files
+            if any(
+                plan.actions.get(target) is not None
+                and plan.actions[target].state in {"blocked", "unknown", "failed", "partial"}
+                for target in failed_targets
+            )
+        }
+        if not failed_targets or not failed_paths:
+            self.status_var.set("当前没有可重试的失败项")
+            return
+        for name, var in self.target_vars.items():
+            var.set(name in failed_targets)
+        for item in self.items:
+            item.checked = item.relative_path in failed_paths
+        self._render_items()
+        self._invalidate_batch("失败项已重新选择，请执行增量预检查", refresh_targets=False)
+        self.status_var.set(f"已仅选择 {len(failed_targets)} 个失败目标、{len(failed_paths)} 个失败文件；正在重新预检查…")
+        self._preflight()
+
+    def _exclude_failed_items(self) -> None:
+        """Exclude failed target/file pairs after explicit user action."""
+        batch = self.current_batch
+        if batch is None or self._ui_busy():
+            return
+        from tkinter import messagebox
+
+        entries = [
+            (target, plan)
+            for plan in batch.files
+            for target, action in plan.actions.items()
+            if action.state in {"blocked", "unknown", "failed", "partial"}
+        ]
+        if not entries:
+            self.status_var.set("当前没有可排除的失败项")
+            return
+        if not messagebox.askyesno(
+            "排除失败项",
+            f"将排除 {len(entries)} 个目标/文件组合；这些内容不会写入目标工作副本。是否继续？",
+            parent=self.root,
+        ):
+            return
+        excluded = 0
+        for target, plan in entries:
+            try:
+                self.engine.exclude_failed_target_file(batch, target, plan.relative_path)
+                excluded += 1
+            except Exception:
+                continue
+        self._render_target_statuses()
+        self._show_matrix_panel(batch)
+        self._refresh_primary_button()
+        self.status_var.set(f"已排除 {excluded} 个失败项；其余可提交内容仍保留在当前批次")
 
     def _preflight(self, *, auto_start: bool = False):
         from tkinter import messagebox
