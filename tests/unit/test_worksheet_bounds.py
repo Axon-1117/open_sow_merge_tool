@@ -5,7 +5,11 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from sow_merge_tool.legacy_core import _row_sig_list_for_ws, _worksheet_scan_bounds
+from sow_merge_tool.legacy_core import (
+    _row_sig_list_for_ws,
+    _workbook_health_evidence,
+    _worksheet_scan_bounds,
+)
 
 
 def _write_book(path: Path, values: list[list[object]]) -> None:
@@ -39,6 +43,10 @@ def test_read_only_bounds_recover_rows_from_misleading_a1_dimension(tmp_path):
     _write_book(mine, [["id", "value"], [1, "same"], [2, "mine"]])
     _force_a1_dimension(base)
     _force_a1_dimension(mine)
+    health = _workbook_health_evidence(str(mine))
+    assert health["ready"] is True
+    assert health["worksheet_count"] == 1
+    assert health["a1_dimension_parts"] == ("xl/worksheets/sheet1.xml",)
 
     base_wb = load_workbook(base, read_only=True, data_only=False)
     mine_wb = load_workbook(mine, read_only=True, data_only=False)
@@ -51,4 +59,3 @@ def test_read_only_bounds_recover_rows_from_misleading_a1_dimension(tmp_path):
     finally:
         base_wb.close()
         mine_wb.close()
-

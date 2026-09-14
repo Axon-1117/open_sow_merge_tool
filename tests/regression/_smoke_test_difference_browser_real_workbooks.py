@@ -489,7 +489,10 @@ def main() -> None:
 
         loaded_view._on_main_vertical_grip_press(_GripEvent(500))
         loaded_view._on_main_vertical_grip_motion(_GripEvent(100))
-        vertical_saved = app.settings.get("vertical_sashes", {}).get(pane_key, {})
+        vertical_saved = app.settings.get("vertical_sashes", {}).get(
+            loaded_view._vertical_layout_key,
+            {},
+        )
         assert loaded_view._vertical_layout.lower_height >= vertical_before
         assert vertical_saved.get("lower_height") == loaded_view._vertical_layout.lower_height
         loaded_view._on_hover_vertical_grip_press(_GripEvent(500))

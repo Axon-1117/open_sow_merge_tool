@@ -9,6 +9,7 @@ Tk startup probe and records the existing startup trace/heartbeat metrics.
 
 from __future__ import annotations
 
+import _tkinter
 import json
 import os
 import shutil
@@ -25,6 +26,13 @@ from sow_merge_tool import legacy_core as smt
 
 ITERATIONS = 4
 P95_LIMIT_MS = 1500.0
+
+
+def _pump_tk(root, *, budget: int = 1) -> None:
+    """Run a bounded Tk event slice for deterministic hidden UI probes."""
+    for _ in range(max(1, int(budget))):
+        if not root.tk.dooneevent(_tkinter.DONT_WAIT):
+            break
 
 
 def _write_synthetic(path: Path) -> None:
@@ -137,17 +145,37 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
     try:
         app = smt.SowMergeApp(str(left), str(right))
         app.root.withdraw()
+        # Hidden performance probes must not include the Windows maximize/DWM
+        # transition; real DPI/window geometry remains covered by Native.
+        app._intended_window_state = "normal"
         probe_started = time.perf_counter()
         first_sheet = str(getattr(app, "selected_sheet", "") or "")
         first_ready_at = None
         deadline = time.monotonic() + 45.0
+        pump_last = time.perf_counter()
+        pump_pre_max = 0.0
+        pump_post_max = 0.0
         while time.monotonic() < deadline:
-            app.root.update()
+            _pump_tk(app.root)
+            pump_now = time.perf_counter()
+            pump_gap = pump_now - pump_last
+            pump_last = pump_now
+            if first_ready_at is None:
+                pump_pre_max = max(pump_pre_max, pump_gap)
+            else:
+                pump_post_max = max(pump_post_max, pump_gap)
             if first_ready_at is None:
                 view = getattr(app, "sheet_views", {}).get(first_sheet)
                 if view is not None and bool(getattr(view, "_data_ready", False)):
                     first_ready_at = time.perf_counter()
-            if getattr(app, "_ui_heartbeat_samples", 0) >= 10:
+            # Do not stop at the heartbeat sample quota before the first Sheet
+            # has actually become usable; startup readiness is the primary
+            # signal and the old ordering made a slow first cache look like a
+            # successful probe with ``first_sheet_ready=false``.
+            if (
+                first_ready_at is not None
+                and getattr(app, "_ui_heartbeat_samples", 0) >= 10
+            ):
                 break
             time.sleep(0.01)
         durations = app._startup_trace.durations()
@@ -166,6 +194,8 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
                 float(getattr(app, "_ui_heartbeat_max_gap", 0.0)) * 1000.0,
                 2,
             ),
+            "pump_pre_first_ready_max_gap_ms": round(pump_pre_max * 1000.0, 2),
+            "pump_post_first_ready_max_gap_ms": round(pump_post_max * 1000.0, 2),
         }
     finally:
         if app is not None:

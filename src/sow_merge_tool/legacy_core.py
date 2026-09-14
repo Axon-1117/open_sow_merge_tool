@@ -1,62 +1,66 @@
 from __future__ import annotations
 
-import os
-import sys
 import argparse
-import re
-import bisect
-import difflib
-import hashlib
-import tempfile
-import subprocess
-import traceback
 import atexit
+import bisect
 import copy
-import gc
 import ctypes
-import math
-from itertools import zip_longest
-from functools import lru_cache
-from datetime import date, datetime, time as datetime_time, timedelta
-import time
-import stat
-import shutil
-import zipfile
-import posixpath
-import platform
-import xml.etree.ElementTree as ET
-import unicodedata
-from urllib.parse import quote
-from dataclasses import dataclass, field
-from enum import Enum
-import sqlite3
-from collections.abc import Iterable, Sequence
-
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import difflib
+import gc
+import hashlib
 import json
+import math
+import os
+import pickle
+import platform
+import posixpath
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
 import threading
+import time
+import tkinter as tk
+import traceback
+import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from datetime import time as datetime_time
+from enum import Enum
+from functools import lru_cache
+from itertools import zip_longest
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import quote
 
-from openpyxl import load_workbook as _openpyxl_load_workbook, Workbook
-from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+from openpyxl import Workbook
+from openpyxl import load_workbook as _openpyxl_load_workbook
 from openpyxl.formula import Tokenizer
 from openpyxl.formula.translate import Translator
-from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
+
 # Note: formulas will be treated as cached values only (data_only), with fallback when cache is missing.
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to_excel
+from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+
+from .difference_browser import DifferenceBrowser
 from .ui_foundation import (
     THEME,
-    UiTrace,
+    CommandState,
     DifferenceItem,
     DifferenceKind,
-    CommandState,
+    UiTrace,
     configure_ttk_style,
 )
-from .difference_browser import DifferenceBrowser
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update99"
+APP_VERSION = "2026-09-14.update100"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -90,6 +94,9 @@ _FAST_RENDER_ROW_LIMIT = 800
 _FAST_RENDER_BATCH = 500
 _LARGE_SHEET_ROW_THRESHOLD = 2000
 _LARGE_SHEET_INITIAL_ROWS = 200
+_PREVIEW_CACHE_ROWS = 20
+_PREVIEW_RENDER_ROWS = 10
+_PREVIEW_MAX_COLS = 64
 _LARGE_SHEET_BLOCK_ROWS = 1000
 _LARGE_DIFF_NAV_PREVIEW_ROWS = 12
 _CELL_UNDO_INCREMENTAL_ROW_LIMIT = 24
@@ -4999,8 +5006,9 @@ def _read_rows_into_cache(
         and str(getattr(ws.__class__, "__module__", "")).startswith("openpyxl.")
     ):
         for row_offset, row_idx in enumerate(needed):
-            if cancel_check is not None and (row_offset & 127) == 0:
+            if cancel_check is not None and (row_offset & 15) == 0:
                 cancel_check()
+                time.sleep(0.001)
             values = []
             for col_idx in range(1, read_max_col + 1):
                 cell = sparse_cells.get((row_idx, col_idx))
@@ -5020,8 +5028,9 @@ def _read_rows_into_cache(
             ),
             start=min_r,
         ):
-            if cancel_check is not None and (idx & 127) == 0:
+            if cancel_check is not None and (idx & 15) == 0:
                 cancel_check()
+                time.sleep(0.001)
             if idx in needed_set:
                 rows[idx] = _pad_row_values(row, max_col)
     except InterruptedError:
@@ -8554,6 +8563,85 @@ def _workbook_package_ready(path: str) -> bool:
         return False
 
 
+def _workbook_health_evidence(path: str | None) -> dict[str, object]:
+    """Return lightweight OOXML/package evidence without loading cell data."""
+    started = time.perf_counter()
+    evidence: dict[str, object] = {
+        "path": str(path or ""),
+        "ready": False,
+        "member_count": 0,
+        "worksheet_count": 0,
+        "a1_dimension_parts": (),
+        "reason": "",
+    }
+    if not path or not os.path.isfile(path):
+        evidence["reason"] = "missing input path"
+        return evidence
+    try:
+        with zipfile.ZipFile(path, "r") as package:
+            names = tuple(package.namelist())
+            evidence["member_count"] = len(names)
+            if "[Content_Types].xml" not in names or "xl/workbook.xml" not in names:
+                evidence["reason"] = "missing OOXML manifest or workbook part"
+                return evidence
+            if package.testzip() is not None:
+                evidence["reason"] = "ZIP CRC failure"
+                return evidence
+            worksheet_parts = tuple(
+                name for name in names
+                if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            )
+            malformed = []
+            for name in worksheet_parts:
+                payload = package.read(name)
+                match = re.search(rb"<dimension[^>]*\bref=\"([^\"]+)\"", payload)
+                if match and match.group(1).upper() == b"A1":
+                    malformed.append(name)
+            evidence["ready"] = True
+            evidence["worksheet_count"] = len(worksheet_parts)
+            evidence["a1_dimension_parts"] = tuple(sorted(malformed))
+            evidence["reason"] = "complete OOXML package"
+            return evidence
+    except (OSError, zipfile.BadZipFile, EOFError, KeyError, ValueError) as exc:
+        evidence["reason"] = f"health evidence failed: {exc}"
+        return evidence
+    finally:
+        evidence["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+
+
+def _write_cache_worker_artifact(
+    output_path: str,
+    *,
+    sheet: str,
+    generation: int,
+    hashes: dict[str, str],
+    cache: dict,
+) -> None:
+    """Atomically publish a Tk-free full-cache envelope from a worker process."""
+    payload = {
+        "protocol": 1,
+        "sheet": str(sheet),
+        "generation": int(generation),
+        "hashes": dict(hashes or {}),
+        "cache": cache,
+    }
+    target = os.path.abspath(str(output_path))
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    temporary = f"{target}.{os.getpid()}.tmp"
+    try:
+        with open(temporary, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+
+
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -11357,7 +11445,9 @@ def _cross_branch_source_delta_premerge(
         if large_xlsx:
             from .fast_branch_merge import analyze_source as _fast_analyze_source
             from .fast_branch_merge import analyze_target as _fast_analyze_target
-            from .fast_branch_merge import apply_source_change_plan as _fast_apply_source_change_plan
+            from .fast_branch_merge import (
+                apply_source_change_plan as _fast_apply_source_change_plan,
+            )
 
             fast_delta = _fast_analyze_source(source_before_path, source_after_path)
             fast_decision = _fast_analyze_target(fast_delta, target_working_path)
@@ -14625,7 +14715,11 @@ class SheetView:
         self._refresh_interaction_gate()
         if getattr(self, "_lifecycle_state", "") == "READY":
             return True
-        if getattr(self, "_lifecycle_state", "") == "EDIT_LOADING":
+        if (
+            getattr(self, "_lifecycle_state", "")
+            in {"EDIT_LOADING", "DIFFING", "BUSY"}
+            and not self.app._edit_workbooks_ready()
+        ):
             # The first explicit mutation opts into the deferred editable
             # preload.  Never wait on the Tk thread; the current click is
             # rejected safely and the next click can proceed after READY.
@@ -29223,8 +29317,50 @@ class SheetView:
                 w.insert("1.0", "\n".join(lines) + ("\n" if lines else ""))
                 w.tag_remove("diffrow", "1.0", "end")
                 w.configure(state="disabled")
-            except Exception:
+            except tk.TclError:
                 pass
+
+    def _render_preview_rows(self):
+        """Paint bounded cached rows without a foreground workbook rescan."""
+        # Keep the first paint deliberately small.  The cache still retains
+        # the bounded 200-row horizon for exact background work, while Tk only
+        # inserts enough rows to make the Sheet immediately usable.
+        limit = min(len(self.row_pairs), _PREVIEW_RENDER_ROWS)
+        self._full_render = False
+        self._render_limit = max(1, limit)
+        self._full_display_rows = list(range(limit))
+        self.display_rows = list(self._full_display_rows)
+        self.row_to_line = {
+            pair_idx: line + 1
+            for line, pair_idx in enumerate(self.display_rows)
+        }
+        lines_a = [self.pair_text_a.get(pair_idx, "") for pair_idx in self.display_rows]
+        lines_b = [self.pair_text_b.get(pair_idx, "") for pair_idx in self.display_rows]
+        lines_base = [self.pair_text_base.get(pair_idx, "") for pair_idx in self.display_rows]
+        for widget, lines in (
+            (self.left, lines_a),
+            (self.base, lines_base),
+            (self.right, lines_b),
+        ):
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("1.0", "\n".join(lines) + ("\n" if lines else ""))
+            except tk.TclError:
+                pass
+        self._render_row_headers_full()
+        diff_args = []
+        for line, pair_idx in enumerate(self.display_rows, start=1):
+            if self._visual_diff_cols_for_pair(pair_idx):
+                diff_args.extend((f"{line}.0", f"{line}.end"))
+        if diff_args:
+            for widget in (self.left, self.base, self.right):
+                try:
+                    widget.tag_add("diffrow", *diff_args)
+                except tk.TclError:
+                    pass
+        self._display_diff_row_count = len(diff_args) // 2
+        self._invalidate_diff_block_model()
 
     def _render_row_header_line(self, line: int, pair_idx: int):
         rn_w = self._sync_row_header_width_widgets()
@@ -30892,6 +31028,15 @@ class SowMergeApp:
         self.raw_mine = raw_mine
         self.raw_theirs = raw_theirs
         self.role_mode = str(role_mode or "")
+        self._cache_worker_mode = os.environ.get("SOW_CACHE_WORKER", "") == "1"
+        self._cache_worker_sheet = os.environ.get("SOW_CACHE_WORKER_SHEET", "")
+        self._cache_worker_output = os.environ.get("SOW_CACHE_WORKER_OUTPUT", "")
+        try:
+            self._cache_worker_generation = int(
+                os.environ.get("SOW_CACHE_WORKER_GENERATION", "0") or 0
+            )
+        except ValueError:
+            self._cache_worker_generation = 0
         self.diff_base_mine_mode = bool(
             not self.merge_mode and self.raw_base and self.raw_mine
         )
@@ -30970,6 +31115,8 @@ class SowMergeApp:
         # load settings
         self.settings = {}
         self.only_diff_default = 0
+        self.workbook_health: dict[str, dict[str, object]] = {}
+        self._isolated_cache_disabled_sheets: set[str] = set()
         try:
             os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
             if os.path.exists(_SETTINGS_PATH):
@@ -30987,6 +31134,7 @@ class SowMergeApp:
         self._wb_base_edit = None
         self._edit_loaded_event = threading.Event()
         self._initial_sheet_ready_event = threading.Event()
+        self._initial_preview_applied_event = threading.Event()
         self._edit_preload_active_event = threading.Event()
         self._edit_loading_started = False
         self._edit_preload_runner = None
@@ -31025,6 +31173,13 @@ class SowMergeApp:
                 report("正在打开 Excel 合并工具", f"加载 mine：{os.path.basename(self.file_a)}", 8)
                 t0 = datetime.now()
                 self._file_a_val_path = _prepare_val_path(self.file_a)
+                self.workbook_health["A"] = _workbook_health_evidence(self._file_a_val_path)
+                _dlog(
+                    f"WORKBOOK_HEALTH role=A ready={self.workbook_health['A']['ready']} "
+                    f"worksheets={self.workbook_health['A']['worksheet_count']} "
+                    f"a1_dims={len(self.workbook_health['A']['a1_dimension_parts'])} "
+                    f"reason={self.workbook_health['A']['reason']}"
+                )
                 self._wb_a_val = load_workbook(
                     self._file_a_val_path,
                     data_only=True,
@@ -31038,6 +31193,13 @@ class SowMergeApp:
                 report("正在打开 Excel 合并工具", f"加载 {side_label}：{os.path.basename(mine_working_path)}", 30)
                 t0 = datetime.now()
                 self._file_b_val_path = _prepare_val_path(mine_working_path)
+                self.workbook_health["B"] = _workbook_health_evidence(self._file_b_val_path)
+                _dlog(
+                    f"WORKBOOK_HEALTH role=B ready={self.workbook_health['B']['ready']} "
+                    f"worksheets={self.workbook_health['B']['worksheet_count']} "
+                    f"a1_dims={len(self.workbook_health['B']['a1_dimension_parts'])} "
+                    f"reason={self.workbook_health['B']['reason']}"
+                )
                 self._wb_b_val = load_workbook(
                     self._file_b_val_path,
                     data_only=True,
@@ -31050,6 +31212,13 @@ class SowMergeApp:
                     report("正在打开 Excel 合并工具", f"加载 base：{os.path.basename(self.base_path)}", 52)
                     t0 = datetime.now()
                     self._file_base_val_path = _prepare_val_path(self.base_path)
+                    self.workbook_health["BASE"] = _workbook_health_evidence(self._file_base_val_path)
+                    _dlog(
+                        f"WORKBOOK_HEALTH role=BASE ready={self.workbook_health['BASE']['ready']} "
+                        f"worksheets={self.workbook_health['BASE']['worksheet_count']} "
+                        f"a1_dims={len(self.workbook_health['BASE']['a1_dimension_parts'])} "
+                        f"reason={self.workbook_health['BASE']['reason']}"
+                    )
                     self._wb_base_val = load_workbook(
                         self._file_base_val_path,
                         data_only=True,
@@ -31132,9 +31301,14 @@ class SowMergeApp:
         except Exception:
             pass
 
+        # Let the root window establish its first heartbeat before the XML
+        # worker consumes CPU/GIL for the initial preview.
+        self._defer_initial_compute = True
         self._build_ui()
         self._startup_trace.mark("main-ui-built")
-        self._safe_root_after(0, self._ensure_only_diff_progress_dialog)
+        # The optional exact-diff dialog is created lazily by the explicit
+        # command that needs it; constructing it during startup causes a
+        # native Tk layout pass before the first preview is usable.
         self._ui_heartbeat_last = time.perf_counter()
         self._ui_heartbeat_max_gap = 0.0
         self._ui_heartbeat_samples = 0
@@ -31156,12 +31330,20 @@ class SowMergeApp:
                     )
                 except Exception:
                     pass
+            wake = getattr(self, "_ui_task_wakeup", None)
+            drain = getattr(self, "_drain_ui_tasks", None)
+            if wake is not None and drain is not None and wake.is_set():
+                wake.clear()
+                drain()
             self._safe_root_after(50, _ui_heartbeat)
 
         def _show_main_window_after_layout():
             if self._is_closing:
                 return
             try:
+                if self._cache_worker_mode:
+                    self.root.withdraw()
+                    return
                 self.root.update_idletasks()
                 _dlog(
                     f"WINDOW_STATE stage=before-show state={self.root.state()} "
@@ -31174,14 +31356,22 @@ class SowMergeApp:
                     f"WINDOW_STATE stage=after-show state={self.root.state()} "
                     f"geometry={self.root.geometry()}"
                 )
+                # Establish the heartbeat baseline after the one-time native
+                # show/maximize layout; subsequent gaps represent real UI
+                # starvation rather than window-manager setup.
+                self._ui_heartbeat_last = time.perf_counter()
                 durations = self._startup_trace.durations()
                 _dlog("STARTUP_TRACE " + " ".join(f"{key}={value * 1000.0:.1f}ms" for key, value in durations.items()))
             except Exception as exc:
                 _dlog(f"main window show failed: {exc}")
 
         self._safe_root_after(0, _show_main_window_after_layout)
-        self._safe_root_after(50, _ui_heartbeat)
+        # Start the heartbeat on the first idle turn so the initial preview
+        # cannot hide a long gap behind the 50 ms bootstrap delay.
+        self._safe_root_after(0, _ui_heartbeat)
         self._schedule_auto_recalc()
+        self._defer_initial_compute = False
+        self._safe_root_after(50, self._kick_worker)
 
     def _configure_workspace_chrome(self):
         """Install styles for surrounding UI chrome without touching sheet cells."""
@@ -35011,6 +35201,8 @@ class SowMergeApp:
         self._sheet_cache_store: dict[str, dict] = {}
         self._ui_task_lock = threading.Lock()
         self._ui_tasks = []
+        self._ui_task_wakeup = threading.Event()
+        self._ui_preview_grace_until = 0.0
 
         def _enqueue_sheet(
             sheet: str,
@@ -35061,35 +35253,75 @@ class SowMergeApp:
                 else:
                     self._compute_queue.append(sheet)
 
-        def _queue_ui_task(fn):
+        def _queue_ui_task(fn, *, front: bool = False):
             if self._is_closing:
                 return False
             with self._ui_task_lock:
                 if self._is_closing:
                     return False
-                self._ui_tasks.append(fn)
+                if front:
+                    self._ui_tasks.insert(0, fn)
+                else:
+                    self._ui_tasks.append(fn)
+                self._ui_task_wakeup.set()
+            if front:
+                # A preview must not wait behind a 1-second adaptive timer
+                # left by a previous status update.  Tk marshals this call to
+                # the UI thread when it is already servicing events; failures
+                # are harmless because the heartbeat wakeup remains active.
+                try:
+                    self._safe_root_after(0, _drain_ui_tasks)
+                except (tk.TclError, RuntimeError):
+                    pass
             return True
 
         def _drain_ui_tasks():
             if self._is_closing:
                 return
-            tasks = []
+            self._ui_task_wakeup.clear()
+            task = None
+            pending = False
+            task_started = time.perf_counter()
             try:
                 with self._ui_task_lock:
                     if self._ui_tasks:
-                        tasks = self._ui_tasks
-                        self._ui_tasks = []
+                        # Apply one background result per Tk turn.  A previous
+                        # drain copied the whole queue and refreshed every
+                        # Sheet in one callback; on a large workbook that
+                        # starved paint/heartbeat and hid the first preview
+                        # behind later full-cache results.
+                        task = self._ui_tasks.pop(0)
+                        pending = bool(self._ui_tasks)
             except Exception:
-                tasks = []
-            ran = bool(tasks)
-            for fn in tasks:
+                task = None
+                pending = False
+            ran = task is not None
+            if task is not None:
                 try:
-                    fn()
+                    task()
                 except Exception as e:
                     _dlog(f"ui task failed: {e}")
             try:
                 # Adaptive delay: poll frequently while work is flowing, back off when idle.
-                delay = 50 if ran else 150
+                # A cache refresh can itself take hundreds of milliseconds.  Do
+                # not schedule the next queued refresh sooner than the callback
+                # just consumed, otherwise ``root.update()`` immediately drains
+                # the entire queue and the Tk heartbeat is starved again.
+                elapsed_ms = (time.perf_counter() - task_started) * 1000.0
+                if pending and ran:
+                    # Keep a real idle slice between expensive cache applies;
+                    # Tk's ``update()`` may otherwise run a timer that became
+                    # due while the preceding refresh was painting.
+                    delay = max(1000, min(1500, int(elapsed_ms * 1.5)))
+                else:
+                    delay = 50
+                grace_remaining = max(
+                    0.0,
+                    float(getattr(self, "_ui_preview_grace_until", 0.0))
+                    - time.perf_counter(),
+                )
+                if grace_remaining:
+                    delay = max(delay, int(grace_remaining * 1000.0))
                 self._safe_root_after(delay, _drain_ui_tasks)
             except Exception:
                 pass
@@ -35108,6 +35340,11 @@ class SowMergeApp:
                 if self._is_closing:
                     raise InterruptedError("background compute cancelled during shutdown")
                 time.sleep(0.01)
+            # Yield even when no cancellation/priority flag is set.  XML
+            # parsing and row alignment are Python-heavy; a short cooperative
+            # pause keeps Tk heartbeats and input dispatch alive while the
+            # background cache is being built.
+            time.sleep(0.005)
 
         def _compute_trim_bounds(ws, row_cache=None):
             # Find the true last non-empty row for this sheet. Empty strings are
@@ -35128,8 +35365,9 @@ class SowMergeApp:
                     ws.iter_rows(min_row=1, max_row=max_r, min_col=1, max_col=max_c, values_only=True),
                     start=1,
                 ):
-                    if (row_idx & 127) == 0:
+                    if (row_idx & 15) == 0:
                         _check_bg_cancel()
+                        time.sleep(0.001)
                     if captured_rows is not None:
                         captured_rows.append(tuple(row or ()))
                     row_last_col = 0
@@ -35196,16 +35434,24 @@ class SowMergeApp:
             ws_a_edit=None,
             ws_b_edit=None,
             force: bool = False,
+            bounded: bool = False,
         ):
             """Compute row alignment pairs using difflib.SequenceMatcher (background-safe)."""
-            max_row_a, max_row_b = _shared_physical_row_horizon(
-                ws_a,
-                ws_b,
-                max_row_a,
-                max_row_b,
-                ws_a_edit,
-                ws_b_edit,
-            )
+            if not bounded:
+                max_row_a, max_row_b = _shared_physical_row_horizon(
+                    ws_a,
+                    ws_b,
+                    max_row_a,
+                    max_row_b,
+                    ws_a_edit,
+                    ws_b_edit,
+                )
+            else:
+                # Preview callers intentionally pass a bounded row horizon.
+                # Do not replace it with the worksheet's physical max_row: doing
+                # so reparses the entire ReadOnlyWorksheet before first paint.
+                max_row_a = max(1, int(max_row_a or 1))
+                max_row_b = max(1, int(max_row_b or 1))
             if not _should_auto_row_align(max_row_a, max_row_b, force=force):
                 max_row = max(max_row_a, max_row_b)
                 pairs = []
@@ -35215,16 +35461,23 @@ class SowMergeApp:
                     pairs.append((ra, rb))
                 return pairs
 
-            source_width_a = max(
-                _worksheet_scan_bounds(ws_a)[1],
-                _worksheet_scan_bounds(ws_a_edit)[1] if ws_a_edit is not None else 1,
-            )
-            source_width_b = max(
-                _worksheet_scan_bounds(ws_b)[1],
-                _worksheet_scan_bounds(ws_b_edit)[1] if ws_b_edit is not None else 1,
-            )
-            width_a = max(1, min(int(max_col or 1), source_width_a))
-            width_b = max(1, min(int(max_col or 1), source_width_b))
+            if bounded:
+                # The caller already supplied a bounded physical width for a
+                # first paint.  Avoid four extra ReadOnlyWorksheet dimension
+                # passes just to rediscover that width.
+                width_a = max(1, int(max_col or 1))
+                width_b = max(1, int(max_col or 1))
+            else:
+                source_width_a = max(
+                    _worksheet_scan_bounds(ws_a)[1],
+                    _worksheet_scan_bounds(ws_a_edit)[1] if ws_a_edit is not None else 1,
+                )
+                source_width_b = max(
+                    _worksheet_scan_bounds(ws_b)[1],
+                    _worksheet_scan_bounds(ws_b_edit)[1] if ws_b_edit is not None else 1,
+                )
+                width_a = max(1, min(int(max_col or 1), source_width_a))
+                width_b = max(1, min(int(max_col or 1), source_width_b))
             pair_cache_key = (
                 "typed-row-pair",
                 id(ws_a),
@@ -35257,8 +35510,9 @@ class SowMergeApp:
                         max_col=width,
                         values_only=True,
                     ), start=1):
-                        if (row_idx & 127) == 0:
+                        if (row_idx & 15) == 0:
                             _check_bg_cancel()
+                            time.sleep(0.001)
                         rows.append(_pad_row_values(row, width))
                 except InterruptedError:
                     raise
@@ -35498,39 +35752,87 @@ class SowMergeApp:
             wb_base_edit=None,
             need_exact_only_diff: bool = False,
             force_sequence_align: bool = False,
+            preview_only: bool = False,
         ):
             _check_bg_cancel()
             trimmed_rows_cache = {}
             ws_a = wb_a_val[sheet]
             ws_b = wb_b_val[sheet]
-            max_r_a, max_c_a = _compute_trim_bounds(ws_a, trimmed_rows_cache)
-            max_r_b, max_c_b = _compute_trim_bounds(ws_b, trimmed_rows_cache)
-            _check_bg_cancel()
             ws_a_edit = wb_a_edit[sheet]
             ws_b_edit = wb_b_edit[sheet]
-            edit_r_a, edit_c_a = _compute_trim_bounds(ws_a_edit, trimmed_rows_cache)
-            edit_r_b, edit_c_b = _compute_trim_bounds(ws_b_edit, trimmed_rows_cache)
-            max_r_a, max_c_a = max(max_r_a, edit_r_a), max(max_c_a, edit_c_a)
-            max_r_b, max_c_b = max(max_r_b, edit_r_b), max(max_c_b, edit_c_b)
+            if preview_only:
+                def _preview_bounds(ws):
+                    try:
+                        declared_rows = max(1, int(getattr(ws, "max_row", 1) or 1))
+                        declared_cols = max(1, int(getattr(ws, "max_column", 1) or 1))
+                        if declared_rows > 1 or declared_cols > 1:
+                            return declared_rows, declared_cols
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                    # A malformed ``dimension ref=A1`` is the one case where
+                    # the health-aware recovery scan is required.
+                    return _worksheet_scan_bounds(ws)
+
+                # First paint only needs a bounded row horizon.  Use declared
+                # OOXML bounds (including the A1-dimension recovery) instead
+                # of scanning every row before publishing the preview.
+                raw_r_a, raw_c_a = _preview_bounds(ws_a)
+                raw_r_b, raw_c_b = _preview_bounds(ws_b)
+                # Value and read-only editable views share the same physical
+                # package dimensions; avoid four additional XML passes before
+                # the first paint.
+                full_r_a = raw_r_a
+                full_r_b = raw_r_b
+                max_r_a = min(full_r_a, _PREVIEW_CACHE_ROWS)
+                max_r_b = min(full_r_b, _PREVIEW_CACHE_ROWS)
+                max_c_a = min(raw_c_a, _PREVIEW_MAX_COLS)
+                max_c_b = min(raw_c_b, _PREVIEW_MAX_COLS)
+            else:
+                max_r_a, max_c_a = _compute_trim_bounds(ws_a, trimmed_rows_cache)
+                max_r_b, max_c_b = _compute_trim_bounds(ws_b, trimmed_rows_cache)
+                edit_r_a, edit_c_a = _compute_trim_bounds(ws_a_edit, trimmed_rows_cache)
+                edit_r_b, edit_c_b = _compute_trim_bounds(ws_b_edit, trimmed_rows_cache)
+                max_r_a, max_c_a = max(max_r_a, edit_r_a), max(max_c_a, edit_c_a)
+                max_r_b, max_c_b = max(max_r_b, edit_r_b), max(max_c_b, edit_c_b)
+                full_r_a = max_r_a
+                full_r_b = max_r_b
+            _check_bg_cancel()
             ws_base = None
             ws_base_edit = None
             max_r_base = 0
             max_c_base = 0
+            full_r_base = 0
             if wb_base_val is not None and sheet in wb_base_val.sheetnames:
                 ws_base = wb_base_val[sheet]
-                max_r_base, max_c_base = _compute_trim_bounds(ws_base, trimmed_rows_cache)
+                if preview_only:
+                    raw_r_base, raw_c_base = _preview_bounds(ws_base)
+                    full_r_base = raw_r_base
+                    max_r_base = min(raw_r_base, _PREVIEW_CACHE_ROWS)
+                    max_c_base = min(raw_c_base, _PREVIEW_MAX_COLS)
+                else:
+                    max_r_base, max_c_base = _compute_trim_bounds(ws_base, trimmed_rows_cache)
                 if wb_base_edit is not None and sheet in wb_base_edit.sheetnames:
                     ws_base_edit = wb_base_edit[sheet]
-                    edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit, trimmed_rows_cache)
+                    if preview_only:
+                        # The value-side horizon is enough for a first paint;
+                        # editable rows are consumed only by the exact pass.
+                        edit_r_base = max_r_base
+                        edit_c_base = max_c_base
+                    else:
+                        edit_r_base, edit_c_base = _compute_trim_bounds(ws_base_edit, trimmed_rows_cache)
                     max_r_base = max(max_r_base, edit_r_base)
                     max_c_base = max(max_c_base, edit_c_base)
+            if not preview_only:
+                full_r_base = max_r_base
+            if ws_base is None:
+                full_r_base = 0
             common_sheet_added_vs_base = bool(
                 getattr(self, "has_base", False)
                 and wb_base_val is not None
                 and ws_base is None
             )
             _check_bg_cancel()
-            max_row = max(max_r_a, max_r_b, max_r_base)
+            max_row = max(full_r_a, full_r_b, full_r_base)
             max_col = max(max_c_a, max_c_b, max_c_base)
             signature_cache = {}
 
@@ -35546,6 +35848,7 @@ class SowMergeApp:
                 ws_a_edit,
                 ws_b_edit,
                 force=force_sequence_align,
+                bounded=preview_only,
             )
             row_pairs = _collapse_one_sided_blank_tail_padding(
                 row_pairs,
@@ -35586,6 +35889,7 @@ class SowMergeApp:
                         ws_a_edit,
                         ws_base_edit,
                         force=force_sequence_align,
+                        bounded=preview_only,
                     )
                     mine_base_pairs = _collapse_one_sided_blank_tail_padding(
                         mine_base_pairs,
@@ -35613,6 +35917,7 @@ class SowMergeApp:
                         ws_b_edit,
                         ws_base_edit,
                         force=force_sequence_align,
+                        bounded=preview_only,
                     )
                     theirs_base_pairs = _collapse_one_sided_blank_tail_padding(
                         theirs_base_pairs,
@@ -35781,15 +36086,17 @@ class SowMergeApp:
                     need_exact_only_diff = True
                     self._compute_exact_only_diff_requested.discard(sheet)
             large_preview_only = bool(
-                max_row >= _LARGE_SHEET_ROW_THRESHOLD and not need_exact_only_diff
+                preview_only
+                or (max_row >= _LARGE_SHEET_ROW_THRESHOLD and not need_exact_only_diff)
             )
             if large_preview_only:
                 has_diff = bool(column_comparison_cache.structural_diff_cols)
                 for idx in range(len(row_pairs) - 1, -1, -1):
                     if has_diff:
                         break
-                    if (idx & 127) == 0:
+                    if (idx & 15) == 0:
                         _check_bg_cancel()
+                        time.sleep(0.001)
                     ra, rb = row_pairs[idx]
                     comparison = compare_logical_row_2way(
                         column_comparison_cache,
@@ -35927,8 +36234,9 @@ class SowMergeApp:
                 rows_base_val = rows_base_val_all
                 rows_base_edit = rows_base_edit_all
                 for idx, (ra, rb) in enumerate(row_pairs):
-                    if (idx & 127) == 0:
+                    if (idx & 15) == 0:
                         _check_bg_cancel()
+                        time.sleep(0.001)
                     parts_a = []
                     parts_b = []
                     parts_base = []
@@ -36057,9 +36365,9 @@ class SowMergeApp:
             return {
                 "sheet": sheet,
                 "max_row": max_row,
-                "max_row_a": max_r_a,
-                "max_row_b": max_r_b,
-                "max_row_base": max_r_base,
+                "max_row_a": full_r_a,
+                "max_row_b": full_r_b,
+                "max_row_base": full_r_base,
                 "max_col": max_col,
                 "col_max_a": max_c_a,
                 "col_max_base": max_c_base,
@@ -36080,9 +36388,9 @@ class SowMergeApp:
                 "has_diff": has_diff,
                 "only_diff_rows": exact_only_diff_rows,
                 "completeness": {
-                    "formula_aware": True,
-                    "row_model_exact": True,
-                    "column_projection_exact": True,
+                    "formula_aware": not preview_only,
+                    "row_model_exact": not preview_only,
+                    "column_projection_exact": not preview_only,
                     "ab_diff_exact": not large_preview_only,
                     "base_diff_exact": bool(
                         not large_preview_only
@@ -36101,6 +36409,10 @@ class SowMergeApp:
 
         def _apply_sheet_cache(cache: dict):
             sheet = cache["sheet"]
+            cache_preview = bool(cache.get("preview_only", False))
+            preview_apply_started = (
+                time.perf_counter() if cache_preview else None
+            )
             cache_generation = int(cache.get("generation", 0))
             current_generation = int(self._sheet_compute_generation.get(sheet, 0))
             if cache_generation != current_generation:
@@ -36114,7 +36426,11 @@ class SowMergeApp:
                 # Preserve the exact result for lazy tab creation. The previous
                 # implementation discarded it and recomputed the whole Sheet.
                 self._sheet_cache_store[sheet] = cache
-                self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+                self.set_sheet_has_diff(
+                    sheet,
+                    cache.get("has_diff", False),
+                    confirmed=not cache_preview,
+                )
                 self.refresh_sheet_nav()
                 self.refresh_difference_browser()
                 return
@@ -36154,14 +36470,24 @@ class SowMergeApp:
                 new_diff_count = sum(1 for _k, _v in (cache.get("pair_diff_cols", {}) or {}).items() if _v)
             except Exception:
                 new_diff_count = 0
-            if getattr(view, "_data_ready", False) and old_diff_count > 0 and new_diff_count == 0:
+            if (
+                getattr(view, "_data_ready", False)
+                and old_diff_count > 0
+                and new_diff_count == 0
+                and not bool(getattr(view, "_preview_cache_applied", False))
+            ):
                 _dlog(f"skip stale cache downgrade: sheet={sheet} old_diff={old_diff_count} new_diff={new_diff_count}")
                 view._hide_loading()
                 self.refresh_sheet_nav()
                 self._initial_sheet_ready_event.set()
                 return
             # From this point we will apply this cache to the visible view.
-            self.set_sheet_has_diff(sheet, cache.get("has_diff", False), confirmed=True)
+            self.set_sheet_has_diff(
+                sheet,
+                cache.get("has_diff", False),
+                confirmed=not cache_preview,
+            )
+            view._preview_cache_applied = cache_preview
             view._lifecycle_error = None
             view._lifecycle_canceled = False
             view._invalidate_only_diff_snapshot_cache()
@@ -36175,7 +36501,9 @@ class SowMergeApp:
             view._base_bounds_checked = bool(
                 getattr(self, "has_base", False) and "col_max_base" in cache
             )
-            view._is_large_sheet = view.max_row >= _LARGE_SHEET_ROW_THRESHOLD
+            view._is_large_sheet = bool(
+                cache_preview or view.max_row >= _LARGE_SHEET_ROW_THRESHOLD
+            )
             view._bounds_checked = True
 
             # Apply row-aligned pair data (computed in background with row alignment)
@@ -36186,11 +36514,14 @@ class SowMergeApp:
                 for idx, cols in (cache.get("pair_base_diff_cols", {}) or {}).items()
             }
             view.column_comparison_cache = cache.get("column_comparison_cache")
-            if isinstance(view.column_comparison_cache, LogicalColumnComparisonCache):
+            if (
+                not cache_preview
+                and isinstance(view.column_comparison_cache, LogicalColumnComparisonCache)
+            ):
                 view._install_column_projection(view.column_comparison_cache)
                 view.column_alignment_2way = view.column_comparison_cache.two_way_alignment
                 view.column_alignment_3way = view.column_comparison_cache.three_way_alignment
-            else:
+            elif not cache_preview:
                 view.column_alignment_2way = None
                 view.column_alignment_3way = None
             view.mine_to_base_row = cache.get("mine_to_base_row", {}) or {}
@@ -36201,18 +36532,47 @@ class SowMergeApp:
             pair_parts_a = cache.get("pair_parts_a", {}) or {}
             pair_parts_b = cache.get("pair_parts_b", {}) or {}
             pair_parts_base = cache.get("pair_parts_base", {}) or {}
-            view._stage_cached_pair_parts(
-                pair_parts_a,
-                pair_parts_b,
-                pair_parts_base,
-                cache.get("col_char_widths", {}),
-            )
-            if is_visible_sheet:
-                view._materialize_staged_pair_parts()
-            elif not pair_parts_a and not pair_parts_b:
-                # Backward-compatible fallback for older cache shape.
-                view.pair_text_a = cache.get("pair_text_a", {})
-                view.pair_text_b = cache.get("pair_text_b", {})
+            if cache_preview:
+                # Do not install a full logical projection or materialize its
+                # width/tag maps on the first paint.  The preview is read-only;
+                # the exact cache below will install the authoritative model.
+                view.pair_parts_a = {
+                    int(idx): tuple(parts or ())
+                    for idx, parts in pair_parts_a.items()
+                }
+                view.pair_parts_b = {
+                    int(idx): tuple(parts or ())
+                    for idx, parts in pair_parts_b.items()
+                }
+                view.pair_parts_base = {
+                    int(idx): tuple(parts or ())
+                    for idx, parts in pair_parts_base.items()
+                }
+                view.pair_text_a = {
+                    int(idx): "\t".join(str(value) for value in parts or ())
+                    for idx, parts in pair_parts_a.items()
+                }
+                view.pair_text_b = {
+                    int(idx): "\t".join(str(value) for value in parts or ())
+                    for idx, parts in pair_parts_b.items()
+                }
+                view.pair_text_base = {
+                    int(idx): "\t".join(str(value) for value in parts or ())
+                    for idx, parts in pair_parts_base.items()
+                }
+            else:
+                view._stage_cached_pair_parts(
+                    pair_parts_a,
+                    pair_parts_b,
+                    pair_parts_base,
+                    cache.get("col_char_widths", {}),
+                )
+                if is_visible_sheet:
+                    view._materialize_staged_pair_parts()
+                elif not pair_parts_a and not pair_parts_b:
+                    # Backward-compatible fallback for older cache shape.
+                    view.pair_text_a = cache.get("pair_text_a", {})
+                    view.pair_text_b = cache.get("pair_text_b", {})
 
             view.row_a_to_pair_idx = cache["row_a_to_pair_idx"]
             view.row_b_to_pair_idx = cache["row_b_to_pair_idx"]
@@ -36290,7 +36650,8 @@ class SowMergeApp:
                 self.refresh_sheet_nav()
                 self._initial_sheet_ready_event.set()
                 return
-            self._reserve_ui_transition_window(350)
+            if not cache_preview:
+                self._reserve_ui_transition_window(350)
             # Preserve viewport/cursor when background cache is applied; otherwise
             # user operations (overwrite/resolve) appear to "jump to first row/first column".
             prev_first = 0.0
@@ -36302,7 +36663,20 @@ class SowMergeApp:
                 prev_insert = view.left.index("insert")
             except Exception:
                 pass
-            view.refresh(row_only=None, rescan=False)
+            if cache_preview:
+                if preview_apply_started is not None:
+                    _dlog(
+                        f"SHEET_PREVIEW_APPLY_BEFORE_RENDER sheet={sheet} "
+                        f"elapsed_ms={(time.perf_counter() - preview_apply_started) * 1000.0:.1f}"
+                    )
+                preview_ui_started = time.perf_counter()
+                view._render_preview_rows()
+                _dlog(
+                    f"SHEET_PREVIEW_RENDER sheet={sheet} rows={len(view.display_rows)} "
+                    f"elapsed_ms={(time.perf_counter() - preview_ui_started) * 1000.0:.1f}"
+                )
+            else:
+                view.refresh(row_only=None, rescan=False)
             try:
                 view.left.yview_moveto(prev_first)
                 if view._is_three_way_enabled():
@@ -36337,17 +36711,38 @@ class SowMergeApp:
                 view.right.mark_set("insert", idx)
             except Exception:
                 pass
-            view._update_cursor_lines()
-            view._hide_loading()
-            if needs_exact_build:
+            if not cache_preview:
+                view._update_cursor_lines()
+            if cache_preview:
+                try:
+                    view.loading_progress.stop()
+                    view.loading_progress.pack_forget()
+                except (tk.TclError, AttributeError):
+                    pass
+            else:
+                view._hide_loading()
+            if needs_exact_build and not cache_preview:
                 view._start_async_large_only_diff_build()
-            view._refresh_interaction_gate()
-            self.refresh_sheet_nav()
-            self.refresh_difference_browser()
+            if cache_preview:
+                # Give Tk several heartbeat turns before the CPU-heavy exact
+                # pass begins; unopened Sheet work is deferred on the same
+                # startup budget below.
+                self._ui_preview_grace_until = time.perf_counter() + 5.0
+                try:
+                    view.info.configure(text="首批行已就绪，正在后台生成完整差异…")
+                except (AttributeError, tk.TclError):
+                    pass
+            if not cache_preview:
+                view._refresh_interaction_gate()
+            if not cache_preview:
+                self.refresh_sheet_nav()
+                self.refresh_difference_browser()
             # The first useful Sheet is now visible.  Let editable-workbook
             # preload begin while unopened-tab scans yield via
             # _edit_preload_active_event.
             self._initial_sheet_ready_event.set()
+            if cache_preview and sheet == getattr(self, "_initial_sheet_name", None):
+                self._initial_preview_applied_event.set()
 
         def _mark_sheet_compute_failed(
             sheet: str,
@@ -36382,6 +36777,10 @@ class SowMergeApp:
             wb_a_e = None
             wb_b_e = None
             wb_base_e = None
+            previous_switch_interval = sys.getswitchinterval()
+            # openpyxl XML parsing is GIL-heavy. A short switch interval keeps
+            # the Tk heartbeat responsive while the worker builds cache data.
+            sys.setswitchinterval(min(previous_switch_interval, 0.0005))
             try:
                 try:
                     # Use separate read-only workbooks to avoid threading issues
@@ -36389,10 +36788,13 @@ class SowMergeApp:
                     wb_b_ro = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
                     if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
                         wb_base_ro = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
-                    wb_a_e = load_workbook(self.file_a, data_only=False, read_only=True)
-                    wb_b_e = load_workbook(self._mine_working_path(), data_only=False, read_only=True)
-                    if getattr(self, "has_base", False) and getattr(self, "base_path", None):
-                        wb_base_e = load_workbook(self.base_path, data_only=False, read_only=True)
+                    # Keep formula/edit XML unopened until the first preview
+                    # is visible.  The value workbooks are sufficient for the
+                    # bounded read-only paint; opening three more OOXML
+                    # packages here was the largest initial GIL spike.
+                    wb_a_e = None
+                    wb_b_e = None
+                    wb_base_e = None
                 except Exception as e:
                     _dlog(f"bg compute open read-only failed: {e}")
                     with self._compute_lock:
@@ -36409,7 +36811,7 @@ class SowMergeApp:
                             )
                         )
                     return
-                if wb_a_ro is None or wb_b_ro is None or wb_a_e is None or wb_b_e is None:
+                if wb_a_ro is None or wb_b_ro is None:
                     _dlog("bg compute read-only workbooks not available; skip background compute")
                     return
 
@@ -36442,6 +36844,84 @@ class SowMergeApp:
                     )
                     try:
                         _dlog(f"bg compute sheet: {sheet}")
+                        try:
+                            declared_preview_rows = max(
+                                int(getattr(wb_a_ro[sheet], "max_row", 1) or 1),
+                                int(getattr(wb_b_ro[sheet], "max_row", 1) or 1),
+                            )
+                        except (KeyError, AttributeError, TypeError, ValueError):
+                            declared_preview_rows = _PREVIEW_CACHE_ROWS
+                        preview_first_sheet = bool(
+                            sheet == getattr(self, "_initial_sheet_name", None)
+                            and declared_preview_rows >= _PREVIEW_CACHE_ROWS
+                            and not self._cache_worker_mode
+                        )
+                        if preview_first_sheet:
+                            preview_started = time.perf_counter()
+                            preview_cache = _compute_sheet_cache(
+                                wb_a_ro,
+                                wb_b_ro,
+                                wb_a_ro,
+                                wb_b_ro,
+                                sheet,
+                                wb_base_ro,
+                                wb_base_e,
+                                need_exact_only_diff=False,
+                                force_sequence_align=force_sequence_align,
+                                preview_only=True,
+                            )
+                            preview_cache["generation"] = compute_generation
+                            preview_cache["preview_only"] = True
+                            _dlog(
+                                f"SHEET_CACHE_PREVIEW sheet={sheet} rows={len(preview_cache.get('row_pairs', ())) } "
+                                f"elapsed_ms={(time.perf_counter() - preview_started) * 1000.0:.1f}"
+                            )
+                            _queue_ui_task(
+                                lambda c=preview_cache: _apply_sheet_cache(c),
+                                front=True,
+                            )
+                            # Do not start the expensive full cache until the
+                            # first preview has made it through the Tk queue;
+                            # otherwise full results can monopolize the queue
+                            # before the first usable Sheet is painted.
+                            preview_event = getattr(
+                                self, "_initial_preview_applied_event", None
+                            )
+                            if preview_event is not None:
+                                preview_event.wait(timeout=5.0)
+                            grace_remaining = max(
+                                0.0,
+                                float(
+                                    getattr(
+                                        self, "_ui_preview_grace_until", 0.0
+                                    )
+                                )
+                                - time.perf_counter(),
+                            )
+                            if grace_remaining:
+                                time.sleep(grace_remaining)
+                        if wb_a_e is None or wb_b_e is None:
+                            edit_open_started = time.perf_counter()
+                            wb_a_e = load_workbook(
+                                self.file_a, data_only=False, read_only=True
+                            )
+                            wb_b_e = load_workbook(
+                                self._mine_working_path(),
+                                data_only=False,
+                                read_only=True,
+                            )
+                            if getattr(self, "has_base", False) and getattr(
+                                self, "base_path", None
+                            ):
+                                wb_base_e = load_workbook(
+                                    self.base_path,
+                                    data_only=False,
+                                    read_only=True,
+                                )
+                            _dlog(
+                                f"BG_EDIT_READONLY_OPEN elapsed_ms={(time.perf_counter() - edit_open_started) * 1000.0:.1f}"
+                            )
+                        full_started = time.perf_counter()
                         cache = _compute_sheet_cache(
                             wb_a_ro,
                             wb_b_ro,
@@ -36454,6 +36934,30 @@ class SowMergeApp:
                             force_sequence_align=force_sequence_align,
                         )
                         cache["generation"] = compute_generation
+                        cache["preview_only"] = False
+                        _dlog(
+                            f"SHEET_CACHE_FULL sheet={sheet} rows={len(cache.get('row_pairs', ())) } "
+                            f"elapsed_ms={(time.perf_counter() - full_started) * 1000.0:.1f}"
+                        )
+                        if (
+                            self._cache_worker_mode
+                            and sheet == self._cache_worker_sheet
+                        ):
+                            worker_hashes = {
+                                "left": _sha256_file(self.file_a),
+                                "right": _sha256_file(self.file_b),
+                            }
+                            if getattr(self, "base_path", None):
+                                worker_hashes["base"] = _sha256_file(self.base_path)
+                            _write_cache_worker_artifact(
+                                self._cache_worker_output,
+                                sheet=sheet,
+                                generation=self._cache_worker_generation,
+                                hashes=worker_hashes,
+                                cache=cache,
+                            )
+                            _queue_ui_task(lambda: self.root.quit(), front=True)
+                            return
                         if self._is_closing:
                             break
                         # Never call tkinter APIs from background threads.
@@ -36488,13 +36992,218 @@ class SowMergeApp:
                             # with the first usable render and checkbox actions.
                             _queue_ui_task(self._initial_sheet_ready_event.set)
             finally:
+                sys.setswitchinterval(previous_switch_interval)
                 _wbs_close(wb_a_ro, wb_b_ro, wb_base_ro, wb_a_e, wb_b_e, wb_base_e)
                 with self._compute_lock:
                     if self._compute_thread is threading.current_thread():
                         self._compute_thread = None
 
+        def _should_isolate_initial_cache():
+            # The process bridge is experimental until its worker can bypass
+            # the full Tk startup path. Keep the production path on the
+            # bounded preview/thread implementation; opt in explicitly for
+            # isolated-worker profiling.
+            if os.environ.get("SOW_ENABLE_CACHE_PROCESS", "").strip() != "1":
+                return False
+            if self._cache_worker_mode or getattr(self, "_is_closing", False):
+                return False
+            with self._compute_lock:
+                if self._compute_thread is not None and self._compute_thread.is_alive():
+                    return False
+                if len(self._compute_queue) != 1:
+                    return False
+                sheet = self._compute_queue[0]
+            return bool(
+                sheet == getattr(self, "_initial_sheet_name", None)
+                and sheet not in self._isolated_cache_disabled_sheets
+            )
+
+        def _start_isolated_cache_worker() -> bool:
+            if not _should_isolate_initial_cache():
+                return False
+            with self._compute_lock:
+                if not self._compute_queue:
+                    return False
+                sheet = self._compute_queue.pop(0)
+                need_exact_only_diff = sheet in self._compute_exact_only_diff_requested
+                self._compute_exact_only_diff_requested.discard(sheet)
+                force_sequence_align = sheet in self._compute_force_align_requested
+                self._compute_force_align_requested.discard(sheet)
+                generation = int(self._sheet_compute_generation.get(sheet, 0))
+                self._compute_inflight.add(sheet)
+                progress_current = min(self._compute_done + 1, self._compute_total)
+                progress_total = self._compute_total
+            _queue_ui_task(
+                lambda s=sheet, cur=progress_current, total=progress_total: self._set_task_status(
+                    f"正在隔离进程加载 Sheet：{s}（{cur}/{total}）",
+                    active=True,
+                    current=max(0, cur - 1),
+                    total=total,
+                ),
+                front=True,
+            )
+
+            def _run_isolated():
+                output_path = ""
+                process = None
+                success = False
+                try:
+                    output_fd, output_path = tempfile.mkstemp(
+                        prefix="sow-cache-worker-", suffix=".pkl"
+                    )
+                    os.close(output_fd)
+                    left_path = str(getattr(self, "_file_a_val_path", None) or self.file_a)
+                    right_path = str(getattr(self, "_file_b_val_path", None) or self.file_b)
+                    base_path = str(
+                        getattr(self, "_file_base_val_path", None)
+                        or getattr(self, "base_path", "")
+                        or ""
+                    )
+                    expected_hashes = {
+                        "left": _sha256_file(left_path),
+                        "right": _sha256_file(right_path),
+                    }
+                    if base_path:
+                        expected_hashes["base"] = _sha256_file(base_path)
+                    command = [
+                        sys.executable,
+                        "-m",
+                        "sow_merge_tool",
+                        "--worker-cache",
+                        "--left",
+                        left_path,
+                        "--right",
+                        right_path,
+                        "--sheet",
+                        sheet,
+                        "--output",
+                        output_path,
+                        "--generation",
+                        str(generation),
+                    ]
+                    if base_path:
+                        command.extend(("--base", base_path))
+                    worker_env = os.environ.copy()
+                    worker_env.update(
+                        {
+                            "SOW_CACHE_WORKER": "1",
+                            "SOW_CACHE_WORKER_SHEET": str(sheet),
+                            "SOW_CACHE_WORKER_OUTPUT": output_path,
+                            "SOW_CACHE_WORKER_GENERATION": str(generation),
+                        }
+                    )
+                    creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    process = subprocess.Popen(
+                        command,
+                        env=worker_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags,
+                    )
+                    deadline = time.monotonic() + 60.0
+                    while process.poll() is None:
+                        if self._is_closing or time.monotonic() >= deadline:
+                            try:
+                                process.terminate()
+                            except OSError:
+                                pass
+                            break
+                        time.sleep(0.05)
+                    if process.poll() is None:
+                        process.wait(timeout=5.0)
+                    if process.returncode != 0 or not os.path.isfile(output_path):
+                        raise RuntimeError(
+                            f"cache worker exit={process.returncode}"
+                        )
+                    with open(output_path, "rb") as stream:
+                        envelope = pickle.load(stream)
+                    if not isinstance(envelope, dict):
+                        raise TypeError("cache worker envelope is not a mapping")
+                    if (
+                        int(envelope.get("protocol", 0)) != 1
+                        or str(envelope.get("sheet", "")) != str(sheet)
+                        or int(envelope.get("generation", -1)) != generation
+                        or dict(envelope.get("hashes") or {}) != expected_hashes
+                        or not isinstance(envelope.get("cache"), dict)
+                    ):
+                        raise ValueError("cache worker generation/hash validation failed")
+                    cache = dict(envelope["cache"])
+                    cache["generation"] = generation
+                    cache["preview_only"] = False
+                    _queue_ui_task(
+                        lambda c=cache: _apply_sheet_cache(c),
+                        front=True,
+                    )
+                    success = True
+                except (
+                    OSError,
+                    EOFError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    RuntimeError,
+                    pickle.PickleError,
+                    subprocess.SubprocessError,
+                ) as exc:
+                    _dlog(f"isolated cache worker failed sheet={sheet}: {exc}")
+                finally:
+                    if process is not None and process.poll() is None:
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                    if not success:
+                        self._isolated_cache_disabled_sheets.add(sheet)
+                        _enqueue_sheet(
+                            sheet,
+                            front=True,
+                            exact_only_diff=need_exact_only_diff,
+                            force_recompute=True,
+                            force_align=force_sequence_align,
+                        )
+                    with self._compute_lock:
+                        self._compute_inflight.discard(sheet)
+                        self._compute_done = min(
+                            self._compute_total, self._compute_done + 1
+                        )
+                        if self._compute_thread is threading.current_thread():
+                            self._compute_thread = None
+                    _queue_ui_task(
+                        lambda: _kick_worker(),
+                        front=True,
+                    )
+                    try:
+                        if output_path and os.path.exists(output_path):
+                            os.remove(output_path)
+                    except OSError:
+                        pass
+
+            thread = self._start_background_thread(
+                _run_isolated,
+                name="sow-cache-worker",
+            )
+            if thread is None:
+                with self._compute_lock:
+                    self._compute_inflight.discard(sheet)
+                self._isolated_cache_disabled_sheets.add(sheet)
+                self._enqueue_sheet(
+                    sheet,
+                    front=True,
+                    exact_only_diff=need_exact_only_diff,
+                    force_recompute=True,
+                    force_align=force_sequence_align,
+                )
+                return False
+            self._compute_thread = thread
+            return True
+
         def _kick_worker():
             # start a worker if not running
+            if bool(getattr(self, "_defer_initial_compute", False)):
+                return
+            if _start_isolated_cache_worker():
+                return
             with self._compute_lock:
                 th = self._compute_thread
                 if th is not None and th.is_alive():
@@ -36511,6 +37220,7 @@ class SowMergeApp:
         self._queue_ui_task = _queue_ui_task
         self._enqueue_sheet = _enqueue_sheet
         self._kick_worker = _kick_worker
+        self._drain_ui_tasks = _drain_ui_tasks
 
         # Lazy-create SheetView UI immediately; compute diff in background.
         def _on_tab_changed(_evt=None):
@@ -36582,6 +37292,7 @@ class SowMergeApp:
                             )
                         )
                         and not bool(getattr(active_view, "_only_diff_async_building", False))
+                        and not bool(getattr(active_view, "_preview_cache_applied", False))
                     ):
                         active_view._start_async_large_only_diff_build()
                     active_view._refresh_interaction_gate()
@@ -36647,6 +37358,22 @@ class SowMergeApp:
             pass
 
         # Load the initially selected tab immediately so first-open state is ready.
+        try:
+            tabs = self.nb.tabs()
+            selected_tab = self.nb.select() or (tabs[0] if tabs else "")
+            if selected_tab:
+                self.nb.select(selected_tab)
+            self._initial_sheet_name = self.nb.tab(selected_tab, "text")
+        except (tk.TclError, KeyError, AttributeError, TypeError):
+            # Tk can report no selected tab while the withdrawn notebook is
+            # being laid out.  The display order is already authoritative and
+            # avoids losing the initial Sheet identity in headless startup.
+            self._initial_sheet_name = (
+                str(self.display_sheets[0]) if self.display_sheets else None
+            )
+        # Keep the selected-sheet identity available before the first Tk event
+        # turn; hidden/headless callers use it to observe the initial preview.
+        self.selected_sheet = str(self._initial_sheet_name or "")
         _on_tab_changed()
         self._sheet_filter_initializing = False
 
@@ -36849,12 +37576,61 @@ class SowMergeApp:
         # Enqueue all sheets for background confirmation (slow compute)
         self._defer_sheet_nav_refresh = True
         try:
-            for s in self.compare_sheets:
-                _enqueue_sheet(s, front=False)
-            if self.compare_sheets:
+            if self._cache_worker_mode:
+                worker_sheet = str(
+                    self._cache_worker_sheet
+                    or getattr(self, "_initial_sheet_name", "")
+                    or ""
+                )
+                if worker_sheet in self.compare_sheets:
+                    _enqueue_sheet(worker_sheet, front=True)
+                else:
+                    raise RuntimeError(
+                        f"cache worker Sheet not found: {worker_sheet}"
+                    )
                 _kick_worker()
+                deferred_sheets = []
+                initial_sheet = worker_sheet
             else:
-                self._set_task_status("数据加载完成：没有需要逐行计算的同名 Sheet", active=False)
+                initial_sheet = str(getattr(self, "_initial_sheet_name", "") or "")
+                deferred_sheets = [
+                    s for s in self.compare_sheets if s != initial_sheet
+                ]
+                if initial_sheet in self.compare_sheets:
+                    _enqueue_sheet(initial_sheet, front=True)
+                else:
+                    # A defensive fallback for unusual filtered/empty notebook
+                    # states; normal startup always has the selected Sheet above.
+                    for s in self.compare_sheets:
+                        _enqueue_sheet(s, front=False)
+                if initial_sheet in self.compare_sheets or self.compare_sheets:
+                    _kick_worker()
+                else:
+                    self._set_task_status("数据加载完成：没有需要逐行计算的同名 Sheet", active=False)
+
+            def _enqueue_deferred_sheets():
+                if self._is_closing or not deferred_sheets:
+                    return
+                with self._compute_lock:
+                    initial_busy = bool(
+                        initial_sheet
+                        and (
+                            initial_sheet in self._compute_inflight
+                            or initial_sheet in self._compute_queue
+                        )
+                    )
+                if initial_busy:
+                    self._safe_root_after(500, _enqueue_deferred_sheets)
+                    return
+                for sheet_name in deferred_sheets:
+                    _enqueue_sheet(sheet_name, front=False)
+                _kick_worker()
+
+            # Keep unopened Sheets in their explicit unknown/loading state
+            # while the first visible Sheet gets the CPU.  Switching a tab
+            # still enqueues that Sheet immediately through _on_tab_changed.
+            if not self._cache_worker_mode:
+                self._safe_root_after(4500, _enqueue_deferred_sheets)
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
         finally:
@@ -39197,6 +39973,49 @@ def main():
         sys.exit(1)
 
 
+def _run_cache_worker_entrypoint(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--left", required=True)
+    parser.add_argument("--right", required=True)
+    parser.add_argument("--base", default="")
+    parser.add_argument("--sheet", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--generation", required=True, type=int)
+    args = parser.parse_args(argv)
+    os.environ["SOW_CACHE_WORKER"] = "1"
+    os.environ["SOW_CACHE_WORKER_SHEET"] = str(args.sheet)
+    os.environ["SOW_CACHE_WORKER_OUTPUT"] = str(args.output)
+    os.environ["SOW_CACHE_WORKER_GENERATION"] = str(args.generation)
+    app = None
+    try:
+        app = SowMergeApp(
+            str(args.left),
+            str(args.right),
+            merge_mode=bool(args.base),
+            base_path=str(args.base) if args.base else None,
+        )
+        app.run()
+        return 0 if os.path.isfile(str(args.output)) else 1
+    except (
+        OSError,
+        EOFError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RuntimeError,
+        tk.TclError,
+        pickle.PickleError,
+    ) as exc:
+        _dlog(f"cache worker entrypoint failed: {exc}")
+        return 1
+    finally:
+        if app is not None:
+            try:
+                app._shutdown_root(force=True)
+            except (tk.TclError, RuntimeError):
+                pass
+
+
 def run_entrypoint() -> None:
     """Dispatch GUI, CLI and hidden helper modes from every launch surface."""
     try:
@@ -39207,6 +40026,8 @@ def run_entrypoint() -> None:
         )
     except Exception:
         pass
+    if len(sys.argv) >= 2 and sys.argv[1] == "--worker-cache":
+        raise SystemExit(_run_cache_worker_entrypoint(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "--internal-svn-status-query":
         from sow_merge_tool.svn_status_provider import internal_status_entrypoint
 
