@@ -56,7 +56,7 @@ from .ui_foundation import (
 from .difference_browser import DifferenceBrowser
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-12.update97"
+APP_VERSION = "2026-09-14.update98"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -528,11 +528,10 @@ def load_workbook(filename, *args, **kwargs):
 def _worksheet_scan_bounds(ws) -> tuple[int, int]:
     """Return safe worksheet dimensions, recovering absent OOXML dimensions.
 
-    Some valid XLSX writers omit ``<dimension>`` from worksheet XML.  Excel
-    scans the sheet data when opening those files, but openpyxl's read-only
-    mode leaves ``max_row`` and ``max_column`` as ``None``.  Treating that as
-    a 1x1 sheet makes every later column look deleted.  Ask openpyxl to scan
-    only in that incomplete-metadata case; normal workbooks keep their cheap
+    Some valid XLSX writers omit ``<dimension>`` from worksheet XML.  A few
+    SVN/export paths also write the misleading ``A1`` dimension while keeping
+    the complete row XML.  Both cases must be scanned; trusting ``A1`` makes
+    every later column look deleted.  Normal workbooks keep their cheap
     declared dimensions.
     """
     try:
@@ -540,6 +539,26 @@ def _worksheet_scan_bounds(ws) -> tuple[int, int]:
         max_c = getattr(ws, "max_column", None)
     except Exception:
         return 1, 1
+    malformed_single_cell_dimension = (
+        max_r == 1
+        and max_c == 1
+        and callable(getattr(ws, "reset_dimensions", None))
+    )
+    if malformed_single_cell_dimension:
+        try:
+            ws.reset_dimensions()
+            ws.calculate_dimension(force=True)
+            max_r = getattr(ws, "max_row", None)
+            max_c = getattr(ws, "max_column", None)
+            _dlog(
+                f"worksheet A1 dimension reset: sheet={getattr(ws, 'title', '?')} "
+                f"rows={max_r} cols={max_c}"
+            )
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            _dlog(
+                f"worksheet A1 dimension reset failed: sheet={getattr(ws, 'title', '?')} "
+                f"err={exc}"
+            )
     if max_r is None or max_c is None:
         try:
             ws.calculate_dimension(force=True)
