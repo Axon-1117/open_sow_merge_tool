@@ -10,6 +10,7 @@ parsing happen only after an explicit row-open action.
 from __future__ import annotations
 
 import os
+import json
 import queue
 import subprocess
 import sys
@@ -32,6 +33,12 @@ from .path_selection import (
     validate_excel_package,
     validate_file_pair,
 )
+
+
+def comparison_queue_path() -> str:
+    """Return the user-local review queue path, never inside the repository."""
+    root = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return os.path.join(root, "SowMergeTool", "comparison-queue.json")
 
 COMPARISON_STATES = ("未打开", "启动中", "比较中", "已关闭", "启动失败")
 
@@ -267,10 +274,19 @@ class ComparisonListModel:
         self.set_mappings(mappings)
 
     def set_mappings(self, mappings: Iterable[RelativeMapping]) -> None:
-        self.rows = {
-            f"mapping-{index}": ComparisonRow(f"mapping-{index}", mapping)
-            for index, mapping in enumerate(mappings)
+        previous = {
+            (row.mapping.relative_path, row.mapping.left_path, row.mapping.right_path): row
+            for row in self.rows.values()
         }
+        self.rows = {}
+        for index, mapping in enumerate(mappings):
+            old = previous.get((mapping.relative_path, mapping.left_path, mapping.right_path))
+            self.rows[f"mapping-{index}"] = ComparisonRow(
+                f"mapping-{index}",
+                mapping,
+                state=old.state if old else "未打开",
+                session_id=old.session_id if old else "",
+            )
 
     refresh = set_mappings
 
@@ -338,6 +354,64 @@ class ComparisonListModel:
         """Resume polling an existing child when the pairing list is reopened."""
         self.manager.resume(root)
 
+    def save_review_queue(self, path: str | None = None) -> str:
+        """Persist the path mapping and review state for explicit restart recovery."""
+        destination = os.fspath(path or comparison_queue_path())
+        payload = {
+            "version": 1,
+            "rows": [
+                {
+                    "relative_path": row.mapping.relative_path,
+                    "left_path": row.mapping.left_path,
+                    "right_path": row.mapping.right_path,
+                    "status": row.mapping.status.value,
+                    "reason": row.mapping.reason,
+                    "state": row.state,
+                    "session_id": row.session_id,
+                }
+                for row in self.rows.values()
+            ],
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+        temporary = destination + f".tmp-{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+        os.replace(temporary, destination)
+        return destination
+
+    def load_review_queue(self, path: str | None = None) -> int:
+        """Restore a previously saved queue; file validation remains on open."""
+        source = os.fspath(path or comparison_queue_path())
+        try:
+            with open(source, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            if int(payload.get("version", 0)) != 1:
+                return 0
+            rows = []
+            restored_states = []
+            for raw in payload.get("rows", []):
+                if not isinstance(raw, dict) or not raw.get("left_path") or not raw.get("right_path"):
+                    continue
+                try:
+                    status = PairStatus(str(raw.get("status", PairStatus.INVALID.value)))
+                except ValueError:
+                    status = PairStatus.INVALID
+                rows.append(RelativeMapping(
+                    str(raw.get("relative_path", "")),
+                    str(raw["left_path"]),
+                    str(raw["right_path"]),
+                    status,
+                    str(raw.get("reason", "")),
+                ))
+                restored_states.append((str(raw.get("state", "未打开")), str(raw.get("session_id", ""))))
+            self.set_mappings(rows)
+            for row, (state, session_id) in zip(self.rows.values(), restored_states):
+                row.state = state if state in COMPARISON_STATES else "未打开"
+                row.session_id = session_id
+            return len(rows)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
+
 
 def _status_text(status: PairStatus) -> str:
     return {
@@ -384,6 +458,8 @@ class CompareSelectionDialog:
         self._mapping_queue: queue.Queue = queue.Queue()
         self._mapping_after = None
         self._directory_svn_label = "待确认"
+        self._review_state_path = comparison_queue_path()
+        self._review_states: dict[str, tuple[str, str]] = {}
         self._mapping_tooltip = None
         self._mapping_tooltip_after = None
         self.manager = manager or ComparisonSessionManager(parent)
@@ -412,6 +488,11 @@ class CompareSelectionDialog:
         self.win.lift()
         if values:
             self._validate()
+        else:
+            restored = self._restore_review_queue()
+            if restored:
+                self._render_mappings(restored)
+                self.status_var.set(f"已恢复上次审核队列 {len(restored)} 个配对；打开前会重新核对文件状态。")
 
     def _build(self):
         ttk = self.ttk
@@ -543,7 +624,7 @@ class CompareSelectionDialog:
             if override is not None:
                 mapping = override_mapping(mapping, left_path=override[0], right_path=override[1])
             self.mapping_rows[iid] = mapping
-            session_text = self._session_text(iid)
+            session_text = self._review_states.get(mapping.relative_path, ("未打开", ""))[0]
             self.mapping_tree.insert(
                 "", "end", iid=iid,
                 values=(
@@ -562,6 +643,65 @@ class CompareSelectionDialog:
             self.mapping_tree.focus(first)
         self.status_var.set(f"已加载 {len(self.mapping_rows)} 个配对；目录扫描只读取路径，打开前才核对 SHA256。")
         self._selection_changed()
+        self._persist_review_queue()
+
+    def _persist_review_queue(self) -> None:
+        rows = []
+        for mapping in self.mapping_rows.values():
+            state, session_id = self._review_states.get(mapping.relative_path, ("未打开", ""))
+            rows.append({
+                "relative_path": mapping.relative_path,
+                "left_path": mapping.left_path,
+                "right_path": mapping.right_path,
+                "status": mapping.status.value,
+                "reason": mapping.reason,
+                "state": state,
+                "session_id": session_id,
+            })
+        if not rows:
+            return
+        destination = self._review_state_path
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+            temporary = destination + f".tmp-{os.getpid()}"
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "rows": rows}, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, destination)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def _restore_review_queue(self) -> list[RelativeMapping]:
+        try:
+            with open(self._review_state_path, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            if int(payload.get("version", 0)) != 1:
+                return []
+            mappings = []
+            for raw in payload.get("rows", []):
+                if not isinstance(raw, dict) or not raw.get("left_path") or not raw.get("right_path"):
+                    continue
+                try:
+                    status = PairStatus(str(raw.get("status", PairStatus.INVALID.value)))
+                except ValueError:
+                    status = PairStatus.INVALID
+                relative = str(raw.get("relative_path", ""))
+                state = str(raw.get("state", "未打开"))
+                if state not in COMPARISON_STATES:
+                    state = "未打开"
+                # A process cannot safely be considered active after restart.
+                if state in {"启动中", "比较中"}:
+                    state = "未打开"
+                self._review_states[relative] = (state, "")
+                mappings.append(RelativeMapping(
+                    relative,
+                    str(raw["left_path"]),
+                    str(raw["right_path"]),
+                    status,
+                    str(raw.get("reason", "")),
+                ))
+            return mappings
+        except (OSError, ValueError, TypeError, AttributeError):
+            return []
 
     def _start_directory_mapping(self, left: str, right: str):
         self._mapping_generation += 1
@@ -811,6 +951,7 @@ class CompareSelectionDialog:
         iid = next((key for key, value in self._row_sessions.items() if value == session.session_id), None)
         if iid and self.mapping_tree.exists(iid):
             mapping = self.mapping_rows[iid]
+            self._review_states[mapping.relative_path] = (session.state, session.session_id)
             self.mapping_tree.set(iid, "session", session.state)
             self.mapping_tree.item(iid, tags=("running",) if session.state in {"启动中", "比较中"} else ("ready",) if mapping.complete else ("blocked",))
         self.session_status_var.set(
@@ -821,6 +962,7 @@ class CompareSelectionDialog:
             {"启动中": "比较正在启动；配对列表保持可见。", "比较中": "比较进行中；当前列表不会销毁。", "已关闭": "比较窗口已关闭；可继续选择其他配对。", "启动失败": "比较启动失败；请检查文件路径后重试。"}.get(session.state, self.status_var.get())
         )
         self._selection_changed()
+        self._persist_review_queue()
 
     def _open_selected(self):
         if self.manager.active_session is not None:
@@ -853,7 +995,9 @@ class CompareSelectionDialog:
             return
         self._row_sessions[iid] = session.session_id
         self._sessions[session.session_id] = session
+        self._review_states[mapping.relative_path] = (session.state, session.session_id)
         self.mapping_tree.set(iid, "session", session.state)
+        self._persist_review_queue()
         self._selection_changed()
         self.result = StartCenterResult("compare", (current.left.path, current.right.path), current.mapping)
         if callable(self.on_confirm):
@@ -863,6 +1007,7 @@ class CompareSelectionDialog:
     def _cancel(self):
         self._cancel_mapping()
         self._hide_mapping_tooltip()
+        self._persist_review_queue()
         # Parent list closure never kills a child comparison.
         self.manager.close(terminate=False)
         self.result = self.result or StartCenterResult(None)
