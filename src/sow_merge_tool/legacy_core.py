@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update114"
+APP_VERSION = "2026-09-15.update115"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -7413,7 +7413,16 @@ def _xlsx_contains_formulas(path: str) -> bool:
     return False
 
 
-def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, tuple[int, int]]:
+def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, str]:
+    from .sheet_screening import sheet_fingerprints
+    try:
+        return sheet_fingerprints(path)
+    except Exception as exc:
+        _dlog(f"sheet screening unavailable: {exc}")
+        return {}
+
+
+def _xlsx_sheet_zip_part_fingerprints(path: str) -> dict[str, tuple[int, int]]:
     """Return cheap per-Sheet XML fingerprints from the ZIP central directory.
 
     A mismatch is only a provisional difference signal: worksheet XML also
@@ -37063,7 +37072,9 @@ class SowMergeApp:
                 # Let the ZIP central-directory fingerprint pass classify
                 # unchanged Sheets before the worker commits to a full row
                 # parse.  It is bounded and falls through if the pass fails.
-                self._fingerprint_premark_event.wait(timeout=0.75)
+                while not self._fingerprint_premark_event.wait(timeout=0.05):
+                    if self._is_closing:
+                        return
 
                 while True:
                     if self._is_closing:

@@ -60,7 +60,8 @@ def _prepare_inputs(root: Path) -> tuple[Path, Path, str]:
     left = root / "left.xlsx"
     right = root / "right.xlsx"
     shutil.copy2(source, left)
-    shutil.copy2(source, right)
+    right_source = os.environ.get('SOW_PROFILE_RIGHT', '').strip()
+    shutil.copy2(Path(right_source).resolve() if right_source else source, right)
     return left, right, fixture
 
 
@@ -141,7 +142,11 @@ def _headless_heartbeat_probe(left: Path, right: Path) -> dict[str, float]:
 
 
 def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
+    from unittest.mock import patch
     app = None
+    hide = patch.object(smt.tk.Tk, 'deiconify', lambda self: None)
+    hide.start()
+    total_started = time.perf_counter()
     try:
         app = smt.SowMergeApp(str(left), str(right))
         app.root.withdraw()
@@ -190,6 +195,8 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
             time.sleep(0.01)
         durations = app._startup_trace.durations()
         return {
+            'total_compare_ms': round((time.perf_counter() - total_started) * 1000, 2),
+            'screened_clean': len(getattr(app, '_fingerprint_identical_sheets', ())),
             "trace_ms": {key: round(value * 1000.0, 2) for key, value in durations.items()},
             "first_sheet": first_sheet,
             "first_sheet_ready": first_ready_at is not None,
@@ -198,7 +205,10 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
                 if first_ready_at is not None
                 else None
             ),
-            "full_compare_ready": full_ready_at is not None,
+            "full_compare_ready": full_ready_at is not None and all(
+                status.phase == 'ready' for status in
+                getattr(getattr(app, '_sheet_filter_model', None), 'statuses', {}).values()
+            ),
             "full_compare_ready_ms": (
                 round((full_ready_at - probe_started) * 1000.0, 2)
                 if full_ready_at is not None
@@ -225,6 +235,7 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
     finally:
         if app is not None:
             app._shutdown_root()
+        hide.stop()
 
 
 def main() -> None:
