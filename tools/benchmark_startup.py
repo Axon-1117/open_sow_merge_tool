@@ -151,10 +151,12 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
         probe_started = time.perf_counter()
         first_sheet = str(getattr(app, "selected_sheet", "") or "")
         first_ready_at = None
-        deadline = time.monotonic() + 45.0
+        full_probe = os.environ.get("SOW_PROFILE_FULL_COMPARE", "").strip() == "1"
+        deadline = time.monotonic() + (120.0 if full_probe else 45.0)
         pump_last = time.perf_counter()
         pump_pre_max = 0.0
         pump_post_max = 0.0
+        full_ready_at = None
         while time.monotonic() < deadline:
             _pump_tk(app.root)
             pump_now = time.perf_counter()
@@ -168,14 +170,22 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
                 view = getattr(app, "sheet_views", {}).get(first_sheet)
                 if view is not None and bool(getattr(view, "_data_ready", False)):
                     first_ready_at = time.perf_counter()
+            if full_probe and full_ready_at is None:
+                model = getattr(app, "_sheet_filter_model", None)
+                statuses = getattr(model, "statuses", {}) if model is not None else {}
+                if statuses and all(
+                    status.phase in {"ready", "failed"}
+                    for status in statuses.values()
+                ):
+                    full_ready_at = time.perf_counter()
             # Do not stop at the heartbeat sample quota before the first Sheet
             # has actually become usable; startup readiness is the primary
             # signal and the old ordering made a slow first cache look like a
             # successful probe with ``first_sheet_ready=false``.
-            if (
-                first_ready_at is not None
-                and getattr(app, "_ui_heartbeat_samples", 0) >= 10
-            ):
+            if full_probe:
+                if full_ready_at is not None:
+                    break
+            elif first_ready_at is not None and getattr(app, "_ui_heartbeat_samples", 0) >= 10:
                 break
             time.sleep(0.01)
         durations = app._startup_trace.durations()
@@ -188,6 +198,21 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
                 if first_ready_at is not None
                 else None
             ),
+            "full_compare_ready": full_ready_at is not None,
+            "full_compare_ready_ms": (
+                round((full_ready_at - probe_started) * 1000.0, 2)
+                if full_ready_at is not None
+                else None
+            ),
+            "full_compare_confirmed": sum(
+                1
+                for status in (
+                    getattr(getattr(app, "_sheet_filter_model", None), "statuses", {})
+                    or {}
+                ).values()
+                if status.phase in {"ready", "failed"}
+            ),
+            "full_compare_total": len(getattr(app, "compare_sheets", ()) or ()),
             "edit_loaded_during_probe": bool(app._edit_workbooks_ready()),
             "heartbeat_samples": int(getattr(app, "_ui_heartbeat_samples", 0)),
             "heartbeat_max_gap_ms": round(
