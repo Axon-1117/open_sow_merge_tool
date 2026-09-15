@@ -7417,7 +7417,7 @@ def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, str]:
     from .sheet_screening import sheet_fingerprints
     try:
         return sheet_fingerprints(path)
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, RuntimeError, ET.ParseError, zipfile.BadZipFile) as exc:
         _dlog(f"sheet screening unavailable: {exc}")
         return {}
 
