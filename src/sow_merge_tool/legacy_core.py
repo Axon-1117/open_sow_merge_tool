@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update113"
+APP_VERSION = "2026-09-14.update114"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -35396,6 +35396,14 @@ class SowMergeApp:
             sheet: 0 for sheet in self.compare_sheets
         }
         self._compute_thread = None
+        try:
+            self._parallel_max_workers = max(
+                1,
+                min(3, int(os.environ.get("SOW_SHEET_WORKERS", "2") or 2)),
+            )
+        except (TypeError, ValueError):
+            self._parallel_max_workers = 2
+        self._parallel_sheet_workers: set[threading.Thread] = set()
         self._compute_total = max(1, len(self.compare_sheets))
         self._compute_done = 0
         # Keep completed background results for tabs that have not been opened yet.
@@ -37325,6 +37333,84 @@ class SowMergeApp:
                     if self._compute_thread is threading.current_thread():
                         self._compute_thread = None
 
+        def _parallel_sheet_job(sheet: str, generation: int, need_exact_only_diff: bool, force_align: bool):
+            """Compute one already-screened Sheet on an isolated worker thread."""
+            wb_a = wb_b = wb_base = wb_a_edit = wb_b_edit = wb_base_edit = None
+            try:
+                wb_a = load_workbook(self._file_a_val_path, data_only=True, read_only=True)
+                wb_b = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
+                if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
+                    wb_base = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
+                formula_a = _xlsx_sheet_formula_flags(self._file_a_val_path).get(sheet, True)
+                formula_b = _xlsx_sheet_formula_flags(self._file_b_val_path).get(sheet, True)
+                has_formula = bool(formula_a or formula_b)
+                if has_formula:
+                    wb_a_edit = load_workbook(self.file_a, data_only=False, read_only=True)
+                    wb_b_edit = load_workbook(self._mine_working_path(), data_only=False, read_only=True)
+                    if getattr(self, "has_base", False) and getattr(self, "base_path", None):
+                        wb_base_edit = load_workbook(self.base_path, data_only=False, read_only=True)
+                else:
+                    wb_a_edit, wb_b_edit, wb_base_edit = wb_a, wb_b, wb_base
+                started = time.perf_counter()
+                cache = _compute_sheet_cache(
+                    wb_a, wb_b, wb_a_edit, wb_b_edit, sheet,
+                    wb_base, wb_base_edit,
+                    need_exact_only_diff=need_exact_only_diff,
+                    force_sequence_align=force_align,
+                )
+                cache["generation"] = generation
+                cache["preview_only"] = False
+                _dlog(
+                    f"SHEET_CACHE_PARALLEL sheet={sheet} rows={len(cache.get('row_pairs', ())) } "
+                    f"elapsed_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+                )
+                _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
+            except InterruptedError:
+                pass
+            except (AttributeError, IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                _dlog(f"parallel sheet compute failed sheet={sheet}: {exc}")
+                _queue_ui_task(
+                    lambda s=sheet, err=str(exc), gen=generation: _mark_sheet_compute_failed(s, err, gen)
+                )
+            finally:
+                _wbs_close(wb_a, wb_b, wb_base, wb_a_edit, wb_b_edit, wb_base_edit)
+                with self._compute_lock:
+                    self._compute_inflight.discard(sheet)
+                    self._compute_done = min(self._compute_total, self._compute_done + 1)
+                    self._parallel_sheet_workers.discard(threading.current_thread())
+                self._kick_parallel_sheets()
+
+        def _kick_parallel_sheets():
+            if self._is_closing or self._cache_worker_mode:
+                return
+            with self._compute_lock:
+                if self._compute_thread is not None and self._compute_thread.is_alive():
+                    return
+                while (
+                    self._compute_queue
+                    and len(self._parallel_sheet_workers) < self._parallel_max_workers
+                ):
+                    sheet = self._compute_queue.pop(0)
+                    if sheet in self._fingerprint_clean_sheets:
+                        continue
+                    need_exact = sheet in self._compute_exact_only_diff_requested
+                    self._compute_exact_only_diff_requested.discard(sheet)
+                    force_align = sheet in self._compute_force_align_requested
+                    self._compute_force_align_requested.discard(sheet)
+                    generation = int(self._sheet_compute_generation.get(sheet, 0))
+                    self._compute_inflight.add(sheet)
+                    thread = self._start_background_thread(
+                        lambda s=sheet, g=generation, n=need_exact, f=force_align: _parallel_sheet_job(s, g, n, f),
+                        name=f"sow-sheet-diff-{len(self._parallel_sheet_workers) + 1}",
+                    )
+                    if thread is None:
+                        self._compute_inflight.discard(sheet)
+                        self._compute_queue.insert(0, sheet)
+                        break
+                    self._parallel_sheet_workers.add(thread)
+
+        self._kick_parallel_sheets = _kick_parallel_sheets
+
         def _should_isolate_initial_cache():
             # The process bridge is experimental until its worker can bypass
             # the full Tk startup path. Keep the production path on the
@@ -37992,7 +38078,7 @@ class SowMergeApp:
                     if sheet_name in self._fingerprint_clean_sheets:
                         continue
                     _enqueue_sheet(sheet_name, front=False)
-                _kick_worker()
+                self._kick_parallel_sheets()
 
             # Keep unopened Sheets in their explicit unknown/loading state
             # while the first visible Sheet gets the CPU.  Switching a tab
