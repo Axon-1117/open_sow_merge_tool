@@ -41,3 +41,25 @@ def test_internal_status_entrypoint_accepts_local_mode(tmp_path, monkeypatch):
     assert result == 0
     assert seen == [False]
     assert json.loads(output.read_text(encoding="utf-8"))["items"] == []
+
+
+def test_cli_status_uses_against_revision_for_remote_freshness():
+    xml = """
+    <status>
+      <target path="C:/wc">
+        <entry path="Quest.xlsx">
+          <wc-status item="normal" props="normal" revision="41226">
+            <commit revision="41220" />
+          </wc-status>
+        </entry>
+        <against revision="41226" />
+      </target>
+    </status>
+    """
+
+    records = provider._parse_cli_status(xml, r"C:\wc")
+
+    assert len(records) == 1
+    assert records[0].revision == 41226
+    assert records[0].repository_revision == 41226
+    assert records[0].remote_revision == 41226

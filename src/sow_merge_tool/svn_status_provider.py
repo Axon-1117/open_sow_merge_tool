@@ -148,6 +148,10 @@ def _parse_cli_status(xml_text: str, requested_path: str) -> list[SvnStatusRecor
         raise SvnStatusError(f"SVN 状态 XML 无效：{exc}") from exc
     requested = os.path.abspath(requested_path)
     records: list[SvnStatusRecord] = []
+    against = root.find(".//against")
+    against_revision = None
+    if against is not None and str(against.get("revision") or "").isdigit():
+        against_revision = int(against.get("revision"))
     changelist_by_entry: dict[int, str] = {}
     for changelist in root.findall(".//changelist"):
         name = str(changelist.get("name") or "")
@@ -171,6 +175,11 @@ def _parse_cli_status(xml_text: str, requested_path: str) -> list[SvnStatusRecor
         remote_revision = None
         if repos is not None and str(repos.get("revision") or "").isdigit():
             remote_revision = int(repos.get("revision"))
+        if remote_revision is None:
+            # ``svn status --show-updates --xml`` reports the repository
+            # freshness for the target under <against revision="..."> when
+            # no per-entry <repos-status> element is emitted.
+            remote_revision = against_revision
         changed_revision = None
         if commit is not None and str(commit.get("revision") or "").isdigit():
             changed_revision = int(commit.get("revision"))

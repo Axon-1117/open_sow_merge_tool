@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update108"
+APP_VERSION = "2026-09-14.update109"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
