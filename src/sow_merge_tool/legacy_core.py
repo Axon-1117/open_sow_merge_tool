@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update112"
+APP_VERSION = "2026-09-14.update113"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -14800,6 +14800,7 @@ class SheetView:
             # it never performs a synchronous workbook scan on Tk.
             try:
                 app = self.app
+                self._fingerprint_equal_lazy = False
                 requested = getattr(app, "_exact_requested_sheets", None)
                 if isinstance(requested, set):
                     requested.add(self.sheet)
@@ -34483,6 +34484,19 @@ class SowMergeApp:
         if model is None:
             return
         model.set_mode(mode)
+        if str(mode).lower() in {"all", "全部", "0"}:
+            sheet = getattr(self, "selected_sheet", "")
+            view = getattr(self, "sheet_views", {}).get(sheet)
+            if view is not None and bool(getattr(view, "_fingerprint_equal_lazy", False)):
+                view._fingerprint_equal_lazy = False
+                self._exact_requested_sheets.add(sheet)
+                self._enqueue_sheet(
+                    sheet,
+                    front=True,
+                    exact_only_diff=False,
+                    force_recompute=True,
+                )
+                self._kick_worker()
         self._sync_sheet_filter_selection()
         self.refresh_sheet_nav()
 
@@ -35371,6 +35385,7 @@ class SowMergeApp:
         self._compute_inflight = set()
         self._fingerprint_clean_sheets: set[str] = set()
         self._fingerprint_identical_sheets: set[str] = set()
+        self._fingerprint_premark_event = threading.Event()
         self._compute_exact_only_diff_requested: set[str] = set()
         self._deferred_exact_sheets: set[str] = set()
         # A force-align request is carried into the background cache builder
@@ -36616,6 +36631,7 @@ class SowMergeApp:
         def _apply_sheet_cache(cache: dict):
             sheet = cache["sheet"]
             cache_preview = bool(cache.get("preview_only", False))
+            fingerprint_equal = bool(cache.get("fingerprint_equal", False))
             preview_apply_started = (
                 time.perf_counter() if cache_preview else None
             )
@@ -36635,7 +36651,7 @@ class SowMergeApp:
                 self.set_sheet_has_diff(
                     sheet,
                     cache.get("has_diff", False),
-                    confirmed=not cache_preview,
+                    confirmed=not cache_preview or fingerprint_equal,
                 )
                 self.refresh_sheet_nav()
                 self.refresh_difference_browser()
@@ -36691,8 +36707,10 @@ class SowMergeApp:
             self.set_sheet_has_diff(
                 sheet,
                 cache.get("has_diff", False),
-                confirmed=not cache_preview,
+                confirmed=not cache_preview or fingerprint_equal,
             )
+            if fingerprint_equal and view is not None:
+                view._fingerprint_equal_lazy = True
             view._preview_cache_applied = cache_preview
             view._lifecycle_error = None
             view._lifecycle_canceled = False
@@ -37034,6 +37052,10 @@ class SowMergeApp:
                     if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None)
                     else {}
                 )
+                # Let the ZIP central-directory fingerprint pass classify
+                # unchanged Sheets before the worker commits to a full row
+                # parse.  It is bounded and falls through if the pass fails.
+                self._fingerprint_premark_event.wait(timeout=0.75)
 
                 while True:
                     if self._is_closing:
@@ -37087,6 +37109,32 @@ class SowMergeApp:
                             and sheet not in getattr(self, "_exact_requested_sheets", set())
                             and not fingerprint_identical
                         )
+                        if fingerprint_identical:
+                            quick_started = time.perf_counter()
+                            quick_cache = _compute_sheet_cache(
+                                wb_a_ro,
+                                wb_a_ro,
+                                wb_a_ro,
+                                wb_a_ro,
+                                sheet,
+                                wb_a_ro if getattr(self, "has_base", False) else None,
+                                wb_a_ro if getattr(self, "has_base", False) else None,
+                                need_exact_only_diff=False,
+                                force_sequence_align=False,
+                                preview_only=True,
+                            )
+                            quick_cache["generation"] = compute_generation
+                            quick_cache["preview_only"] = True
+                            quick_cache["fingerprint_equal"] = True
+                            _dlog(
+                                f"SHEET_CACHE_FINGERPRINT_EQUAL sheet={sheet} "
+                                f"elapsed_ms={(time.perf_counter() - quick_started) * 1000.0:.1f}"
+                            )
+                            _queue_ui_task(
+                                lambda c=quick_cache: _apply_sheet_cache(c),
+                                front=True,
+                            )
+                            continue
                         if preview_first_sheet:
                             preview_started = time.perf_counter()
                             preview_cache = _compute_sheet_cache(
@@ -37737,6 +37785,8 @@ class SowMergeApp:
                 )
             except Exception as e:
                 _dlog(f"sheet fingerprint premark worker failed: {e}")
+            finally:
+                self._fingerprint_premark_event.set()
 
         def _sheet_has_diff_fast_tail(ws_a, ws_b, max_row: int, max_col: int, min_row: int = 1):
             none_sig = tuple("" for _ in range(max_col))
@@ -37883,6 +37933,7 @@ class SowMergeApp:
                 pass
         else:
             self._fast_tabmark_thread = None
+            self._fingerprint_premark_event.set()
 
         # Enqueue all sheets for background confirmation (slow compute)
         self._defer_sheet_nav_refresh = True
