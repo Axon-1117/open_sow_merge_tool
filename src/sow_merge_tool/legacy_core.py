@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update109"
+APP_VERSION = "2026-09-14.update110"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -31114,7 +31114,7 @@ class SowMergeApp:
         # it out of the normal startup path prevents a large OOXML pass from
         # freezing the user's desktop; an edit/refresh/explicit exact request
         # promotes the Sheet and runs the same authoritative calculation.
-        self._auto_exact_initial = os.environ.get("SOW_AUTO_EXACT_INITIAL", "") == "1"
+        self._auto_exact_initial = os.environ.get("SOW_AUTO_EXACT_INITIAL", "1") == "1"
         self._cache_worker_sheet = os.environ.get("SOW_CACHE_WORKER_SHEET", "")
         self._cache_worker_output = os.environ.get("SOW_CACHE_WORKER_OUTPUT", "")
         try:
@@ -37052,7 +37052,15 @@ class SowMergeApp:
                             )
                             if preview_event is not None:
                                 preview_event.wait(timeout=5.0)
-                            if not bool(getattr(self, "_auto_exact_initial", False)):
+                            preview_max_row = int(
+                                preview_cache.get("max_row", _PREVIEW_CACHE_ROWS)
+                                or _PREVIEW_CACHE_ROWS
+                            )
+                            defer_large_exact = preview_max_row >= _PREVIEW_CACHE_ROWS
+                            if (
+                                not bool(getattr(self, "_auto_exact_initial", False))
+                                and defer_large_exact
+                            ):
                                 # Keep the exact job queued but do not begin it
                                 # until the user explicitly requests an edit,
                                 # refresh, or exact-only view.  The preview is
@@ -37808,7 +37816,11 @@ class SowMergeApp:
                             or initial_sheet in self._compute_queue
                         )
                     )
-                if initial_busy:
+                preview_applied = bool(
+                    not initial_sheet
+                    or self._initial_preview_applied_event.is_set()
+                )
+                if initial_busy or not preview_applied:
                     self._safe_root_after(500, _enqueue_deferred_sheets)
                     return
                 for sheet_name in deferred_sheets:
@@ -37819,12 +37831,11 @@ class SowMergeApp:
             # while the first visible Sheet gets the CPU.  Switching a tab
             # still enqueues that Sheet immediately through _on_tab_changed.
             if not self._cache_worker_mode:
-                # Do not wake the parser merely because the window stayed
-                # open.  Unselected Sheets are queued when the user switches
-                # to them (or explicitly requests a refresh); an automatic
-                # fan-out after a few seconds can reacquire the GIL and make
-                # an otherwise idle desktop appear hung.
-                pass
+                # Start unopened-sheet confirmation after the first visible
+                # Sheet has had a short head start.  The worker is still
+                # single-owner and the UI remains usable while it advances
+                # through the remaining Sheets.
+                self._safe_root_after(2500, _enqueue_deferred_sheets)
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
         finally:
