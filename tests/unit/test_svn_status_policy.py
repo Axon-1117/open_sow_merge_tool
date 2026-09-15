@@ -30,9 +30,9 @@ ALL_NATIVE_STATUSES = {
 @pytest.mark.parametrize(
     ("status", "visible", "selectable", "checked", "policy"),
     (
-        ("none", True, False, False, "不进入批次"),
+        ("none", False, False, False, "不进入批次"),
         ("unversioned", True, True, False, "勾选后在目标新增"),
-        ("normal", True, False, False, "不进入批次"),
+        ("normal", False, False, False, "不进入批次"),
         ("added", True, True, True, "在目标新增文件"),
         ("missing", True, True, True, "仅源分支；目标不变"),
         ("deleted", True, True, True, "同步删除到目标"),
@@ -79,6 +79,35 @@ def test_every_native_status_has_an_explicit_policy(
 
 def test_native_status_enum_is_fully_accounted_for():
     assert set(sp.STATUS_NAMES.values()) == ALL_NATIVE_STATUSES
+
+
+def test_clean_normal_files_are_hidden_but_abnormal_normal_is_visible(tmp_path, monkeypatch):
+    branch = tmp_path / "develop"
+    branch.mkdir()
+    clean = branch / "Clean.xlsx"
+    locked = branch / "Locked.xlsx"
+    clean.write_bytes(b"clean")
+    locked.write_bytes(b"locked")
+    monkeypatch.setattr(
+        bs,
+        "scan_status",
+        lambda *_args, **_kwargs: [
+            sp.SvnStatusRecord(
+                path=str(clean), node_kind="file", node_status="normal",
+                text_status="normal", prop_status="normal", versioned=True,
+            ),
+            sp.SvnStatusRecord(
+                path=str(locked), node_kind="file", node_status="normal",
+                text_status="normal", prop_status="normal", versioned=True,
+                wc_locked=True,
+            ),
+        ],
+    )
+
+    items = bs.scan_changes(str(tmp_path), "develop", str(branch))
+
+    assert [item.relative_path for item in items] == ["Locked.xlsx"]
+    assert "Cleanup" in items[0].reason
 
 
 def test_workbench_root_enter_excludes_message_and_search_inputs():

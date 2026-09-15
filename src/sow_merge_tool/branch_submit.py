@@ -483,6 +483,24 @@ def scan_changes(wc_root: str, source_branch: str, scope_path: str, *, cancel_ev
     for record in records:
         if not _is_within(record.path, scope) or not _is_within(record.path, branch_root):
             continue
+        # A clean versioned file is not actionable in either single-branch or
+        # multi-branch submission.  Keep abnormal metadata states visible, but
+        # do not fill the workbench with hundreds of ``normal`` rows that can
+        # never enter a batch.
+        clean_normal = (
+            record.node_status in {"none", "normal"}
+            and record.text_status in {"none", "normal"}
+            and record.prop_status in {"none", "normal"}
+            and not record.conflicted
+            and not record.switched
+            and not record.file_external
+            and not record.wc_locked
+            and not record.moved_from
+            and not record.moved_to
+            and not record.changelist
+        )
+        if clean_normal:
+            continue
         if record.node_status in {"ignored", "external"} or record.file_external:
             continue
         relative = os.path.relpath(record.path, branch_root).replace("\\", "/")
