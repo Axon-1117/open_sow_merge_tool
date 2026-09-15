@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import replace
-from collections.abc import Callable, Iterable
+import time
 import tkinter as tk
+from collections import Counter
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 from tkinter import ttk
 
-from .ui_foundation import DifferenceItem, DifferenceKind, THEME, configure_ttk_style
+from .ui_foundation import THEME, DifferenceItem, DifferenceKind, configure_ttk_style
 
 
 class DifferenceIndex:
@@ -253,8 +254,8 @@ class DifferenceBrowser:
             f"全部 {counts['total']} · 冲突 {counts[DifferenceKind.CONFLICT]} · 修改 {counts[DifferenceKind.MODIFIED]} · "
             f"增行 {counts[DifferenceKind.ADDED]} · 删行 {counts[DifferenceKind.DELETED]} · 已处理 {counts[DifferenceKind.PROCESSED]}"
         )
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
+        old_selection = self.tree.selection()
+        removals = iter(self.tree.get_children())
         self._rendered = {}
         # The index retains every item; the visible first page is bounded so a
         # very large workbook never blocks the Tk event loop.
@@ -262,10 +263,32 @@ class DifferenceBrowser:
         page_count = max(1, (len(filtered) + 499) // 500)
         self._page = min(self._page, page_count - 1)
         self.page_var.set(f"第 {self._page + 1} 页 / {page_count}")
-        for item in filtered[self._page * 500:(self._page + 1) * 500]:
-            iid = f"diff-{item.id}"
-            self._rendered[iid] = item
-            self.tree.insert("", "end", iid=iid, values=(item.sheet, item.kind_label, item.display_location, item.summary, item.role, item.status_label), tags=(("processed" if item.processed else "conflict" if item.conflict else ""),))
+        self._render_generation = getattr(self, '_render_generation', 0) + 1
+        generation = self._render_generation
+        self._render_busy = True
+        pending = iter(filtered[self._page * 500:(self._page + 1) * 500])
+        def append_chunk():
+            if generation != self._render_generation or not self.tree.winfo_exists():
+                return
+            started = time.perf_counter()
+            for iid in removals:
+                if self.tree.exists(iid):
+                    self.tree.delete(iid)
+                if time.perf_counter() - started >= 0.016:
+                    self.tree.after(1, append_chunk)
+                    return
+            for item in pending:
+                iid = f"diff-{item.id}"
+                self._rendered[iid] = item
+                self.tree.insert("", "end", iid=iid, values=(item.sheet, item.kind_label, item.display_location, item.summary, item.role, item.status_label), tags=(("processed" if item.processed else "conflict" if item.conflict else ""),))
+                if time.perf_counter() - started >= 0.016:
+                    self.tree.after(1, append_chunk)
+                    return
+            self._render_busy = False
+            if old_selection and not self.tree.selection() and old_selection[0] in self._rendered:
+                self.tree.selection_set(old_selection[0])
+                self.tree.focus(old_selection[0])
+        append_chunk()
 
     def _selected(self, _event=None):
         selection = self.tree.selection()

@@ -10,6 +10,7 @@ Tk startup probe and records the existing startup trace/heartbeat metrics.
 from __future__ import annotations
 
 import _tkinter
+import hashlib
 import json
 import os
 import shutil
@@ -172,13 +173,14 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
             else:
                 pump_post_max = max(pump_post_max, pump_gap)
             if first_ready_at is None:
+                first_sheet = str(getattr(app, 'selected_sheet', '') or first_sheet)
                 view = getattr(app, "sheet_views", {}).get(first_sheet)
                 if view is not None and bool(getattr(view, "_data_ready", False)):
                     first_ready_at = time.perf_counter()
             if full_probe and full_ready_at is None:
                 model = getattr(app, "_sheet_filter_model", None)
                 statuses = getattr(model, "statuses", {}) if model is not None else {}
-                if statuses and all(
+                if not getattr(app._diff_browser, '_render_busy', False) and statuses and all(
                     status.phase in {"ready", "failed"}
                     for status in statuses.values()
                 ):
@@ -194,7 +196,14 @@ def _hidden_ui_probe(left: Path, right: Path) -> dict[str, object]:
                 break
             time.sleep(0.01)
         durations = app._startup_trace.durations()
+        evidence = sorted([
+            (i.sheet, str(i.kind), i.row, i.column, str(i.base_value), str(i.mine_value),
+             str(i.theirs_value), i.summary, i.evidence_text)
+            for i in app.difference_items
+        ], key=repr)
         return {
+            'difference_count': len(evidence),
+            'difference_sha256': hashlib.sha256(json.dumps(evidence, ensure_ascii=False).encode()).hexdigest(),
             'total_compare_ms': round((time.perf_counter() - total_started) * 1000, 2),
             'screened_clean': len(getattr(app, '_fingerprint_identical_sheets', ())),
             "trace_ms": {key: round(value * 1000.0, 2) for key, value in durations.items()},

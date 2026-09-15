@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-15.update115"
+APP_VERSION = "2026-09-15.update116"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -5025,6 +5025,9 @@ def _read_rows_into_cache(
     min_r = needed[0]
     max_r = needed[-1]
     needed_set = set(needed)
+    frozen_rows = getattr(ws, '_sow_complete_read_rows', None)
+    if frozen_rows is not None and max_r <= len(frozen_rows):
+        return {r: _pad_row_values(frozen_rows[r - 1], max_col) for r in needed}
     # Normal openpyxl worksheets materialize cells when iter_rows is asked to
     # extend beyond the current physical horizon.  Logical projection often
     # requests the wider peer width, so cap the actual read and pad in memory;
@@ -6684,6 +6687,8 @@ def _canonicalize_formula_column_references(edit_value, physical_to_logical) -> 
     if _special_formula_signature(edit_value) is not None:
         return edit_value
     formula = _formula_text(edit_value)
+    if not formula:
+        return edit_value
     mapping_entries = _immutable_formula_mapping_entries(physical_to_logical)
     if not formula or not mapping_entries:
         return edit_value
@@ -7413,10 +7418,10 @@ def _xlsx_contains_formulas(path: str) -> bool:
     return False
 
 
-def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, str]:
+def _xlsx_sheet_part_fingerprints(path: str, *, formula_flags=None) -> dict[str, str]:
     from .sheet_screening import sheet_fingerprints
     try:
-        return sheet_fingerprints(path)
+        return sheet_fingerprints(path, formula_flags=formula_flags)
     except (OSError, ValueError, KeyError, RuntimeError, ET.ParseError, zipfile.BadZipFile) as exc:
         _dlog(f"sheet screening unavailable: {exc}")
         return {}
@@ -23627,8 +23632,18 @@ class SheetView:
         grid_on = self._is_grid_overlay_enabled()
         sep = _COL_SEP if grid_on else "   "
         trail = " \u2502" if grid_on else ""
+        cache = getattr(self, '_cell_format_cache', None)
+        if cache is None or len(cache) > 8192:
+            cache = self._cell_format_cache = {}
+        def format_part(index):
+            value = raw_parts[index]
+            width = self.col_char_widths.get(index + 1, 1)
+            key = (value, width)
+            if key not in cache:
+                cache[key] = _format_cell(value, width)
+            return cache[key]
         return sep.join(
-            _format_cell(raw_parts[i], self.col_char_widths.get(i + 1, 1))
+            format_part(i)
             for i in range(len(raw_parts))
         ) + trail
 
@@ -23971,14 +23986,20 @@ class SheetView:
             pair_parts_base,
             physical_widths,
         )
+        # Raw parts retain every row. Only format visible differences on the
+        # initial diff-only view; the existing missing-line path fills other
+        # rows when the user switches to the full view.
+        diff_only = bool(getattr(self, 'only_diff_var', None) and self.only_diff_var.get())
+        def needs_text(idx):
+            return not diff_only or self._pair_has_visual_diff(int(idx))
         if pair_parts_a or pair_parts_b:
             rendered_a = {
                 int(idx): self._render_line_from_raw_parts(list(parts), "A")
-                for idx, parts in pair_parts_a.items()
+                for idx, parts in pair_parts_a.items() if needs_text(idx)
             }
             rendered_b = {
                 int(idx): self._render_line_from_raw_parts(list(parts), "B")
-                for idx, parts in pair_parts_b.items()
+                for idx, parts in pair_parts_b.items() if needs_text(idx)
             }
             if replace:
                 self.pair_text_a = rendered_a
@@ -23991,7 +24012,7 @@ class SheetView:
                 self._render_line_from_raw_parts(list(parts), "BASE")
                 if parts else ""
             )
-            for idx, parts in pair_parts_base.items()
+            for idx, parts in pair_parts_base.items() if needs_text(idx)
         }
         if replace:
             self.pair_text_base = rendered_base
@@ -31118,6 +31139,9 @@ class SowMergeApp:
         self._is_closing = False
         self._sheet_filter_model = None
         self._sheet_filter_programmatic_select = False
+        self._sheet_user_interacted = False
+        self._screen_formula_flags = {}
+        self._pending_sheet_results = set()
         self._sheet_filter_initializing = True
         self._background_threads_lock = threading.Lock()
         self._background_threads: set[threading.Thread] = set()
@@ -31370,6 +31394,25 @@ class SowMergeApp:
 
                 report("正在分析工作簿结构", "读取 Sheet 列表并判断整表新增、删除...", 76)
                 self._refresh_sheet_catalog()
+                # Choose the initial pane from completed screening before
+                # constructing any SheetView. Reuse this evidence below.
+                self._startup_screen_results = {}
+                for screen_path in dict.fromkeys(p for p in (
+                    self._file_a_val_path, self._file_b_val_path,
+                    getattr(self, '_file_base_val_path', None),
+                ) if p):
+                    flags = {}
+                    self._startup_screen_results[screen_path] = _xlsx_sheet_part_fingerprints(
+                        screen_path, formula_flags=flags)
+                    self._screen_formula_flags[screen_path] = flags
+                left_marks = self._startup_screen_results[self._file_a_val_path]
+                right_marks = self._startup_screen_results[self._file_b_val_path]
+                base_marks = self._startup_screen_results.get(getattr(self, '_file_base_val_path', ''), {})
+                self._startup_candidates = [s for s in self.compare_sheets if (
+                    not left_marks.get(s) or not right_marks.get(s)
+                    or left_marks.get(s) != right_marks.get(s)
+                    or (self.has_base and (not base_marks.get(s) or left_marks.get(s) != base_marks.get(s)))
+                )]
                 self._startup_trace.mark("sheet-catalog-ready")
                 if self._wb_a_edit is None or self._wb_b_edit is None or (self.has_base and self._wb_base_edit is None):
                     # Do not compete with the first visible Sheet's XML
@@ -31407,6 +31450,10 @@ class SowMergeApp:
         self._diff_browser = None
 
         self.root = _take_startup_progress_root()
+        def user_interacted(_event):
+            self._sheet_user_interacted = True
+        self.root.bind('<ButtonPress>', user_interacted, add='+')
+        self.root.bind('<KeyPress>', user_interacted, add='+')
         self._startup_trace.mark("startup-window-ready")
         self._window_title_suffix = f"{APP_NAME} {APP_VERSION} [{APP_BUILD_TAG}]"
         self.root.title(self._window_title_suffix)
@@ -35432,6 +35479,8 @@ class SowMergeApp:
         ):
             if self._is_closing:
                 return
+            if sheet in self._pending_sheet_results and not force_recompute:
+                return
             exact_request_supplied = exact_only_diff is not None
             queued_view = self.sheet_views.get(sheet)
             if queued_view is None or not getattr(queued_view, "_data_ready", False):
@@ -35448,6 +35497,8 @@ class SowMergeApp:
                     self._deferred_exact_sheets.discard(sheet)
                 if exact_request_supplied or force_recompute or force_align:
                     self._exact_requested_sheets.add(sheet)
+                    self._fingerprint_identical_sheets.discard(sheet)
+                    self._fingerprint_clean_sheets.discard(sheet)
                 if exact_only_diff:
                     self._compute_exact_only_diff_requested.add(sheet)
                 if force_align is None:
@@ -35534,7 +35585,7 @@ class SowMergeApp:
                     # when the pending task was only a status update; heavy
                     # cache application is already limited to one callback per
                     # turn and can yield through the normal Tk event loop.
-                    delay = max(80, min(200, int(elapsed_ms * 1.2)))
+                    delay = 1
                 else:
                     delay = 50
                 grace_remaining = max(
@@ -35548,6 +35599,7 @@ class SowMergeApp:
             except Exception:
                 pass
 
+        yield_clock = threading.local()
         def _check_bg_cancel():
             if self._is_closing:
                 raise InterruptedError("background compute cancelled during shutdown")
@@ -35566,7 +35618,10 @@ class SowMergeApp:
             # parsing and row alignment are Python-heavy; a short cooperative
             # pause keeps Tk heartbeats and input dispatch alive while the
             # background cache is being built.
-            time.sleep(0.005)
+            now = time.perf_counter()
+            if now - getattr(yield_clock, 'last', 0.0) >= 0.008:
+                time.sleep(0.001)
+                yield_clock.last = time.perf_counter()
 
         def _compute_trim_bounds(ws, row_cache=None):
             # Find the true last non-empty row for this sheet. Empty strings are
@@ -35618,6 +35673,7 @@ class SowMergeApp:
                         last_c = max(last_c, row_last_col)
                 if row_cache is not None:
                     row_cache[id(ws)] = captured_rows
+                    ws._sow_complete_read_rows = tuple(captured_rows)
                 if not found:
                     return 1, max(1, max_c)
                 return max(1, last_r), max(1, last_c)
@@ -36647,6 +36703,7 @@ class SowMergeApp:
 
         def _apply_sheet_cache(cache: dict):
             sheet = cache["sheet"]
+            self._pending_sheet_results.discard(sheet)
             cache_preview = bool(cache.get("preview_only", False))
             fingerprint_equal = bool(cache.get("fingerprint_equal", False))
             preview_apply_started = (
@@ -36968,7 +37025,7 @@ class SowMergeApp:
                 # Give Tk several heartbeat turns before the CPU-heavy exact
                 # pass begins; unopened Sheet work is deferred on the same
                 # startup budget below.
-                self._ui_preview_grace_until = time.perf_counter() + 5.0
+                self._ui_preview_grace_until = 0.0
                 try:
                     view.info.configure(
                         text=(
@@ -37062,19 +37119,15 @@ class SowMergeApp:
                 if wb_a_ro is None or wb_b_ro is None:
                     _dlog("bg compute read-only workbooks not available; skip background compute")
                     return
-                formula_flags_a = _xlsx_sheet_formula_flags(self._file_a_val_path)
-                formula_flags_b = _xlsx_sheet_formula_flags(self._file_b_val_path)
-                formula_flags_base = (
-                    _xlsx_sheet_formula_flags(self._file_base_val_path)
-                    if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None)
-                    else {}
-                )
                 # Let the ZIP central-directory fingerprint pass classify
                 # unchanged Sheets before the worker commits to a full row
                 # parse.  It is bounded and falls through if the pass fails.
                 while not self._fingerprint_premark_event.wait(timeout=0.05):
                     if self._is_closing:
                         return
+                formula_flags_a = self._screen_formula_flags.get(self._file_a_val_path, {})
+                formula_flags_b = self._screen_formula_flags.get(self._file_b_val_path, {})
+                formula_flags_base = self._screen_formula_flags.get(getattr(self, '_file_base_val_path', ''), {})
 
                 while True:
                     if self._is_closing:
@@ -37094,6 +37147,8 @@ class SowMergeApp:
                         )
                         fingerprint_identical = sheet in self._fingerprint_identical_sheets
                         sheet_has_formulas = (
+                            sheet in self._exact_requested_sheets
+                            or
                             formula_flags_a.get(sheet, True)
                             or formula_flags_b.get(sheet, True)
                             or (
@@ -37125,6 +37180,7 @@ class SowMergeApp:
                             sheet == getattr(self, "_initial_sheet_name", None)
                             and declared_preview_rows >= _PREVIEW_CACHE_ROWS
                             and not self._cache_worker_mode
+                            and sheet not in getattr(self, '_startup_candidates', ())
                             and sheet not in getattr(self, "_exact_requested_sheets", set())
                             and not fingerprint_identical
                         )
@@ -37145,6 +37201,7 @@ class SowMergeApp:
                             quick_cache["generation"] = compute_generation
                             quick_cache["preview_only"] = True
                             quick_cache["fingerprint_equal"] = True
+                            self._pending_sheet_results.add(sheet)
                             _dlog(
                                 f"SHEET_CACHE_FINGERPRINT_EQUAL sheet={sheet} "
                                 f"elapsed_ms={(time.perf_counter() - quick_started) * 1000.0:.1f}"
@@ -37304,6 +37361,7 @@ class SowMergeApp:
                         if self._is_closing:
                             break
                         # Never call tkinter APIs from background threads.
+                        self._pending_sheet_results.add(sheet)
                         _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
                     except InterruptedError:
                         break
@@ -37352,9 +37410,10 @@ class SowMergeApp:
                 wb_b = load_workbook(self._file_b_val_path, data_only=True, read_only=True)
                 if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None):
                     wb_base = load_workbook(self._file_base_val_path, data_only=True, read_only=True)
-                formula_a = _xlsx_sheet_formula_flags(self._file_a_val_path).get(sheet, True)
-                formula_b = _xlsx_sheet_formula_flags(self._file_b_val_path).get(sheet, True)
-                has_formula = bool(formula_a or formula_b)
+                formula_a = self._screen_formula_flags.get(self._file_a_val_path, {}).get(sheet, True)
+                formula_b = self._screen_formula_flags.get(self._file_b_val_path, {}).get(sheet, True)
+                formula_base = self._screen_formula_flags.get(getattr(self, '_file_base_val_path', ''), {}).get(sheet, bool(self.has_base))
+                has_formula = bool(formula_a or formula_b or formula_base or sheet in self._exact_requested_sheets)
                 if has_formula:
                     wb_a_edit = load_workbook(self.file_a, data_only=False, read_only=True)
                     wb_b_edit = load_workbook(self._mine_working_path(), data_only=False, read_only=True)
@@ -37375,6 +37434,7 @@ class SowMergeApp:
                     f"SHEET_CACHE_PARALLEL sheet={sheet} rows={len(cache.get('row_pairs', ())) } "
                     f"elapsed_ms={(time.perf_counter() - started) * 1000.0:.1f}"
                 )
+                self._pending_sheet_results.add(sheet)
                 _queue_ui_task(lambda c=cache: _apply_sheet_cache(c))
             except InterruptedError:
                 pass
@@ -37775,6 +37835,11 @@ class SowMergeApp:
         except Exception:
             pass
 
+        if getattr(self, '_startup_candidates', ()):
+            first_candidate = self._startup_candidates[0]
+            if first_candidate in self._sheet_containers:
+                self.nb.select(self._sheet_containers[first_candidate])
+
         # Main-thread UI task pump (for background compute/sample updates).
         try:
             self._safe_root_after(50, _drain_ui_tasks)
@@ -37817,10 +37882,18 @@ class SowMergeApp:
         def _scan_sheet_fingerprint_marks():
             started = time.monotonic()
             try:
-                fp_a = _xlsx_sheet_part_fingerprints(self._file_a_val_path)
-                fp_b = _xlsx_sheet_part_fingerprints(self._file_b_val_path)
+                def screen(path):
+                    if path in getattr(self, '_startup_screen_results', {}):
+                        return self._startup_screen_results[path]
+                    flags = {}
+                    result = _xlsx_sheet_part_fingerprints(path, formula_flags=flags)
+                    if result:
+                        self._screen_formula_flags[path] = flags
+                    return result
+                fp_a = screen(self._file_a_val_path)
+                fp_b = screen(self._file_b_val_path)
                 fp_base = (
-                    _xlsx_sheet_part_fingerprints(self._file_base_val_path)
+                    screen(self._file_base_val_path)
                     if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None)
                     else {}
                 )
@@ -37842,7 +37915,7 @@ class SowMergeApp:
                         if base_sig is not None:
                             has_probable_diff = a_sig != base_sig or b_sig != base_sig
                         else:
-                            has_probable_diff = a_sig != b_sig
+                            has_probable_diff = True
                     else:
                         has_probable_diff = a_sig != b_sig
                     if has_probable_diff:
@@ -37883,6 +37956,29 @@ class SowMergeApp:
             except Exception as e:
                 _dlog(f"sheet fingerprint premark worker failed: {e}")
             finally:
+                # Screening owns the initial queue: publish candidates before
+                # releasing the worker, without waiting for a clean preview.
+                candidates = [s for s in self.compare_sheets
+                              if s not in self._fingerprint_identical_sheets]
+                with self._compute_lock:
+                    if candidates and not self._sheet_user_interacted:
+                        self._compute_queue[:] = [s for s in self._compute_queue
+                                                  if s not in self._fingerprint_identical_sheets]
+                    for candidate in reversed(candidates):
+                        if candidate in self._compute_queue:
+                            self._compute_queue.remove(candidate)
+                        if candidate not in self._compute_inflight:
+                            self._compute_queue.insert(0, candidate)
+                            self._compute_exact_only_diff_requested.add(candidate)
+                def screened_ready():
+                    model = getattr(self, '_sheet_filter_model', None)
+                    if candidates and model is not None and not self._sheet_user_interacted:
+                        for clean_sheet in self._fingerprint_identical_sheets:
+                            model.publish(clean_sheet, False, count=0, confirmed=True)
+                            self.sheet_diff_state[clean_sheet] = 0
+                        self._select_sheet_for_filter(candidates[0])
+                    _kick_worker()
+                _queue_ui_task(screened_ready, front=True)
                 self._fingerprint_premark_event.set()
 
         def _sheet_has_diff_fast_tail(ws_a, ws_b, max_row: int, max_col: int, min_row: int = 1):
@@ -38099,7 +38195,9 @@ class SowMergeApp:
                 # Sheet has had a short head start.  The worker is still
                 # single-owner and the UI remains usable while it advances
                 # through the remaining Sheets.
-                self._safe_root_after(2500, _enqueue_deferred_sheets)
+                # Candidate work is released by the completed screening event.
+                # Keep this callback only as the existing explicit fallback.
+                pass
         except Exception as e:
             _dlog(f"enqueue all sheets failed: {e}")
         finally:
@@ -38329,12 +38427,17 @@ class SowMergeApp:
             except (AttributeError, tk.TclError):
                 pass
 
-        self.nav_canvas.update_idletasks()
-        self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all"))
-        try:
-            self.nav_canvas.xview_moveto(nav_x)
-        except Exception:
-            pass
+        # Geometry settles on the next Tk turn. A synchronous idle flush here
+        # re-entered every pending Sheet layout while publishing one status.
+        if not getattr(self, '_nav_geometry_pending', False):
+            self._nav_geometry_pending = True
+            def finish_nav_geometry():
+                self._nav_geometry_pending = False
+                if self._is_closing:
+                    return
+                self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox('all'))
+                self.nav_canvas.xview_moveto(nav_x)
+            self._safe_root_after(1, finish_nav_geometry)
     def open_textdiff(self):
         try:
             temp_root = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Temp", "TortoiseXlsTemp")

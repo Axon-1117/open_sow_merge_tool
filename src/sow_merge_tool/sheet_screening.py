@@ -9,7 +9,7 @@ import zipfile
 NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 
 
-def sheet_fingerprints(path: str) -> dict[str, str]:
+def sheet_fingerprints(path: str, *, formula_flags: dict | None = None) -> dict[str, str]:
     """Ignore saved viewport/dimension hints, retain content and dependencies.
 
     Missing or unsupported evidence is never equality. Shared string indices
@@ -24,7 +24,7 @@ def sheet_fingerprints(path: str) -> dict[str, str]:
         targets = {r.get('Id'): r.get('Target', '') for r in relations}
         strings = []
         if 'xl/sharedStrings.xml' in names:
-            strings = [ET.tostring(item, encoding='unicode')
+            strings = [hashlib.sha256(ET.tostring(item)).hexdigest()
                        for item in ET.fromstring(archive.read('xl/sharedStrings.xml'))]
         dependencies = hashlib.sha256()
         for name in sorted(names):
@@ -53,6 +53,8 @@ def sheet_fingerprints(path: str) -> dict[str, str]:
             if not part.startswith('xl/worksheets/'):
                 continue
             root = ET.fromstring(archive.read(part))
+            if formula_flags is not None:
+                formula_flags[sheet.attrib['name']] = next(root.iter(NS + 'f'), None) is not None
             for tag in ('sheetViews', 'dimension'):
                 for child in root.findall(NS + tag):
                     root.remove(child)
