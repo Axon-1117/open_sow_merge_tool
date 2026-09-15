@@ -920,7 +920,10 @@ class BranchSubmitEngine:
     ) -> dict[str, object]:
         local_revision = record.revision if record.revision is not None else expected_revision
         remote_revision = self._remote_revision(record)
-        if remote_revision is None and not self.require_remote_freshness:
+        if phase == 'source' and record.node_status in {'added', 'unversioned'} and local_revision is None:
+            state = 'not_applicable'
+            reason = '新增文件尚无 BASE revision；由新增路径检查和 SVN 提交校验处理'
+        elif remote_revision is None and not self.require_remote_freshness:
             state = "unverified"
             reason = "当前适配器未提供远端 revision（兼容旧测试/离线适配器）"
         elif remote_revision is None:
