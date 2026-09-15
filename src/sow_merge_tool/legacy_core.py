@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update110"
+APP_VERSION = "2026-09-14.update111"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -35336,6 +35336,7 @@ class SowMergeApp:
         self._compute_lock = threading.Lock()
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
+        self._fingerprint_clean_sheets: set[str] = set()
         self._compute_exact_only_diff_requested: set[str] = set()
         self._deferred_exact_sheets: set[str] = set()
         # A force-align request is carried into the background cache builder
@@ -37582,7 +37583,16 @@ class SowMergeApp:
         def _apply_fast_mark_result(sheet: str, has: bool):
             if has:
                 self.set_sheet_has_diff(sheet, True, confirmed=False)
-                self.refresh_sheet_nav()
+
+        def _apply_fast_clean_result(sheet: str):
+            """Confirm a byte-identical worksheet without opening its rows."""
+            with self._compute_lock:
+                self._fingerprint_clean_sheets.add(sheet)
+                try:
+                    self._compute_queue.remove(sheet)
+                except ValueError:
+                    pass
+            self.set_sheet_has_diff(sheet, False, confirmed=True)
 
         def _scan_sheet_fingerprint_marks():
             started = time.monotonic()
@@ -37601,6 +37611,7 @@ class SowMergeApp:
                     )
                     return
                 marked = 0
+                clean = 0
                 for sheet in self.compare_sheets:
                     if self._is_closing:
                         return
@@ -37617,8 +37628,23 @@ class SowMergeApp:
                     if has_probable_diff:
                         marked += 1
                         _queue_ui_task(lambda s=sheet: _apply_fast_mark_result(s, True))
+                    elif a_sig is not None and b_sig is not None:
+                        # The selected Sheet still needs a cache to render its
+                        # grid.  Only remove clean unopened Sheets from the
+                        # exact queue; the active Sheet continues through the
+                        # normal preview/full path.
+                        if sheet != getattr(self, "_initial_sheet_name", None):
+                            clean += 1
+                            with self._compute_lock:
+                                self._fingerprint_clean_sheets.add(sheet)
+                                try:
+                                    self._compute_queue.remove(sheet)
+                                except ValueError:
+                                    pass
+                            _queue_ui_task(lambda s=sheet: _apply_fast_clean_result(s))
+                _queue_ui_task(self.refresh_sheet_nav, front=True)
                 _dlog(
-                    f"sheet fingerprint premark done: marked={marked}/{len(self.compare_sheets)} "
+                    f"sheet fingerprint premark done: marked={marked} clean={clean}/{len(self.compare_sheets)} "
                     f"elapsed={time.monotonic() - started:.3f}s"
                 )
             except Exception as e:
