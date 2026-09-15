@@ -60,7 +60,7 @@ from .ui_foundation import (
 )
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-09-14.update111"
+APP_VERSION = "2026-09-14.update112"
 APP_BUILD_TAG = "commercial-compare-workspace"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
@@ -7463,6 +7463,39 @@ def _xlsx_sheet_part_fingerprints(path: str) -> dict[str, tuple[int, int]]:
     except Exception as e:
         _dlog(f"sheet fingerprint premark failed: path={path} err={e}")
     return fingerprints
+
+
+def _xlsx_sheet_formula_flags(path: str) -> dict[str, bool]:
+    """Return per-Sheet formula presence without loading a workbook model."""
+    flags: dict[str, bool] = {}
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            workbook_root = ET.fromstring(zf.read("xl/workbook.xml"))
+            rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            rel_targets = {
+                str(rel.attrib.get("Id") or ""): str(rel.attrib.get("Target") or "")
+                for rel in rels_root.iter()
+                if rel.tag.rsplit("}", 1)[-1] == "Relationship"
+            }
+            rel_id_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            for sheet_node in workbook_root.iter():
+                if sheet_node.tag.rsplit("}", 1)[-1] != "sheet":
+                    continue
+                name = str(sheet_node.attrib.get("name") or "")
+                rel_id = str(sheet_node.attrib.get(rel_id_attr) or "")
+                if not rel_id:
+                    rel_id = str(next(
+                        (value for key, value in sheet_node.attrib.items()
+                         if key == "id" or key.rsplit("}", 1)[-1] == "id"),
+                        "",
+                    ))
+                target = rel_targets.get(rel_id, "").replace("\\", "/")
+                part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+                if name and part in zf.namelist():
+                    flags[name] = bool(re.search(rb"<(?:[A-Za-z_][\w.-]*:)?f(?:\s|>)", zf.read(part)))
+    except Exception as exc:
+        _dlog(f"sheet formula flags failed: path={path} err={exc}")
+    return flags
 
 
 def _xlsx_requires_native_structural_replay(path: str) -> bool:
@@ -35337,6 +35370,7 @@ class SowMergeApp:
         self._compute_queue = []  # list of sheet names
         self._compute_inflight = set()
         self._fingerprint_clean_sheets: set[str] = set()
+        self._fingerprint_identical_sheets: set[str] = set()
         self._compute_exact_only_diff_requested: set[str] = set()
         self._deferred_exact_sheets: set[str] = set()
         # A force-align request is carried into the background cache builder
@@ -35507,6 +35541,22 @@ class SowMergeApp:
             # treated as empty so formulas returning "" do not expand the bounds.
             # Keep max_c on read-only fallback paths so earlier wide rows are preserved.
             max_r, max_c = _worksheet_scan_bounds(ws)
+            if isinstance(row_cache, dict):
+                cached_rows = row_cache.get(id(ws))
+                if isinstance(cached_rows, (list, tuple)) and len(cached_rows) >= max_r:
+                    last_r = 1
+                    last_c = 1
+                    found = False
+                    for row_idx, row in enumerate(cached_rows[:max_r], start=1):
+                        row_last_col = 0
+                        for col_idx, value in enumerate(row or (), start=1):
+                            if value not in (None, ""):
+                                row_last_col = col_idx
+                        if row_last_col:
+                            found = True
+                            last_r = row_idx
+                            last_c = max(last_c, row_last_col)
+                    return (max(1, last_r), max(1, max_c if _USE_CACHED_VALUES_ONLY and max_c > last_c else last_c)) if found else (1, max(1, max_c))
             last_r = 1
             last_c = 1
             found = False
@@ -36977,6 +37027,13 @@ class SowMergeApp:
                 if wb_a_ro is None or wb_b_ro is None:
                     _dlog("bg compute read-only workbooks not available; skip background compute")
                     return
+                formula_flags_a = _xlsx_sheet_formula_flags(self._file_a_val_path)
+                formula_flags_b = _xlsx_sheet_formula_flags(self._file_b_val_path)
+                formula_flags_base = (
+                    _xlsx_sheet_formula_flags(self._file_base_val_path)
+                    if getattr(self, "has_base", False) and getattr(self, "_file_base_val_path", None)
+                    else {}
+                )
 
                 while True:
                     if self._is_closing:
@@ -36993,6 +37050,15 @@ class SowMergeApp:
                         self._compute_force_align_requested.discard(sheet)
                         compute_generation = int(
                             self._sheet_compute_generation.get(sheet, 0)
+                        )
+                        fingerprint_identical = sheet in self._fingerprint_identical_sheets
+                        sheet_has_formulas = (
+                            formula_flags_a.get(sheet, True)
+                            or formula_flags_b.get(sheet, True)
+                            or (
+                                getattr(self, "has_base", False)
+                                and formula_flags_base.get(sheet, True)
+                            )
                         )
                         self._compute_inflight.add(sheet)
                         progress_current = min(self._compute_done + 1, self._compute_total)
@@ -37019,6 +37085,7 @@ class SowMergeApp:
                             and declared_preview_rows >= _PREVIEW_CACHE_ROWS
                             and not self._cache_worker_mode
                             and sheet not in getattr(self, "_exact_requested_sheets", set())
+                            and not fingerprint_identical
                         )
                         if preview_first_sheet:
                             preview_started = time.perf_counter()
@@ -37095,7 +37162,18 @@ class SowMergeApp:
                                 handoff_to_process = True
                                 _queue_ui_task(lambda: _kick_worker(), front=True)
                                 return
-                        if wb_a_e is None or wb_b_e is None:
+                        if fingerprint_identical:
+                            compute_wb_b_val = wb_a_ro
+                            sheet_wb_a_e = wb_a_ro
+                            sheet_wb_b_e = wb_a_ro
+                            sheet_wb_base_e = wb_a_ro if getattr(self, "has_base", False) else None
+                            sheet_has_formulas = False
+                        else:
+                            compute_wb_b_val = wb_b_ro
+                            sheet_wb_a_e = wb_a_e if sheet_has_formulas else wb_a_ro
+                            sheet_wb_b_e = wb_b_e if sheet_has_formulas else wb_b_ro
+                            sheet_wb_base_e = wb_base_e if sheet_has_formulas else wb_base_ro
+                        if not fingerprint_identical and sheet_has_formulas and (wb_a_e is None or wb_b_e is None):
                             edit_open_started = time.perf_counter()
                             wb_a_e = load_workbook(
                                 self.file_a, data_only=False, read_only=True
@@ -37116,15 +37194,18 @@ class SowMergeApp:
                             _dlog(
                                 f"BG_EDIT_READONLY_OPEN elapsed_ms={(time.perf_counter() - edit_open_started) * 1000.0:.1f}"
                             )
+                            sheet_wb_a_e = wb_a_e
+                            sheet_wb_b_e = wb_b_e
+                            sheet_wb_base_e = wb_base_e
                         full_started = time.perf_counter()
                         cache = _compute_sheet_cache(
                             wb_a_ro,
-                            wb_b_ro,
-                            wb_a_e,
-                            wb_b_e,
+                            compute_wb_b_val,
+                            sheet_wb_a_e,
+                            sheet_wb_b_e,
                             sheet,
                             wb_base_ro,
-                            wb_base_e,
+                            sheet_wb_base_e,
                             need_exact_only_diff=need_exact_only_diff,
                             force_sequence_align=force_sequence_align,
                         )
@@ -37585,13 +37666,7 @@ class SowMergeApp:
                 self.set_sheet_has_diff(sheet, True, confirmed=False)
 
         def _apply_fast_clean_result(sheet: str):
-            """Confirm a byte-identical worksheet without opening its rows."""
-            with self._compute_lock:
-                self._fingerprint_clean_sheets.add(sheet)
-                try:
-                    self._compute_queue.remove(sheet)
-                except ValueError:
-                    pass
+            """Compatibility callback; clean state is published in the worker."""
             self.set_sheet_has_diff(sheet, False, confirmed=True)
 
         def _scan_sheet_fingerprint_marks():
@@ -37633,6 +37708,7 @@ class SowMergeApp:
                         # grid.  Only remove clean unopened Sheets from the
                         # exact queue; the active Sheet continues through the
                         # normal preview/full path.
+                        self._fingerprint_identical_sheets.add(sheet)
                         if sheet != getattr(self, "_initial_sheet_name", None):
                             clean += 1
                             with self._compute_lock:
@@ -37641,7 +37717,19 @@ class SowMergeApp:
                                     self._compute_queue.remove(sheet)
                                 except ValueError:
                                     pass
-                            _queue_ui_task(lambda s=sheet: _apply_fast_clean_result(s))
+                            model = getattr(self, "_sheet_filter_model", None)
+                            if model is not None:
+                                model.publish(
+                                    sheet,
+                                    False,
+                                    count=0,
+                                    confirmed=True,
+                                )
+                            confirmed_sheets = getattr(self, "_sheet_diff_confirmed", None)
+                            if confirmed_sheets is not None:
+                                confirmed_sheets.add(sheet)
+                            if sheet in self.sheet_diff_state:
+                                self.sheet_diff_state[sheet] = 0
                 _queue_ui_task(self.refresh_sheet_nav, front=True)
                 _dlog(
                     f"sheet fingerprint premark done: marked={marked} clean={clean}/{len(self.compare_sheets)} "
@@ -37850,6 +37938,8 @@ class SowMergeApp:
                     self._safe_root_after(500, _enqueue_deferred_sheets)
                     return
                 for sheet_name in deferred_sheets:
+                    if sheet_name in self._fingerprint_clean_sheets:
+                        continue
                     _enqueue_sheet(sheet_name, front=False)
                 _kick_worker()
 
