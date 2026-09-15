@@ -473,7 +473,10 @@ def query_tortoise_status_in_child(path: str, *, remote: bool = False) -> list[S
 def internal_status_entrypoint(argv: list[str]) -> int:
     if len(argv) not in {2, 3}:
         return 2
-    path, output_path = argv
+    # The optional third argument is the remote/show-updates mode flag.  Do
+    # not unpack the complete argv into two variables: preflight always uses
+    # this mode for target freshness checks.
+    path, output_path = argv[:2]
     remote = len(argv) == 3 and argv[2] in {"--remote", "--show-updates"}
     payload: dict
     try:
