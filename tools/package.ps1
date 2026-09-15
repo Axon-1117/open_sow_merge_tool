@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = '',
-  [string]$Version = '2026-09-14.update106'
+  [string]$Version = '2026-09-14.update107'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +15,22 @@ $release = Join-Path $repo "artifacts\release\$slug"
 if (Test-Path -LiteralPath $release) { Remove-Item -LiteralPath $release -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $release | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $release 'sow_merge_tool.exe')
+$runtimeCandidates = @(Get-ChildItem -LiteralPath (Join-Path $repo '.local\tools') -Directory -Filter 'SlikSVN-*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+$runtimeBin = if ($runtimeCandidates.Count -gt 0) {
+  Join-Path $runtimeCandidates[0].FullName 'portable\PFiles\bin'
+} else { '' }
+$runtimeFiles = @()
+if ($runtimeBin -and (Test-Path -LiteralPath $runtimeBin)) {
+  $runtimeFiles = @(Get-ChildItem -LiteralPath $runtimeBin -File | Where-Object {
+    $_.Name -eq 'svn.exe' -or $_.Extension -ieq '.dll'
+  })
+  if ($runtimeFiles.Count -eq 0) { throw "Bundled SVN runtime is empty: $runtimeBin" }
+  $runtimeRelease = Join-Path $release 'svn_runtime'
+  New-Item -ItemType Directory -Force -Path $runtimeRelease | Out-Null
+  foreach ($runtimeFile in $runtimeFiles) {
+    Copy-Item -LiteralPath $runtimeFile.FullName -Destination (Join-Path $runtimeRelease $runtimeFile.Name)
+  }
+}
 $releaseFiles = @()
 # Resolve owned documentation/scripts by extension and size so this remains
 # reliable under legacy Windows PowerShell code pages.
@@ -29,13 +45,19 @@ if (Test-Path -LiteralPath $usageGuide) {
 foreach ($file in $releaseFiles) {
   Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $release $file.Name)
 }
+$hashLines = @()
+foreach ($file in @(Get-ChildItem -LiteralPath $release -File -Recurse | Sort-Object FullName)) {
+  $relative = [IO.Path]::GetRelativePath($release, $file.FullName).Replace('\','/')
+  $fileHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+  $hashLines += "$fileHash  $relative"
+}
 $hash = (Get-FileHash -LiteralPath (Join-Path $release 'sow_merge_tool.exe') -Algorithm SHA256).Hash
-Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Value "$hash  sow_merge_tool.exe" -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Value $hashLines -Encoding ASCII
 $manifest = [ordered]@{
   version = $Version
   package = "sow_merge_tool_$slug.zip"
   directory = $slug
-  files = @('sow_merge_tool.exe') + @($releaseFiles.Name) + @('SHA256SUMS.txt')
+  files = @('sow_merge_tool.exe') + @($releaseFiles.Name) + @('svn_runtime/*') + @('SHA256SUMS.txt')
   sha256 = $hash
   generatedAt = (Get-Date).ToUniversalTime().ToString('o')
 }

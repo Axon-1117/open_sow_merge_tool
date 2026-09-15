@@ -110,6 +110,21 @@ def _find_svn_cli() -> str | None:
         candidate = os.path.join(root, "TortoiseSVN", "bin", "svn.exe")
         if os.path.isfile(candidate):
             return candidate
+    # TortoiseSVN installations may omit the command-line client.  The
+    # release package carries a private, version-pinned CLI fallback so remote
+    # status can reuse the user's Subversion auth cache without relying on the
+    # TortoiseSVN DLL ABI.
+    executable_root = Path(sys.executable).resolve().parent
+    bundled = executable_root / "svn_runtime" / "svn.exe"
+    if bundled.is_file():
+        return str(bundled)
+    if not getattr(sys, "frozen", False):
+        repo_root = Path(__file__).resolve().parents[2]
+        tools_root = repo_root / ".local" / "tools"
+        for runtime_root in sorted(tools_root.glob("SlikSVN-*") if tools_root.is_dir() else ()):
+            candidate = runtime_root / "portable" / "PFiles" / "bin" / "svn.exe"
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 
@@ -265,6 +280,18 @@ class _SvnOptRevision(ctypes.Structure):
     _fields_ = [("kind", ctypes.c_int), ("value", _SvnOptRevisionValue)]
 
 
+class _SvnError(ctypes.Structure):
+    """Leading fields of Subversion's ``svn_error_t`` for diagnostics."""
+
+    _fields_ = [
+        ("apr_err", ctypes.c_long),
+        ("message", ctypes.c_char_p),
+        ("child", ctypes.c_void_p),
+        ("file", ctypes.c_char_p),
+        ("line", ctypes.c_long),
+    ]
+
+
 class _SvnClientStatus(ctypes.Structure):
     # Subversion 1.14 svn_client_status_t through moved_to_abspath.  The object
     # is allocated by libsvn, so forward-compatible tail fields are harmless.
@@ -311,16 +338,31 @@ def _native_error(svn, pointer, operation: str) -> None:
     if not pointer:
         return
     message = ""
+    apr_code = None
     try:
         svn.svn_err_best_message.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         svn.svn_err_best_message.restype = ctypes.c_char_p
         buffer = ctypes.create_string_buffer(2048)
         svn.svn_err_best_message(pointer, buffer, len(buffer))
         message = buffer.value.decode("utf-8", errors="replace")
+        try:
+            error = ctypes.cast(pointer, ctypes.POINTER(_SvnError)).contents
+            apr_code = int(error.apr_err)
+            if not message and error.message:
+                message = _decode(error.message)
+            if not message and apr_code is not None and hasattr(svn, "svn_strerror"):
+                svn.svn_strerror.argtypes = [ctypes.c_long, ctypes.c_char_p, ctypes.c_size_t]
+                svn.svn_strerror.restype = ctypes.c_char_p
+                fallback = ctypes.create_string_buffer(2048)
+                svn.svn_strerror(apr_code, fallback, len(fallback))
+                message = _decode(fallback.value)
+        except (AttributeError, ctypes.ArgumentError, ValueError, TypeError):
+            pass
         svn.svn_error_clear.argtypes = [ctypes.c_void_p]
         svn.svn_error_clear(pointer)
     finally:
-        raise SvnStatusError(f"{operation}：{message or 'native SVN error'}")
+        suffix = f"（apr_err={apr_code}）" if apr_code is not None else ""
+        raise SvnStatusError(f"{operation}：{message or 'native SVN error'}{suffix}")
 
 
 def query_tortoise_status_in_child(path: str, *, remote: bool = False) -> list[SvnStatusRecord]:
@@ -351,10 +393,21 @@ def query_tortoise_status_in_child(path: str, *, remote: bool = False) -> list[S
             svn.svn_wc_initialize.argtypes = [ctypes.c_void_p]
             svn.svn_wc_initialize.restype = ctypes.c_void_p
             _native_error(svn, svn.svn_wc_initialize(pool), "SVN 工作副本初始化失败")
+        config = ctypes.c_void_p()
+        if hasattr(svn, "svn_config_get_config"):
+            svn.svn_config_get_config.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_void_p
+            ]
+            svn.svn_config_get_config.restype = ctypes.c_void_p
+            _native_error(
+                svn,
+                svn.svn_config_get_config(ctypes.byref(config), None, pool),
+                "SVN 配置初始化失败",
+            )
         context = ctypes.c_void_p()
         svn.svn_client_create_context2.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p]
         svn.svn_client_create_context2.restype = ctypes.c_void_p
-        _native_error(svn, svn.svn_client_create_context2(ctypes.byref(context), None, pool), "SVN 客户端初始化失败")
+        _native_error(svn, svn.svn_client_create_context2(ctypes.byref(context), config, pool), "SVN 客户端初始化失败")
 
         records: list[SvnStatusRecord] = []
         # Subversion callbacks use the C calling convention.  On Win64 the

@@ -27,6 +27,7 @@ if ($running) { throw 'sow_merge_tool.exe is running; close it before deployment
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 $managedNames = @(
   'sow_merge_tool.exe', '安装.bat', '卸载.bat', '使用说明.md', 'SHA256SUMS.txt',
+  'svn_runtime',
   'install_context_menu.bat', 'uninstall_context_menu.bat', 'register_tortoisesvn_sow_tool.bat',
   'install.bat', 'uninstall.bat', 'register_tortoisesvn_excel_merge_tool.bat',
   'restore_tortoisesvn_config_latest.bat', 'README.md', '使用说明.txt',
@@ -50,6 +51,10 @@ foreach ($name in @('sow_merge_tool.exe','安装.bat','卸载.bat','使用说明
   $item = Join-Path $source $name
   if (-not (Test-Path -LiteralPath $item)) { throw "Package file missing: $item" }
   Copy-Item -LiteralPath $item -Destination (Join-Path $target $name) -Force
+}
+$runtimeSource = Join-Path $source 'svn_runtime'
+if (Test-Path -LiteralPath $runtimeSource) {
+  Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $target 'svn_runtime') -Recurse -Force
 }
 
 $installedExe = Join-Path $target 'sow_merge_tool.exe'
