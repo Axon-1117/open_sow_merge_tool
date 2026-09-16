@@ -1,4 +1,4 @@
-"""Exercise Excel COM structural replay with an explicit blank cell operation."""
+"""Exercise Excel COM replay with blank and explicitly typed cell operations."""
 
 import os
 
@@ -34,6 +34,10 @@ def main():
         output,
         {
             ("S1", 2, 2): None,
+            # Windows PowerShell 5 parses JSON integers as System.Int64, which
+            # Excel Range.Value2 rejects unless the replay script casts it.
+            ("S1", 2, 3): 2_147_483_648,
+            ("S1", 2, 4): False,
         },
         row_ops=[{
             "kind": "insert_rows",
@@ -46,19 +50,19 @@ def main():
         source_paths={"B": theirs},
     )
     if not ok:
-        print("SMOKE_EXCEL_COM_BLANK_CELL_SKIPPED (Excel COM unavailable)")
+        print("SMOKE_EXCEL_COM_TYPED_CELL_SKIPPED (Excel COM unavailable)")
         return
 
     wb = load_workbook(output, data_only=False)
     ws = wb["S1"]
     assert ws["A2"].value == "inserted", ws["A2"].value
     assert ws["B2"].value is None, ws["B2"].value
-    assert ws["C2"].value == 9, ws["C2"].value
-    assert ws["D2"].value is True, ws["D2"].value
+    assert ws["C2"].value == 2_147_483_648, ws["C2"].value
+    assert ws["D2"].value is False, ws["D2"].value
     assert ws["E2"].value == "source-text", ws["E2"].value
     assert ws["A3"].value == "original", ws["A3"].value
     wb.close()
-    print("SMOKE_EXCEL_COM_BLANK_CELL_OK")
+    print("SMOKE_EXCEL_COM_TYPED_CELL_OK")
 
 
 if __name__ == "__main__":

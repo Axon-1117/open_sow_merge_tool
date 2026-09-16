@@ -622,6 +622,42 @@ def _route_hthumb(app, view, pane, fraction, generation, deadline):
     )
 
 
+def _wide_main_local_xviews(view):
+    widgets = {
+        "left": view.left,
+        "base": view.base,
+        "right": view.right,
+        "left_header": view.left_colhdr,
+        "base_header": view.base_colhdr,
+        "right_header": view.right_colhdr,
+    }
+    return {
+        name: float((widget.xview() or (0.0, 1.0))[0])
+        for name, widget in widgets.items()
+    }
+
+
+def _assert_wide_main_local_xviews_zero(view, label):
+    state = _wide_main_local_xviews(view)
+    assert all(
+        math.isfinite(value) and abs(value) <= 1e-6
+        for value in state.values()
+    ), (label, state)
+    return state
+
+
+def _seed_wide_main_local_xview(app, view, fraction=0.36):
+    for widget in (
+        view.left, view.base, view.right,
+        view.left_colhdr, view.base_colhdr, view.right_colhdr,
+    ):
+        widget.xview_moveto(float(fraction))
+    _pump(app.root)
+    state = _wide_main_local_xviews(view)
+    assert any(value > 0.05 for value in state.values()), state
+    return state
+
+
 def _route_vminimap_tail(app, view, generation, deadline):
     canvas, y = _wide_vdiff_event(view)
     return _route(app, view, "vminimap", lambda: canvas.event_generate("<Button-1>", x=1, y=y), generation, deadline)
@@ -652,6 +688,12 @@ def _run_wide_3way():
     deadline = time.monotonic() + _CASE_TIMEOUT
     original_settings = os.fspath(sm._SETTINGS_PATH)
     original_state = _setting(original_settings)
+    original_auto_preload = sm.SowMergeApp._request_edit_preload_for_exact_view
+    # This case proves that public wide-viewport navigation stays immutable
+    # and never demands editable workbooks. Production now warms those books
+    # automatically after the first exact surface, so suppress only that
+    # unrelated owner for the duration of this test and restore it below.
+    sm.SowMergeApp._request_edit_preload_for_exact_view = lambda _app, _view: False
     app = None
     root = None
     primary = None
@@ -710,9 +752,46 @@ def _run_wide_3way():
                             assert record.get("kind") == "complete" and record.get("counted") and record.get("surface_changed"), record
                             changed.append(record)
                             _pump(app.root)
+                            _assert_wide_main_local_xviews_zero(view, f"hminimap-{cycle}-{label}")
                             _same(hard, _wide_hard(app, view, inputs), f"hminimap-{cycle}-{label}")
                             _assert_inputs(inputs, before_inputs)
                             assert tuple(app._edit_load_requests) == request_baseline and not app._edit_workbooks_ready()
+                    # Reproduce the field report exactly: the logical window is
+                    # already zero while A/Base/B retain a non-zero local Tk
+                    # xview. A same-position scrollbar command must heal it
+                    # without requiring a restart or redundant publication.
+                    seeded_noop = _seed_wide_main_local_xview(app, view)
+                    noop = _route_hthumb(app, view, "left", 0.00, generation, deadline)
+                    noop["position"] = "left-thumb-zero-local-xview-recovery"
+                    routes.append(noop)
+                    assert noop.get("kind") == "complete" and not noop.get("counted"), noop
+                    assert int(view._virtual_column_window_start) == 0
+                    reset_noop = _assert_wide_main_local_xviews_zero(view, "same-position recovery")
+                    print(
+                        "WIDE_LOCAL_XVIEW_NOOP_RESET="
+                        + json.dumps({"before": seeded_noop, "after": reset_noop}, sort_keys=True),
+                        flush=True,
+                    )
+                    # A real far-right -> far-left publication must also clear
+                    # local drift carried by the previous bounded document.
+                    seeded_publish = _seed_wide_main_local_xview(app, view)
+                    for label, fraction in (
+                        ("last-local-xview-recovery", 1.00),
+                        ("first-local-xview-recovery", 0.00),
+                    ):
+                        record = _route_hminimap(app, view, fraction, generation, deadline)
+                        record["position"] = label
+                        routes.append(record)
+                        assert record.get("kind") == "complete" and record.get("counted") and record.get("surface_changed"), record
+                        changed.append(record)
+                        _pump(app.root)
+                        _assert_wide_main_local_xviews_zero(view, label)
+                    print(
+                        "WIDE_LOCAL_XVIEW_PUBLISH_RESET="
+                        + json.dumps({"before": seeded_publish, "after": _wide_main_local_xviews(view)}, sort_keys=True),
+                        flush=True,
+                    )
+                    _same(hard, _wide_hard(app, view, inputs), "wide local xview recovery")
                     # Invoke each actual bottom main-pane scrollbar in three-way mode.
                     # The scrollbar leading-edge fraction is start / total; it
                     # must round-trip to the same logical window start.
@@ -886,6 +965,7 @@ def _run_wide_3way():
                         raise AssertionError(text)
     finally:
         sm._SETTINGS_PATH = original_settings
+        sm.SowMergeApp._request_edit_preload_for_exact_view = original_auto_preload
         active = primary if primary is not None else sys.exc_info()[1]
         def outer_check(label, callback):
             try:

@@ -50,8 +50,8 @@ from openpyxl.utils.datetime import CALENDAR_MAC_1904, CALENDAR_WINDOWS_1900, to
 
 
 APP_NAME = "sow_merge_tool"
-APP_VERSION = "2026-08-31.update92"
-APP_BUILD_TAG = "new169-wide-hscroll-threeway-sync"
+APP_VERSION = "2026-09-16.update95"
+APP_BUILD_TAG = "new172-premerge-formula-cache-save-guard"
 _SUPPORTED_WORKBOOK_EXTS = (".xlsx", ".xlsm")
 
 # Debug logging (writes to %TEMP%\sow_merge_tool_debug.log)
@@ -12835,6 +12835,28 @@ def _excel_com_cell_op(sheet: str, row: int, col: int, value) -> dict:
         value = seconds / 86400.0
     elif isinstance(value, timedelta):
         value = value.total_seconds() / 86400.0
+    # Windows PowerShell 5's Excel COM adapter caches the first Range.Value2
+    # setter type used at one loop call site. A later heterogeneous value (for
+    # example Boolean after Double) then raises InvalidCastException instead of
+    # changing the VARIANT type. ConvertFrom-Json also materializes JSON integer
+    # values as Int64. Classify and canonicalize scalars here; the COM script
+    # uses reflection below to bypass that unsafe setter cache.
+    if isinstance(value, bool):
+        return {
+            "sheet": sheet,
+            "r": int(row),
+            "c": int(col),
+            "value": bool(value),
+            "value_kind": "boolean",
+        }
+    if isinstance(value, (int, float)):
+        return {
+            "sheet": sheet,
+            "r": int(row),
+            "c": int(col),
+            "value": float(value),
+            "value_kind": "number",
+        }
     return {
         "sheet": sheet,
         "r": int(row),
@@ -13144,6 +13166,9 @@ def _build_manual_merge_output_with_excel(
             # mojibake before Excel receives them.  Read the bytes explicitly.
             "$payload=ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($opsPath,[System.Text.Encoding]::UTF8));"
             "$xl=$null;$wb=$null;$wbMine=$null;$wbBase=$null;$wbTheirs=$null;$wbCheck=$null;"
+            "function Set-ExcelCellValue2($target,[object]$value){"
+            "  [void]$target.GetType().InvokeMember('Value2',[System.Reflection.BindingFlags]::SetProperty,$null,$target,[object[]]@($value))"
+            "};"
             "try{"
             "$xl=New-Object -ComObject Excel.Application;"
             "$xl.Visible=$false;"
@@ -13273,14 +13298,20 @@ def _build_manual_merge_output_with_excel(
             "  if($null -ne $op.formula){$cell.Formula=$op.formula}"
             "  elseif($op.value_kind -eq 'blank'){$cell.ClearContents()}"
             "  elseif($op.value_kind -eq 'datetime_serial'){"
-            "    $serial=[double]$op.value;if($wb.Date1904){$serial-=1462};$cell.Value2=$serial"
+            "    $serial=[double]$op.value;if($wb.Date1904){$serial-=1462};Set-ExcelCellValue2 $cell $serial"
             "  }"
             "  elseif($op.value_kind -eq 'text'){"
             "    if($cell.NumberFormat -eq 'General'){$cell.NumberFormat='@'};"
             "    $textValue=[string]$op.value;"
             "    $cell.Value=$textValue"
             "  }"
-            "  else{$cell.Value2=$op.value}"
+            "  elseif($op.value_kind -eq 'number'){"
+            "    $numberValue=[double]$op.value;Set-ExcelCellValue2 $cell $numberValue"
+            "  }"
+            "  elseif($op.value_kind -eq 'boolean'){"
+            "    $booleanValue=[bool]$op.value;Set-ExcelCellValue2 $cell $booleanValue"
+            "  }"
+            "  else{throw ('unsupported cell value kind: '+$op.value_kind)}"
             "};"
             "$wb.SaveCopyAs($out);"
             "if($wb -ne $null){$wb.Close($false);[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($wb);$wb=$null};"
@@ -17215,6 +17246,79 @@ def _cross_branch_source_delta_premerge(
                     pass
 
 
+def _validate_formula_caches_for_save(path: str) -> None:
+    """Check every formula before publishing; empty string results are valid."""
+    if not _workbook_package_ready(path):
+        raise RuntimeError(f"保存候选文件完整性校验失败：{path}")
+    missing = []
+    count = 0
+    with zipfile.ZipFile(path) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    sheets = _ooxml_sheet_part_map(payloads)
+    if not sheets:
+        raise RuntimeError("无法读取保存候选文件的 Sheet 映射；已停止覆盖。")
+    q = lambda name: f"{{{_OOXML_MAIN_NS}}}{name}"
+    for sheet, part in sheets.items():
+        for cell in ET.fromstring(payloads[part]).iter(q("c")):
+            if cell.find(q("f")) is None:
+                continue
+            value = cell.find(q("v"))
+            if value is None or (value.text is None and cell.get("t") != "str"):
+                count += 1
+                if len(missing) < 8:
+                    missing.append(f"{sheet}!{cell.get('r', '?')}")
+    if count:
+        raise RuntimeError(
+            f"保存已停止：{count} 个公式缺少计算结果缓存，目标文件未被替换。"
+            f"\n涉及：{', '.join(missing)}"
+            "\n请先补全公式计算结果后重试。"
+        )
+
+
+def _restore_premerge_formula_caches(path, mine_path, theirs_path, added_sheets, origins):
+    """Restore raw cache types/results after serializing newly copied sheets."""
+    q = lambda name: f"{{{_OOXML_MAIN_NS}}}{name}"
+    donors = {}
+    for side, source in (("mine", mine_path), ("theirs", theirs_path)):
+        with zipfile.ZipFile(source) as archive:
+            payloads = {name: archive.read(name) for name in archive.namelist()}
+        for sheet, part in _ooxml_sheet_part_map(payloads).items():
+            for cell in ET.fromstring(payloads[part]).iter(q("c")):
+                if cell.find(q("f")) is not None:
+                    donors[(side, sheet, cell.get("r"))] = cell
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        payloads = {info.filename: archive.read(info.filename) for info in infos}
+    for sheet, part in _ooxml_sheet_part_map(payloads).items():
+        _register_xml_namespaces(_extract_ns_map(payloads[part]))
+        root = ET.fromstring(payloads[part])
+        changed = False
+        for cell in root.iter(q("c")):
+            if cell.find(q("f")) is None:
+                continue
+            coord = cell.get("r")
+            side, source_coord = origins.get(
+                (sheet, coord), ("theirs" if sheet in added_sheets else "mine", coord)
+            )
+            donor = donors.get((side, sheet, source_coord))
+            if donor is None:
+                raise RuntimeError(f"无法确定预合并公式缓存来源：{sheet}!{coord}")
+            for value in list(cell.findall(q("v"))):
+                cell.remove(value)
+            cell.attrib.pop("t", None)
+            if donor.get("t") is not None:
+                cell.set("t", donor.get("t"))
+            value = donor.find(q("v"))
+            if value is not None:
+                cell.append(copy.deepcopy(value))
+            changed = True
+        if changed:
+            payloads[part] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for info in infos:
+            archive.writestr(info, payloads[info.filename])
+
+
 def _merge_three_way(
     base_path: str,
     mine_path: str,
@@ -17296,6 +17400,9 @@ def _merge_three_way(
 
     # Start merged as mine (copy in-memory by reusing workbook; then save to merged_path)
     wb_merged = wb_mine
+    premerge_ops = {}
+    premerge_cached_values = {}
+    premerge_origins = {}
 
     set_base = set(wb_base_val.sheetnames)
     set_mine = set(wb_mine_val.sheetnames)
@@ -17533,6 +17640,11 @@ def _merge_three_way(
                                 ws_m_edit.cell(row=ra, column=c),
                                 _new_edit_v,
                             )
+                            premerge_ops[(name, ra, c)] = _new_edit_v
+                            premerge_cached_values[(name, ra, c)] = ws_t.cell(row=rb, column=c).value
+                            premerge_origins[(name, f"{get_column_letter(c)}{ra}")] = (
+                                "theirs", f"{get_column_letter(c)}{rb}"
+                            )
                             auto_merged_count += 1
                     continue
 
@@ -17557,6 +17669,24 @@ def _merge_three_way(
                         conflict_cells_by_sheet.setdefault(name, {}).setdefault(conflict_row, set()).add(1)
                         unresolved_structural_count += 1
 
+    def _write_premerge_candidate(path):
+        if only_theirs:
+            # Sheet creation still needs serialization. Restore every formula's
+            # raw cached value from its selected source, including blank strings.
+            _atomic_save_wb(wb_merged, path)
+            _restore_premerge_formula_caches(
+                path, mine_path, theirs_path, set(only_theirs), premerge_origins
+            )
+        elif premerge_ops:
+            _build_manual_merge_xlsx_via_zip(
+                mine_path, path, premerge_ops, cached_values=premerge_cached_values
+            )
+            _restore_premerge_formula_caches(
+                path, mine_path, theirs_path, set(), premerge_origins
+            )
+        else:
+            shutil.copy2(mine_path, path)
+
     _merge_result = None
     try:
         # Always save a preview for UI if needed
@@ -17568,7 +17698,7 @@ def _merge_three_way(
             )
             os.close(fd)
             try:
-                _atomic_save_wb(wb_merged, preview)
+                _write_premerge_candidate(preview)
             except Exception:
                 _readonly_safe_unlink(preview)
                 raise
@@ -17576,7 +17706,14 @@ def _merge_three_way(
             _merge_result = (conflicts, preview, conflict_cells_by_sheet)
         else:
             # No conflicts: save directly to merged path
-            _atomic_save_wb(wb_merged, merged_path)
+            fd, candidate = tempfile.mkstemp(suffix=_workbook_ext(merged_path), dir=os.path.dirname(os.path.abspath(merged_path)))
+            os.close(fd)
+            try:
+                _write_premerge_candidate(candidate)
+                _validate_formula_caches_for_save(candidate)
+                os.replace(candidate, merged_path)
+            finally:
+                _readonly_safe_unlink(candidate)
             _merge_result = ([], None, {})
     finally:
         _wbs_close(wb_base_val, wb_mine_val, wb_theirs_val, wb_mine, wb_base_edit, wb_theirs_edit)
@@ -20508,7 +20645,14 @@ class SheetView:
         _dlog(f"click_trace {stage} x(left={lx:.6f},right={rx:.6f},c={cx:.6f}) insert(left={li},right={ri})")
 
     def _post_click_x_guard(self, saved_x: float, stage: str):
+        local_xview_reset = False
         if self._wide_column_virtual_active():
+            # The logical start deliberately ignores the bounded Text xview,
+            # so inspect and repair that independent local coordinate before
+            # comparing logical fractions.
+            local_xview_reset = self._reset_wide_main_local_xviews(
+                reason=f"click-guard-{stage}"
+            )
             active = getattr(self, "_viewport_request_active", None)
             pending_col = getattr(active, "get", lambda *_args: None)("column_start")
             if (
@@ -20535,7 +20679,11 @@ class SheetView:
                 pass
             _dlog(f"click_guard_restore stage={stage} saved={saved_x:.6f} now={now_x:.6f} drift={drift:.6f}")
         else:
-            _dlog(f"click_guard_ok stage={stage} saved={saved_x:.6f} now={now_x:.6f}")
+            outcome = "restore-local" if local_xview_reset else "ok"
+            _dlog(
+                f"click_guard_{outcome} stage={stage} "
+                f"saved={saved_x:.6f} now={now_x:.6f}"
+            )
         self._log_click_trace_state(f"post_guard:{stage}")
 
     def _xview_cursor_cmp(self, *args):
@@ -21247,6 +21395,58 @@ class SheetView:
         # ``xview_moveto`` here because doing so would re-enter xscrollcommand
         # while publishing a logical scrollbar thumb.
 
+    def _reset_wide_main_local_xviews(self, *, reason: str = "") -> bool:
+        """Keep bounded wide documents at their own physical left edge.
+
+        Wide sheets have two horizontal coordinates: the authoritative logical
+        column-window start and each short Tk Text document's local pixel
+        ``xview``. Tk can retain or recreate a non-zero local xview across a
+        whole-document replacement even when the logical window is already at
+        column zero. That clips the first rendered fields in A/Base/B while C,
+        whose independent document is explicitly restored to zero, stays
+        correct. Local xview is never user-visible global state in wide mode,
+        so it must always be zero for both body and header documents.
+        """
+        if not self._wide_column_virtual_active():
+            return False
+        widgets = (
+            ("left", getattr(self, "left", None)),
+            ("base", getattr(self, "base", None)),
+            ("right", getattr(self, "right", None)),
+            ("left_header", getattr(self, "left_colhdr", None)),
+            ("base_header", getattr(self, "base_colhdr", None)),
+            ("right_header", getattr(self, "right_colhdr", None)),
+        )
+        drifted: dict[str, float] = {}
+        failures: list[str] = []
+        previous_xsync = bool(getattr(self, "_xsyncing", False))
+        self._xsyncing = True
+        try:
+            for name, widget in widgets:
+                if widget is None:
+                    continue
+                try:
+                    first = float((widget.xview() or (0.0, 1.0))[0])
+                    if not math.isfinite(first) or abs(first) <= 1e-6:
+                        continue
+                    drifted[name] = first
+                    widget.xview_moveto(0.0)
+                    restored = float((widget.xview() or (0.0, 1.0))[0])
+                    if not math.isfinite(restored) or abs(restored) > 1e-6:
+                        failures.append(f"{name}={restored!r}")
+                except Exception as exc:
+                    failures.append(f"{name}:{type(exc).__name__}:{exc}")
+        finally:
+            self._xsyncing = previous_xsync
+        if drifted:
+            _dlog(
+                "WIDE_LOCAL_XVIEW_RESET "
+                f"sheet={self.sheet} reason={reason or '-'} before={drifted} "
+                f"failures={failures or '-'}"
+            )
+            self._set_wide_column_scrollbars()
+        return bool(drifted and not failures)
+
     def _clear_prepared_text_for_column_window(self):
         """Drop rendered strings tied to a previous logical column window.
 
@@ -21459,6 +21659,12 @@ class SheetView:
             and self._virtual_pending_column_start is None
             and target == int(getattr(self, "_virtual_column_window_start", 0) or 0)
         ):
+            # A same-position thumb/arrow event is still a recovery boundary.
+            # The logical window can be correct while the bounded main Text
+            # documents retain a stale local pixel xview (the observed
+            # MapMonster A/B-vs-C divergence). Repair it without an otherwise
+            # redundant immutable document publication.
+            self._reset_wide_main_local_xviews(reason=f"{reason}-no-op")
             self._complete_viewport_request_if_current()
             return True
         self._virtual_pending_column_start = target
@@ -21846,6 +22052,11 @@ class SheetView:
                 # request, not only wide tables, so the end-to-end boundary
                 # never leaves a stale selection/C surface behind.
                 self._update_cursor_lines()
+            # Whole-document replacement and later selection work may preserve
+            # a Tk-local pixel offset. Wide mode exposes only the logical
+            # column window, so finish every publication with all main bodies
+            # and headers at the local left edge.
+            self._reset_wide_main_local_xviews(reason="viewport-publish")
             first, last = self._virtual_scroll_fractions()
             self._yscroll_all(first, last)
             self._set_wide_column_scrollbars()
@@ -42468,15 +42679,9 @@ class SowMergeApp:
             )
             self._show_exact_readiness_modal(action, sorted(self._pending_mutation_sheets(target_side)))
             return False
-        blocked = []
-        for sheet in sorted(self._pending_mutation_sheets(target_side)):
-            view = getattr(self, "sheet_views", {}).get(sheet)
-            if view is None or view._derive_lifecycle_state() != "READY":
-                state = "未加载" if view is None else view._derive_lifecycle_state()
-                blocked.append(f"{sheet}({state})")
-        if blocked:
-            self._show_exact_readiness_modal(action, [item.split("(", 1)[0] for item in blocked])
-            return False
+        # Executed operations already contain physical workbook coordinates.
+        # A failed/stale/unopened comparison view must not strand those edits.
+        # Mutation gates and output replay/overlay validation remain in force.
         return True
 
     def _request_edit_preload_for_exact_view(self, view) -> bool:
@@ -42700,6 +42905,67 @@ class SowMergeApp:
         if self._wb_base_val is None:
             raise KeyError("base workbook not available")
         return self._wb_base_val[sheet]
+
+    def _missing_sheet_comparison_cache(self, sheet: str, *, cancel_check=None) -> dict:
+        """Compare whole-Sheet presence without indexing an absent worksheet.
+
+        As in the missing-Sheet view, rows use physical order: only whole-Sheet
+        actions are available, so no inferred cross-side row/column map is needed.
+        """
+        meta = self.get_sheet_meta(sheet)
+        snapshots = {}
+        for side, flag in (("A", "has_a"), ("B", "has_b"), ("BASE", "has_base")):
+            if cancel_check:
+                cancel_check()
+            if meta.get(flag):
+                snapshots[side] = self.selected_sheet_snapshot(side, sheet, cancel_check=cancel_check)
+                if snapshots[side] is None:
+                    raise RuntimeError(f"无法读取已有工作表：{side}/{sheet}")
+        bounds = {side: int(snapshots[side].max_row) if side in snapshots else 0
+                  for side in ("A", "B", "BASE")}
+        width = max([1] + [int(snapshot.max_col) for snapshot in snapshots.values()])
+        height = max(1, *bounds.values())
+        pairs, base_rows = [], {}
+        parts = {side: {} for side in ("A", "B", "BASE")}
+        widths = {col: 4 for col in range(1, width + 1)}
+        for idx in range(height):
+            if cancel_check and idx % 128 == 0:
+                cancel_check()
+            row = idx + 1
+            pairs.append((row if row <= bounds["A"] else None,
+                          row if row <= bounds["B"] else None))
+            if row <= bounds["BASE"]:
+                base_rows[idx] = row
+            for side in parts:
+                snapshot = snapshots.get(side)
+                values, formulas = (_snapshot_row_payload(snapshot, row)
+                                    if snapshot is not None and row <= bounds[side] else ((), ()))
+                text = []
+                for col in range(width):
+                    value = values[col] if col < len(values) else None
+                    formula = formulas[col] if col < len(formulas) else None
+                    display, _, _ = _cell_display_and_equal_from_values(value, None, formula, None)
+                    text.append(_val_to_str(display))
+                    widths[col + 1] = max(widths[col + 1], min(len(text[-1]), _COL_MAX_DISPLAY_WIDTH))
+                parts[side][idx] = text
+        return {
+            "sheet": sheet, "max_row": height, "max_col": width,
+            "max_row_a": bounds["A"], "max_row_b": bounds["B"], "max_row_base": bounds["BASE"],
+            "col_max_a": max(1, snapshots["A"].max_col) if "A" in snapshots else 1,
+            "col_max_b": max(1, snapshots["B"].max_col) if "B" in snapshots else 1,
+            "col_max_base": max(1, snapshots["BASE"].max_col) if "BASE" in snapshots else 1,
+            "row_pairs": pairs, "pair_diff_cols": {idx: {-1} for idx in range(height)},
+            "pair_base_diff_cols": {}, "pair_base_row_override": base_rows,
+            "mine_to_base_row": {row: row for row in range(1, min(bounds["A"], bounds["BASE"]) + 1)},
+            "theirs_to_base_row": {row: row for row in range(1, min(bounds["B"], bounds["BASE"]) + 1)},
+            "row_a_to_pair_idx": {row: row - 1 for row in range(1, bounds["A"] + 1)},
+            "row_b_to_pair_idx": {row: row - 1 for row in range(1, bounds["B"] + 1)},
+            "pair_parts_a": parts["A"], "pair_parts_b": parts["B"], "pair_parts_base": parts["BASE"],
+            "col_char_widths": widths, "sheet_structural_diff": True, "has_diff": True,
+            "only_diff_rows": list(range(height)), "prepared_complete": True, "snapshot_engine": True,
+            "completeness": dict.fromkeys(("formula_aware", "row_model_exact", "column_projection_exact",
+                "sheet_summary_exact", "ab_diff_exact", "base_diff_exact", "only_diff_rows_exact"), True),
+        }
 
     def selected_sheet_snapshot(self, side: str, sheet: str, *, mutation_generation: int = 0, cancel_check=None) -> SheetSnapshot | None:
         """Return one generation-safe immutable snapshot without scanning siblings.
@@ -43279,7 +43545,6 @@ class SowMergeApp:
 
     def build_manual_merge_output_file(self):
         """Build merge output by XML-level patching from pristine mine snapshot."""
-        self._ensure_live_column_mappings_current("构建合并输出")
         self._ensure_column_replay_available("A")
         src = self._merge_mine_snapshot if (self._merge_mine_snapshot and os.path.exists(self._merge_mine_snapshot)) else self.file_a
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -43426,7 +43691,6 @@ class SowMergeApp:
 
     def build_manual_b_output_file(self):
         """Build a 2-way B-side result by replaying structural operations safely."""
-        self._ensure_live_column_mappings_current("构建B输出")
         self._ensure_column_replay_available("B")
         src = self.file_b
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -46162,6 +46426,8 @@ class SowMergeApp:
             snapshot_only: bool = False,
         ):
             _check_bg_cancel()
+            if self.get_sheet_meta(sheet).get("view_mode") == "missing_sheet":
+                return self._missing_sheet_comparison_cache(sheet, cancel_check=_check_bg_cancel)
             snapshot_cache = _try_snapshot_sheet_cache(sheet)
             if snapshot_cache is not None:
                 return snapshot_cache
@@ -46837,7 +47103,7 @@ class SowMergeApp:
                     view._only_diff_preview_full = False
                     view._only_diff_async_building = False
                     view._show_exact_unavailable(
-                        f"未解决：{unresolved_reason}。当前只读，修改和保存均已阻止；请刷新后重试。"
+                        f"未解决：{unresolved_reason}。当前 Sheet 不可修改；已执行的操作仍可保存。"
                     )
                 self._update_exact_status_ui()
                 self.refresh_sheet_nav()
@@ -47296,7 +47562,7 @@ class SowMergeApp:
             view._only_diff_preview_full = False
             view._only_diff_async_building = False
             view._show_exact_unavailable(
-                f"计算失败：{view._lifecycle_error}。当前只读，修改和保存均已阻止；请刷新后重试。"
+                f"计算失败：{view._lifecycle_error}。当前 Sheet 不可修改；已执行的操作仍可保存。"
             )
             self._update_exact_status_ui()
             self.refresh_sheet_nav()
@@ -49606,7 +49872,6 @@ class SowMergeApp:
             return
         self._ensure_edit_loaded()
         try:
-            self._ensure_live_column_mappings_current("保存B")
             self._ensure_column_replay_available("B")
         except Exception as exc:
             messagebox.showerror("保存已停止", str(exc))
@@ -49660,7 +49925,6 @@ class SowMergeApp:
             return
         self._ensure_edit_loaded()
         try:
-            self._ensure_live_column_mappings_current("保存A")
             self._ensure_column_replay_available("A")
         except Exception as exc:
             messagebox.showerror("保存已停止", str(exc))
@@ -49927,10 +50191,14 @@ class SowMergeApp:
     def save_merged_and_exit(self, auto: bool = False):
         if not self.merged_path:
             return
+        # Only an explicit save may persist partial review progress. Automatic
+        # save/resolve must still wait for exact comparison of every common Sheet.
+        if auto and any(not self._is_sheet_exact_current(sheet)
+                        for sheet in getattr(self, "compare_sheets", ())):
+            return
         if not self._guard_save_readiness("保存 Merged", "A"):
             return
         try:
-            self._ensure_live_column_mappings_current("保存Merged")
             self._ensure_column_replay_available("A")
         except Exception as exc:
             messagebox.showerror("保存已停止", str(exc))
@@ -50011,11 +50279,14 @@ class SowMergeApp:
                 except Exception:
                     pass
 
+                if not merged_source_path:
+                    fd, merged_source_path = tempfile.mkstemp(suffix=_workbook_ext(self.merged_path))
+                    os.close(fd)
+                    self._atomic_save_with_retry(wb_to_save, merged_source_path)
+                report("正在校验公式缓存", "检查全部公式计算结果，完成后才覆盖目标文件...", 78)
+                _validate_formula_caches_for_save(merged_source_path)
                 report("正在写入 merged 文件", os.path.basename(self.merged_path), 82)
-                if merged_source_path:
-                    self._atomic_replace_file_with_retry(merged_source_path, self.merged_path)
-                else:
-                    self._atomic_save_with_retry(wb_to_save, self.merged_path)
+                self._atomic_replace_file_with_retry(merged_source_path, self.merged_path)
 
                 report("正在校验保存结果", "检查 OOXML/ZIP 结构和文件完整性...", 95)
                 if not _workbook_package_ready(self.merged_path):
